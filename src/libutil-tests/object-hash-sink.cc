@@ -553,6 +553,7 @@ TEST(ObjectHashSink, permittedPullFoldMatchesSerialAndNarAcrossTheFiniteMetadata
                     source->typed = typed;
                     source->sized = sized;
                     source->addFile(CanonPath("a/x"), "plain");
+                    source->addFile(CanonPath("a/z"), "second leaf");
                     source->addFile(CanonPath("b/y"), "second");
                     source->addFile(CanonPath("Foo"), "upper");
                     source->addFile(
@@ -583,6 +584,95 @@ TEST(ObjectHashSink, permittedPullFoldMatchesSerialAndNarAcrossTheFiniteMetadata
                     }
                 }
     EXPECT_EQ(cases, 256u);
+}
+
+/* A pool used by an earlier directory must not change the first error of
+   a later directory whose children are all scheduled inline. The oracle is
+   the first child index, with its read preceding its fold, not a read trace. */
+TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
+{
+    enum class Outcome { Success, ReadFailure, FoldFailure };
+    const auto outcomes = {Outcome::Success, Outcome::ReadFailure, Outcome::FoldFailure};
+    const HashedNode file{
+        .entry = {merkle::Mode::Regular, merkle::blobId("")}, .narSize = merkle::nar::regular(0, false)};
+    const HashedNode empty{
+        .entry = {merkle::Mode::Directory, merkle::treeId("")}, .narSize = merkle::nar::Directory{}.finish()};
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (auto first : outcomes)
+            for (auto second : outcomes) {
+                HashingVisitor visitor{workers};
+                visitor.directory(CanonPath("warm"), [&](auto each) {
+                    each("directory", true, [&] { return empty; });
+                    each("file", false, [&] { return file; });
+                });
+                const std::array selected{first, second};
+                const std::array names{"first", "second"};
+                std::atomic<size_t> active{0}, started{0}, completed{0};
+                std::string failure, message;
+                try {
+                    visitor.directory(CanonPath("checked"), [&](auto each) {
+                        for (size_t i = 0; i < selected.size(); ++i)
+                            each(names[i], false, [&, i] {
+                                ++active;
+                                ++started;
+                                Finally done{[&] {
+                                    --active;
+                                    ++completed;
+                                }};
+                                if (selected[i] == Outcome::ReadFailure)
+                                    throw std::runtime_error(names[i]);
+                                auto node = file;
+                                if (selected[i] == Outcome::FoldFailure)
+                                    node.entry.hash = Hash{HashAlgorithm::SHA1};
+                                return node;
+                            });
+                    });
+                } catch (const Error & e) {
+                    failure = "fold";
+                    message = e.what();
+                } catch (const std::runtime_error & e) {
+                    failure = "read";
+                    message = e.what();
+                }
+                auto expected = first != Outcome::Success    ? size_t{0}
+                                : second != Outcome::Success ? size_t{1}
+                                                             : size_t{2};
+                if (expected == 2) {
+                    EXPECT_TRUE(failure.empty());
+                    EXPECT_EQ(started.load(), 2u);
+                } else {
+                    EXPECT_EQ(failure, selected[expected] == Outcome::ReadFailure ? "read" : "fold");
+                    EXPECT_NE(message.find(names[expected]), std::string::npos);
+                }
+                EXPECT_EQ(active.load(), 0u);
+                EXPECT_EQ(started.load(), completed.load());
+                ++cases;
+            }
+    EXPECT_EQ(cases, 72u);
+
+    /* A false hint can still descend into work which forks; true hints can
+       describe regular nodes. Their values, not those hints, name the tree. */
+    auto source = make_ref<MemorySourceAccessor>();
+    source->addFile(CanonPath("directory/a"), "");
+    source->addFile(CanonPath("directory/b"), "");
+    source->addFile(CanonPath("file"), "");
+    const auto expected = expectedRoot(source);
+    for (size_t workers = 1; workers <= 8; ++workers) {
+        HashingVisitor visitor{workers};
+        auto result = visitor.directory(CanonPath::root, [&](auto each) {
+            each("directory", false, [&] {
+                return visitor.directory(CanonPath("directory"), [&](auto nested) {
+                    nested("a", true, [&] { return file; });
+                    nested("b", true, [&] { return file; });
+                });
+            });
+            each("file", false, [&] { return file; });
+        });
+        EXPECT_EQ(result.entry, expected);
+        ASSERT_TRUE(result.narSize);
+        EXPECT_EQ(merkle::nar::root(*result.narSize), narOf(*source).size());
+    }
 }
 
 TEST(ObjectHashSink, permittedPullUsesWorkersButAnExplicitVisitorKeepsItsCallerThread)

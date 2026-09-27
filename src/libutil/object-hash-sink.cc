@@ -146,10 +146,11 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
         children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit), std::nullopt});
         });
-        if (!pool && kids.size() > 1
-            && std::any_of(kids.begin(), kids.end(), [](auto & child) { return child.subdirectory; }))
+        bool canFork =
+            kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & child) { return child.subdirectory; });
+        if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
-        if (pool)
+        if (canFork)
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },

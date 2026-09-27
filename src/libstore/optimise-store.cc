@@ -740,7 +740,9 @@ struct MaterialisingVisitor : LinkingVisitor
         });
         /* A singleton can still find parallel work below it. Construct
            the shared scheduler only at the first branching directory. */
-        if (!pool && kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; }))
+        bool canFork =
+            kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & c) { return c.subdirectory; });
+        if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
         auto * sink = currentFrame().sink;
         auto run = [&](size_t i, bool) {
@@ -753,7 +755,7 @@ struct MaterialisingVisitor : LinkingVisitor
             assert(c.node);
             each(std::string_view(c.disk).substr(0, c.nameSize), c.subdirectory, [&] { return std::move(*c.node); });
         };
-        if (pool)
+        if (canFork)
             pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
         else
             for (size_t i = 0; i < kids.size(); ++i) {

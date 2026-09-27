@@ -16,12 +16,17 @@ void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
     assert(kind == "blob" || kind == "tree");
     /* Four kind bytes, a space, at most 20 uint64_t digits, and NUL. */
     char header[26];
-    std::copy_n(kind.begin(), 4, header);
-    header[4] = ' ';
-    auto [end, ec] = std::to_chars(header + 5, header + 25, size);
-    assert(ec == std::errc{});
-    *end++ = '\0';
-    sink({header, static_cast<size_t>(end - header)});
+    auto * end = header + sizeof(header);
+    auto * begin = end;
+    *--begin = '\0';
+    do {
+        *--begin = static_cast<char>('0' + size % 10);
+        size /= 10;
+    } while (size);
+    *--begin = ' ';
+    begin -= 4;
+    std::copy_n(kind.begin(), 4, begin);
+    sink({begin, static_cast<size_t>(end - begin)});
 }
 
 ObjectHasher::ObjectHasher(std::string_view kind, uint64_t size)
