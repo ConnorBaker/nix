@@ -61,7 +61,8 @@ std::string readHashColumn(LocalStore & store, const StorePath & path)
 {
     auto db = openDb(store);
     SQLiteStmt stmt{db, "select hash from ValidPaths where path = ?"};
-    auto use(stmt.use().apply(store.printStorePath(path)));
+    auto use(stmt.use());
+    use.apply(store.printStorePath(path));
     if (!use.next())
         throw Error("no row for '%s'", store.printStorePath(path));
     return use.getStr(0);

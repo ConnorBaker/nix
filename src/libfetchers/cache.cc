@@ -131,7 +131,8 @@ struct CacheImpl : Cache
     {
         auto state(_state.lock());
 
-        auto stmt(state->lookup.use().apply(key.first).apply(encodeAttrs(key.second)));
+        auto stmt(state->lookup.use());
+        stmt.apply(key.first).apply(encodeAttrs(key.second));
         if (!stmt.next()) {
             /* `debug` evaluates its arguments only at that verbosity
                (`printMsgUsing`, logging.hh), so the JSON rendering costs

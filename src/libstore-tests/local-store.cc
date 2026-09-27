@@ -4794,6 +4794,68 @@ TEST_F(LocalStoreObjectsTest, concurrentMissesShareTheFirstCompletedHolder)
             }
 }
 
+/* A holder names the same owned file for every admitted root spelling.
+   Filesystem-root cases only read that spelling; all files stay in the fixture. */
+TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
+{
+    auto & objects = store->objects;
+    unsigned cases = 0;
+    for (bool executable : {false, true})
+        for (unsigned route : {0u, 1u, 2u}) {
+            auto dir = tempStoreDir.path() / fmt("holder-root-%d-%d", executable, route);
+            createDir(dir);
+            auto fd = openDirectory(dir);
+            auto where = dir / "a";
+            auto bytes = dir.filename().string();
+            auto id = merkle::blobId(bytes);
+            writeFile(where, bytes);
+            chmod(where, executable ? 0555 : 0444);
+            setWriteTime(where, 1, 1);
+            auto before = st(where);
+            auto name = CanonPath::fromFilename("a");
+            struct Spelling
+            {
+                std::filesystem::path root, file;
+                std::string expectedName;
+            };
+            const Spelling spellings[] = {
+                {{}, where, where.string()},
+                {where, where, ""},
+                {dir, where, "a"},
+                {dir.string() + "/", dir.string() + "/a", "a"},
+                {dir.string() + "//", dir.string() + "//a", "a"},
+                {where.root_path(), where, where.relative_path().string()},
+            };
+            for (const auto & spelling : spellings) {
+                SCOPED_TRACE(fmt("root=%s executable=%d route=%d", spelling.root.string(), executable, route));
+                auto hold = objects.hold();
+                hold.setRoot(spelling.root);
+                if (route == 2)
+                    ASSERT_TRUE(objects.place(
+                        id, executable, fd.get(), name, spelling.file, before, NoRepair, hold));
+                else
+                    objects.enterWritten(
+                        id, executable, fd.get(), name, spelling.file, NoRepair, hold, /*looked=*/route == 1);
+
+                auto holder = hold.pendingHolder(id, executable);
+                ASSERT_TRUE(holder);
+                EXPECT_EQ(std::filesystem::path(*holder).lexically_normal(), where.lexically_normal());
+                auto projection = hold.takeProjection();
+                ASSERT_EQ(projection.regular.size(), 1u);
+                EXPECT_TRUE(projection.auxiliary.empty());
+                const auto & row = projection.regular.front();
+                EXPECT_EQ(row.name, spelling.expectedName);
+                EXPECT_EQ(row.id, id);
+                EXPECT_EQ(row.executable, executable);
+                EXPECT_EQ(row.ino, before.st_ino);
+                EXPECT_EQ(row.dev, before.st_dev);
+                EXPECT_EQ(row.size, static_cast<uint64_t>(before.st_size));
+                ++cases;
+            }
+        }
+    EXPECT_EQ(cases, 36u);
+}
+
 TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollectedBeforeRegistration)
 {
     setenv("_NIX_TEST_NO_LSOF", "1", 1);

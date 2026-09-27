@@ -289,7 +289,7 @@ static std::string nameUnderRoot(const std::filesystem::path & where, const std:
     auto & w = where.native();
     if (r.empty() || w.size() < r.size() || w.compare(0, r.size(), r) != 0)
         return w;
-    return w.size() == r.size() ? std::string() : w.substr(r.size() + 1);
+    return w.size() == r.size() ? std::string() : w.substr(r.size() + (r.back() != '/'));
 }
 
 GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)

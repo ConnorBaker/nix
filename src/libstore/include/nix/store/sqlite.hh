@@ -118,6 +118,8 @@ struct SQLiteStmt
 
     public:
 
+        Use(const Use &) = delete;
+
         ~Use();
 
         /**

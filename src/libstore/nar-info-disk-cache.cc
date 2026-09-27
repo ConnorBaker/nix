@@ -194,7 +194,8 @@ private:
                the the subtraction would promote time_t to unsigned if time_t is
                32 bit. */
             auto timestamp = static_cast<int64_t>(time(nullptr)) - static_cast<int64_t>(settings.ttlMeta.get());
-            auto queryCache(state.queryCache.use().apply(uri).apply(timestamp));
+            auto queryCache(state.queryCache.use());
+            queryCache.apply(uri).apply(timestamp);
             if (!queryCache.next())
                 return std::nullopt;
             auto cache = Cache{
@@ -226,12 +227,12 @@ public:
             Cache ret{.storeDir = storeDir, .info = info};
 
             {
-                auto r(state->insertCache.use()
-                           .apply(uri)
-                           .apply(time(nullptr))
-                           .apply(storeDir)
-                           .apply(info.wantMassQuery)
-                           .apply(info.priority));
+                auto r(state->insertCache.use());
+                r.apply(uri)
+                    .apply(time(nullptr))
+                    .apply(storeDir)
+                    .apply(info.wantMassQuery)
+                    .apply(info.priority);
                 if (!r.next()) {
                     unreachable();
                 }
@@ -267,11 +268,11 @@ public:
 
                 auto now = time(nullptr);
 
-                auto queryNAR(state->queryNAR.use()
-                                  .apply(cache.info.id)
-                                  .apply(hashPart)
-                                  .apply(now - settings.ttlNegative)
-                                  .apply(now - settings.ttlPositive));
+                auto queryNAR(state->queryNAR.use());
+                queryNAR.apply(cache.info.id)
+                    .apply(hashPart)
+                    .apply(now - settings.ttlNegative)
+                    .apply(now - settings.ttlPositive);
 
                 if (!queryNAR.next())
                     return {oUnknown, 0};
@@ -315,12 +316,12 @@ public:
 
                 auto now = time(nullptr);
 
-                auto queryRealisation(state->queryRealisation.use()
-                                          .apply(cache.info.id)
-                                          .apply(id.drvPath.to_string())
-                                          .apply(id.outputName)
-                                          .apply(now - settings.ttlNegative)
-                                          .apply(now - settings.ttlPositive));
+                auto queryRealisation(state->queryRealisation.use());
+                queryRealisation.apply(cache.info.id)
+                    .apply(id.drvPath.to_string())
+                    .apply(id.outputName)
+                    .apply(now - settings.ttlNegative)
+                    .apply(now - settings.ttlPositive);
 
                 if (!queryRealisation.next())
                     return {oUnknown, nullptr};

@@ -141,11 +141,11 @@ struct AttrDb
             auto state(_state->lock());
 
             // Seal the attribute names: we now know the complete set.
-            auto upsertAttribute(state->upsertAttribute.use()
-                                     .apply(key.first)
-                                     .apply(symbols[key.second])
-                                     .apply(AttrType::FullAttrs)
-                                     .apply(0, false));
+            auto upsertAttribute(state->upsertAttribute.use());
+            upsertAttribute.apply(key.first)
+                .apply(symbols[key.second])
+                .apply(AttrType::FullAttrs)
+                .apply(0, false);
             upsertAttribute.next();
             auto rowId = (AttrId) upsertAttribute.getInt(0);
             assert(rowId);
@@ -314,7 +314,8 @@ struct AttrDb
     {
         auto state(_state->lock());
 
-        auto queryAttribute(state->queryAttribute.use().apply(key.first).apply(symbols[key.second]));
+        auto queryAttribute(state->queryAttribute.use());
+        queryAttribute.apply(key.first).apply(symbols[key.second]);
         if (!queryAttribute.next())
             return {};
 
@@ -327,7 +328,8 @@ struct AttrDb
         case AttrType::FullAttrs: {
             // FIXME: expensive, should separate this out.
             std::vector<Symbol> attrs;
-            auto queryAttributes(state->queryAttributes.use().apply(rowId));
+            auto queryAttributes(state->queryAttributes.use());
+            queryAttributes.apply(rowId);
             while (queryAttributes.next())
                 attrs.emplace_back(symbols.create(queryAttributes.getStr(0)));
             return {{rowId, attrs}};
