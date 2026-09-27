@@ -1815,7 +1815,7 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
 
         void readDirectoryWithEntries(
             const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }

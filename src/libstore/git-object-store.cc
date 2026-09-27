@@ -104,7 +104,7 @@ void GitObjectStore::createDirectories() const
 
 Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path)
 {
-    merkle::BlobHasher hasher{static_cast<uint64_t>(lstat(path).st_size)};
+    merkle::ObjectHasher hasher{"blob", static_cast<uint64_t>(lstat(path).st_size)};
     readFile(path, hasher);
     return hasher.finish();
 }
@@ -247,7 +247,7 @@ bool GitObjectStore::verify(RepairFlag repair)
                     if (tree)
                         return merkle::treeId(
                             drainFD(fd.get(), {.size = static_cast<size_t>(metadata.st_size), .expected = false}));
-                    merkle::BlobHasher hasher{static_cast<uint64_t>(metadata.st_size)};
+                    merkle::ObjectHasher hasher{"blob", static_cast<uint64_t>(metadata.st_size)};
                     drainFD(fd.get(), hasher);
                     return hasher.finish();
                 }();

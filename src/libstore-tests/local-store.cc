@@ -9892,7 +9892,8 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
                             scopedPath,
                             [&](SourceAccessor & child,
                                 const CanonPath & relative,
-                                const SourceAccessor::DirEntries & entries) {
+                                SourceAccessor::DirectoryListing && listing) {
+                                const auto & entries = listing.entries();
                                 callback();
                                 checkEntries(entries);
                                 bytes = child.readFile(scopedFile(relative));

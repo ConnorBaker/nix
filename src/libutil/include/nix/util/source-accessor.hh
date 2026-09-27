@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
+#include <variant>
 
 #include "nix/util/canon-path.hh"
 #include "nix/util/fun.hh"
@@ -163,6 +165,50 @@ public:
 
     typedef std::map<std::string, DirEntry, std::less<>> DirEntries;
 
+    /** A listing owned by this value or borrowed from a live directory scope.
+     * Consumers may read either form or filter it into an owning map.
+     * Filtering transfers owned nodes and copies only accepted borrowed nodes,
+     * preserving the lender's admission snapshot. Borrowing is callback-scoped. */
+    class DirectoryListing
+    {
+        using Borrowed = std::reference_wrapper<const DirEntries>;
+        std::variant<DirEntries, Borrowed> value;
+
+    public:
+        explicit DirectoryListing(DirEntries && entries)
+            : value(std::move(entries))
+        {
+        }
+
+        explicit DirectoryListing(Borrowed entries)
+            : value(entries)
+        {
+        }
+
+        DirectoryListing(DirectoryListing &&) = default;
+
+        const DirEntries & entries() const
+        {
+            if (auto owned = std::get_if<DirEntries>(&value))
+                return *owned;
+            return std::get<Borrowed>(value).get();
+        }
+
+        template<typename Predicate>
+        DirEntries filter(Predicate && keep) &&
+        {
+            if (auto owned = std::get_if<DirEntries>(&value)) {
+                std::erase_if(*owned, [&](const auto & entry) { return !keep(entry); });
+                return std::move(*owned);
+            }
+            DirEntries admitted;
+            for (const auto & entry : std::get<Borrowed>(value).get())
+                if (keep(entry))
+                    admitted.insert(admitted.end(), entry);
+            return admitted;
+        }
+    };
+
     /**
      * @note Like `readFile`, this method should *not* follow symlinks.
      */
@@ -187,12 +233,14 @@ public:
 
     /** List and scope the same opened directory for a recursive walk. */
     virtual void readDirectoryWithEntries(
-        const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+        const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
     {
         auto keepAlive = weak_from_this().lock();
         auto entries = readDirectory(path);
         readDirectory(path, [&](SourceAccessor & accessor, const CanonPath & relative) {
-            callback(accessor, relative, entries);
+            /* The virtual scoped operation may invoke its callback again;
+               retain this default listing for the entire operation. */
+            callback(accessor, relative, DirectoryListing(std::cref(entries)));
         });
     }
 

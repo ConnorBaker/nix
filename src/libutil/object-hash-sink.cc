@@ -30,7 +30,7 @@ HashedNode HashingVisitor::regular(const CanonPath & path, fun<void(CreateRegula
     {
         const CanonPath & path;
         bool executable = false;
-        std::optional<merkle::BlobHasher> hasher;
+        std::optional<merkle::ObjectHasher> hasher;
         uint64_t announced = 0;
         uint64_t received = 0;
 
@@ -54,7 +54,7 @@ HashedNode HashingVisitor::regular(const CanonPath & path, fun<void(CreateRegula
             if (hasher)
                 throw Error("object hash: the size of file '%s' was announced twice", path);
             announced = size;
-            hasher.emplace(size);
+            hasher.emplace("blob", size);
             if (!buffer.empty()) {
                 (*hasher)(buffer);
                 buffer.clear();

@@ -349,7 +349,7 @@ public:
 
     void readDirectoryWithEntries(
         const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override;
+        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override;
 
     std::string readLink(const CanonPath & path) override;
 
@@ -618,7 +618,7 @@ try {
 }
 
 void PosixDirectorySourceAccessor::readDirectoryWithEntries(
-    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
 {
     auto keepAlive = weak_from_this().lock();
     try {
@@ -627,7 +627,7 @@ void PosixDirectorySourceAccessor::readDirectoryWithEntries(
         /* fdopendir owns the descriptor for the whole callback. The scoped
            accessor borrows it, including while directory workers run. */
         PosixDirectorySourceAccessor accessor{::dirfd(dir.get()), fsPath / path.rel(), trackLastModified};
-        callback(accessor, CanonPath::root, entries);
+        callback(accessor, CanonPath::root, DirectoryListing(std::move(entries)));
         PosixSourceAccessorBase::maybeUpdateMtime(accessor.mtime);
     } catch (SymlinkNotAllowed & e) {
         throw SymlinkNotAllowed(e.path, "path '%s' is a symlink", showPath(e.path));

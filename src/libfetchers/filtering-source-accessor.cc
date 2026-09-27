@@ -56,17 +56,14 @@ SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPat
 }
 
 void FilteringSourceAccessor::readDirectoryScoped(
-    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback)
+    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
 {
     /* The scoped view borrows this policy throughout the callback. Stack
        scopes are already kept alive by their enclosing directory call. */
     auto owner = weak_from_this().lock();
     checkAllowed(path);
-    auto handler = [&](SourceAccessor & inner, const CanonPath & relative, const DirEntries & entries) {
-        DirEntries admitted;
-        for (auto & entry : entries)
-            if (isAllowed(path / entry.first))
-                admitted.insert(admitted.end(), entry);
+    auto handler = [&](SourceAccessor & inner, const CanonPath & relative, DirectoryListing && listing) {
+        auto admitted = std::move(listing).filter([&](const auto & entry) { return isAllowed(path / entry.first); });
 
         struct Scoped final : FilteringSourceAccessor
         {
@@ -127,12 +124,12 @@ void FilteringSourceAccessor::readDirectoryScoped(
 
             void readDirectoryWithEntries(
                 const CanonPath & p,
-                std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+                std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
             {
                 readDirectoryScoped(p, std::move(callback));
             }
         } scoped{inner, relative, *this, path, admitted};
-        callback(scoped, CanonPath::root, admitted);
+        callback(scoped, CanonPath::root, DirectoryListing(std::cref(admitted)));
     };
     next->readDirectoryWithEntries(prefix / path, std::ref(handler));
 }
@@ -183,7 +180,7 @@ struct AllowListSourceAccessorImpl final : AllowListSourceAccessor
 
     void readDirectoryWithEntries(
         const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
     {
         readDirectoryScoped(path, std::move(callback));
     }
@@ -265,7 +262,7 @@ struct FixedSetFilteringSourceAccessor : FilteringSourceAccessor
 {
     void readDirectoryWithEntries(
         const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
     {
         readDirectoryScoped(path, std::move(callback));
     }

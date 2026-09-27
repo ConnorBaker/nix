@@ -138,7 +138,8 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                 std::optional<Result> result;
                 auto directory = [&](SourceAccessor & subdirAccessor,
                                      const CanonPath & subdirFrom,
-                                     const SourceAccessor::DirEntries & entries) {
+                                     SourceAccessor::DirectoryListing && listing) {
+                    const auto & entries = listing.entries();
                     /* Without a suffix the listing already has the tree's
                        unique names in its order, under either case-hack
                        setting. Otherwise validate and reorder every name

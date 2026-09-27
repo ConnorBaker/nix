@@ -118,7 +118,7 @@ public:
 
     void readDirectoryWithEntries(
         const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
     {
         auto inner = next;
         inner->readDirectoryWithEntries(path, std::move(callback));

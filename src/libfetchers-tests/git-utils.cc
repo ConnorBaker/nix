@@ -1359,7 +1359,11 @@ TEST_F(GitUtilsTest, workdirDomainIsTheFixedTrackedPrefixesAndTheirAncestors)
                             entries.insert(entry);
                     EXPECT_EQ(workdir->readDirectory(q), entries);
                     workdir->readDirectoryWithEntries(
-                        q, [&](SourceAccessor & scoped, const CanonPath & relative, const auto & observed) {
+                        q,
+                        [&](SourceAccessor & scoped,
+                            const CanonPath & relative,
+                            SourceAccessor::DirectoryListing && listing) {
+                            const auto & observed = listing.entries();
                             EXPECT_EQ(observed, entries);
                             for (const auto & entry : observed)
                                 EXPECT_EQ(
@@ -2184,7 +2188,8 @@ TEST_F(GitUtilsTest, sharedRepositoryAttributeReadersAgreeAfterRefresh)
                     path,
                     [&](SourceAccessor & scoped,
                         const CanonPath & relative,
-                        const SourceAccessor::DirEntries & entries) {
+                        SourceAccessor::DirectoryListing && listing) {
+                        const auto & entries = listing.entries();
                         for (auto & [name, type] : entries)
                             std::get<0>(result).insert(name);
                         /* The LFS attribute is true but these are ordinary

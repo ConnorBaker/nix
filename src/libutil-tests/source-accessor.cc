@@ -147,7 +147,8 @@ TEST_F(FSSourceAccessorTest, scopedDirectoryCallbacksRetainTheirReceiver)
                                 relative,
                                 [&](SourceAccessor & inner,
                                     const CanonPath & root,
-                                    const SourceAccessor::DirEntries & entries) {
+                                    SourceAccessor::DirectoryListing && listing) {
+                                    const auto & entries = listing.entries();
                                     ++borrowedCalls;
                                     EXPECT_TRUE(inner.weak_from_this().expired());
                                     EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
@@ -164,7 +165,8 @@ TEST_F(FSSourceAccessorTest, scopedDirectoryCallbacksRetainTheirReceiver)
                                     path,
                                     [&](SourceAccessor & scoped,
                                         const CanonPath & relative,
-                                        const SourceAccessor::DirEntries & entries) {
+                                        SourceAccessor::DirectoryListing && listing) {
+                                        const auto & entries = listing.entries();
                                         EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
                                         callback(scoped, relative);
                                     });
@@ -489,7 +491,8 @@ TEST_F(FSSourceAccessorTest, listingAndScopeUseTheSameOpenedDirectory)
     auto accessor = makeFSSourceAccessor(tmpDir, true);
     accessor->readDirectoryWithEntries(
         CanonPath("old"),
-        [&](SourceAccessor & scoped, const CanonPath & root, const SourceAccessor::DirEntries & entries) {
+        [&](SourceAccessor & scoped, const CanonPath & root, SourceAccessor::DirectoryListing && listing) {
+            const auto & entries = listing.entries();
             ASSERT_EQ(entries.size(), 2u);
             std::filesystem::rename(tmpDir / "old", tmpDir / "moved");
             createDirs(tmpDir / "old");
@@ -497,7 +500,7 @@ TEST_F(FSSourceAccessorTest, listingAndScopeUseTheSameOpenedDirectory)
             EXPECT_EQ(scoped.readFile(root / "file"), "observed");
             EXPECT_EQ(scoped.readLink(root / "link"), "file");
             EXPECT_THROW(
-                scoped.readDirectoryWithEntries(root / "link", [](auto &, auto &, auto &) {}), SymlinkNotAllowed);
+                scoped.readDirectoryWithEntries(root / "link", [](auto &, auto &, const auto &) {}), SymlinkNotAllowed);
         });
     EXPECT_GT(accessor->getLastModified(), 0);
 }
@@ -723,10 +726,10 @@ struct CachingOwnershipProbe : SourceAccessor
 
     void readDirectoryWithEntries(
         const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
     {
         DirEntries entries{{"entry", tRegular}};
-        callback(*this, path, entries);
+        callback(*this, path, DirectoryListing(std::move(entries)));
     }
 
     std::string readLink(const CanonPath &) override
@@ -1130,7 +1133,8 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
                             path,
                             [&](SourceAccessor & scoped,
                                 const CanonPath & relative,
-                                const SourceAccessor::DirEntries & entries) {
+                                SourceAccessor::DirectoryListing && listing) {
+                                const auto & entries = listing.entries();
                                 callback();
                                 EXPECT_EQ(scoped.number, childNumber);
                                 EXPECT_EQ(relative, path);
@@ -1326,7 +1330,8 @@ TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
                         path,
                         [&](SourceAccessor & scoped,
                             const CanonPath & relative,
-                            const SourceAccessor::DirEntries & entries) {
+                            SourceAccessor::DirectoryListing && listing) {
+                            const auto & entries = listing.entries();
                             observe(Event::Scope);
                             EXPECT_EQ(&scoped, accessor);
                             EXPECT_EQ(relative, path);

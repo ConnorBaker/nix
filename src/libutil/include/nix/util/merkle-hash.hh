@@ -44,18 +44,18 @@ constexpr HashAlgorithm hashAlgo = HashAlgorithm::SHA256;
 void feedHeader(Sink & sink, std::string_view kind, uint64_t size);
 
 /**
- * Incremental blob identifier: `BlobHasher h{size}; h(chunk)...; h.finish()`.
- * The size is git's, so it is needed before the first byte.  A `Sink`, so
+ * Incremental object identifier: `ObjectHasher h{kind, size}; h(chunk)...; h.finish()`.
+ * The kind is `blob` or `tree`; the size is needed before the first byte. A `Sink`, so
  * that `SourceAccessor::readFile` can write into one.
  */
-struct BlobHasher : Sink
+struct ObjectHasher : Sink
 {
-    explicit BlobHasher(uint64_t size);
+    explicit ObjectHasher(std::string_view kind, uint64_t size);
 
-    ~BlobHasher() override;
+    ~ObjectHasher() override;
 
-    BlobHasher(const BlobHasher &) = delete;
-    BlobHasher & operator=(const BlobHasher &) = delete;
+    ObjectHasher(const ObjectHasher &) = delete;
+    ObjectHasher & operator=(const ObjectHasher &) = delete;
 
     void operator()(std::string_view chunk) override;
 

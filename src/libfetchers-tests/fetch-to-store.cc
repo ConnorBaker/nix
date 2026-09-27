@@ -1538,7 +1538,7 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
 
         void readDirectoryWithEntries(
             const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
         {
             ++active;
             ++opened;
@@ -1586,7 +1586,7 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
 
         void readDirectoryWithEntries(
             const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }
@@ -1810,24 +1810,123 @@ TEST(ScopedFilter, nestedScopesKeepTheListedPhysicalDirectoryAfterRename)
             return RestrictedPathError("denied '%s'", path);
         });
     accessor->readDirectoryWithEntries(CanonPath("before"), [&](auto & outer, const auto &, const auto &) {
-        outer.readDirectoryWithEntries(CanonPath("child"), [&](auto & inner, const auto &, const auto & entries) {
-            ASSERT_EQ(entries.size(), 2u);
-            std::filesystem::rename(before, moved);
-            createDirs(before / "child");
-            writeFile(before / "child/file", "replacement");
-            EXPECT_EQ(inner.readFile(CanonPath("file")), "observed");
-            EXPECT_EQ(inner.readLink(CanonPath("link")), "file");
-            inner.readDirectoryWithEntries(CanonPath::root, [&](auto & repeated, const auto &, const auto &) {
-                EXPECT_EQ(repeated.readFile(CanonPath("file")), "observed");
-                EXPECT_THROW(
-                    repeated.readDirectoryWithEntries(CanonPath("link"), [](auto &, const auto &, const auto &) {}),
-                    SymlinkNotAllowed);
+        outer.readDirectoryWithEntries(
+            CanonPath("child"), [&](auto & inner, const auto &, SourceAccessor::DirectoryListing && listing) {
+                const auto & entries = listing.entries();
+                ASSERT_EQ(entries.size(), 2u);
+                std::filesystem::rename(before, moved);
+                createDirs(before / "child");
+                writeFile(before / "child/file", "replacement");
+                EXPECT_EQ(inner.readFile(CanonPath("file")), "observed");
+                EXPECT_EQ(inner.readLink(CanonPath("link")), "file");
+                inner.readDirectoryWithEntries(CanonPath::root, [&](auto & repeated, const auto &, const auto &) {
+                    EXPECT_EQ(repeated.readFile(CanonPath("file")), "observed");
+                    EXPECT_THROW(
+                        repeated.readDirectoryWithEntries(CanonPath("link"), [](auto &, const auto &, const auto &) {}),
+                        SymlinkNotAllowed);
+                });
             });
-        });
     });
     EXPECT_EQ(readFile(before / "child/file"), "replacement");
 }
 #endif
+
+TEST(ScopedFilter, consumingListingPreservesUpstreamAdmissionSnapshots)
+{
+    struct Stopped
+    {};
+
+    const SourceAccessor::DirEntries expected{{"denied", SourceAccessor::tRegular}, {"keep", SourceAccessor::tRegular}};
+
+    struct Physical : MemorySourceAccessor
+    {
+        bool owned;
+
+        explicit Physical(bool owned)
+            : owned(owned)
+        {
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        {
+            auto entries = readDirectory(path);
+            auto before = entries;
+            Finally unchanged{[&] {
+                if (!owned)
+                    EXPECT_EQ(entries, before);
+            }};
+            if (owned)
+                callback(*this, path, DirectoryListing(std::move(entries)));
+            else
+                callback(*this, path, DirectoryListing(std::cref(entries)));
+        }
+    };
+
+    struct InnerPolicy : FilteringSourceAccessor
+    {
+        const DirEntries & expected;
+        size_t checked = 0;
+
+        void anchor() override {}
+
+        InnerPolicy(ref<SourceAccessor> next, const DirEntries & expected)
+            : FilteringSourceAccessor(SourcePath(next), [](const CanonPath &) { return RestrictedPathError("inner"); })
+            , expected(expected)
+        {
+        }
+
+        bool isAllowed(const CanonPath &) override
+        {
+            return true;
+        }
+
+        void readDirectoryWithEntries(
+            const CanonPath & path,
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        {
+            readDirectoryScoped(
+                path, [&](SourceAccessor & scoped, const CanonPath & relative, DirectoryListing && listing) {
+                    const auto & snapshot = listing.entries();
+                    Finally unchanged{[&] {
+                        EXPECT_EQ(snapshot, expected);
+                        EXPECT_TRUE(scoped.pathExists(relative / "denied"));
+                        ++checked;
+                    }};
+                    callback(scoped, relative, std::move(listing));
+                });
+        }
+    };
+
+    for (bool owned : {false, true})
+        for (bool stop : {false, true}) {
+            SCOPED_TRACE(fmt("owned=%d stop=%d", owned, stop));
+            auto physical = make_ref<Physical>(owned);
+            physical->addFile(CanonPath("keep"), "kept bytes");
+            physical->addFile(CanonPath("denied"), "other bytes");
+            auto inner = make_ref<InnerPolicy>(physical, expected);
+            auto outer = makeFixedSetFilteringSourceAccessor(SourcePath(inner), {CanonPath::root, CanonPath("keep")});
+            auto invoke = [&] {
+                outer->readDirectoryWithEntries(
+                    CanonPath::root,
+                    [&](SourceAccessor & scoped,
+                        const CanonPath & relative,
+                        SourceAccessor::DirectoryListing && listing) {
+                        EXPECT_EQ(listing.entries(), (SourceAccessor::DirEntries{{"keep", SourceAccessor::tRegular}}));
+                        EXPECT_EQ(scoped.readFile(relative / "keep"), "kept bytes");
+                        EXPECT_FALSE(scoped.pathExists(relative / "denied"));
+                        if (stop)
+                            throw Stopped{};
+                    });
+            };
+            if (stop)
+                EXPECT_THROW(invoke(), Stopped);
+            else
+                invoke();
+            EXPECT_EQ(inner->checked, 1u);
+        }
+}
 
 TEST(ScopedFilter, concurrencyPermissionRequiresBothThePolicyAndPhysicalAccessor)
 {
@@ -1866,7 +1965,7 @@ TEST(ScopedFilter, concurrencyPermissionRequiresBothThePolicyAndPhysicalAccessor
 
         void readDirectoryWithEntries(
             const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, const DirEntries &)> callback) override
+            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }
@@ -2160,7 +2259,10 @@ TEST(FilteringSourceAccessor, forwardingRetainsTheSelectedChildAndScopedPolicy)
                             } else if (call == Call::Directory) {
                                 source->readDirectoryWithEntries(
                                     directory,
-                                    [&](SourceAccessor & scoped, const CanonPath & relative, const auto & entries) {
+                                    [&](SourceAccessor & scoped,
+                                        const CanonPath & relative,
+                                        SourceAccessor::DirectoryListing && listing) {
+                                        const auto & entries = listing.entries();
                                         observe();
                                         EXPECT_EQ(entries.size(), 2u);
                                         EXPECT_TRUE(scoped.pathExists(relative / CanonPath("sub/g")));
@@ -2172,7 +2274,8 @@ TEST(FilteringSourceAccessor, forwardingRetainsTheSelectedChildAndScopedPolicy)
                                             relative / "sub",
                                             [&](SourceAccessor & nested,
                                                 const CanonPath & root,
-                                                const auto & nestedEntries) {
+                                                SourceAccessor::DirectoryListing && listing) {
+                                                const auto & nestedEntries = listing.entries();
                                                 EXPECT_EQ(nestedEntries.size(), 1u);
                                                 EXPECT_EQ(nested.readFile(root / "g"), "contents");
                                             });
@@ -2359,9 +2462,11 @@ TEST(FilteringSourceAccessor, admissionCallbacksKeepTheirRequiredPolicyAlive)
                     EXPECT_EQ(source->readDirectory(path).size(), 1u);
                     break;
                 case Operation::ScopedDirectory:
-                    source->readDirectoryScoped(path, [](SourceAccessor &, const CanonPath &, const auto & entries) {
-                        EXPECT_EQ(entries.size(), 1u);
-                    });
+                    source->readDirectoryScoped(
+                        path, [](SourceAccessor &, const CanonPath &, SourceAccessor::DirectoryListing && listing) {
+                            const auto & entries = listing.entries();
+                            EXPECT_EQ(entries.size(), 1u);
+                        });
                     break;
                 case Operation::Link:
                     EXPECT_EQ(source->readLink(path), "target");

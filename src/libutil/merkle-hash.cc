@@ -33,21 +33,21 @@ void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
     sink(header);
 }
 
-BlobHasher::BlobHasher(uint64_t size)
+ObjectHasher::ObjectHasher(std::string_view kind, uint64_t size)
 {
     static_assert(hashAlgo == HashAlgorithm::SHA256);
     SHA256_Init(&context);
-    feedHeader(*this, "blob", size);
+    feedHeader(*this, kind, size);
 }
 
-BlobHasher::~BlobHasher() = default;
+ObjectHasher::~ObjectHasher() = default;
 
-void BlobHasher::operator()(std::string_view chunk)
+void ObjectHasher::operator()(std::string_view chunk)
 {
     SHA256_Update(&context, chunk.data(), chunk.size());
 }
 
-Hash BlobHasher::finish()
+Hash ObjectHasher::finish()
 {
     Hash hash(hashAlgo);
     SHA256_Final(hash.hash, &context);
@@ -56,15 +56,9 @@ Hash BlobHasher::finish()
 
 static Hash hashObject(std::string_view kind, std::string_view body)
 {
-    static_assert(hashAlgo == HashAlgorithm::SHA256);
-    SHA256_CTX context;
-    SHA256_Init(&context);
-    LambdaSink direct{[&](std::string_view chunk) { SHA256_Update(&context, chunk.data(), chunk.size()); }};
-    feedHeader(direct, kind, body.size());
-    direct(body);
-    Hash hash(hashAlgo);
-    SHA256_Final(hash.hash, &context);
-    return hash;
+    ObjectHasher hasher{kind, body.size()};
+    hasher(body);
+    return hasher.finish();
 }
 
 Hash blobId(std::string_view bytes)
