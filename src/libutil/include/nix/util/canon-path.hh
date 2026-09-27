@@ -325,6 +325,32 @@ public:
     bool isAllowed(const std::set<CanonPath> & allowed) const;
 
     /**
+     * The ordered set must use CanonPath's ascending order and provide
+     * lower_bound(), end() and count().
+     */
+    template<typename OrderedSet>
+    bool isAllowed(const OrderedSet & allowed) const
+    {
+        /* Check if `this` is an exact match or the parent of an
+           allowed path. */
+        auto lb = allowed.lower_bound(*this);
+        if (lb != allowed.end()) {
+            if (lb->isWithin(*this))
+                return true;
+        }
+
+        /* Check if a parent of `this` is allowed. */
+        auto path = *this;
+        while (!path.isRoot()) {
+            path.pop();
+            if (allowed.count(path))
+                return true;
+        }
+
+        return false;
+    }
+
+    /**
      * Return a representation `x` of `path` relative to `this`, i.e.
      * `CanonPath(this.makeRelative(x), this) == path`.
      */

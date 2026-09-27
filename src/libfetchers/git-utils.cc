@@ -680,19 +680,21 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             if (git_status_list_new(Setter(status), *this, &options))
                 throw GitError("getting working directory status");
 
-            for (size_t n = 0, count = git_status_list_entrycount(status.get()); n < count; ++n) {
+            auto count = git_status_list_entrycount(status.get());
+            decltype(info.files)::sequence_type paths;
+            paths.reserve(count);
+            for (size_t n = 0; n < count; ++n) {
                 auto entry = git_status_byindex(status.get(), n);
                 const char * path =
                     entry->head_to_index ? entry->head_to_index->old_file.path : entry->index_to_workdir->old_file.path;
                 auto statusFlags = entry->status;
-                /* The hint is advisory: case folding and conflict entries
-                   need not arrive in CanonPath order. Sorted runs need no
-                   logarithmic search; every other order keeps the same set. */
                 if (!(statusFlags & GIT_STATUS_INDEX_DELETED) && !(statusFlags & GIT_STATUS_WT_DELETED))
-                    info.files.insert(info.files.end(), CanonPath(path));
+                    paths.emplace_back(path);
                 if (statusFlags != GIT_STATUS_CURRENT)
                     info.isDirty = true;
             }
+            /* Git's status order need not be CanonPath order. */
+            info.files.adopt_sequence(std::move(paths));
         }
 
         /* Gitlinks in the index are the submodules; .gitmodules only

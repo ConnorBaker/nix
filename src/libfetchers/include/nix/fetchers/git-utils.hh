@@ -4,6 +4,7 @@
 #include "nix/fetchers/merkle-tar-adapter.hh"
 
 #include <memory>
+#include <boost/container/flat_set.hpp>
 
 namespace nix {
 
@@ -84,7 +85,7 @@ struct GitRepo
 
         /* All files in the working directory that are unchanged,
            modified or added, but excluding deleted files. */
-        std::set<CanonPath> files;
+        boost::container::flat_set<CanonPath> files;
 
         /* The submodules listed in .gitmodules of this workdir. */
         std::vector<Submodule> submodules;

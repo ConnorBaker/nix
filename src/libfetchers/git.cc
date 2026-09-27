@@ -16,6 +16,7 @@
 #include "nix/util/memo.hh"
 #include "nix/util/mounted-source-accessor.hh"
 
+#include <ranges>
 #include <sys/time.h>
 
 #ifndef _WIN32
@@ -1017,8 +1018,8 @@ struct GitInputScheme : InputScheme
            The cache keeps the original immutable status snapshot. */
         if (!workdirInfo->submodules.empty()) {
             auto withMounts = std::make_shared<GitRepo::WorkdirInfo>(*workdirInfo);
-            for (auto & submodule : withMounts->submodules)
-                withMounts->files.insert(submodule.path);
+            auto paths = withMounts->submodules | std::views::transform(&GitRepo::Submodule::path);
+            withMounts->files.insert(paths.begin(), paths.end());
             workdirInfo = std::move(withMounts);
         }
         bool isDirty = workdirInfo->isDirty;

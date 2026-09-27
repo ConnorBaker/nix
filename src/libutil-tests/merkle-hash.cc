@@ -2,6 +2,7 @@
 #include <rapidcheck/gtest.h>
 
 #include <array>
+#include <limits>
 
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/git.hh"
@@ -95,6 +96,40 @@ TEST(MerkleHash, blobHeaderAndIncrementalHasher)
     StringSink treeHeader;
     merkle::feedHeader(treeHeader, "tree", 0);
     EXPECT_EQ(treeHeader.s, std::string("tree 0\0", 7));
+
+    /* Exact decimal patterns at every width transition and uint64_t's
+       endpoints; even an empty body gets one call. */
+    size_t headerCases = 0;
+    for (std::string_view kind : {"blob", "tree"}) {
+        SCOPED_TRACE(kind);
+        auto check = [&](uint64_t size, std::string_view expectedDigits) {
+            SCOPED_TRACE(size);
+            std::string actual;
+            size_t calls = 0;
+            LambdaSink sink{[&](std::string_view bytes) {
+                ++calls;
+                actual.append(bytes);
+            }};
+            merkle::feedHeader(sink, kind, size);
+            auto expected = std::string(kind) + " " + std::string(expectedDigits);
+            expected += '\0';
+            EXPECT_EQ(actual, expected);
+            EXPECT_EQ(calls, 1u);
+            ++headerCases;
+        };
+        const auto maximum = std::numeric_limits<uint64_t>::max();
+        check(0, "0");
+        check(1, "1");
+        check(maximum, "18446744073709551615");
+        for (uint64_t boundary = 10, width = 1;; boundary *= 10, ++width) {
+            check(boundary - 1, std::string(width, '9'));
+            check(boundary, "1" + std::string(width, '0'));
+            check(boundary + 1, "1" + std::string(width - 1, '0') + "1");
+            if (boundary > maximum / 10)
+                break;
+        }
+    }
+    EXPECT_EQ(headerCases, 120u);
 
     /* git's ids of the empty blob and the empty tree under SHA-256, to pin
        the framing to git's: `git hash-object --stdin < /dev/null` and
@@ -245,6 +280,36 @@ TEST(MerkleHash, serialiseTreeIsGitsBody)
     /* Names that merely begin with a dot are names. */
     EXPECT_NO_THROW(merkle::insertEntry(t, ".git", {.mode = Mode::Directory, .hash = hD}));
     EXPECT_NO_THROW(merkle::insertEntry(t, "...", {.mode = Mode::Regular, .hash = hA}));
+}
+
+TEST(MerkleHash, rawModesPreserveOctalEndpointsAndWidthTransitions)
+{
+    const auto hash = merkle::blobId("raw-mode bytes");
+    size_t cases = 0;
+    auto check = [&](RawMode mode, std::string_view expectedDigits) {
+        SCOPED_TRACE(mode);
+        merkle::Tree tree;
+        tree.emplace("raw", TreeEntry{static_cast<Mode>(mode), hash});
+        auto expected = std::string(expectedDigits) + " raw";
+        expected += '\0';
+        expected.append(reinterpret_cast<const char *>(hash.hash), hash.hashSize);
+        EXPECT_EQ(merkle::serialiseTree(tree), expected);
+        ++cases;
+    };
+    const auto maximum = std::numeric_limits<RawMode>::max();
+    check(0, "0");
+    check(1, "1");
+    check(maximum, "37777777777");
+    /* At each 8^k boundary the independent strings are k sevens,
+       one followed by k zeroes, and one followed by k-1 zeroes and one. */
+    for (RawMode boundary = 8, width = 1;; boundary *= 8, ++width) {
+        check(boundary - 1, std::string(width, '7'));
+        check(boundary, "1" + std::string(width, '0'));
+        check(boundary + 1, "1" + std::string(width - 1, '0') + "1");
+        if (boundary > maximum / 8)
+            break;
+    }
+    EXPECT_EQ(cases, 33u);
 }
 
 TEST(MerkleHash, logicalNamesNeverContainThePhysicalCaseHackMarker)

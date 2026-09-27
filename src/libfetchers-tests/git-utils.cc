@@ -51,6 +51,7 @@
 #include <future>
 #include <iostream>
 #include <latch>
+#include <ranges>
 #include <stdexcept>
 #include <tuple>
 #include <typeinfo>
@@ -1262,7 +1263,7 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     auto repo = openRepo();
     auto wd = repo->getWorkdirInfo();
     ASSERT_TRUE(wd.isDirty);
-    ASSERT_EQ(wd.files, (std::set<CanonPath>{CanonPath("clean/a"), CanonPath("dirty/c")}));
+    ASSERT_THAT(wd.files, ::testing::ElementsAre(CanonPath("clean/a"), CanonPath("dirty/c")));
     unsigned int cleanStatus = 0, dirtyStatus = 0;
     ASSERT_EQ(git_status_file(&cleanStatus, rawRepo, "clean/a"), 0);
     ASSERT_EQ(git_status_file(&dirtyStatus, rawRepo, "dirty/c"), 0);
@@ -1281,6 +1282,126 @@ TEST_F(GitUtilsTest, workdirReadsAndNamesItsFilesystemView)
     write("dirty/c", "C");
     EXPECT_EQ(workdir->readFile(CanonPath("clean/a")), "A");
     EXPECT_EQ(workdir->readFile(CanonPath("dirty/c")), "C");
+}
+
+TEST(GitWorkdirInfo, bulkMembershipMatchesCanonicalSetsAndPrefixQueries)
+{
+    const std::array<const char *, 6> names{"a/child", "a!", "A", "a//child", "a\xc3\xa9", "a"};
+    const std::vector<GitRepo::Submodule> modules{
+        {CanonPath("module/deep"), "deep-url", "deep-branch"},
+        {CanonPath("a"), "a-url", "a-branch"},
+        {CanonPath("module"), "module-url", "module-branch"},
+        {CanonPath("module"), "duplicate-url", "duplicate-branch"},
+    };
+    const std::array<const char *, 12> queries{
+        "",
+        "a",
+        "a/child",
+        "a/child/deeper",
+        "a!",
+        "A",
+        "a\xc3\xa9",
+        "a/absent",
+        "module",
+        "module/deep",
+        "module/other",
+        "missing"};
+    auto prefixOf = [](const CanonPath & a, const CanonPath & b) {
+        return a.isRoot() || a.abs() == b.abs() || b.abs().starts_with(a.abs() + "/");
+    };
+    std::array<size_t, 6> order{0, 1, 2, 3, 4, 5};
+    size_t permutations = 0;
+    do {
+        /* Every arrival order and prefix length: empty sets, canonical
+           aliases, duplicates, case, high bytes and slash/punctuation order. */
+        for (size_t count = 0; count <= names.size(); ++count)
+            for (bool root : {false, true}) {
+                SCOPED_TRACE(fmt("permutation=%d count=%d root=%d", permutations, count, root));
+                GitRepo::WorkdirInfo wd;
+                wd.submodules = modules;
+                decltype(wd.files)::sequence_type paths;
+                paths.reserve(count + root);
+                std::set<CanonPath> expected;
+                if (root) {
+                    paths.push_back(CanonPath::root);
+                    expected.insert(CanonPath::root);
+                }
+                for (size_t i = 0; i < count; ++i) {
+                    paths.emplace_back(names[order[i]]);
+                    expected.emplace(names[order[i]]);
+                }
+                wd.files.adopt_sequence(std::move(paths));
+                EXPECT_THAT(wd.files, ::testing::ElementsAreArray(expected));
+                for (bool mount : {false, true}) {
+                    auto view = wd;
+                    auto members = expected;
+                    if (mount) {
+                        auto mountPaths = view.submodules | std::views::transform(&GitRepo::Submodule::path);
+                        view.files.insert(mountPaths.begin(), mountPaths.end());
+                        for (auto & module : modules)
+                            members.insert(module.path);
+                    }
+                    EXPECT_THAT(view.files, ::testing::ElementsAreArray(members));
+                    for (auto raw : queries) {
+                        CanonPath q(raw);
+                        bool admitted = std::any_of(members.begin(), members.end(), [&](const auto & p) {
+                            return prefixOf(p, q) || prefixOf(q, p);
+                        });
+                        EXPECT_EQ(q.isAllowed(view.files), admitted) << raw;
+                    }
+                    EXPECT_THAT(wd.files, ::testing::ElementsAreArray(expected));
+                    for (size_t i = 0; i < modules.size(); ++i) {
+                        EXPECT_EQ(view.submodules[i].path, modules[i].path);
+                        EXPECT_EQ(view.submodules[i].url, modules[i].url);
+                        EXPECT_EQ(view.submodules[i].branch, modules[i].branch);
+                    }
+                }
+            }
+        ++permutations;
+    } while (std::next_permutation(order.begin(), order.end()));
+    EXPECT_EQ(permutations, 720u);
+}
+
+TEST_F(GitUtilsTest, workdirMembershipKeepsConflictsAndExcludesBothDeletionKinds)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    for (auto path : {"A-file", "a!", "a/child", "gone", "staged-gone"})
+        write(path, path);
+    auto rev = commitPaths(rawRepo, {"A-file", "a!", "a/child", "gone", "staged-gone"}, "initial");
+    git_index * index = nullptr;
+    ASSERT_EQ(git_repository_index(&index, rawRepo), 0);
+    Finally closeIndex{[&] { git_index_free(index); }};
+    auto original = git_index_get_bypath(index, "a/child", 0);
+    ASSERT_NE(original, nullptr);
+    auto conflict = *original;
+    conflict.path = "a/child"; // independent of index removal inside conflict_add
+    ASSERT_EQ(git_index_conflict_add(index, &conflict, &conflict, &conflict), 0);
+    deletePath(tmpDir / "gone");
+    ASSERT_EQ(git_index_remove_bypath(index, "staged-gone"), 0);
+    write("added", "added");
+    ASSERT_EQ(git_index_add_bypath(index, "added"), 0);
+    ASSERT_EQ(git_index_write(index), 0);
+    git_config * config = nullptr;
+    ASSERT_EQ(git_repository_config(&config, rawRepo), 0);
+    Finally closeConfig{[&] { git_config_free(config); }};
+    for (bool ignoreCase : {false, true}) {
+        SCOPED_TRACE(ignoreCase);
+        ASSERT_EQ(git_config_set_bool(config, "core.ignorecase", ignoreCase), 0);
+        auto repo = openRepo();
+        auto wd = repo->getWorkdirInfo();
+        EXPECT_EQ(wd.headRev, rev);
+        EXPECT_TRUE(wd.isDirty);
+        EXPECT_THAT(
+            wd.files,
+            ::testing::ElementsAre(CanonPath("A-file"), CanonPath("a/child"), CanonPath("a!"), CanonPath("added")));
+        auto accessor = repo->getAccessor(
+            make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) { return RestrictedPathError("no"); });
+        write("A-file", ignoreCase ? "second live value" : "first live value");
+        EXPECT_EQ(accessor->readFile(CanonPath("A-file")), ignoreCase ? "second live value" : "first live value");
+        EXPECT_FALSE(accessor->pathExists(CanonPath("staged-gone")));
+    }
 }
 
 TEST_F(GitUtilsTest, workdirDomainIsTheFixedTrackedPrefixesAndTheirAncestors)
@@ -1321,9 +1442,11 @@ TEST_F(GitUtilsTest, workdirDomainIsTheFixedTrackedPrefixesAndTheirAncestors)
     for (unsigned subset = 0; subset < (1u << domain.size()); ++subset) {
         SCOPED_TRACE(subset);
         GitRepo::WorkdirInfo wd;
+        decltype(wd.files)::sequence_type paths;
         for (size_t i = 0; i < domain.size(); ++i)
             if (subset & (1u << i))
-                wd.files.insert(domain[i]);
+                paths.push_back(domain[i]);
+        wd.files.adopt_sequence(std::move(paths));
         auto admitted = [&](const CanonPath & q) {
             return q.isRoot() || std::any_of(wd.files.begin(), wd.files.end(), [&](const auto & p) {
                        return prefixOf(p, q) || prefixOf(q, p);
@@ -1384,7 +1507,7 @@ TEST_F(GitUtilsTest, workdirTrackedPrefixStillAdmitsAReplacementDirectory)
 {
     write("tracked", "before");
     GitRepo::WorkdirInfo wd;
-    wd.files.insert(CanonPath("tracked"));
+    wd.files = {CanonPath("tracked")};
     auto workdir = openRepo()->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, [](const CanonPath &) {
         return RestrictedPathError("untracked");
     });
@@ -1394,7 +1517,7 @@ TEST_F(GitUtilsTest, workdirTrackedPrefixStillAdmitsAReplacementDirectory)
     std::filesystem::remove(tmpDir / "tracked");
     write("tracked/sub/child", "after");
     write("untracked", "hidden");
-    wd.files.insert(CanonPath("untracked"));
+    wd.files = {CanonPath("tracked"), CanonPath("untracked")};
     EXPECT_EQ(workdir->lstat(CanonPath("tracked")).type, SourceAccessor::tDirectory);
     EXPECT_EQ(workdir->readFile(CanonPath("tracked/sub/child")), "after");
     EXPECT_FALSE(workdir->getFingerprint(CanonPath("tracked/sub/child")));
@@ -1440,7 +1563,7 @@ TEST_F(GitUtilsTest, cachedWorkdirSnapshotsStayImmutableAcrossRenderingAndInvali
             EXPECT_EQ(first->isDirty, initiallyDirty);
             EXPECT_EQ(first->headRev, rev);
             EXPECT_EQ(first->submodules.size(), submodule ? 1u : 0u);
-            EXPECT_EQ(first->files, (std::set<CanonPath>{CanonPath("file")}));
+            EXPECT_THAT(first->files, ::testing::ElementsAre(CanonPath("file")));
 
             auto input = Input::fromAttrs({
                 {"type", "git"},
@@ -1456,7 +1579,7 @@ TEST_F(GitUtilsTest, cachedWorkdirSnapshotsStayImmutableAcrossRenderingAndInvali
             }
             /* Adding mount prefixes belongs to the rendered view, never
                to the cached status snapshot shared by another caller. */
-            EXPECT_EQ(first->files, (std::set<CanonPath>{CanonPath("file")}));
+            EXPECT_THAT(first->files, ::testing::ElementsAre(CanonPath("file")));
             EXPECT_EQ(first, GitRepo::getCachedWorkdirInfo(repoPath));
 
             auto nextContents = initiallyDirty ? "original" : "changed bytes";

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <charconv>
 #include <iterator>
 
 #include "nix/util/merkle-hash.hh"
@@ -10,27 +11,17 @@ namespace nix::merkle {
 
 void DirectorySink::anchor() {}
 
-/* Append a non-negative integer in base `base` without generic formatting. */
-template<unsigned base>
-static void appendDigits(std::string & out, uint64_t value)
-{
-    char buf[64];
-    size_t i = sizeof(buf);
-    do {
-        buf[--i] = char('0' + value % base);
-        value /= base;
-    } while (value);
-    out.append(buf + i, sizeof(buf) - i);
-}
-
 void feedHeader(Sink & sink, std::string_view kind, uint64_t size)
 {
-    std::string header;
-    header += kind;
-    header += ' ';
-    appendDigits<10>(header, size);
-    header += '\0';
-    sink(header);
+    assert(kind == "blob" || kind == "tree");
+    /* Four kind bytes, a space, at most 20 uint64_t digits, and NUL. */
+    char header[26];
+    std::copy_n(kind.begin(), 4, header);
+    header[4] = ' ';
+    auto [end, ec] = std::to_chars(header + 5, header + 25, size);
+    assert(ec == std::errc{});
+    *end++ = '\0';
+    sink({header, static_cast<size_t>(end - header)});
 }
 
 ObjectHasher::ObjectHasher(std::string_view kind, uint64_t size)
@@ -89,9 +80,14 @@ std::string serialiseTree(const Tree & tree)
         case Mode::Symlink:
             body += "120000 "sv;
             break;
-        default:
-            appendDigits<8>(body, static_cast<RawMode>(entry.mode));
+        default: {
+            /* Every uint32_t RawMode fits in eleven octal digits. */
+            char digits[11];
+            auto [end, ec] = std::to_chars(digits, digits + sizeof(digits), static_cast<RawMode>(entry.mode), 8);
+            assert(ec == std::errc{});
+            body.append(digits, static_cast<size_t>(end - digits));
             body += ' ';
+        }
         }
         body += name;
         body += '\0';

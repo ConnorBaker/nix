@@ -2,7 +2,6 @@
 
 #include <filesystem>
 #include <functional>
-#include <variant>
 
 #include "nix/util/canon-path.hh"
 #include "nix/util/fun.hh"
@@ -172,16 +171,17 @@ public:
     class DirectoryListing
     {
         using Borrowed = std::reference_wrapper<const DirEntries>;
-        std::variant<DirEntries, Borrowed> value;
+        DirEntries owned;
+        const DirEntries * borrowed = nullptr;
 
     public:
         explicit DirectoryListing(DirEntries && entries)
-            : value(std::move(entries))
+            : owned(std::move(entries))
         {
         }
 
         explicit DirectoryListing(Borrowed entries)
-            : value(entries)
+            : borrowed(&entries.get())
         {
         }
 
@@ -189,20 +189,18 @@ public:
 
         const DirEntries & entries() const
         {
-            if (auto owned = std::get_if<DirEntries>(&value))
-                return *owned;
-            return std::get<Borrowed>(value).get();
+            return borrowed ? *borrowed : owned;
         }
 
         template<typename Predicate>
         DirEntries filter(Predicate && keep) &&
         {
-            if (auto owned = std::get_if<DirEntries>(&value)) {
-                std::erase_if(*owned, [&](const auto & entry) { return !keep(entry); });
-                return std::move(*owned);
+            if (!borrowed) {
+                std::erase_if(owned, [&](const auto & entry) { return !keep(entry); });
+                return std::move(owned);
             }
             DirEntries admitted;
-            for (const auto & entry : std::get<Borrowed>(value).get())
+            for (const auto & entry : *borrowed)
                 if (keep(entry))
                     admitted.insert(admitted.end(), entry);
             return admitted;
