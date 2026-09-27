@@ -117,6 +117,7 @@ scope: {
         ./patches/0003-packbuilder-correct-config.patch
         ./patches/0004-pack-compression-heuristic.patch
         ./patches/0005-tracked-diff-ignores.patch
+        ./patches/0006-pack-compression-buffer.patch
       ];
       cmakeFlags = prevAttrs.cmakeFlags ++ [ "-DUSE_COMPRESSION=zlib-ng" ];
       buildInputs = prevAttrs.buildInputs ++ [ pkgs.zlib-ng ];

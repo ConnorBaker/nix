@@ -58,8 +58,6 @@ struct FilteringSourceAccessor : SourceAccessor
 
     std::string showPath(const CanonPath & path) override;
 
-    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override;
-
     void invalidateCache() override
     {
         auto inner = next;

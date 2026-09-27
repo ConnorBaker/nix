@@ -166,7 +166,7 @@ void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t,
     wait(group);
     if (failure)
         std::rethrow_exception(failure);
-    for (size_t i = 0; i < group.failedIndex; ++i)
+    for (size_t i = 0, end = group.failedIndex; i < end; ++i)
         consume(i);
     if (group.failure)
         std::rethrow_exception(group.failure);

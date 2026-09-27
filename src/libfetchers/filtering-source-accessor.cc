@@ -147,17 +147,6 @@ std::string FilteringSourceAccessor::showPath(const CanonPath & path)
     return displayPrefix + next->showPath(prefix / path) + displaySuffix;
 }
 
-std::optional<std::pair<CanonPath, std::string>> FilteringSourceAccessor::getFingerprint(const CanonPath & path)
-{
-    /* A filtered subtree is not the inner subtree, so the inner name does
-       not name it.  A subclass that knows what it admits below `path`
-       names the subtree (the fixed-set accessor below, the allow list
-       under an allowed prefix); the rest give no name. */
-    if (fingerprint)
-        return std::pair{path, *fingerprint};
-    return std::nullopt;
-}
-
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 {
     auto owner = weak_from_this().lock();

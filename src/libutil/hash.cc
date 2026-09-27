@@ -32,13 +32,12 @@ const StringSet hashAlgorithms = {"blake3", "md5", "sha1", "sha256", "sha512"};
 const StringSet hashFormats = {"base64", "nix32", "base16", "sri"};
 
 Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
-    : algo(algo)
+    : hashSize(regularHashSize(algo))
+    , algo(algo)
 {
     if (algo == HashAlgorithm::BLAKE3) {
         xpSettings.require(Xp::BLAKE3Hashes);
     }
-    hashSize = regularHashSize(algo);
-    assert(hashSize <= maxHashSize);
 }
 
 bool Hash::operator==(const Hash & h2) const noexcept

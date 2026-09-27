@@ -1,0 +1,495 @@
+--- a/src/libgit2/pack-objects.c
++++ b/src/libgit2/pack-objects.c
+@@ -317,6 +317,7 @@
+ static int write_object(
+ 	git_packbuilder *pb,
+ 	git_pobject *po,
++	unsigned char **compress_buffer,
+ 	int (*write_cb)(void *buf, size_t size, void *cb_data),
+ 	void *cb_data)
+ {
+@@ -371,8 +372,14 @@
+ 			(error = git_hash_update(&pb->ctx, data, data_len)) < 0)
+ 			goto done;
+ 	} else {
+-		zbuf = git__malloc(zbuf_len);
+-		GIT_ERROR_CHECK_ALLOC(zbuf);
++		if (!*compress_buffer) {
++			*compress_buffer = git__malloc(zbuf_len);
++			if (!*compress_buffer) {
++				error = -1;
++				goto done;
++			}
++		}
++		zbuf = *compress_buffer;
+ 
+ 		git_zstream_reset(&pb->zstream);
+ 
+@@ -412,7 +419,6 @@
+ 	pb->nr_written++;
+ 
+ done:
+-	git__free(zbuf);
+ 	git_odb_object_free(obj);
+ 	return error;
+ }
+@@ -428,6 +434,7 @@
+ 	enum write_one_status *status,
+ 	git_packbuilder *pb,
+ 	git_pobject *po,
++	unsigned char **compress_buffer,
+ 	int (*write_cb)(void *buf, size_t size, void *cb_data),
+ 	void *cb_data)
+ {
+@@ -444,7 +451,7 @@
+ 	if (po->delta) {
+ 		po->recursing = 1;
+ 
+-		if ((error = write_one(status, pb, po->delta, write_cb, cb_data)) < 0)
++		if ((error = write_one(status, pb, po->delta, compress_buffer, write_cb, cb_data)) < 0)
+ 			return error;
+ 
+ 		/* we cannot depend on this one */
+@@ -456,7 +463,7 @@
+ 	po->written = 1;
+ 	po->recursing = 0;
+ 
+-	return write_object(pb, po, write_cb, cb_data);
++	return write_object(pb, po, compress_buffer, write_cb, cb_data);
+ }
+ 
+ GIT_INLINE(void) add_to_write_order(git_pobject **wo, size_t *endp,
+@@ -647,6 +654,8 @@
+ {
+ 	git_pobject **write_order;
+ 	git_pobject *po;
++	/* One lazy heap buffer for this write operation, never shared by builders. */
++	unsigned char *compress_buffer = NULL;
+ 	enum write_one_status status;
+ 	struct git_pack_header ph;
+ 	git_oid entry_oid;
+@@ -677,7 +686,7 @@
+ 		for ( ; i < pb->nr_objects; ++i) {
+ 			po = write_order[i];
+ 
+-			if ((error = write_one(&status, pb, po, write_cb, cb_data)) < 0)
++			if ((error = write_one(&status, pb, po, &compress_buffer, write_cb, cb_data)) < 0)
+ 				goto done;
+ 		}
+ 
+@@ -701,6 +710,7 @@
+ 		}
+ 	}
+ 
++	git__free(compress_buffer);
+ 	git__free(write_order);
+ 	return error;
+ }
+diff --git a/tests/libgit2/pack/scratch.c b/tests/libgit2/pack/scratch.c
+new file mode 100644
+--- /dev/null
++++ b/tests/libgit2/pack/scratch.c
+@@ -0,0 +1,403 @@
++#include "clar_libgit2.h"
++#include "alloc.h"
++#include "futils.h"
++#include "odb.h"
++#include "pack-objects.h"
++#include "git2/odb_backend.h"
++
++#define SCRATCH_SIZE (1024 * 1024)
++
++struct expected_object {
++	git_oid oid;
++	git_object_t type;
++	unsigned char *data;
++	size_t size;
++};
++
++struct pack_state {
++	const char *path;
++	git_repository *repo;
++	git_odb *source, *packed;
++	git_packbuilder *builder;
++	git_indexer *indexer;
++	git_odb_object *object, *held;
++	git_str bytes, index_path;
++	git_buf public_bytes;
++	struct expected_object expected[8];
++	size_t count;
++};
++
++static struct pack_state states[2];
++static git_allocator saved_allocator;
++static bool observing;
++static void *scratch[8];
++static size_t allocations, releases, live, peak, attempts;
++static bool reject_scratch, observer_overflow;
++
++static bool is_scratch(void *ptr)
++{
++	size_t i;
++	for (i = 0; i < ARRAY_SIZE(scratch); i++)
++		if (scratch[i] && scratch[i] == ptr)
++			return true;
++	return false;
++}
++
++static void *observe_malloc(size_t size, const char *file, int line)
++{
++	void *ptr;
++	size_t i;
++
++	if (size == SCRATCH_SIZE) {
++		attempts++;
++		if (reject_scratch)
++			return NULL;
++	}
++	ptr = saved_allocator.gmalloc(size, file, line);
++	if (size != SCRATCH_SIZE || !ptr)
++		return ptr;
++	allocations++;
++	live++;
++	if (live > peak)
++		peak = live;
++	for (i = 0; i < ARRAY_SIZE(scratch); i++) {
++		if (!scratch[i]) {
++			scratch[i] = ptr;
++			return ptr;
++		}
++	}
++	observer_overflow = true;
++	return ptr;
++}
++
++static void observe_free(void *ptr)
++{
++	size_t i;
++	for (i = 0; i < ARRAY_SIZE(scratch); i++) {
++		if (ptr && scratch[i] == ptr) {
++			scratch[i] = NULL;
++			releases++;
++			live--;
++			break;
++		}
++	}
++	saved_allocator.gfree(ptr);
++}
++
++static void begin_observation(bool reject)
++{
++	git_allocator allocator = saved_allocator;
++	memset(scratch, 0, sizeof(scratch));
++	allocations = releases = live = peak = attempts = 0;
++	observer_overflow = false;
++	reject_scratch = reject;
++	allocator.gmalloc = observe_malloc;
++	allocator.gfree = observe_free;
++	cl_git_pass(git_allocator_setup(&allocator));
++	observing = true;
++}
++
++static void end_observation(void)
++{
++	git_allocator_setup(&saved_allocator);
++	observing = false;
++}
++
++static void dispose_state(struct pack_state *state)
++{
++	size_t i;
++	git_odb_object_free(state->object);
++	git_odb_object_free(state->held);
++	git_odb_free(state->packed);
++	git_indexer_free(state->indexer);
++	git_packbuilder_free(state->builder);
++	git_odb_free(state->source);
++	git_repository_free(state->repo);
++	git_str_dispose(&state->bytes);
++	git_str_dispose(&state->index_path);
++	git_buf_dispose(&state->public_bytes);
++	for (i = 0; i < state->count; i++)
++		git__free(state->expected[i].data);
++	if (state->path && git_fs_path_exists(state->path))
++		cl_git_pass(git_futils_rmdir_r(state->path, NULL, GIT_RMDIR_REMOVE_FILES));
++	memset(state, 0, sizeof(*state));
++}
++
++void test_pack_scratch__initialize(void)
++{
++	memset(states, 0, sizeof(states));
++	saved_allocator = git__allocator;
++	observing = false;
++}
++
++void test_pack_scratch__cleanup(void)
++{
++	if (observing)
++		end_observation();
++	dispose_state(&states[1]);
++	dispose_state(&states[0]);
++}
++
++static void new_state(struct pack_state *state, git_oid_t oid_type, int window, int cache)
++{
++	git_repository_init_options options = GIT_REPOSITORY_INIT_OPTIONS_INIT;
++	state->path = state == &states[0] ? "scratch-a.git" : "scratch-b.git";
++	options.flags = GIT_REPOSITORY_INIT_BARE | GIT_REPOSITORY_INIT_MKPATH;
++	options.oid_type = oid_type;
++	cl_git_pass(git_repository_init_ext(&state->repo, state->path, &options));
++	cl_repo_set_int(state->repo, "pack.window", window);
++	cl_repo_set_int(state->repo, "pack.deltaCacheSize", cache);
++	cl_git_pass(git_repository_odb(&state->source, state->repo));
++	cl_git_pass(git_packbuilder_new(&state->builder, state->repo));
++	git_packbuilder_set_threads(state->builder, 1);
++}
++
++static void add_object(struct pack_state *state, git_object_t type, size_t size, unsigned seed)
++{
++	struct expected_object *object;
++	uint32_t value = seed;
++	size_t i;
++	cl_assert(state->count < ARRAY_SIZE(state->expected));
++	object = &state->expected[state->count++];
++	object->size = size;
++	object->type = type;
++	object->data = git__malloc(size ? size : 1);
++	cl_assert(object->data);
++	for (i = 0; i < size; i++) {
++		/* Fixed, portable bytes: seed zero is compressible; others are not. */
++		value ^= value << 13;
++		value ^= value >> 17;
++		value ^= value << 5;
++		object->data[i] = (unsigned char)value;
++	}
++	cl_git_pass(git_odb_write(&object->oid, state->source, object->data, size, type));
++	cl_git_pass(git_packbuilder_insert(state->builder, &object->oid, "same-path"));
++}
++
++static int collect_bytes(void *data, size_t size, void *payload)
++{
++	struct pack_state *state = payload;
++	return git_str_put(&state->bytes, data, size);
++}
++
++static void verify_pack(struct pack_state *state, git_oid_t oid_type, bool already_written)
++{
++	git_indexer_options index_options = GIT_INDEXER_OPTIONS_INIT;
++	git_odb_options odb_options = GIT_ODB_OPTIONS_INIT;
++	git_odb_backend_pack_options backend_options = GIT_ODB_BACKEND_PACK_OPTIONS_INIT;
++	git_odb_backend *backend = NULL;
++	git_indexer_progress stats = { 0 };
++	const char *name;
++	size_t i;
++
++	index_options.oid_type = odb_options.oid_type = backend_options.oid_type = oid_type;
++	if (already_written) {
++		name = git_packbuilder_name(state->builder);
++	} else {
++		const void *data = state->public_bytes.ptr ? state->public_bytes.ptr : state->bytes.ptr;
++		size_t size = state->public_bytes.ptr ? state->public_bytes.size : state->bytes.size;
++		cl_git_pass(git_indexer_new(&state->indexer, state->path, &index_options));
++		cl_git_pass(git_indexer_append(state->indexer, data, size, &stats));
++		cl_git_pass(git_indexer_commit(state->indexer, &stats));
++		cl_assert_equal_sz(state->count, stats.total_objects);
++		cl_assert_equal_sz(state->count, stats.indexed_objects);
++		name = git_indexer_name(state->indexer);
++	}
++	cl_git_pass(git_str_printf(&state->index_path, "%s/pack-%s.idx", state->path, name));
++	/* This ODB has only the new pack: loose source objects cannot mask errors. */
++	cl_git_pass(git_odb_new_ext(&state->packed, &odb_options));
++	cl_git_pass(git_odb_backend_one_pack(&backend, state->index_path.ptr, &backend_options));
++	cl_git_pass(git_odb_add_backend(state->packed, backend, 1));
++	for (i = 0; i < state->count; i++) {
++		struct expected_object *expected = &state->expected[i];
++		cl_git_pass(git_odb_read(&state->object, state->packed, &expected->oid));
++		cl_assert_equal_i(expected->type, git_odb_object_type(state->object));
++		cl_assert_equal_sz(expected->size, git_odb_object_size(state->object));
++		if (expected->size)
++			cl_assert_equal_i(0, memcmp(expected->data, git_odb_object_data(state->object), expected->size));
++		git_odb_object_free(state->object);
++		state->object = NULL;
++	}
++}
++
++static void roundtrip(git_oid_t oid_type)
++{
++	struct pack_state *state = &states[0];
++	int method;
++
++	new_state(state, oid_type, 0, 1);
++	cl_git_pass(git_packbuilder_foreach(state->builder, collect_bytes, state));
++	verify_pack(state, oid_type, false);
++	dispose_state(state);
++	for (method = 0; method < 3; method++) {
++		new_state(state, oid_type, 0, 1);
++		add_object(state, GIT_OBJECT_TREE, 0, 0);
++		add_object(state, GIT_OBJECT_BLOB, 0, 0);
++		add_object(state, GIT_OBJECT_BLOB, 4096, 1);
++		add_object(state, GIT_OBJECT_BLOB, 4097, 2);
++		add_object(state, GIT_OBJECT_BLOB, 2 * SCRATCH_SIZE + 17, 3);
++		add_object(state, GIT_OBJECT_BLOB, 2 * SCRATCH_SIZE + 18, 0);
++		if (method == 0) {
++			cl_git_pass(git_packbuilder_foreach(state->builder, collect_bytes, state));
++			cl_assert(state->bytes.size > 2 * SCRATCH_SIZE);
++		} else if (method == 1) {
++			cl_git_pass(git_packbuilder_write_buf(&state->public_bytes, state->builder));
++			cl_assert(state->public_bytes.size > 2 * SCRATCH_SIZE);
++		} else {
++			cl_git_pass(git_packbuilder_write(state->builder, state->path, 0, NULL, NULL));
++		}
++		verify_pack(state, oid_type, method == 2);
++		dispose_state(state);
++	}
++}
++
++void test_pack_scratch__roundtrip_sha1(void) { roundtrip(GIT_OID_SHA1); }
++void test_pack_scratch__roundtrip_sha256(void) { roundtrip(GIT_OID_SHA256); }
++
++static void delta_roundtrip(bool cached)
++{
++	git_oid_t types[] = { GIT_OID_SHA1, GIT_OID_SHA256 };
++	struct pack_state *state = &states[0];
++	size_t t, i, deltas, compressed;
++
++	for (t = 0; t < ARRAY_SIZE(types); t++) {
++		new_state(state, types[t], 10, cached ? 256 * 1024 * 1024 : 1);
++		/* Different sizes share almost all bytes and produce nontrivial deltas. */
++		for (i = 0; i < 3; i++)
++			add_object(state, GIT_OBJECT_BLOB, 65536 + 17 * i, 7);
++		cl_git_pass(git_packbuilder__prepare(state->builder));
++		deltas = compressed = 0;
++		for (i = 0; i < state->builder->nr_objects; i++) {
++			git_pobject *object = &state->builder->object_list[i];
++			deltas += object->delta != NULL;
++			compressed += object->z_delta_size != 0;
++		}
++		cl_assert(deltas > 0);
++		cl_assert_equal_sz(cached ? deltas : 0, compressed);
++		cl_git_pass(git_packbuilder_foreach(state->builder, collect_bytes, state));
++		verify_pack(state, types[t], false);
++		dispose_state(state);
++	}
++}
++
++void test_pack_scratch__cached_deltas(void) { delta_roundtrip(true); }
++void test_pack_scratch__recomputed_deltas(void) { delta_roundtrip(false); }
++
++struct cancel_state { struct pack_state *pack; int stage; bool reached; };
++
++static int discard_or_cancel(void *data, size_t size, void *payload)
++{
++	struct cancel_state *state = payload;
++	bool cancel = state->stage == 0 ||
++		(state->stage == 1 && is_scratch(data)) ||
++		(state->stage == 2 && state->pack->builder->nr_written == state->pack->count);
++	GIT_UNUSED(size);
++	if (cancel) {
++		state->reached = true;
++		return -1111;
++	}
++	return 0;
++}
++
++void test_pack_scratch__one_allocation_and_callback_cleanup(void)
++{
++	struct pack_state *state = &states[0];
++	struct cancel_state cancel;
++	int stage, error;
++	size_t i;
++
++	/* Small bodies and a discard callback isolate the 1 MiB allocation. */
++	for (stage = -1; stage < 3; stage++) {
++		new_state(state, GIT_OID_SHA1, 0, 1);
++		for (i = 0; i < 3; i++)
++			add_object(state, GIT_OBJECT_BLOB, 19 + i, (unsigned)i + 1);
++		cancel.pack = state;
++		cancel.stage = stage;
++		cancel.reached = false;
++		begin_observation(false);
++		error = git_packbuilder_foreach(state->builder, discard_or_cancel, &cancel);
++		end_observation();
++		cl_assert_equal_i(stage < 0 ? 0 : -1111, error);
++		cl_assert_equal_i(stage >= 0, cancel.reached);
++		cl_assert_equal_sz(stage == 0 ? 0 : 1, allocations);
++		cl_assert_equal_sz(allocations, releases);
++		cl_assert_equal_sz(0, live);
++		cl_assert(!observer_overflow);
++		dispose_state(state);
++	}
++}
++
++struct nested_state { bool entered; struct pack_state *outer, *inner; };
++
++static int nested_write(void *data, size_t size, void *payload)
++{
++	struct nested_state *state = payload;
++	int error;
++	if (!state->entered && is_scratch(data)) {
++		state->entered = true;
++		if ((error = git_packbuilder_foreach(state->inner->builder, collect_bytes, state->inner)) < 0)
++			return error;
++	}
++	/* Consume the still-borrowed outer bytes only after the nested write. */
++	return collect_bytes(data, size, state->outer);
++}
++
++void test_pack_scratch__nested_distinct_builders_keep_their_bytes(void)
++{
++	struct nested_state nested = { false, &states[0], &states[1] };
++	int error;
++	new_state(&states[0], GIT_OID_SHA1, 0, 1);
++	new_state(&states[1], GIT_OID_SHA256, 0, 1);
++	add_object(&states[0], GIT_OBJECT_BLOB, 65537, 11);
++	add_object(&states[1], GIT_OBJECT_BLOB, 65537, 23);
++	begin_observation(false);
++	error = git_packbuilder_foreach(states[0].builder, nested_write, &nested);
++	end_observation();
++	cl_assert_equal_i(0, error);
++	cl_assert(nested.entered);
++	cl_assert_equal_sz(2, allocations);
++	cl_assert_equal_sz(2, releases);
++	cl_assert_equal_sz(2, peak);
++	cl_assert_equal_sz(0, live);
++	cl_assert(!observer_overflow);
++	verify_pack(&states[0], GIT_OID_SHA1, false);
++	verify_pack(&states[1], GIT_OID_SHA256, false);
++}
++
++static int arm_allocation_failure(void *data, size_t size, void *payload)
++{
++	unsigned *callbacks = payload;
++	GIT_UNUSED(data);
++	GIT_UNUSED(size);
++	/* Pack header, then ordinary object header: the next malloc is scratch. */
++	if (++*callbacks == 2)
++		reject_scratch = true;
++	return 0;
++}
++
++void test_pack_scratch__allocation_failure_releases_the_odb_read(void)
++{
++	struct pack_state *state = &states[0];
++	unsigned callbacks = 0;
++	int error, error_class, references;
++	new_state(state, GIT_OID_SHA1, 0, 1);
++	add_object(state, GIT_OBJECT_TREE, 0, 0);
++	/* A held cached tree makes a leaked read reference directly observable. */
++	cl_git_pass(git_odb_read(&state->held, state->source, &state->expected[0].oid));
++	cl_git_pass(git_odb_read(&state->object, state->source, &state->expected[0].oid));
++	cl_assert(state->held == state->object);
++	git_odb_object_free(state->object);
++	state->object = NULL;
++	references = git_atomic32_get(&state->held->cached.refcount);
++	begin_observation(false);
++	error = git_packbuilder_foreach(state->builder, arm_allocation_failure, &callbacks);
++	error_class = git_error_last() ? git_error_last()->klass : -1;
++	end_observation();
++	cl_assert_equal_i(-1, error);
++	cl_assert_equal_i(GIT_ERROR_NOMEMORY, error_class);
++	cl_assert_equal_i(2, callbacks);
++	cl_assert_equal_sz(1, attempts);
++	cl_assert_equal_sz(0, allocations);
++	cl_assert_equal_sz(0, live);
++	cl_assert_equal_i(references, git_atomic32_get(&state->held->cached.refcount));
++}
