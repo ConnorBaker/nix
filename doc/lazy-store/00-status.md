@@ -1,6 +1,6 @@
 # Lazy-store status
 
-The latest measured runtime is **29f2fc433**, against fixed branch base **8aad447**. All nine cases have lower separate wall medians and paired wall ratios, with **70/75 faster pairs**, but **three CPU medians and seven peak-RSS medians rise**. Directly against **a357d6454**, only three separate wall medians and five paired ratios are lower, with **36/75 faster pairs**. These observations do not establish an overall resource improvement. The SQL auxiliary representation described below has passed validation but has no completed release or timing results yet.
+Latest measured runtime **daa1ff079** lowers all nine wall medians against fixed branch base **8aad447**, with **69/75 faster pairs**, while **three CPU medians and seven peak-RSS medians rise**. Directly against **0871ab183**, three separate wall medians and three paired ratios are lower, with **29/75 faster pairs**; the lower-case sets differ. Cold-path wall is higher in all five direct pairs. These changes establish no universal resource improvement.
 
 ## Semantic model
 
@@ -16,20 +16,26 @@ The [specification](01-specification.md), [implementation derivation](04-derivat
 
 ## Current validation
 
-The nineteen-file SQL auxiliary change passes **2,512 primary unit tests** and **909 fallback-util tests**, with zero failures. Primary skips/disabled are **2/3**, fallback **1/1**; those counts remain separate. All **94 primary and 29 fallback required cases**, **17 functionals** and **12 real-overlay targets** pass. The [completed independent review](/tmp/nix-auxiliary-sql-validation-review-v2/result.json) binds the tested source and reconciles all recorded cases and outcomes. It covers typed keys/chunks, owned snapshots, complete publication, corruption/repair, ingestion leases, bounded legacy cleanup and overlay authority. This is source/debug validation, not an optimized-release or performance result. Windows execution remains unverified.
+[Current validation](/home/connorbaker/Benchmarks/nix-performance-fixes/empty-copy-groups-validation/README.md) passes **2,516 primary / 911 fallback tests**, zero failures, with skips 2/1 and disabled 3/1. All **99/32 required cases**, **17 functionals** and **12 real overlays** pass. The new 72-case oracle checks first-child read/fold failure selection; existing header, advisory-flag, listing, SQL and ownership cases remain. The packaged release passes 207 tests, zero failures and 36 skips. Skipped/disabled/device-unavailable and Windows cases are not executed coverage; debug allocator observations do not measure release resources.
+
+The measured four-file change uses scheduler groups only with more than one worker, more than one child and at least one directory hint; other groups read/fold inline even with an existing pool. It also uses bounded backward decimal-header conversion. First failing child/read-before-own-fold selection is preserved. Later unstarted effects and resource failure traces are not asserted identical.
 
 ## Latest completed performance
 
-Five cold and ten warm pairs per case retain every observation. Cold means fresh private application state, not evicted OS caches; GitHub cold includes network access. Median paired wall changes against fixed base (negative means lower):
+Each independent series retains five cold and ten warm pairs per case. Cold means fresh private application state, not evicted OS caches; GitHub cold includes network access. Median paired wall changes against fixed base (negative means lower):
 
 | Workload | `path:` | `git+file:` | `github:` |
 | --- | ---: | ---: | ---: |
-| Cold · 32 attributes | -4.911% | -19.627% | -40.997% |
-| Warm · 8 attributes | -85.449% | -6.864% | -13.762% |
-| Warm · 32 attributes | -74.014% | -5.514% | -7.959% |
+| Cold · 32 attributes | -6.538% | -20.022% | -40.703% |
+| Warm · 8 attributes | -87.082% | -6.244% | -10.745% |
+| Warm · 32 attributes | -73.745% | -3.690% | -8.047% |
 
-Cold-path CPU rises **3.190→6.570 s** and peak RSS **445.21→474.34 MiB**, both higher in every pair. Both warm Git cases also have higher CPU in every pair. Direct wall medians are higher for all three cold cases and warm path8. Warm Git8/Git32 have higher separate wall medians but lower paired ratios; direct CPU and RSS are mixed.
+Cold-path CPU rises **3.190→5.630 s** and peak RSS **445.22→484.70 MiB**, both higher in every pair. Both warm Git cases also have higher CPU in every pair.
 
-The [complete 29f2 numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-29f2fc433/README.md) retains all eighteen cases, five metrics, ties, reversals and raw ranges. The [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-29f2fc433-audit/README.md) checks 156 outputs and eighteen store-graph comparisons; the [direct audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-29f2fc433-vs-a357d6454-audit/README.md) checks another 156 outputs, without new supplemental graph walks. The [strict release proof](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-29f2fc433.json) binds the actual measured sources and outputs.
+Direct cold-path wall worsens **1.093% separately / 2.809% paired**, with **0/5 faster pairs**, CPU **5.750→5.500 s**, and RSS **492.72→502.74 MiB**. Cold GitHub wall worsens **19.796% / 14.120%**. Warm Git8 and GitHub8 reverse in opposite directions between separate and paired wall summaries. Direct CPU/RSS remain mixed.
 
-Earlier f83, 117 and 110 profiles and syscall traces are historical diagnostics, not measurements of 29f2 or SQL storage. Incomplete callers, unknown/empty frames, overlapping routes and different collection environments limit attribution. [09-performance.md](09-performance.md) is awaiting its compact 29f2 replacement; its older measured revision must not be read as the current source or latest result. No series is pooled and no individual edit is assigned causal credit.
+The [performance report](09-performance.md) retains all eighteen rows and limits. The [complete numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-daa1ff079/README.md) preserves all ninety metric cells, ties, reversals and ranges. The [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/paired-daa1ff079-audit/README.md) checks 156 outputs and eighteen store graphs; the [direct audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resources-daa1ff079-vs-0871ab183-audit/README.md) checks another 156 outputs without supplemental graph walks. The [release proof](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-daa1ff079.json) binds measured sources/outputs. Separate series are not pooled and do not isolate individual edits.
+
+Fresh [daa1 user-FP findings](/home/connorbaker/Benchmarks/nix-performance-fixes/resource-profile-user-fp-daa1ff079/independent-review/interpretation/README.md) retain all nine cases, 26,518 samples, incomplete callers, 2,530 unknown leaves and two zero-IP observations. Hashing, CopyPool and SQL publication remain visible; sampled shares do not isolate the direct regressions. The [completed compiled comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-empty-groups-header-daa1ff079-vs-0871/comparison/ROUTES.md) finds header bytes 724→304 and frame bytes 320→64; both consumer frames remain 592. Selected instruction bytes fall 756 while the store ELF grows 80 bytes. For at least two children with all-false hints, the warmed-pool bypass adds a hint scan and avoids empty group machinery; no dynamic benefit follows from those static facts. Earlier 6043 kernel/syscall observations remain separately identified in the report.
+
+Base libgit2 1.9.7 versus branch 2.0.0-rc1 plus patches is a dependency confound; the direct comparison controls these versions while retaining the combined edits/layout. Base Git revision-keyed reuse also differs from the branch's absence of a worktree fingerprint: clean revision metadata does not name live/rendered bytes.
