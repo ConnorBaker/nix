@@ -52,7 +52,7 @@ struct CacheImpl : Cache
         auto dbPath = getCacheDir() / "fetcher-cache-v5.sqlite";
         createDirs(dbPath.parent_path());
 
-        state->db = SQLite(dbPath, {.useWAL = nix::settings.useSQLiteWAL});
+        state->db = SQLite(dbPath, {.useWAL = nix::settings.useSQLiteWAL, .externalSynchronization = true});
         state->db.isCache();
         /* Room to hold a naming walk's rows while it writes them.  The keys
            are content addresses, so the probes and the inserts of one walk

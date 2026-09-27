@@ -99,6 +99,7 @@ public:
 
         createDirs(dbPath.parent_path());
 
+        sqliteSettings.externalSynchronization = true;
         state->db = SQLite(dbPath, SQLite::Settings{sqliteSettings});
 
         state->db.isCache();

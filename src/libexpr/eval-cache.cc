@@ -80,7 +80,7 @@ struct AttrDb
 
         auto dbPath = cacheDir / (fingerprint.to_string(HashFormat::Base16, false) + ".sqlite");
 
-        state->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL});
+        state->db = SQLite(dbPath, {.useWAL = settings.useSQLiteWAL, .externalSynchronization = true});
         state->db.isCache();
         state->db.exec(schema);
 
