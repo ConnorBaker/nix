@@ -1,48 +1,48 @@
 # Evaluation performance and preserved behavior
 
-Latest measured runtime **a12e3dfabba797bd81c3544568760f57af932ced** lowers all nine wall medians against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, with **69/75 faster pairs**. **Four CPU medians and six peak-RSS medians rise.** Directly against **daa1ff0798b3ec211f4d40c3f2bdc10f8f52b0bc**, four separate wall medians and four paired ratios are lower, with **39/75 faster pairs**; seven CPU and six RSS medians rise. The combined changes establish no universal performance or resource improvement.
+Latest measured runtime **8dbd3414f6d607fc378709faa7e0c80a23f08d24** lowers all nine wall medians against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, with **68/75 faster pairs**. **Three CPU medians and seven peak-RSS medians rise.** Directly against **a12e3dfabba797bd81c3544568760f57af932ced**, six separate wall medians and six paired ratios are lower, with **44/75 faster pairs**; CPU medians are six lower, two equal and one higher, while six RSS medians rise. These combined changes establish no universal performance or resource improvement.
 
 ## Protocol and measurements
 
 The fixed nine-case domain evaluates Nixpkgs `6aefcda9401be8acc2b74244fb3b37520ea1f0a8` on aarch64 Linux. Each series has five cold pairs per source and ten pairs per warm count/source: **156 evaluations, six excluded warm seeds and 75 retained pairs**. Every scheduled observation is retained. The [driver](runs/nixpkgs-evaluation.py) records commands, identities and samples. Cold means fresh private application state, not evicted OS caches; GitHub acquisition includes network work. Target affinity does not reserve the host.
 
-Rows show baseline→a12 separate medians. Wall changes distinguish the ratio of separate medians from the median of paired ratios, each minus one; negative is lower. CPU adds recorded user and system centiseconds for each observation before taking the median; component medians need not add. RSS is peak resident memory, not allocated bytes. Rounded displays do not decide signs.
+Rows show baseline→8dbd separate medians. Wall changes distinguish the ratio of separate medians from the median of paired ratios, each minus one; negative is lower. CPU adds recorded user and system centiseconds for each observation before taking the median; component medians need not add. RSS is peak resident memory, not allocated bytes. Rounded displays do not decide signs.
 
-### Fixed branch base → a12
-
-| Case | Wall s | Wall change separate / paired | Faster pairs | CPU s | RSS MiB |
-| --- | --- | --- | --- | --- | --- |
-| cold 32 path | 3.890228→3.396120 | -12.701% / -12.260% | 5/5 | 3.290→5.090 | 444.70→498.26 |
-| cold 32 git | 3.035077→2.446773 | -19.383% / -19.169% | 5/5 | 2.590→2.620 | 479.13→482.38 |
-| cold 32 github | 6.671025→3.689074 | -44.700% / -41.384% | 4/5 | 21.590→5.280 | 974.64→961.93 |
-| warm 8 path | 3.160004→0.384250 | -87.840% / -87.735% | 10/10 | 2.920→0.815 | 223.83→202.23 |
-| warm 8 git | 0.849799→0.775626 | -8.728% / -7.857% | 8/10 | 0.785→1.250 | 254.36→259.25 |
-| warm 8 github | 0.294399→0.261492 | -11.178% / -12.129% | 10/10 | 0.290→0.245 | 197.11→200.97 |
-| warm 32 path | 3.751498→0.927370 | -75.280% / -75.569% | 10/10 | 3.490→1.360 | 444.65→428.87 |
-| warm 32 git | 1.434248→1.337699 | -6.732% / -7.017% | 8/10 | 1.340→1.790 | 478.93→479.94 |
-| warm 32 github | 0.853804→0.801648 | -6.109% / -7.778% | 9/10 | 0.845→0.785 | 441.99→445.30 |
-
-Cold-path wall falls **12.701% separately / 12.260% paired**, while CPU rises **3.290→5.090 s** and RSS **444.70→498.26 MiB**. Every cold-path pair has higher CPU and RSS; both warm Git cases also have higher CPU in every pair. Cold Git CPU reverses: its separate median rises **2.590→2.620 s**, while its paired ratio is lower. All nine lower wall medians describe this batch, not every execution.
-
-### Previous runtime daa1 → a12
+### Fixed branch base → 8dbd
 
 | Case | Wall s | Wall change separate / paired | Faster pairs | CPU s | RSS MiB |
 | --- | --- | --- | --- | --- | --- |
-| cold 32 path | 3.626626→3.444141 | -5.032% / -3.670% | 5/5 | 5.650→5.670 | 500.28→490.39 |
-| cold 32 git | 2.333357→2.434631 | +4.340% / +0.533% | 2/5 | 2.540→2.570 | 479.70→481.92 |
-| cold 32 github | 3.947010→4.139549 | +4.878% / +0.056% | 2/5 | 5.330→5.420 | 967.92→949.59 |
-| warm 8 path | 0.395639→0.392383 | -0.823% / -0.607% | 6/10 | 0.850→0.845 | 204.12→204.24 |
-| warm 8 git | 0.855274→0.837922 | -2.029% / -2.339% | 8/10 | 1.315→1.305 | 259.08→259.31 |
-| warm 8 github | 0.259264→0.263280 | +1.549% / +0.798% | 3/10 | 0.245→0.250 | 200.96→200.84 |
-| warm 32 path | 0.949361→0.944139 | -0.550% / -2.520% | 7/10 | 1.380→1.390 | 426.82→429.79 |
-| warm 32 git | 1.395024→1.446803 | +3.712% / +2.257% | 3/10 | 1.850→1.855 | 478.94→481.04 |
-| warm 32 github | 0.789530→0.797470 | +1.006% / +1.566% | 3/10 | 0.780→0.785 | 445.72→445.78 |
+| cold 32 path | 4.095549→3.801950 | -7.169% / -14.628% | 4/5 | 3.420→5.520 | 439.86→484.38 |
+| cold 32 git | 3.093098→2.628947 | -15.006% / -14.153% | 4/5 | 2.790→2.710 | 479.10→478.50 |
+| cold 32 github | 6.990010→4.224880 | -39.558% / -41.454% | 5/5 | 17.810→5.420 | 941.65→949.59 |
+| warm 8 path | 3.592236→0.639032 | -82.211% / -82.747% | 10/10 | 3.105→0.820 | 223.82→207.78 |
+| warm 8 git | 0.918399→0.783594 | -14.678% / -11.942% | 10/10 | 0.815→1.270 | 254.33→259.11 |
+| warm 8 github | 0.306117→0.263502 | -13.921% / -14.372% | 10/10 | 0.290→0.250 | 197.04→200.51 |
+| warm 32 path | 4.239329→1.062735 | -74.932% / -71.734% | 10/10 | 3.605→1.385 | 392.10→424.86 |
+| warm 32 git | 1.475405→1.340140 | -9.168% / -4.651% | 7/10 | 1.390→1.815 | 478.92→480.15 |
+| warm 32 github | 0.909042→0.838234 | -7.789% / -7.876% | 8/10 | 0.880→0.815 | 444.31→444.79 |
 
-Direct cold-path wall falls **5.032% separately / 3.670% paired**, with **5/5 faster pairs**. Its CPU rises **5.650→5.670 s** separately but falls paired. Cold Git and GitHub wall medians rise; GitHub's **+4.878% separate / +0.056% paired** illustrates the difference between these reductions. The same four cases have lower separate and paired wall medians: cold path, warm path8, warm Git8 and warm path32.
+Cold-path wall is lower by both reductions, while CPU rises **3.420→5.520 s** and RSS **439.86→484.38 MiB**. Every cold-path pair has higher CPU and RSS; both warm Git cases also have higher CPU in every pair. Cold Git CPU falls overall but system time rises **1.170→1.270 s**. All nine lower wall medians describe this batch, not every execution.
 
-Direct CPU cases are **2 lower/0 equal/7 higher** separately versus **6/1/2** paired; RSS is **3/0/6** separately versus **4/0/5** paired. All three cold CPU cases and warm Git32 reverse from higher separately to lower paired; warm path32 becomes equal paired. Warm Git8 RSS is higher separately but **0.000798% lower paired**, a sign hidden by ordinary rounding. Direct CPU pairs are **33/9/33**, RSS **34/0/41**. Warm GitHub32 user time falls separately but rises paired. No case changes sign between its paired ratio and paired delta in this batch.
+### Previous runtime a12 → 8dbd
 
-The [complete numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-a12e3dfab/COMPLETED-REVIEW.md) and [exact result](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-a12e3dfab/result.json) retain all eighteen cases × five metrics, user/system CPU, ranges, dispersion, ties and reversals. Independent checking covers **312 raw observations, 150 pairs, ninety cells and 1,481 numeric fields**. Main and direct series remain separate. These finite observations establish neither significance nor causal attribution to one edit.
+| Case | Wall s | Wall change separate / paired | Faster pairs | CPU s | RSS MiB |
+| --- | --- | --- | --- | --- | --- |
+| cold 32 path | 3.386493→3.205255 | -5.352% / -2.521% | 3/5 | 5.330→4.920 | 499.97→490.43 |
+| cold 32 git | 2.781779→2.601610 | -6.477% / -6.477% | 3/5 | 2.710→2.660 | 480.05→480.46 |
+| cold 32 github | 9.178208→4.361612 | -52.479% / -45.943% | 5/5 | 7.600→6.300 | 880.46→932.44 |
+| warm 8 path | 0.388680→0.387309 | -0.353% / -0.710% | 7/10 | 0.840→0.840 | 205.00→203.12 |
+| warm 8 git | 0.787756→0.798235 | +1.330% / +1.875% | 4/10 | 1.290→1.275 | 259.21→259.26 |
+| warm 8 github | 0.260434→0.264068 | +1.395% / +0.941% | 4/10 | 0.250→0.250 | 199.82→200.46 |
+| warm 32 path | 0.936221→0.936834 | +0.065% / +0.207% | 5/10 | 1.380→1.365 | 424.82→425.97 |
+| warm 32 git | 1.375393→1.360736 | -1.066% / -0.184% | 6/10 | 1.805→1.810 | 480.83→479.78 |
+| warm 32 github | 0.803770→0.794486 | -1.155% / -1.709% | 7/10 | 0.785→0.780 | 444.71→446.09 |
+
+Direct cold GitHub wall falls **9.178208→4.361612 s**, with **5/5 faster pairs** and CPU **7.600→6.300 s**; RSS rises **880.46→932.44 MiB** and is higher in all five pairs. Network/acquisition variability remains in this five-pair case; the combined dependency and Nix changes do not isolate a compression effect. Warm Git8, warm GitHub8 and warm path32 have higher separate and paired wall medians. Warm path32 divides **5 faster / 5 slower** despite its higher medians.
+
+Direct CPU cases are **6 lower/2 equal/1 higher** separately versus **5/2/2** paired. Warm path8 is equal separately but higher paired; warm path32 is lower separately but equal paired. Its system time reverses from higher separately to lower paired; its user time is equal separately and by paired delta, but its paired ratio is **0.031270% lower**. This near-tie shows that paired ratios and paired deltas can also differ. Direct CPU pairs are **36/15/24** and RSS **24/0/51**. RSS cases are **3/0/6** under both median reductions; warm GitHub8/32 RSS is higher in every pair.
+
+The [complete numeric review](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-8dbd3414f/COMPLETED-REVIEW.md) and [exact result](/home/connorbaker/Benchmarks/nix-performance-fixes/numeric-review-8dbd3414f/result.json) retain all eighteen cases × five metrics, user/system CPU, ranges, dispersion, ties and reversals. Independent checking covers **312 raw observations, 150 pairs, ninety cells and 1,481 numeric fields**. Main and direct series remain separate. These finite observations establish neither significance nor causal attribution to one edit.
 
 ## Source meaning and actual routes
 
@@ -58,41 +58,58 @@ The [fetcher selection](../../src/libfetchers/git.cc) and [accessors](../../src/
 
 Base 8aad adds clean-worktree revision metadata and derives a revision-based fingerprint. The branch explicitly caches no fingerprint: revision metadata does not identify live or attribute-rendered bytes. Base revision-keyed reuse and the branch's repeated walks therefore follow different identity rules. This explains route selection without assigning elapsed time to sampled weights or claiming every repeated walk is unavoidable.
 
-Six separate [base/daa1 debug evaluations](/home/connorbaker/Benchmarks/nix-performance-fixes/warm-git-route-base-daa1/nix-warm-git-route-diagnostic-base-daa1-interpretation/README.md) confirm persistent root-cache hits on both warm base runs and live-root hashing on both warm daa1 runs. Daa1 also completes 237/553 requested-subpath copy operations, with destinations and hashes matching its seed. These messages do not count physical writes: regular roots buffered within 1 MiB can return for an already-valid destination before creating temporary files. Directory and larger-file routes can still materialise temporary state. These diagnostics are not a12 timings or a fresh filesystem census.
+Six separate [base/daa1 debug evaluations](/home/connorbaker/Benchmarks/nix-performance-fixes/warm-git-route-base-daa1/nix-warm-git-route-diagnostic-base-daa1-interpretation/README.md) confirm persistent root-cache hits on both warm base runs and live-root hashing on both warm daa1 runs. Daa1 also completes 237/553 requested-subpath copy operations, with destinations and hashes matching its seed. These messages do not count physical writes: regular roots buffered within 1 MiB can return for an already-valid destination before creating temporary files. Directory and larger-file routes can still materialise temporary state. These diagnostics are not 8dbd timings or a fresh filesystem census.
 
-The measured [seven-file cohort](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-simplification-validation-a12e3dfab/source.patch) replaces CopyPool's per-child failure vector with one earliest-index failure. Accepted children still join, launch failures retain priority and ordered consumption stops at the winning child failure. Discarded exception objects are destroyed outside the pool mutex and before their jobs become joined; their destruction can occur earlier and reenter the pool. Full effect and resource-failure traces are not asserted identical.
+The measured seven-file cohort gives traversal's directory operation a lexical scope: the root borrows its existing filter prefix, while a nonroot join lives through the complete directory callback and joined child visits. This removes the prior optional prefix owner without introducing a cache. FilteringSourceAccessor inherits the identical base fingerprint implementation; a filtered subtree still cannot claim the inner subtree's identity merely because it wraps it.
 
-Traversal borrows an existing prefix at the accessor root and retains an owned join elsewhere. Tar ancestor insertion uses `try_emplace`, preserving existing directory/file/symlink conflict behavior while avoiding mapped-value construction on a hit; the owning key remains. Hash construction removes a redundant zeroing operation after member initialization. Auxiliary publication relies on the key validation already performed by `Hold::addAuxiliary` before staging; complete transaction publication remains.
+CopyPool snapshots its completed failure index after joining, so opaque consume callbacks do not force repeated loads of that fixed bound. Launch-failure priority, earliest child failure, ordered folding and exception cleanup remain. Hash construction initializes its width directly for the valid algorithm domain; the feature gate and final initialized value remain, without promising identical bytes in an object whose construction fails.
+
+The packaged libgit2 change gives each pack-write operation one lazily allocated **1 MiB heap scratch buffer**, reused across ordinary compressed objects and recursive delta-base writes, then released at the operation's exit. Empty and precompressed-only writes need no scratch; nested distinct builders have distinct buffers. Callback/error cleanup retains ownership, including releasing the acquired ODB object if the first scratch allocation fails. This removes repeated allocation requests but extends a successful buffer's lifetime; it proves neither lower peak RSS nor unchanged allocation-failure traces.
 
 The inherited SQL representation owns typed, chunked directory bodies and symlink targets per ingestion. Reads own and verify a complete body snapshot; reused bodies enter the recipient's projection. Leases and complete publication replace per-body files and auxiliary graph marking. Regular holders retain physical checks and valid-path eligibility; overlay mutation remains upper-only. Optional early-hit traces and resource failures are not asserted identical.
 
-### Actual compiled tradeoffs
+### Actual compiled evidence
 
-The [completed AArch64 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-semantic-simplification-a12e3dfab/COMPARISON-SUMMARY.json) has a **380-body union and 340 mutually unique exact-alias matches** across util, store and fetchers; ambiguous aliases remain unmatched. Selected instruction bytes rise **235,724→235,900**. The util ELF grows **eight bytes**; whole store/fetchers sizes are unchanged. This selected family plus one local direct support edge is not a whole-program closure, and unchanged sizes do not establish byte identity.
+The [completed release dependency binding](/home/connorbaker/Benchmarks/nix-performance-fixes/comparison-8dbd3414f/libgit2-binding.json) verifies the exact new libgit2 derivation, all six ordered committed patches, declared development dependency, registered dev/lib outputs, both fetchers/release runtime closures and the selected shared-library digest. It complements the unchanged strict Nix component-source proof; it is not a dynamic-loader trace or a timing attribution.
 
-[CopyPool’s eleven unique bodies](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-semantic-simplification-a12e3dfab/nix-copypool-assembly-comparison-a12e3dfab.md) fall **7,520→7,476 bytes** overall. `ordered` falls **1,260→1,124**, frame **240→224**, removing its exception-array allocation, initialization and scan. `execute` grows **464→544** with frame **80 unchanged**, supporting exception retirement outside the mutex; its success path avoids the old indexed-slot work. Hashing’s directory body grows **4,468→4,576** with frame **592 unchanged** through changed SHA256 inlining; materialisation’s **4,724-byte / 592-byte-frame** body retains its routes.
+The retained [libgit2 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/libgit2-pack-scratch/files/tmp/nix-libgit2-scratch-assembly-v3/README.md) shows eight primary bodies totaling **4,736→4,720 bytes**. `write_one` shrinks **1,408→1,356 bytes**, with frame **208→192 bytes**; `write_pack` grows **1,484→1,520 bytes**, with frame **160→176 bytes**. One active `write_pack`/`write_one` pair therefore remains **368 frame bytes**; this is not a complete stack bound. The other six primary bodies and 27 immediate local support bodies retain their sizes. Lazy scratch ownership and cleanup are emitted; these static changes establish no execution frequency, cycle or RSS improvement.
 
-Auxiliary insertion falls **1,200→928 bytes** with frame **176 unchanged**, removing the repeated key gate and its throw. The admission gate, five SQL binds per chunk, TRANSIENT copies, transaction retries and owning projections remain. The other sixteen primary publication bodies retain their sizes, frames and call maps.
+The [isolated libgit2 controls](/home/connorbaker/Benchmarks/nix-performance-fixes/libgit2-pack-scratch/INDEX.md) pass all **seven new tests**. The broader pack/packed-ODB run includes those seven: **47 cases, 46 passed, one existing conditional skip, zero failures**. With the same corrected setup, original production passes five and fails exactly two intended controls: repeated scratch allocation and the acquired ODB reference left held after scratch-allocation failure. The initial seven setup failures are retained separately.
 
-Root-prefix borrowing grows two traversal bodies: **1,224→1,380 bytes** with frame **256 unchanged**, and **1,192→1,520** with frame **352→368**. It adds optional-state initialization and engagement checks; the nonroot path keeps its join and adds move/cleanup work. The latter body also newly inlines a symlink hashing path with an indirect override fallback. The other 49 compared traversal/enclosing extents retain their sizes, mnemonic/direct-call sequences and stack adjustments apart from relocations.
-
-Tar `addNode` falls **6,560→6,488 bytes**, frame **2,464→2,448**, while `createDirectory` grows **284→380**, frame **192→208**, through cleanup inlining. Their overlapping frame segment remains **2,656 bytes**. The baseline already avoided a map-node allocation on a hit; the removed work is temporary empty-map initialization and cleanup. Long owning keys still allocate. These code, construction and frame facts establish no invocation frequency, total stack bound, cycle or RSS benefit.
+The completed [a12→8dbd util comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/assembly-scoped-ownership-8dbd3414f/util/comparison/ROUTES-v2.md) selects **138→135 bodies**, totaling **67,168→67,224 bytes**, while the whole util ELF shrinks **192 bytes**. Hash construction shrinks **452→376 bytes**, frame **112→96**; BLAKE3 now looks up width before its feature check, so the smaller body does not mean every algorithm performs less work. CopyPool's ordered fold shrinks **1,124→1,120 bytes** with frame **224 unchanged**; the completed failure bound is loaded once across consume calls. Traversal instead grows **12,760→12,952 bytes**, despite **29→27 bodies**: callback inlining duplicates root/nonroot setup. The monostate and HashedNode direct wrapper/callee frame pairs increase **272→352** and **400→544 bytes**. Root-prefix equality now emits a `strlen` call; all four enclosing caller families retain their entry sizes and frames. These bounded code/frame observations establish neither a complete stack maximum nor a runtime cost attribution. The pending MemoVisitor lookup, exact-view root comparison and parsed-name checks are unmeasured and excluded.
 
 ## Validation and evidence boundaries
 
-[Current validation](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-simplification-validation-a12e3dfab/result.json) passes **2,517 primary / 912 fallback tests**, zero failures, with skips **2/1** and disabled **3/1**. All **103/36 required cases**, **17 functionals** and **12 real overlays** pass. The new sixteen-cell exception-cleanup test checks reentry; the expanded 144-cell launch-failure test includes failing detached children. Existing ordered-fold, lifetime, SQL, naming and header oracles remain. The packaged release passes **207 tests**, zero failures and **36 skips**. Skipped/disabled/device-unavailable and Windows cases are not executed coverage; debug allocator observations do not measure release resources.
+[Current validation](/home/connorbaker/Benchmarks/nix-performance-fixes/scoped-ownership-validation/REVIEW.md) independently reconciles **2,517 primary / 912 fallback passes**, zero failures, skips **2/1** and disabled **3/1**. All **103/36 required cases**, **17 functionals** and **12 real overlays** pass; configure, build and the five remaining stages all exit zero. The existing reentrant-exception, ordered-fold, callback-lifetime, SQL, naming and header oracles remain. The packaged release passes **207 tests**, zero failures and **36 skips**. Skipped/disabled/device-unavailable and Windows cases are not executed coverage; debug allocator observations do not measure release resources.
 
-The [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/comparison-a12e3dfab/main-audit.json) checks 156 outputs and eighteen complete store-graph comparisons under injective address mappings. The runner walked graphs; subsequent artifact checking verifies association. The [direct audit](/home/connorbaker/Benchmarks/nix-performance-fixes/comparison-a12e3dfab/direct-audit.json) checks another 156 outputs against own-release and prior references, including drvPath; supplemental stores were not graph-walked. Independent completed-output checks rechecked the schedules, order, commands, time fields, reference mappings and all 312 outputs. This does not prove arbitrary embedded-program equivalence. The [strict release proof](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-a12e3dfab.json) binds actual measured component sources/outputs.
+Validation records the new libgit2 headers/link input and the root's successful loader resolution to that library. The first configure attempt exited zero but was rejected for old headers before build/tests; its history remains separate. Isolated libgit2 regression results are not pooled with Nix unit counts. The optimized release's registered dependency association is independently checked before either timed matrix.
+
+The [main audit](/home/connorbaker/Benchmarks/nix-performance-fixes/comparison-8dbd3414f/main-audit.json) checks 156 outputs and eighteen complete store-graph comparisons under injective address mappings. The runner walked graphs; subsequent artifact checking verifies association. The [direct audit](/home/connorbaker/Benchmarks/nix-performance-fixes/comparison-8dbd3414f/direct-audit.json) checks another 156 outputs against own-release and prior references, including drvPath; supplemental stores were not graph-walked. Independent completed-output checks rechecked both schedules, commands, time fields, reference mappings and all 312 complete outputs. This does not prove arbitrary embedded-program equivalence. The [strict release proof](/home/connorbaker/Benchmarks/nix-performance-fixes/release-provenance-8dbd3414f.json) binds actual measured component sources/outputs.
+
+## Current syscall counts
+
+The completed [8dbd versus fixed-base review](/home/connorbaker/Benchmarks/nix-performance-fixes/syscall-counts-8dbd3414f-vs-base/analysis/README.md) checks all **144 capture files, 24 outputs and 648 cells across 72 syscall labels**. There is one traced execution per side/case and six untraced seeds. These are aggregate Nix/descendant counts, separate from the timed matrices and the a12 comparison.
+
+| Case | Calls base→8dbd | Delta |
+| --- | ---: | ---: |
+| cold 32 path | 1,487,667→1,723,218 | +235,551 |
+| cold 32 git | 1,295,175→1,210,936 | -84,239 |
+| cold 32 github | 668,626→737,553 | +68,927 |
+| warm 8 path | 1,693,990→583,004 | -1,110,986 |
+| warm 8 git | 388,149→860,964 | +472,815 |
+| warm 8 github | 28,532→8,688 | -19,844 |
+| warm 32 path | 1,727,869→604,753 | -1,123,116 |
+| warm 32 git | 422,348→887,073 | +464,725 |
+| warm 32 github | 55,604→24,514 | -31,090 |
+
+Combined `openat`+`openat2` counts fall in seven cases and rise in both warm Git cases; treating `openat2` alone as removed opens would be wrong. Total reported errors fall in all nine, while individual families rise. These summaries have no path, FD, errno, thread, byte or SQL-statement partition and provide no cost attribution. The complete call/error matrices retain adverse and unchanged rows. Tracer timing is not used as a benchmark; concurrent artifact review and a 0.19-second formatter on helper CPUs are recorded, and affinity does not provide host isolation.
 
 ## Historical diagnostics and limits
 
-The [daa1 user-FP interpretation](/home/connorbaker/Benchmarks/nix-performance-fixes/resource-profile-user-fp-daa1ff079/independent-review/interpretation/README.md) and [6043 kernel/syscall findings](/home/connorbaker/Benchmarks/nix-performance-fixes/syscalls-6043a65c5-vs-base/interpretation/README.md) are **historical, not a12 profiles**. Each full profile series has eighteen captures, six seeds and 24 output checks. One instrumented pair per case gives no variance estimate; these observations cannot establish the incremental effect of a12.
+The [daa1 user-FP interpretation](/home/connorbaker/Benchmarks/nix-performance-fixes/resource-profile-user-fp-daa1ff079/independent-review/interpretation/README.md) and [6043 kernel/syscall findings](/home/connorbaker/Benchmarks/nix-performance-fixes/syscalls-6043a65c5-vs-base/interpretation/README.md) are **historical, not 8dbd profiles**. Each full profile series has eighteen captures, six seeds and 24 output checks. One instrumented pair per case gives no variance estimate; these observations cannot establish the incremental effect of 8dbd.
 
-| Historical collection | Samples | Missing user entry | Unknown leaves / frames | Other limits |
-| --- | ---: | ---: | ---: | --- |
-| daa1 user FP | 26,518 | 4,607 | 2,530 / 13,253 | 2,641 at exactly depth 127; max 128; two zero-IP frames |
-| 6043 kernel | 24,948 | n/a | 1 / 1 | 1,885 empty chains; 6.345344% of period |
+The daa1 user-FP collection has **26,518 samples**, 4,607 missing user entries, 2,530 unknown leaves/13,253 unknown frames, 2,641 chains at exactly depth 127, maximum 128 and two zero-IP frames. The 6043 kernel collection has **24,948 samples**, one unknown leaf and one unknown frame, and 1,885 empty chains carrying 6.345344% of period.
 
 Recorded loss/unparsed records and decoder/header stderr are zero, but callers remain incomplete. Exactly 127 is not proof of truncation. Unknown/empty samples stay in denominators; high-bit user unknowns are not assigned to kernel code. Inclusive routes overlap. Sample counts and period weights are not invocation counts or exact cycles; separate collections cannot be pooled. Endpoint identity and startup loader checks do not establish complete mappings or isolation.
 
-Historical cold Git includes status and traversal; warm Git still traverses mutable bytes. Cold GitHub's delta construction/flush/compression differs from warm GitHub's evaluator/parser/inflate route. Base uses **libgit2 1.9.7**; a12 uses **2.0.0-rc1 (`ae45d0d`) plus patches**. Fixed-base results compare dependency bundles. Direct daa1→a12 holds those dependency versions fixed but still compares combined source edits and code layout, not isolated causal effects. Historical [allocator attribution](/home/connorbaker/Benchmarks/nix-performance-fixes/allocation-symbols-110adbaf7-complete-attribution/README.md) also cautions that a shared operator-new[] label does not identify array-buffer cost or RSS ownership.
+Historical cold Git includes status and traversal; warm Git still traverses mutable bytes. Cold GitHub's delta construction/flush/compression differs from warm GitHub's evaluator/parser/inflate route. Base uses **libgit2 1.9.7**; 8dbd uses **2.0.0-rc1 (`ae45d0d`) plus six patches**. Fixed-base results compare dependency bundles. Direct a12→8dbd also changes the libgit2 patch set, alongside Nix source and code layout, so it does not isolate individual effects. Historical [allocator attribution](/home/connorbaker/Benchmarks/nix-performance-fixes/allocation-symbols-110adbaf7-complete-attribution/README.md) cautions that a shared operator-new[] label does not identify array-buffer cost or RSS ownership.

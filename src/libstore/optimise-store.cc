@@ -951,8 +951,7 @@ struct MaterialisingVisitor : LinkingVisitor
                 std::string_view childName{key};
                 if (child.mode == merkle::Mode::Directory)
                     childName.remove_suffix(1);
-                if (childName.empty() || childName == "." || childName == ".."
-                    || childName.find_first_of(std::string_view("/\0", 2)) != std::string_view::npos) {
+                if (childName == ".") {
                     warn(
                         "tree object %s names an entry '%s'; not used",
                         GitObjectStore::idString(entry.hash),

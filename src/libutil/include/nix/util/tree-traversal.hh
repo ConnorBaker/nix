@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace nix {
@@ -177,7 +178,7 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                     return std::move(*result);
                 };
                 /* At the accessor root, the walk already owns this prefix. */
-                return path.abs() == "/" ? visitDirectory(to) : visitDirectory(path / to);
+                return path.abs() == std::string_view{"/"} ? visitDirectory(to) : visitDirectory(path / to);
             }
 
             case SourceAccessor::tChar:
