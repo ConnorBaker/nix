@@ -295,6 +295,112 @@ TEST_F(GitUtilsTest, namesFollowTheTreeObjects)
     EXPECT_EQ(acc1->getFingerprint(CanonPath("shared")), shared1);
 }
 
+TEST_F(GitUtilsTest, fingerprintsRequireCanonicalRawModes)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    git_odb * odb = nullptr;
+    ASSERT_EQ(git_repository_odb(&odb, rawRepo), 0);
+    Finally closeOdb{[&] { git_odb_free(odb); }};
+    git_oid blob;
+    ASSERT_EQ(git_odb_write(&blob, odb, "x", 1, GIT_OBJECT_BLOB), 0);
+
+    /* Every uint16 raw mode in one tree. Fixed-width names are unique and
+       sorted even when a directory's comparison appends a slash. */
+    constexpr unsigned modes = 1u << 16;
+    std::string body;
+    body.reserve(32 * modes);
+    for (unsigned mode = 0; mode < modes; ++mode) {
+        body += fmt("%o %04x", mode, mode);
+        body += '\0';
+        body.append(reinterpret_cast<const char *>(blob.id), GIT_OID_SHA1_SIZE);
+    }
+    git_oid root;
+    ASSERT_EQ(git_odb_write(&root, odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
+    auto acc = openRepo()->getAccessor(Hash::parseAny(git_oid_tostr_s(&root), HashAlgorithm::SHA1), {}, "raw-modes");
+    unsigned named = 0;
+    for (unsigned mode = 0; mode < modes; ++mode) {
+        auto identity = acc->getFingerprint(CanonPath(fmt("%04x", mode)));
+        const bool canonical = mode == 0040000 || mode == 0100644 || mode == 0100755 || mode == 0120000 || mode == 0160000;
+        EXPECT_EQ(identity.has_value(), canonical) << mode;
+        if (identity) {
+            ++named;
+            EXPECT_EQ(identity->first, CanonPath::root);
+            EXPECT_THAT(identity->second, ::testing::StartsWith("git-object-v2:"));
+        }
+    }
+    EXPECT_EQ(named, 5u);
+}
+
+TEST_F(GitUtilsTest, malformedModesCannotReuseExecutableOrLegacyParentMemos)
+{
+    nix::initLibStore(/*loadConfig=*/false);
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+    git_odb * odb = nullptr;
+    ASSERT_EQ(git_repository_odb(&odb, rawRepo), 0);
+    Finally closeOdb{[&] { git_odb_free(odb); }};
+    git_oid blob;
+    ASSERT_EQ(git_odb_write(&blob, odb, "x", 1, GIT_OBJECT_BLOB), 0);
+    std::array<git_oid, 2> roots{};
+    const std::array modes{"100755", "160100"};
+    for (size_t i = 0; i < roots.size(); ++i) {
+        auto body = std::string(modes[i]) + " node";
+        body += '\0';
+        body.append(reinterpret_cast<const char *>(blob.id), GIT_OID_SHA1_SIZE);
+        ASSERT_EQ(git_odb_write(&roots[i], odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
+    }
+    auto repo = openRepo();
+    auto good = repo->getAccessor(Hash::parseAny(git_oid_tostr_s(&roots[0]), HashAlgorithm::SHA1), {}, "executable");
+    auto badHash = Hash::parseAny(git_oid_tostr_s(&roots[1]), HashAlgorithm::SHA1);
+    auto bad = repo->getAccessor(badHash, {}, "gitlink-with-executable-bit");
+    const CanonPath node("node");
+    ASSERT_TRUE(good->lstat(node).isExecutable);
+    ASSERT_TRUE(bad->lstat(node).isExecutable);
+    EXPECT_EQ(good->readFile(node), "x");
+    EXPECT_TRUE(bad->readDirectory(node).empty());
+    EXPECT_THROW(bad->readFile(node), Error);
+
+    auto store = openStore("dummy://?read-only=false");
+    fetchers::Settings settings;
+    const auto method = ContentAddressMethod::Raw::Git;
+    const merkle::TreeEntry executable{merkle::Mode::Executable, merkle::blobId("x")};
+    const auto result = fetchToStore2(settings, *store, SourcePath(good, node), FetchMode::DryRun, "entry", method);
+    EXPECT_EQ(result.second, merkle::objectHash(executable));
+    auto identity = good->getFingerprint(node);
+    ASSERT_TRUE(identity);
+    auto row = settings.getCache()->lookup(makeSourcePathToHashCacheKey(identity->second, method, identity->first));
+    ASSERT_TRUE(row);
+    EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(merkle::Mode::Executable));
+
+    auto rejects = [&](const fetchers::Settings & settings, const SourcePath & source) {
+        try {
+            (void) fetchToStore2(settings, *store, source, FetchMode::DryRun, "entry", method);
+            ADD_FAILURE() << "a memo bypassed the malformed entry's read";
+        } catch (Error & e) {
+            EXPECT_THAT(e.msg(), ::testing::HasSubstr("is not a regular file"));
+        }
+    };
+    /* The same Settings can hit the result memo; fresh Settings can hit
+       the persistent sourcePathToHash row. Neither may hide this error. */
+    rejects(settings, SourcePath(bad, node));
+    fetchers::Settings fresh;
+    rejects(fresh, SourcePath(bad, node));
+
+    /* v1 could fold a bad child hit into a parent row. Even after fixing
+       leaf admission, the parent must not reuse that historical answer. */
+    const merkle::Tree substituted{{"node", executable}};
+    auto wrongParent = merkle::treeId(merkle::serialiseTree(substituted));
+    auto legacyKey = makeSourcePathToHashCacheKey("git-object-v1:tree:" + badHash.gitRev(), method, CanonPath::root);
+    settings.getCache()->upsert(
+        legacyKey,
+        {{"mode", uint64_t(merkle::Mode::Directory)}, {"hash", wrongParent.to_string(HashFormat::SRI, true)}});
+    ASSERT_TRUE(settings.getCache()->lookup(legacyKey));
+    rejects(fresh, SourcePath(bad));
+}
+
 /* Soundness over real Git trees: a subtree shared between two roots is stored
    once by Git under one object id, so it carries the same name under both, and
    its NAR must be the same — the naming law equal-names-imply-equal-NARs

@@ -1126,8 +1126,8 @@ public:
         auto name = [](std::string_view kind, const git_oid & oid) -> std::string {
             auto hash = toHash(oid);
             std::string s;
-            s.reserve(sizeof("git-object-v1:") + kind.size() + base16::encodedLength(hash.hashSize));
-            s += "git-object-v1:";
+            s.reserve(sizeof("git-object-v2:") + kind.size() + base16::encodedLength(hash.hashSize));
+            s += "git-object-v2:";
             s += kind;
             s += ':';
             base16::encodeTo(s, std::as_bytes(std::span<const uint8_t>{&hash.hash[0], hash.hashSize}));
@@ -1145,7 +1145,7 @@ public:
         if (!entry)
             return std::nullopt;
 
-        switch (git_tree_entry_filemode(entry)) {
+        switch (git_tree_entry_filemode_raw(entry)) {
         case GIT_FILEMODE_TREE:
             return std::pair{CanonPath::root, name("tree", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_BLOB:
@@ -1156,7 +1156,7 @@ public:
             return std::pair{CanonPath::root, name("symlink", *git_tree_entry_id(entry))};
         case GIT_FILEMODE_COMMIT:
             /* Rendered as an empty directory whatever the commit is. */
-            return std::pair{CanonPath::root, std::string("git-object-v1:empty-directory")};
+            return std::pair{CanonPath::root, std::string("git-object-v2:empty-directory")};
         case GIT_FILEMODE_UNREADABLE:
             return std::nullopt;
         }
