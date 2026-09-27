@@ -180,7 +180,7 @@ struct GitObjectStore::Hold::Pending
     ~Pending()
     {
         for (auto & shard : shards)
-            delete shard.load();
+            delete shard.load(std::memory_order_relaxed);
     }
 };
 
@@ -200,8 +200,10 @@ void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
     /* A reused hold starts a new path projection. Its previous completed
        rows have already been handed to the store; abandoned rows need no
        publication. No walking worker may outlive this boundary. */
-    for (auto & slot : pending->shards)
-        delete slot.exchange(nullptr);
+    for (auto & slot : pending->shards) {
+        delete slot.load(std::memory_order_relaxed);
+        slot.store(nullptr, std::memory_order_relaxed);
+    }
     pending->root = std::move(root);
 }
 
@@ -235,7 +237,7 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
     size_t regular = 0, auxiliary = 0;
     for (auto & slot : pending->shards)
-        if (auto * shard = slot.load(std::memory_order_acquire))
+        if (auto * shard = slot.load(std::memory_order_relaxed))
             for (const auto & value : shard->byKey)
                 if (std::holds_alternative<Row>(value))
                     ++regular;
@@ -246,7 +248,8 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     projection.regular.reserve(regular);
     projection.auxiliary.reserve(auxiliary);
     for (auto & slot : pending->shards)
-        if (std::unique_ptr<Pending::Shard> shard{slot.exchange(nullptr)}; shard)
+        if (std::unique_ptr<Pending::Shard> shard{slot.load(std::memory_order_relaxed)}; shard) {
+            slot.store(nullptr, std::memory_order_relaxed);
             while (!shard->byKey.empty()) {
                 auto node = shard->byKey.extract(shard->byKey.begin());
                 auto & value = node.value();
@@ -255,6 +258,7 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
                 else
                     projection.auxiliary.push_back(std::move(std::get<Auxiliary>(value)));
             }
+        }
     return projection;
 }
 
