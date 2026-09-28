@@ -277,10 +277,9 @@ struct ProfileManifest
             },
             ObjectHash::of(object.root));
         info.narSize = sink.s.size();
-        info.lazyNarHash = [narHash] { return narHash; };
 
         StringSource source(sink.s);
-        store->addToStore(info, source);
+        store->addToStore(info, source, NoRepair, CheckSigs, [narHash] { return narHash; });
 
         return std::move(info.path);
     }

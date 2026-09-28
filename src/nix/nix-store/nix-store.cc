@@ -603,12 +603,12 @@ static bool walkOldRecord(ValidPathInfo & info)
                 narHash.to_string(HashFormat::Nix32, true));
             return false;
         }
-        if (info.narSize != object.narSize) {
+        if (info.narSize != object.narSize.value()) {
             printError(
                 "path '%s' was modified! expected NAR size %d, got %d; not registered",
                 store->printStorePath(info.path),
                 info.narSize,
-                object.narSize);
+                object.narSize.value());
             return false;
         }
         info.objectHash = ObjectHash::of(object.root);
@@ -655,7 +655,7 @@ static void registerValidity(bool reregister, bool hashGiven, bool canonicalise)
                 auto accessor = store->requireStoreObjectAccessor(info->path, /*requireValidPath=*/false);
                 auto object = objectHashOf(*accessor, CanonPath::root);
                 info->objectHash = ObjectHash::of(object.root);
-                info->narSize = object.narSize;
+                info->narSize = object.narSize.value();
             } else if (!info->objectHash && !walkOldRecord(*info)) {
                 notRegistered++;
                 continue;

@@ -267,6 +267,7 @@ TEST_F(GitTest, tree_digest_read_boundaries)
             return n;
         }
     };
+
     struct Case
     {
         HashAlgorithm algorithm;
@@ -274,6 +275,7 @@ TEST_F(GitTest, tree_digest_read_boundaries)
         bool supported;
         const char * name;
     };
+
     const Case cases[] = {
         {HashAlgorithm::MD5, 16, false, "md5"},
         {HashAlgorithm::SHA1, 20, true, "sha1"},
@@ -332,6 +334,99 @@ TEST_F(GitTest, tree_digest_read_boundaries)
         }
     }
     EXPECT_EQ(checked, 174u); // Five empty, five complete, and every 164 short prefixes.
+}
+
+TEST_F(GitTest, tree_body_matches_canonical_encoding)
+{
+    const std::string_view modes[] = {"40000", "100644", "100755", "120000"};
+    const std::string_view names[] = {"a", "a.", "a0"};
+    size_t checked = 0;
+    for (auto algorithm : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+        auto digest = hashString(algorithm, "tree body bytes");
+        auto entry = [&](std::string_view mode, std::string_view name) {
+            return std::string(mode) + ' ' + std::string(name) + '\0'
+                   + std::string(reinterpret_cast<const char *>(digest.hash), digest.hashSize);
+        };
+        auto check = [&](const std::string & body) {
+            SCOPED_TRACE(checked);
+            /* The old store operation is an independent encoding oracle:
+               parse permissively, then compare the map's canonical bytes. */
+            auto framed = std::to_string(body.size()) + '\0' + body;
+            StringSource source{framed};
+            TestDirectorySink legacy;
+            git::parseTree(legacy, source, algorithm);
+            auto canonical = merkle::serialiseTree(legacy.entries) == body;
+            auto before = body;
+            TestDirectorySink actual;
+            if (canonical)
+                EXPECT_NO_THROW(git::parseTreeBody(actual, body, algorithm));
+            else {
+                try {
+                    git::parseTreeBody(actual, body, algorithm);
+                    FAIL() << "expected noncanonical tree body";
+                } catch (const Error & e) {
+                    EXPECT_EQ(filterANSIEscapes(e.message(), true), "tree body is not its canonical encoding");
+                }
+            }
+            EXPECT_EQ(actual.entries, legacy.entries);
+            EXPECT_EQ(body, before);
+            ++checked;
+        };
+        for (auto mode : modes)
+            for (bool leadingZero : {false, true})
+                for (bool suffix : {false, true})
+                    check(entry((leadingZero ? "0" : "") + std::string(mode) + (suffix ? "x" : ""), "a"));
+        /* All mode pairs and equal/before/after name pairs, including the
+           ordering reversal between directory a/ and ordinary a. or a0. */
+        for (auto firstMode : modes)
+            for (auto secondMode : modes)
+                for (auto firstName : names)
+                    for (auto secondName : names)
+                        check(entry(firstMode, firstName) + entry(secondMode, secondName));
+    }
+    EXPECT_EQ(checked, 320u);
+}
+
+TEST_F(GitTest, tree_body_preserves_sink_and_truncation_errors)
+{
+    struct RejectSecond : merkle::DirectorySink
+    {
+        size_t calls = 0;
+
+        void insertChild(std::string_view, merkle::TreeEntry) override
+        {
+            if (++calls == 2)
+                throw Error("second entry rejected");
+        }
+    };
+
+    size_t checked = 0;
+    for (auto algorithm : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+        auto digest = hashString(algorithm, "tree body bytes");
+        auto bytes = std::string(reinterpret_cast<const char *>(digest.hash), digest.hashSize);
+        auto first = std::string("0100644 a\0", 10) + bytes;
+        auto second = std::string("100644 b\0", 9) + bytes;
+        for (size_t available = 0; available <= second.size(); ++available) {
+            SCOPED_TRACE(available);
+            auto body = first + second.substr(0, available);
+            RejectSecond sink;
+            if (available && available < second.size())
+                EXPECT_THROW(git::parseTreeBody(sink, body, algorithm), EndOfFile);
+            else {
+                try {
+                    git::parseTreeBody(sink, body, algorithm);
+                    FAIL() << "expected tree body failure";
+                } catch (const Error & e) {
+                    EXPECT_EQ(
+                        filterANSIEscapes(e.message(), true),
+                        available ? "second entry rejected" : "tree body is not its canonical encoding");
+                }
+            }
+            EXPECT_EQ(sink.calls, available == second.size() ? 2u : 1u);
+            ++checked;
+        }
+    }
+    EXPECT_EQ(checked, 72u);
 }
 
 namespace memory_source_accessor {

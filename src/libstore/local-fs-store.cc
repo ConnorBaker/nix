@@ -116,7 +116,7 @@ public:
             std::optional<StorePathSet> valid;
             if (requireValidPath)
                 /* One query for the whole listing, not one per entry. */
-                valid = store->queryAllValidPaths();
+                valid = store->queryVisibleValidPaths();
             for (auto & [name, type] : accessor->readDirectory(path)) {
                 auto storePath = maybeGetStoreObjectPath(CanonPath(name));
                 if (!storePath || (valid && !valid->contains(*storePath)))
@@ -127,19 +127,6 @@ public:
         }
         requireStoreObject(path);
         return accessor->readDirectory(path);
-    }
-
-    void readDirectory(
-        const CanonPath & dirPath,
-        std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback) override
-    {
-        if (dirPath.isRoot()) {
-            /* Traverse through this accessor, so that the root listing above applies. */
-            return SourceAccessor::readDirectory(dirPath, std::move(callback));
-        }
-        requireStoreObject(dirPath);
-        auto inner = accessor;
-        return inner->readDirectory(dirPath, std::move(callback));
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override

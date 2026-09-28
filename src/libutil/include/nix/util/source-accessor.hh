@@ -213,33 +213,16 @@ public:
     virtual DirEntries readDirectory(const CanonPath & path) = 0;
 
     /**
-     * Variation of readDirectory that receives a SourceAccessor possibly scoped to @p dirPath.
-     * Primary meant for recursive traversal functions that would benefit from *at-style syscalls
-     * relative to a particular directory.
-     *
-     * @note Like `readFile`, this method should *not* follow symlinks.
-     * @param callback Caller-provided function invoked with a maximally deeply scoped SourceAccessor and the path that
-     * would have to be prepended to each path relative to dirPath to access a particular file with it.
+     * List and scope the same directory for a recursive walk, without
+     * following symlinks. The callback receives the listing and the accessor
+     * and relative path for reading its children. All uses, including joined
+     * parallel visits, must finish before the callback returns.
      */
-    virtual void readDirectory(
-        const CanonPath & dirPath,
-        std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback)
-    {
-        auto keepAlive = weak_from_this().lock();
-        callback(*this, dirPath);
-    }
-
-    /** List and scope the same opened directory for a recursive walk. */
     virtual void readDirectoryWithEntries(
         const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
     {
         auto keepAlive = weak_from_this().lock();
-        auto entries = readDirectory(path);
-        readDirectory(path, [&](SourceAccessor & accessor, const CanonPath & relative) {
-            /* The virtual scoped operation may invoke its callback again;
-               retain this default listing for the entire operation. */
-            callback(accessor, relative, DirectoryListing(std::cref(entries)));
-        });
+        callback(*this, path, DirectoryListing(readDirectory(path)));
     }
 
     virtual std::string readLink(const CanonPath & path) = 0;

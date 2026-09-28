@@ -123,7 +123,7 @@ struct CmdBundle : InstallableValueCommand
             auto * attr = vRes->attrs()->get(evalState->s.name);
             if (!attr)
                 throw Error("attribute 'name' missing");
-            outLink = evalState->realiseNoCtx(*attr->value, attr->pos, "").toOwned();
+            outLink = std::string(evalState->forceStringNoCtx(*attr->value, attr->pos, ""));
         }
 
         // TODO: will crash if not a localFSStore?

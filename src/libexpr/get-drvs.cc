@@ -247,7 +247,7 @@ std::string PackageInfo::queryMetaString(const std::string & name)
     if (!v || v->type() != nString)
         return "";
     /* Text handed to a command: a door. */
-    return state->realise(*v).toOwned();
+    return std::string(v->string_view());
 }
 
 NixInt PackageInfo::queryMetaInt(const std::string & name, NixInt def)

@@ -290,10 +290,10 @@ static void showHelp(std::vector<std::string> subcommand, NixArgs & toplevel)
     if (!attr)
         throw UsageError("Nix has no subcommand '%s'", concatStringsSep("", subcommand));
 
-    auto markdown = state.realise(*attr->value, noPos, "while evaluating the lowdown help text");
+    auto markdown = state.forceString(*attr->value, noPos, "while evaluating the lowdown help text");
 
     RunPager pager;
-    std::cout << renderMarkdownToTerminal(markdown.view()) << "\n";
+    std::cout << renderMarkdownToTerminal(markdown) << "\n";
 }
 
 static NixArgs & getNixArgs(Command & cmd)

@@ -446,7 +446,7 @@ bool GitObjectStore::validHolderMetadata(const Holder & holder, bool executable,
 }
 
 std::optional<GitObjectStore::Holder>
-GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repair, PosixStat * stOut)
+GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repair)
 {
 #ifdef _WIN32
     return std::nullopt;
@@ -465,8 +465,6 @@ GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repa
            The candidate cursor also advances in a read-only store, whose
            forget operation deliberately does nothing. */
         if (st && validHolderMetadata(*row, executable, *st) && (!repair || blobIdOfFile(row->file) == id)) {
-            if (stOut)
-                *stOut = *st;
             return row;
         }
         if (index->forget)
@@ -795,19 +793,8 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
         }
     } into;
 
-    /* The owned body holds entries alone; the parser reads the size git's
-       header puts before them. */
     try {
-        {
-            auto framed = std::to_string(body.size()) + '\0';
-            framed.append(body);
-            StringSource source{framed};
-            git::parseTree(into, source, hashAlgo);
-        }
-        /* The identifier names the canonical encoding of this map, not
-           another spelling or ordering that the raw Git parser accepts. */
-        if (merkle::serialiseTree(into.tree) != body)
-            throw Error("tree body is not its canonical encoding");
+        git::parseTreeBody(into, body, hashAlgo);
     } catch (Error & e) {
         throw Error("malformed tree object %s: %s", idString(id), e.msg());
     }

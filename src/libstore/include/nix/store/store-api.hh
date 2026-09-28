@@ -435,6 +435,7 @@ class Store : public std::enable_shared_from_this<Store>, public StoreDirConfig
 
     /** Both query forms share the backend lookup and cache publication. */
     void queryPathInfoAfterCacheMiss(const StorePath & path, Callback<ref<const ValidPathInfo>> && callback) noexcept;
+    ref<const ValidPathInfo> queryPathInfoAfterCacheMiss(const StorePath & path);
 
 public:
 
@@ -563,6 +564,13 @@ public:
     virtual StorePathSet queryAllValidPaths()
     {
         unsupported("queryAllValidPaths");
+    }
+
+    /** False proves the visible store is empty at this observation.
+     * True also covers stores that do not provide an emptiness query. */
+    virtual bool mayHaveValidPaths()
+    {
+        return true;
     }
 
     constexpr static const char * MissingName = "x";
@@ -708,13 +716,17 @@ public:
 
     /**
      * Import a path into the store. Note that the entire NAR may not be read from `narSource`, e.g. if the path is
-     * already valid.
+     * already valid. `narHash` is an optional replay of the source's NAR
+     * hash for an old peer that needs it before reading the stream. It is
+     * called only when the description has no asserted NAR hash and is
+     * never retained after this operation.
      */
     virtual void addToStore(
         const ValidPathInfo & info,
         Source & narSource,
         RepairFlag repair = NoRepair,
-        CheckSigsFlag checkSigs = CheckSigs) = 0;
+        CheckSigsFlag checkSigs = CheckSigs,
+        const std::function<Hash()> & narHash = {}) = 0;
 
     /**
      * A list of paths infos along with a source providing the content
@@ -724,13 +736,37 @@ public:
 
     /**
      * Import multiple paths into the store.
+     * `narHash`, when supplied, replays the NAR hash for the destination
+     * path named by a transfer. Its source identifies the particular transfer:
+     * different input objects can be renamed to the same destination path.
+     * Pass the original Source object from the PathsSource entry, even when
+     * the backend reads it through a wrapper.
+     * It may be called concurrently, and only during this operation;
+     * descriptions and sources remain ordinary values.
      */
     virtual void addMultipleToStore(
-        PathsSource && pathsToCopy, Activity & act, RepairFlag repair = NoRepair, CheckSigsFlag checkSigs = CheckSigs);
+        PathsSource && pathsToCopy,
+        Activity & act,
+        RepairFlag repair = NoRepair,
+        CheckSigsFlag checkSigs = CheckSigs,
+        const std::function<Hash(const StorePath &, const Source &)> & narHash = {});
 
     /** The same dependency graph with a caller-selected worker bound. */
     void addMultipleToStore(
-        PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, size_t maxThreads);
+        PathsSource && pathsToCopy,
+        Activity & act,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        size_t maxThreads,
+        const std::function<Hash(const StorePath &, const Source &)> & narHash = {});
+
+    /** Optional producer-established canonical entry for the rendered,
+     * filtered subtree, addressed relative to the copy's root. Only
+     * consulted for the root and directories; a missing answer causes an
+     * ordinary source read. A supplied namer may also be consulted during
+     * repair, with acquired regular bytes verified. Fetchers omit this
+     * producer shortcut during repair. */
+    using TreeNamer = fun<std::optional<merkle::TreeEntry>(const CanonPath &, const SourceAccessor::Stat &)>;
 
     /**
      * Copy the contents of a path to the store and register the
@@ -747,7 +783,9 @@ public:
         HashAlgorithm hashAlgo = HashAlgorithm::SHA256,
         const StorePathSet & references = StorePathSet(),
         PathFilter & filter = defaultPathFilter,
-        RepairFlag repair = NoRepair);
+        RepairFlag repair = NoRepair,
+        TreeNamer namer = [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
+        bool callbacksPermitParallelism = false);
 
     /**
      * Copy the contents of a path to the store and register the
@@ -761,6 +799,15 @@ public:
         HashAlgorithm hashAlgo = HashAlgorithm::SHA256,
         const StorePathSet & references = StorePathSet(),
         std::optional<Hash> expectedCAHash = {});
+
+    /** Publish text and protect its references until registration completes.
+     * An already-valid destination protects its closure without uploading again.
+     */
+    StorePath addTextToStore(
+        std::string_view name,
+        std::string_view contents,
+        const StorePathSet & references = {},
+        RepairFlag repair = NoRepair);
 
     /**
      * Like addToStore(), but the contents of the path are contained
@@ -818,12 +865,16 @@ public:
      * Recompute the content hash of `info.path` as stored and compare it
      * with the hash `info` carries: the object hash when present, else
      * the asserted NAR hash (a substituter's description).
+     * An already acquired `accessor` must be rooted at `info.path`; it is
+     * borrowed for the object-hash check. Legacy NAR verification keeps the
+     * store's NAR serialisation route.
      *
      * @return The expected and the recomputed renderings when they
      * differ; nullopt when the content matches.
      * @throws Error if `info` carries neither hash.
      */
-    std::optional<std::pair<std::string, std::string>> contentMismatch(const ValidPathInfo & info);
+    std::optional<std::pair<std::string, std::string>>
+    contentMismatch(const ValidPathInfo & info, SourceAccessor * accessor = nullptr);
 
     /**
      * Add a store path as a temporary root of the garbage collector.
@@ -932,14 +983,14 @@ public:
     }
 
     /**
-     * The object hash of the valid path `path`: the one its description
+     * The object hash of a queried valid path: the one its description
      * carries, else -- for a peer that describes paths by their NAR hash
      * alone -- computed by one walk of the object, which for a
      * remote store reads its whole NAR.
      *
      * @throws InvalidPath if the path is not valid.
      */
-    ObjectHash queryObjectHash(const StorePath & path);
+    ObjectHash queryObjectHash(const ValidPathInfo & info);
 
     /**
      * Add signatures to the specified store path. The signatures are

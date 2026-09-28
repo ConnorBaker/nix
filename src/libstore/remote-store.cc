@@ -437,14 +437,21 @@ StorePath RemoteStore::addToStoreFromDump(
     return storePath;
 }
 
-void RemoteStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
+void RemoteStore::addToStore(
+    const ValidPathInfo & info,
+    Source & source,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash()> & narHash)
 {
     auto conn(getConnection());
 
     conn->to << WorkerProto::Op::AddToStoreNar;
     WorkerProto::write(*this, *conn, info.path);
     WorkerProto::write(*this, *conn, info.deriver);
-    WorkerProto::writePathInfoHashes(*conn, info);
+    WorkerProto::WriteConn wconn(*conn);
+    wconn.narHash = &narHash;
+    WorkerProto::writePathInfoHashes(wconn, info);
     WorkerProto::write(*this, *conn, info.references);
     conn->to << info.registrationTime << info.narSize << info.ultimate;
     WorkerProto::write(*this, *conn, info.sigs);
@@ -464,10 +471,14 @@ void RemoteStore::addToStore(const ValidPathInfo & info, Source & source, Repair
 }
 
 void RemoteStore::addMultipleToStore(
-    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+    PathsSource && pathsToCopy,
+    Activity & act,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
     if (getConnection()->protoVersion.number < WorkerProto::Version::Number{1, 32}) {
-        Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+        Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, narHash);
         return;
     }
 
@@ -495,11 +506,15 @@ void RemoteStore::addMultipleToStore(
                features: the hash slot is the feature's form. */
             WorkerProto::Version multiVersion{
                 .number = {.major = 1, .minor = 16}, .features = conn->protoVersion.features};
+            std::function<Hash()> hashForPath;
+            if (narHash)
+                hashForPath = [&] { return narHash(pathInfo.path, *pathSource); };
             WorkerProto::Serialise<ValidPathInfo>::write(
                 *this,
                 WorkerProto::WriteConn{
                     .to = sink,
                     .version = multiVersion,
+                    .narHash = &hashForPath,
                 },
                 pathInfo);
             pathSource->drainInto(sink);

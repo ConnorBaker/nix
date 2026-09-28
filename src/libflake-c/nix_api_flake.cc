@@ -183,7 +183,6 @@ nix_locked_flake * nix_flake_lock(
 {
     return nix_c_boundary(
         context,
-        eval_state,
         [&] {
             eval_state->state.resetFileCache();
             return nix::make_ref<nix::flake::LockedFlake>(nix::flake::lockFlake(
@@ -204,7 +203,6 @@ nix_value * nix_locked_flake_get_output_attrs(
 {
     return nix_c_boundary(
         context,
-        evalState,
         [&] {
             auto * v = evalState->state.allocValue();
             nix::flake::callFlake(evalState->state, *lockedFlake->lockedFlake, *v);

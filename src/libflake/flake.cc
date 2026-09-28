@@ -94,7 +94,7 @@ static void parseFlakeInputAttr(EvalState & state, const Attr & attr, fetchers::
 #pragma GCC diagnostic ignored "-Wswitch-enum"
     switch (attr.value->type()) {
     case nString:
-        attrs.emplace(state.symbols[attr.name], state.realise(*attr.value).toOwned());
+        attrs.emplace(state.symbols[attr.name], std::string(attr.value->string_view()));
         break;
     case nBool:
         attrs.emplace(state.symbols[attr.name], Explicit<bool>{attr.value->boolean()});
@@ -150,7 +150,7 @@ static FlakeInput parseFlakeInput(
             if (attr.name == sUrl) {
                 forceTrivialValue(state, *attr.value, pos);
                 if (attr.value->type() == nString)
-                    url = state.realise(*attr.value).toOwned();
+                    url = std::string(attr.value->string_view());
                 else if (attr.value->type() == nPath) {
                     auto path = attr.value->path();
                     if (path.accessor != flakeDir.accessor)
@@ -174,7 +174,7 @@ static FlakeInput parseFlakeInput(
                     parseFlakeInputs(state, attr.value, attr.pos, lockRootAttrPath, flakeDir, false).first;
             } else if (attr.name == sFollows) {
                 expectType(state, nString, *attr.value, attr.pos);
-                auto follows(parseInputAttrPath(state.realise(*attr.value).view()));
+                auto follows(parseInputAttrPath(attr.value->string_view()));
                 follows.insert(follows.begin(), lockRootAttrPath.begin(), lockRootAttrPath.end());
                 input.follows = follows;
             } else
@@ -261,7 +261,7 @@ static Flake readFlake(
 
     if (auto description = vInfo.attrs()->get(state.s.description)) {
         expectType(state, nString, *description->value, description->pos);
-        flake.description = state.realise(*description->value).toOwned();
+        flake.description = std::string(description->value->string_view());
     }
 
     auto sInputs = state.symbols.create("inputs");
@@ -825,7 +825,7 @@ LockedFlake lockFlake(
                                 topRef);
 
                         /* Written to disk outside the evaluator: a door. */
-                        auto newLockFileS = state.realise(fmt("%s\n", newLockFile)).toOwned();
+                        auto newLockFileS = fmt("%s\n", newLockFile);
 
                         if (lockFlags.outputLockFilePath) {
                             if (lockFlags.commitLockFile)

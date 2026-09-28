@@ -100,7 +100,6 @@ StorePaths importPaths(Store & store, Source & source, CheckSigsFlag checkSigs)
             info.deriver = store.parseStorePath(deriver);
         info.references = references;
         info.narSize = saved.s.size();
-        info.lazyNarHash = [&nar = saved.s] { return hashString(HashAlgorithm::SHA256, nar); };
 
         // Ignore optional legacy signature.
         if (readInt(source) == 1)
@@ -108,7 +107,7 @@ StorePaths importPaths(Store & store, Source & source, CheckSigsFlag checkSigs)
 
         // Can't use underlying source, which would have been exhausted
         auto source = StringSource(saved.s);
-        store.addToStore(info, source, NoRepair, checkSigs);
+        store.addToStore(info, source, NoRepair, checkSigs, [&] { return hashString(HashAlgorithm::SHA256, saved.s); });
 
         res.push_back(info.path);
     }

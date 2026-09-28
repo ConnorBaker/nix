@@ -180,88 +180,61 @@ void RestoreSink::createDirectory(const CanonPath & path)
 #endif
 };
 
-struct RestoreRegularFile : RegularFileWriter, FdSink
+RegularFileWriter::RegularFileWriter(bool startFsync, RestoreSinkHooks * hooks, AutoCloseFD file)
+    : FdSink(file.get())
+    , file(std::move(file))
+    , startFsync(startFsync)
+    , hooks(hooks)
 {
-    AutoCloseFD fd;
-    bool startFsync = false;
-    bool executable = false;
-    RestoreSinkHooks * hooks = nullptr;
-    bool finished = false;
+    isRegularFile = true; /* Hint for copying contents via CoW copy_file_range. */
+}
 
-    RestoreRegularFile(bool startFSync_, RestoreSinkHooks * hooks_, AutoCloseFD fd_)
-        : FdSink(fd_.get())
-        , fd(std::move(fd_))
-        , startFsync(startFSync_)
-        , executable(false)
-        , hooks(hooks_)
-    {
-        isRegularFile = true; /* Hint for copying contents via CoW copy_file_range. */
-    }
+void RegularFileWriter::finish()
+{
+    assert(!finished);
+    finished = true;
+    flush();
+    if (hooks)
+        hooks->regularFileCreated(file.get(), executable);
+}
 
-    void anchor() override;
-
-    void finish() override
-    {
-        assert(!finished);
-        finished = true;
+RegularFileWriter::~RegularFileWriter()
+{
+    /* Flush before the owned descriptor closes and FdSink is destroyed. */
+    try {
         flush();
-        if (hooks)
-            hooks->regularFileCreated(fd.get(), executable);
+    } catch (...) {
+        ignoreExceptionInDestructor();
     }
 
-    ~RestoreRegularFile()
-    {
-        /* Flush the sink before FdSink destructor has a chance to run and we've
-           closed the file descriptor. */
-        if (fd) {
-            try {
-                FdSink::flush();
-            } catch (...) {
-                ignoreExceptionInDestructor();
-            }
-        }
-
-        /* Initiate an fsync operation without waiting for the
-           result. The real fsync should be run before registering a
-           store path, but this is a performance optimization to allow
-           the disk write to start early. */
-        if (fd && startFsync)
-            fd.startFsync();
-    }
-
-    void isExecutable() override;
-    void preallocateContents(uint64_t size) override;
-};
-
-void RestoreRegularFile::anchor() {}
+    /* Start the write early; publication performs the required fsync. */
+    if (startFsync)
+        file.startFsync();
+}
 
 #ifdef _WIN32
-std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
+AutoCloseFD RestoreSink::openRegularFile(const CanonPath & path) const
 {
-    auto crf = std::make_unique<RestoreRegularFile>(
-        startFsync,
-        hooks,
-        CreateFileW(
-            append(dstPath, path).c_str(),
-            GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            NULL,
-            CREATE_NEW,
-            FILE_ATTRIBUTE_NORMAL,
-            NULL));
-    if (!crf->fd)
+    AutoCloseFD file{CreateFileW(
+        append(dstPath, path).c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        NULL,
+        CREATE_NEW,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL)};
+    if (!file)
         throw NativeSysError("creating file %1%", PathFmt(append(dstPath, path)));
-    return crf;
+    return file;
 }
 #else
-std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
+AutoCloseFD RestoreSink::openRegularFile(const CanonPath & path) const
 {
     auto [owned, parentFd, name] = parentOf(path);
-    return beginRegularFileAt(path, parentFd, name);
+    return openRegularFileAt(path, parentFd, name);
 }
 
-std::unique_ptr<RegularFileWriter>
-RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
+AutoCloseFD RestoreSink::openRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name) const
 {
     assert(!name.isRoot() && name.rel().find('/') == std::string_view::npos);
     /* The parent and validated name are the same ones used for placement.
@@ -270,33 +243,45 @@ RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, con
     AutoCloseFD file{::openat(parentFd, name.rel_c_str(), flags, 0666)};
     if (!file && errno == NIX_ERR_OPEN_SYMLINK)
         throw SymlinkNotAllowed(name);
-    auto crf = std::make_unique<RestoreRegularFile>(startFsync, hooks, std::move(file));
-    if (!crf->fd)
+    if (!file)
         throw NativeSysError("creating file %1%", PathFmt(append(dstPath, path)));
-    return crf;
+    return file;
+}
+
+std::unique_ptr<RegularFileWriter>
+RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
+{
+    auto file = openRegularFileAt(path, parentFd, name);
+    return std::unique_ptr<RegularFileWriter>{new RegularFileWriter(startFsync, hooks, std::move(file))};
 }
 #endif
 
-void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
+std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
 {
-    auto writer = beginRegularFile(path);
-    func(*writer);
-    writer->finish();
+    auto file = openRegularFile(path);
+    return std::unique_ptr<RegularFileWriter>{new RegularFileWriter(startFsync, hooks, std::move(file))};
 }
 
-void RestoreRegularFile::isExecutable()
+void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
+{
+    RegularFileWriter writer{startFsync, hooks, openRegularFile(path)};
+    func(writer);
+    writer.finish();
+}
+
+void RegularFileWriter::isExecutable()
 {
     // Windows doesn't have a notion of executable file permissions we
     // care about here, right?
 #ifndef _WIN32
-    auto st = nix::fstat(fd.get());
-    if (fchmod(fd.get(), st.st_mode | (S_IXUSR | S_IXGRP | S_IXOTH)) == -1)
+    auto st = nix::fstat(file.get());
+    if (fchmod(file.get(), st.st_mode | (S_IXUSR | S_IXGRP | S_IXOTH)) == -1)
         throw SysError("fchmod");
     executable = true;
 #endif
 }
 
-void RestoreRegularFile::preallocateContents(uint64_t len)
+void RegularFileWriter::preallocateContents(uint64_t len)
 {
     if (!restoreSinkSettings.preallocateContents)
         return;
@@ -306,7 +291,7 @@ void RestoreRegularFile::preallocateContents(uint64_t len)
         if (len > std::numeric_limits<off_t>::max())
             throw Error("cannot preallocate contents for a file because it's too large");
 
-        errno = posix_fallocate(fd.get(), 0, len);
+        errno = posix_fallocate(file.get(), 0, len);
         /* Note that EINVAL may indicate that the underlying
            filesystem doesn't support preallocation (e.g. on
            OpenSolaris).  Since preallocation is just an

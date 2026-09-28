@@ -89,7 +89,12 @@ public:
 
     std::map<StorePath, UnkeyedValidPathInfo> queryPathInfosUncached(const StorePathSet & paths);
 
-    void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addToStore(
+        const ValidPathInfo & info,
+        Source & source,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash = {}) override;
 
     void narFromPath(const StorePath & path, Sink & sink) override;
 
@@ -115,7 +120,9 @@ public:
         HashAlgorithm hashAlgo,
         const StorePathSet & references,
         PathFilter & filter,
-        RepairFlag repair) override
+        RepairFlag repair,
+        TreeNamer namer,
+        bool callbacksPermitParallelism) override
     {
         unsupported("addToStore");
     }

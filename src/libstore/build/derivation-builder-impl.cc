@@ -8,6 +8,7 @@
 #include "nix/util/archive.hh"
 #include "nix/util/file-content-address.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/fs-sink.hh"
 #include "nix/util/object-hash.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/processes.hh"
@@ -337,21 +338,15 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 auto [rewriteTempDir, rewriteTempDirFd] = localStore.createTempDirInStore();
                 AutoDelete delRewriteTempDir(rewriteTempDir);
                 std::filesystem::path tmpPath = rewriteTempDir / "x";
-                restorePath(tmpPath, *source);
+                auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
+                restorePath(tmpPath, *source, false, hooks.get());
                 deletePath(actualPath);
                 movePath(tmpPath, actualPath);
 
-                /* FIXME: set proper permissions in restorePath() so
-                   we don't have to do another traversal. */
-                canonicalisePathMetaData(
-                    actualPath,
-                    {
-#ifndef _WIN32
-                        // builder UIDs are already dealt with
-                        .uidRange = std::nullopt,
+#ifdef _WIN32
+                /* The descriptor hooks do not yet canonicalise on Windows. */
+                canonicalisePathMetaData(actualPath, {NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)}, inodesSeen);
 #endif
-                        NIX_WHEN_SUPPORT_ACLS(localSettings.ignoredAcls)},
-                    inodesSeen);
             }
         };
 
@@ -588,7 +583,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         if (buildMode == bmCheck) {
             auto r = objectHashOf(*makeFSSourceAccessor(actualPath), CanonPath::root);
             newInfo.objectHash = ObjectHash::of(r.root);
-            newInfo.narSize = r.narSize;
+            newInfo.narSize = r.narSize.value();
         } else if (keptExisting) {
             auto existing = localStore.queryPathInfo(newInfo.path);
             newInfo.objectHash = existing->objectHash;
@@ -603,7 +598,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                (one hold covers every output, `08` K16). */
             localStore.endIngestion(hold, newInfo.path);
             newInfo.objectHash = ObjectHash::of(r.root);
-            newInfo.narSize = r.narSize;
+            newInfo.narSize = r.narSize.value();
         }
 
         if (buildMode == bmCheck) {

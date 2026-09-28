@@ -54,35 +54,37 @@ void processExpr(
                 vRes = v;
             else
                 state.autoCallFunction(autoArgs, v, vRes);
-            /* In every mode the bytes leave through `emit`, which writes what
-               is pending and copies the inputs the value names before they
-               leave (specification, (C2)); with --read-write-mode there may
-               be something to copy. */
+            /* With --read-write-mode, copy mounted inputs before printing their names. */
             if (output == okRaw) {
-                auto string = state.coerceAndEmit(noPos, vRes, context, "while generating the nix-instantiate output");
+                auto string = state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
+                state.ensureLazyPathsCopied(context);
                 // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a
                 // newline and other interactive shells like Zsh are smart enough to print a missing newline before
                 // the prompt.
-                std::cout << string;
+                std::cout << *string;
             } else if (output == okXML) {
-                std::cout << state.emit(renderValueAsXML(state, strict, location, vRes, context, noPos), context);
+                auto document = renderValueAsXML(state, strict, location, vRes, context, noPos);
+                state.ensureLazyPathsCopied(context);
+                std::cout << document;
             } else if (output == okJSON) {
-                std::cout << state.emit(renderValueAsJSON(state, strict, vRes, v.determinePos(noPos), context), context)
-                          << std::endl;
+                auto document = renderValueAsJSON(state, strict, vRes, v.determinePos(noPos), context);
+                state.ensureLazyPathsCopied(context);
+                std::cout << document << std::endl;
             } else {
                 if (strict)
                     state.forceValueDeep(vRes);
                 std::set<const void *> seen;
                 std::ostringstream out;
                 printAmbiguous(state, vRes, out, &seen, &context);
-                std::cout << state.emit(out.str(), context) << std::endl;
+                state.ensureLazyPathsCopied(context);
+                std::cout << out.str() << std::endl;
             }
         } else {
             PackageInfos drvs;
             getDerivations(state, v, "", autoArgs, drvs, false);
             for (auto & i : drvs) {
                 auto drvPath = i.requireDrvPath();
-                auto drvPathS = state.realise(drvPath).toOwned();
+                auto drvPathS = state.store->printStorePath(drvPath);
 
                 /* What output do we want? */
                 std::string outputName = i.queryOutputName();
@@ -102,8 +104,6 @@ void processExpr(
                 std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
             }
         }
-
-        state.flushPendingWrites();
     }
 }
 

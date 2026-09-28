@@ -63,8 +63,8 @@ create index if not exists IndexDerivationOutputs on DerivationOutputs(path);
 -- whose path is no longer valid (the path was collected), is *stale*.  Two
 -- rules apply: holder lookup requires a valid named path and conditionally
 -- forgets an observed candidate whose file is missing or invalid; the sweep
--- removes stale rows under the GC lock once their holds are gone. This replaces
--- the cascade a foreign key would have given.
+-- removes stale ingestions under the GC lock once their holds are gone. Their
+-- regular and auxiliary projections are removed by the ownership foreign keys.
 create table if not exists Ingestions (
     id   integer primary key autoincrement not null,
     path text, -- completed holder path; null while staged before naming
@@ -76,7 +76,7 @@ create table if not exists Blobs (
     exec      integer not null, -- the mode: 0 or 1
     ino       integer not null, -- the holder's inode
     dev       integer not null, -- and its device
-    ingestion integer not null, -- Ingestions.id: which ingestion's path holds it
+    ingestion integer not null references Ingestions(id) on delete cascade,
     name      text    not null, -- the holder's name under that path ("" for a plain-file root)
     size      integer not null,
     primary key (id, exec, ingestion)

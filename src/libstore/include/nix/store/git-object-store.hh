@@ -31,8 +31,7 @@ namespace nix {
  * Regular bytes are represented by indexed files in store-path holders.
  * Directory bodies and symlink targets are owned bytes in an ingestion's
  * projection, published with that projection in the local-store database.
- * `dir/tmp` contains leases and temporary regular-file links only. Old
- * auxiliary files are ignored by readers and removed by a bounded sweep.
+ * `dir/tmp` contains leases and temporary regular-file links only.
  */
 struct GitObjectStore
 {
@@ -56,11 +55,11 @@ public:
      * and become visible only after publication reconciles overlapping
      * candidates to one physical inode and names the valid path
      * (`LocalStore::registerValidPaths`, `LocalStore::endIngestion`).  There is therefore
-     * **no foreign key and no cascade**: a row whose ingestion has no
+     * **no foreign key to validity**: a row whose ingestion has no
      * path, or whose path is no longer valid, is *stale*, and two things
      * judge it -- `link`, which finds the holder gone or not what the row
      * says and forgets the row, and `LocalStore::sweepStaleBlobRows`,
-     * which removes every stale row under the GC lock with the sweep,
+     * which removes stale ingestions and cascades to their rows under the GC lock,
      * keeping the projection of an ingestion still in flight (its lease
      * still under `tmp/`).
      */
@@ -187,7 +186,7 @@ public:
      * gone or is not what it says is *forgotten* -- the file is a valid
      * store path's and is never removed here (design.md section 3, K2).
      */
-    std::optional<Holder> holderOrForget(const Hash & id, bool executable, RepairFlag repair, PosixStat * st = nullptr);
+    std::optional<Holder> holderOrForget(const Hash & id, bool executable, RepairFlag repair);
 
     /** Physical facts required before sharing a recorded regular-file holder. */
     static bool validHolderMetadata(const Holder & holder, bool executable, const PosixStat & st);
@@ -373,19 +372,22 @@ public:
          * algorithms and hash widths are rejected before touching the map. */
         void addAuxiliary(Auxiliary object) const;
 
-        /**
-         * Per-path state created by `LocalStore::beginIngestion`; absent
-         * when nothing writes an index. Completion assigns `Ingestions.id`;
-         * completion selects stored builder projections at bulk registration.
-         */
+        /** Active per-path state. The ID can name a previously staged projection. */
         struct Ingestion
         {
             std::optional<uint64_t> id;
-            bool completed = false;
+        };
+
+        /** Completed outputs retain their database identity across the next beginIngestion. */
+        struct CompletedIngestion
+        {
+            std::string path;
+            uint64_t id;
         };
 
         /* Accessed only before or after the path's walking workers run. */
         mutable std::optional<Ingestion> ingestion;
+        mutable std::vector<CompletedIngestion> completedIngestions;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;

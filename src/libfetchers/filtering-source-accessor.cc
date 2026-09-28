@@ -13,7 +13,12 @@ std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(co
 {
     auto owner = weak_from_this().lock();
     checkAllowed(path);
-    return next->getPhysicalPath(prefix / path);
+    auto innerPath = prefix / path;
+    /* Admission of a directory says nothing about its descendants. A
+       physical directory would bypass their filtering policy. */
+    if (auto st = next->maybeLstat(innerPath); st && st->type != tDirectory)
+        return next->getPhysicalPath(innerPath);
+    return std::nullopt;
 }
 
 void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
@@ -225,6 +230,23 @@ public:
         prefixes->erase(first, after);
     }
 
+    bool allowsSubtree(const CanonPath & path)
+    {
+        auto prefixes(allowedPrefixes.readLock());
+        auto after = prefixes->upper_bound(path);
+        return after != prefixes->begin() && path.isWithin(*std::prev(after));
+    }
+
+    std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
+    {
+        if (!allowsSubtree(path))
+            return FilteringSourceAccessor::getPhysicalPath(path);
+        /* Admission only grows; release the policy lock before calling
+           the child, which may reenter or release this wrapper. */
+        auto inner = next;
+        return inner->getPhysicalPath(prefix / path);
+    }
+
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
         if (fingerprint)
@@ -233,12 +255,8 @@ public:
            subtree is the inner one and carries its name.  Elsewhere, at an
            ancestor of a prefix for instance, entries are hidden, and the
            subtree has no name. */
-        {
-            auto prefixes(allowedPrefixes.readLock());
-            auto after = prefixes->upper_bound(path);
-            if (after == prefixes->begin() || !path.isWithin(*std::prev(after)))
-                return std::nullopt;
-        }
+        if (!allowsSubtree(path))
+            return std::nullopt;
         /* Admission only grows, so this subtree remains fully admitted
            after unlocking. The child may reenter allowPrefix, or release
            the last owner of this wrapper, while providing its name. */
@@ -302,11 +320,10 @@ public:
            the inner subtree.  The name is for this subtree exactly, hence
            the root path. */
         std::string below;
-        for (auto & p : accepted)
-            if (p.isWithin(path)) {
-                below += p.removePrefix(path).abs();
-                below += '\0';
-            }
+        for (auto i = accepted.lower_bound(path); i != accepted.end() && i->isWithin(path); ++i) {
+            below += i->removePrefix(path).abs();
+            below += '\0';
+        }
         return std::pair{
             CanonPath::root,
             nlohmann::json::array({"filter",

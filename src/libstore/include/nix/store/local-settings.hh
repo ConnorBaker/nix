@@ -52,6 +52,7 @@ void BaseSetting<PathsInChroot>::appendOrSet(PathsInChroot newValue, bool append
 struct RemovedSetting : public BaseSetting<bool>
 {
     const std::string why;
+    bool haveWarned = false;
 
     RemovedSetting(Config * options, const std::string & name, const std::string & why)
         : BaseSetting<bool>(false, false, name, "Removed; accepted and ignored: " + why + ".", {}, std::nullopt)

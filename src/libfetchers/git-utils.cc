@@ -770,8 +770,11 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
     bool attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev) override;
 
-    ref<SourceAccessor>
-    getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) override;
+    ref<SourceAccessor> getAccessor(
+        const Hash & rev,
+        const GitAccessorOptions & options,
+        std::string displayPrefix,
+        std::shared_ptr<fetchers::Cache> cache = nullptr) override;
 
     ref<SourceAccessor>
     getAccessor(ref<const WorkdirInfo> wd, const GitAccessorOptions & options, MakeNotAllowedError e) override;
@@ -1767,15 +1770,30 @@ ref<GitSourceAccessor> GitRepoImpl::getRawAccessor(const Hash & rev, const GitAc
     return make_ref<GitSourceAccessor>(self, rev, options);
 }
 
-ref<SourceAccessor>
-GitRepoImpl::getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix)
+ref<SourceAccessor> GitRepoImpl::getAccessor(
+    const Hash & rev,
+    const GitAccessorOptions & options,
+    std::string displayPrefix,
+    std::shared_ptr<fetchers::Cache> cache)
 {
     auto self = ref<GitRepoImpl>(shared_from_this());
     ref<GitSourceAccessor> rawGitAccessor = getRawAccessor(rev, options);
     rawGitAccessor->setPathDisplay(std::move(displayPrefix));
-    /* When no attributes source names `export-ignore` the filter is the
-       identity: the inner accessor, with its names and no lookup per path. */
-    if (options.exportIgnore && !options.exportIgnoreHidesNothing)
+    /* Only the immutable tree fact may be memoized. External attribute
+       sources are observed for every view before deciding to omit a filter. */
+    auto mentionsExportIgnore = [&] {
+        if (attributesOutsideTheTreeMention("export-ignore", rev))
+            return true;
+        fetchers::Cache::Key key{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+        if (cache)
+            if (auto result = cache->lookup(key))
+                return fetchers::getBoolAttr(*result, "mentions");
+        auto mentions = treeMentionsAttribute(rev, "export-ignore");
+        if (cache)
+            cache->upsert(key, {{"mentions", Explicit<bool>{mentions}}});
+        return mentions;
+    };
+    if (options.exportIgnore && mentionsExportIgnore())
         return make_ref<GitExportIgnoreSourceAccessor>(self, rawGitAccessor, rev);
     else
         return rawGitAccessor;

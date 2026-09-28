@@ -322,7 +322,8 @@ TEST_F(GitUtilsTest, fingerprintsRequireCanonicalRawModes)
     unsigned named = 0;
     for (unsigned mode = 0; mode < modes; ++mode) {
         auto identity = acc->getFingerprint(CanonPath(fmt("%04x", mode)));
-        const bool canonical = mode == 0040000 || mode == 0100644 || mode == 0100755 || mode == 0120000 || mode == 0160000;
+        const bool canonical =
+            mode == 0040000 || mode == 0100644 || mode == 0100755 || mode == 0120000 || mode == 0160000;
         EXPECT_EQ(identity.has_value(), canonical) << mode;
         if (identity) {
             ++named;
@@ -612,7 +613,7 @@ TEST_F(GitUtilsTest, narTreeRoundTripEdgeCases)
    exactly.  For a directory the two shim assertions run: the Git-tree-derived
    narHash equals the store's (the shim `narHashOf`, the address map) and dumping
    the tree reproduces the store's NAR byte-for-byte.  A single-file store object (a
-   .drv/toFile is one regular file, src/libexpr/write-buffer.cc:21,24) is the
+   .drv/toFile is one regular file, Store::addTextToStore) is the
    degenerate root the plan calls out: it interns as a blob, has no tree to hash,
    and must not be forced into a directory. */
 TEST_F(GitUtilsTest, storeObjectsRoundTripThroughAGitTree)
@@ -2078,22 +2079,16 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto repo = openRepo();
     auto raw = repo->getAccessor(rev1, {}, "");
     EXPECT_FALSE(repo->treeMentionsAttribute(rev1, "export-ignore"));
-    auto hidesNothing = [&](ref<GitRepo> r, const Hash & rev) {
-        return !r->treeMentionsAttribute(rev, "export-ignore")
-               && !r->attributesOutsideTheTreeMention("export-ignore", rev);
-    };
-    auto wrapped =
-        repo->getAccessor(rev1, {.exportIgnore = true, .exportIgnoreHidesNothing = hidesNothing(repo, rev1)}, "");
+    auto wrapped = repo->getAccessor(rev1, {.exportIgnore = true}, "");
     /* The filter is left out, so the accessor is the inner one and the
        root's name is the tree's, as with `exportIgnore = false`. */
     wrapped->fingerprint = "whole";
     for (auto p : {"", "clean", "clean/a", "top"})
         EXPECT_EQ(wrapped->getFingerprint(CanonPath(p)), raw->getFingerprint(CanonPath(p))) << p;
 
-    /* Not asked to name subtrees: the whole tree's name, as before. */
-    auto unnamed = repo->getAccessor(rev1, {.exportIgnore = true}, "");
-    unnamed->fingerprint = "whole";
-    EXPECT_EQ(unnamed->getFingerprint(CanonPath("clean")), (std::pair{CanonPath("clean"), std::string("whole")}));
+    /* Construction proves elision for every caller, not only fetchers. */
+    auto another = repo->getAccessor(rev1, {.exportIgnore = true}, "");
+    EXPECT_EQ(another->getFingerprint(CanonPath("clean")), raw->getFingerprint(CanonPath("clean")));
 
     /* The working directory, dirty in one file, under the same wrapper. */
     write("dirty/c", "changed");
@@ -2113,8 +2108,7 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     auto rev2 = commit({"clean/.gitattributes", "dirty/c"}, "two");
     auto repo2 = openRepo();
     EXPECT_TRUE(repo2->treeMentionsAttribute(rev2, "export-ignore"));
-    auto wrapped2 =
-        repo2->getAccessor(rev2, {.exportIgnore = true, .exportIgnoreHidesNothing = hidesNothing(repo2, rev2)}, "");
+    auto wrapped2 = repo2->getAccessor(rev2, {.exportIgnore = true}, "");
     wrapped2->fingerprint = "whole";
     EXPECT_EQ(wrapped2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
     auto wd2 = repo2->getWorkdirInfo();
@@ -2147,7 +2141,7 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
     EXPECT_FALSE(repo->treeMentionsAttribute(rev, "export-ignore"));
     EXPECT_FALSE(repo->attributesOutsideTheTreeMention("export-ignore", rev));
     auto raw = repo->getAccessor(rev, {}, "");
-    auto filtered = repo->getAccessor(rev, {.exportIgnore = true, .exportIgnoreHidesNothing = true}, "");
+    auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "");
     EXPECT_TRUE(typeid(*filtered) == typeid(*raw)) << typeid(*filtered).name();
     EXPECT_EQ(filtered->readDirectory(CanonPath::root), raw->readDirectory(CanonPath::root));
 
@@ -2166,6 +2160,38 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
     auto [pFiltered, hFiltered] = fetchToStore2(settings, *store, SourcePath(filtered), FetchMode::DryRun, "src");
     EXPECT_EQ(hFiltered, hRaw);
     EXPECT_EQ(pFiltered, pRaw);
+}
+
+TEST_F(GitUtilsTest, exportFilterConstructionRechecksExternalSourcesAfterAnImmutableMemoHit)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    write("keep", "visible");
+    write("hide", "conditionally visible");
+    auto rev = commitPaths(rawRepo, {"keep", "hide"}, "without attributes");
+    auto attributes = std::filesystem::path(git_repository_path(rawRepo)) / "info" / "attributes";
+    git_repository_free(rawRepo);
+    Settings settings;
+    auto cache = settings.getCache();
+    auto repo = openRepo();
+    auto raw = repo->getAccessor(rev, {}, "");
+    auto first = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_EQ(first->getFingerprint(CanonPath::root), raw->getFingerprint(CanonPath::root));
+    Cache::Key key{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+    auto memo = cache->lookup(key);
+    ASSERT_TRUE(memo);
+    EXPECT_FALSE(getBoolAttr(*memo, "mentions"));
+
+    createDirs(attributes.parent_path());
+    writeFile(attributes, "hide export-ignore\n");
+    auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_FALSE(filtered->pathExists(CanonPath("hide")));
+    EXPECT_EQ(filtered->readFile(CanonPath("keep")), "visible");
+    EXPECT_FALSE(filtered->getFingerprint(CanonPath::root));
+    std::filesystem::remove(attributes);
+    auto again = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_EQ(again->readFile(CanonPath("hide")), "conditionally visible");
+    EXPECT_EQ(again->getFingerprint(CanonPath::root), raw->getFingerprint(CanonPath::root));
 }
 
 /* A repository naming `export-ignore` in a source the *commit's* lookup
@@ -2189,13 +2215,12 @@ TEST_F(GitUtilsTest, exportIgnoreDeclaredAnywhereKeepsTheFilter)
     write("sub/keep2", "k");
     auto rev0 = commitPaths(rawRepo, {"hide", "keep", "sub/hide2", "sub/keep2"}, "one");
 
-    /* The fetcher's decision (`exportIgnoreHidesNothing`, git.cc) without its cache, and the accessor it gives. */
+    /* Independently inspect the sources and the view constructed without a memo. */
     auto fetch = [&](const Hash & rev) {
         auto repo = openRepo();
         bool hidesNothing = !repo->treeMentionsAttribute(rev, "export-ignore")
                             && !repo->attributesOutsideTheTreeMention("export-ignore", rev);
-        return std::pair{
-            hidesNothing, repo->getAccessor(rev, {.exportIgnore = true, .exportIgnoreHidesNothing = hidesNothing}, "")};
+        return std::pair{hidesNothing, repo->getAccessor(rev, {.exportIgnore = true}, "")};
     };
     auto expectFiltered = [&](const Hash & rev, const char * hidden, const char * kept, const char * source) {
         auto [hidesNothing, acc] = fetch(rev);
@@ -2311,18 +2336,24 @@ TEST_F(GitUtilsTest, committedRevIgnoresTheWorkdirsUncommittedGitattributes)
     write("sub/deep/keep3", "k");
     auto rev = commitPaths(rawRepo, {"sub/hide2", "sub/keep2", "sub/deep/hide3", "sub/deep/keep3"}, "one");
 
-    /* The decision and the accessor, as `exportIgnoreHidesNothing` (git.cc)
-       composes them, without the fetcher cache. */
+    /* Inspect the source facts independently of the accessor's own decision. */
     auto fetch = [&](const Hash & r) {
         auto repo = openRepo();
         bool hidesNothing = !repo->treeMentionsAttribute(r, "export-ignore")
                             && !repo->attributesOutsideTheTreeMention("export-ignore", r);
-        return std::pair{
-            hidesNothing, repo->getAccessor(r, {.exportIgnore = true, .exportIgnoreHidesNothing = hidesNothing}, "")};
+        return std::pair{hidesNothing, repo->getAccessor(r, {.exportIgnore = true}, "")};
     };
-    /* The filter forced on, so that libgit2's own answer is read whatever
-       the decision said. */
-    auto forced = [&](const Hash & r) { return openRepo()->getAccessor(r, {.exportIgnore = true}, ""); };
+    /* A harmless attribute source requires a real filter at construction.
+       Remove it before querying: the lookup must still ignore uncommitted
+       per-directory attributes, independently of the elision fast path. */
+    auto forced = [&](const Hash & r) {
+        auto attributes = std::filesystem::path(git_repository_path(rawRepo)) / "info" / "attributes";
+        createDirs(attributes.parent_path());
+        writeFile(attributes, "__absent_filter_probe__ export-ignore\n");
+        auto accessor = openRepo()->getAccessor(r, {.exportIgnore = true}, "");
+        std::filesystem::remove(attributes);
+        return accessor;
+    };
     auto expectKept = [&](const char * source) {
         auto [hidesNothing, acc] = fetch(rev);
         EXPECT_TRUE(hidesNothing) << source;

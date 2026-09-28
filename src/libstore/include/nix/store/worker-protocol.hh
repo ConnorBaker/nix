@@ -180,6 +180,8 @@ struct WorkerProto
     {
         Sink & to;
         const Version & version;
+        /** Borrowed only while serialising this operation's path info. */
+        const std::function<Hash()> * narHash = nullptr;
     };
 
     /**

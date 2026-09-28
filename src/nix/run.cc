@@ -37,23 +37,11 @@ Strings toEnvp(StringMap env)
     return envStrs;
 }
 
-int execvpAfterEvaluation(const char * program, char * const * argv, FinishedEvaluation)
-{
-    return execvp(program, argv);
-}
-
-/* An exec compiles only after `EvalState::finish()`: neither helper is callable without the token. */
-static_assert(
-    !std::
-        is_invocable_v<decltype(execProgramInStore), ref<Store>, UseLookupPath, const std::string &, const Strings &>);
-static_assert(!std::is_invocable_v<decltype(execvpAfterEvaluation), const char *, char * const *>);
-
 void execProgramInStore(
     ref<Store> store,
     UseLookupPath useLookupPath,
     const std::string & program,
     const Strings & args,
-    FinishedEvaluation,
     std::optional<std::string_view> system,
     std::optional<StringMap> env)
 {
@@ -174,13 +162,12 @@ struct CmdRun : InstallableValueCommand, MixEnvironment
         for (auto & i : args)
             allArgs.push_back(i);
 
-        /* Finished before the environment is replaced: the final write may
-           open a store connection that needs it.  Nothing evaluates after. */
-        auto finished = state->finish();
+        /* Persist evaluator caches before replacing the process environment. */
+        state->evalCaches.clear();
 
         setEnviron();
 
-        execProgramInStore(store, UseLookupPath::DontUse, app.program.string(), allArgs, std::move(finished));
+        execProgramInStore(store, UseLookupPath::DontUse, app.program.string(), allArgs);
     }
 };
 

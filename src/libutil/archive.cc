@@ -62,10 +62,7 @@ StringMap unhackedEntries(SourceAccessor & accessor, const CanonPath & path)
     return unhackedEntries(accessor.readDirectory(path), accessor, path);
 }
 
-StringMap unhackedEntries(
-    const SourceAccessor::DirEntries & entries,
-    SourceAccessor & accessor,
-    const CanonPath & path)
+StringMap unhackedEntries(const SourceAccessor::DirEntries & entries, SourceAccessor & accessor, const CanonPath & path)
 {
     StringMap unhacked;
     for (auto & i : entries) {
@@ -97,8 +94,12 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
         {
         }
 
-        std::monostate
-        node(const CanonPath & path, const SourceAccessor::Stat & st, fun<std::monostate()> descend) override
+        std::monostate node(
+            SourceAccessor &,
+            const CanonPath &,
+            const CanonPath & path,
+            const SourceAccessor::Stat & st,
+            fun<std::monostate()> descend) override
         {
             paths.insert(root / path);
             if (st.type == SourceAccessor::tDirectory)

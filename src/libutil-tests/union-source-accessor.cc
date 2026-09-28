@@ -2,6 +2,7 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/util/serialise.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/tests/gmock-matchers.hh"
 #include "nix/util/tests/source-accessor-gen.hh"
 
@@ -31,6 +32,37 @@ TEST(UnionSourceAccessor, overlaySemantics)
     EXPECT_FALSE(accessor->pathExists(CanonPath("f/z")));
     EXPECT_THROW(accessor->readFile(CanonPath("f/z")), FileNotFound);
     EXPECT_FALSE(accessor->pathExists(CanonPath("nope")));
+}
+
+TEST(UnionSourceAccessor, physicalPathsRepresentTheSelectedSubtree)
+{
+    auto root = createTempDir();
+    AutoDelete cleanup(root, true);
+    createDirs(root / "merged");
+    createDirs(root / "blocked");
+    createDirs(root / "link");
+    createDirs(root / "alone");
+    writeFile(root / "hidden", "physical bytes hidden by memory");
+    writeFile(root / "merged" / "lower", "lower");
+    writeFile(root / "blocked" / "child", "hidden by a leaf");
+    writeFile(root / "link" / "child", "hidden by a symlink");
+    writeFile(root / "alone" / "child", "visible");
+    auto memory = memoryTree({{"hidden", "visible memory bytes"}, {"merged/upper", "upper"}, {"blocked", "leaf"}});
+    MemorySink{*memory}.createSymlink(CanonPath("link"), "target");
+    auto physical = makeFSSourceAccessor(root);
+    auto view = makeUnionSourceAccessor({memory, physical});
+
+    EXPECT_EQ(view->readFile(CanonPath("hidden")), "visible memory bytes");
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("hidden")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("blocked/child")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("link/child")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("link")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("missing")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath("merged")));
+    EXPECT_FALSE(view->getPhysicalPath(CanonPath::root));
+    EXPECT_EQ(view->getPhysicalPath(CanonPath("merged/lower")), root / "merged" / "lower");
+    EXPECT_EQ(view->getPhysicalPath(CanonPath("alone")), root / "alone");
+    EXPECT_EQ(view->readFile(CanonPath("alone/child")), readFile(*view->getPhysicalPath(CanonPath("alone/child"))));
 }
 
 /* The general naming rule: a subtree that is one child's alone gets that
@@ -591,8 +623,11 @@ TEST(UnionSourceAccessor, everyDelegatedBoundaryPreservesItsRequiredOwners)
         {Operation::Name, "lower", "named"},
         {Operation::Name, "missing", "unnamed"},
         {Operation::Name, "blocked/hidden", "unnamed"},
-        {Operation::Physical, "first", "physical"},
-        {Operation::Physical, "upper", "physical"},
+        {Operation::Physical, "first", "absent"},
+        {Operation::Physical, "upper", "absent"},
+        {Operation::Physical, "lower", "physical"},
+        {Operation::Physical, "shared", "absent"},
+        {Operation::Physical, "blocked/hidden", "absent"},
         {Operation::Physical, "missing", "absent"},
         {Operation::Invalidate, "", "invalidated"},
         {Operation::Display, "upper", "shown:/upper"},

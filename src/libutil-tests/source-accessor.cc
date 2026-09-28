@@ -109,97 +109,83 @@ TEST_F(FSSourceAccessorTest, scopedDirectoryCallbacksRetainTheirReceiver)
     writeFile(base / "leaf", contents);
     writeFile(base / "sub" / "leaf", contents);
     unsigned cells = 0, allBorrowedCalls = 0;
-    for (bool withEntries : {false, true})
-        for (bool nested : {false, true})
-            for (auto ending : {Ending::Return, Ending::Exception, Ending::Symlink})
-                for (bool releaseOwner : {false, true})
-                    for (bool track : {false, true}) {
-                        ++cells;
-                        SCOPED_TRACE(
-                            ::testing::Message() << withEntries << ' ' << nested << ' ' << int(ending) << ' '
-                                                 << releaseOwner << ' ' << track);
-                        std::shared_ptr<SourceAccessor> owner = makeFSSourceAccessor(base, track).get_ptr();
-                        std::weak_ptr<SourceAccessor> weakOwner = owner;
-                        auto * accessor = owner.get();
-                        accessor->setPathDisplay("outer-display");
-                        const CanonPath path(nested ? "/sub" : "/");
-                        unsigned calls = 0, borrowedCalls = 0;
-                        auto callback = [&](SourceAccessor & scoped, const CanonPath & relative) {
-                            ++calls;
-                            if (releaseOwner)
-                                owner.reset();
-                            bool alive = !weakOwner.expired();
-                            EXPECT_TRUE(alive);
-                            if (!alive)
-                                throw ReceiverReleased{};
-                            EXPECT_EQ(relative, CanonPath::root);
-                            EXPECT_TRUE(scoped.weak_from_this().expired());
-                            EXPECT_EQ(scoped.readFile(relative / "leaf"), contents);
-                            EXPECT_EQ(scoped.getLastModified().has_value(), track);
-                            /* Both POSIX directory operations must also accept the borrowed
-                               stack receivers they themselves supply to callbacks. */
-                            scoped.readDirectory(relative, [&](SourceAccessor & inner, const CanonPath & root) {
+    for (bool nested : {false, true})
+        for (auto ending : {Ending::Return, Ending::Exception, Ending::Symlink})
+            for (bool releaseOwner : {false, true})
+                for (bool track : {false, true}) {
+                    ++cells;
+                    SCOPED_TRACE(
+                        ::testing::Message() << nested << ' ' << int(ending) << ' ' << releaseOwner << ' ' << track);
+                    std::shared_ptr<SourceAccessor> owner = makeFSSourceAccessor(base, track).get_ptr();
+                    std::weak_ptr<SourceAccessor> weakOwner = owner;
+                    auto * accessor = owner.get();
+                    accessor->setPathDisplay("outer-display");
+                    const CanonPath path(nested ? "/sub" : "/");
+                    unsigned calls = 0, borrowedCalls = 0;
+                    auto callback = [&](SourceAccessor & scoped, const CanonPath & relative) {
+                        ++calls;
+                        if (releaseOwner)
+                            owner.reset();
+                        bool alive = !weakOwner.expired();
+                        EXPECT_TRUE(alive);
+                        if (!alive)
+                            throw ReceiverReleased{};
+                        EXPECT_EQ(relative, CanonPath::root);
+                        EXPECT_TRUE(scoped.weak_from_this().expired());
+                        EXPECT_EQ(scoped.readFile(relative / "leaf"), contents);
+                        EXPECT_EQ(scoped.getLastModified().has_value(), track);
+                        /* Nested scopes also accept borrowed stack receivers. */
+                        scoped.readDirectoryWithEntries(
+                            relative,
+                            [&](SourceAccessor & inner,
+                                const CanonPath & root,
+                                SourceAccessor::DirectoryListing && listing) {
+                                const auto & entries = listing.entries();
                                 ++borrowedCalls;
                                 EXPECT_TRUE(inner.weak_from_this().expired());
+                                EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
                                 EXPECT_EQ(inner.readFile(root / "leaf"), contents);
                             });
-                            scoped.readDirectoryWithEntries(
-                                relative,
-                                [&](SourceAccessor & inner,
-                                    const CanonPath & root,
-                                    SourceAccessor::DirectoryListing && listing) {
-                                    const auto & entries = listing.entries();
-                                    ++borrowedCalls;
-                                    EXPECT_TRUE(inner.weak_from_this().expired());
-                                    EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
-                                    EXPECT_EQ(inner.readFile(root / "leaf"), contents);
-                                });
-                            if (ending == Ending::Exception)
-                                throw CallbackException{};
-                            if (ending == Ending::Symlink)
-                                throw SymlinkNotAllowed(CanonPath("/link"), "callback-marker");
-                        };
-                        auto run = [&] {
-                            if (withEntries)
-                                accessor->readDirectoryWithEntries(
-                                    path,
-                                    [&](SourceAccessor & scoped,
-                                        const CanonPath & relative,
-                                        SourceAccessor::DirectoryListing && listing) {
-                                        const auto & entries = listing.entries();
-                                        EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
-                                        callback(scoped, relative);
-                                    });
-                            else
-                                accessor->readDirectory(path, callback);
-                        };
                         if (ending == Ending::Exception)
-                            EXPECT_THROW(run(), CallbackException);
-                        else if (ending == Ending::Symlink) {
-                            try {
-                                run();
-                                ADD_FAILURE() << "expected callback symlink exception";
-                            } catch (SymlinkNotAllowed & error) {
-                                EXPECT_EQ(error.path, CanonPath("/link"));
-                                if (withEntries) {
-                                    EXPECT_THAT(error.what(), ::testing::HasSubstr("outer-display/link"));
-                                    EXPECT_THAT(error.what(), ::testing::Not(::testing::HasSubstr("callback-marker")));
-                                } else
-                                    EXPECT_THAT(error.what(), ::testing::HasSubstr("callback-marker"));
-                            } catch (...) {
-                                ADD_FAILURE() << "unexpected callback exception";
-                            }
-                        } else
-                            EXPECT_NO_THROW(run());
-                        EXPECT_EQ(calls, 1u);
-                        EXPECT_EQ(borrowedCalls, 2u);
-                        allBorrowedCalls += borrowedCalls;
-                        EXPECT_EQ(weakOwner.expired(), releaseOwner);
-                        owner.reset();
-                        EXPECT_TRUE(weakOwner.expired());
-                    }
-    EXPECT_EQ(cells, 48u);
-    EXPECT_EQ(allBorrowedCalls, 96u);
+                            throw CallbackException{};
+                        if (ending == Ending::Symlink)
+                            throw SymlinkNotAllowed(CanonPath("/link"), "callback-marker");
+                    };
+                    auto run = [&] {
+                        accessor->readDirectoryWithEntries(
+                            path,
+                            [&](SourceAccessor & scoped,
+                                const CanonPath & relative,
+                                SourceAccessor::DirectoryListing && listing) {
+                                const auto & entries = listing.entries();
+                                EXPECT_EQ(entries.at("leaf"), SourceAccessor::tRegular);
+                                callback(scoped, relative);
+                            });
+                    };
+                    if (ending == Ending::Exception)
+                        EXPECT_THROW(run(), CallbackException);
+                    else if (ending == Ending::Symlink) {
+                        try {
+                            run();
+                            ADD_FAILURE() << "expected callback symlink exception";
+                        } catch (SymlinkNotAllowed & error) {
+                            EXPECT_EQ(error.path, CanonPath("/link"));
+                            EXPECT_THAT(error.what(), ::testing::HasSubstr("outer-display/link"));
+                            EXPECT_THAT(error.what(), ::testing::Not(::testing::HasSubstr("callback-marker")));
+                        } catch (...) {
+                            ADD_FAILURE() << "unexpected callback exception";
+                        }
+                    } else
+                        EXPECT_NO_THROW(run());
+                    EXPECT_EQ(calls, 1u);
+                    EXPECT_EQ(borrowedCalls, 1u);
+                    allBorrowedCalls += borrowedCalls;
+                    EXPECT_EQ(weakOwner.expired(), releaseOwner);
+                    owner.reset();
+                    EXPECT_TRUE(weakOwner.expired());
+                }
+    EXPECT_EQ(cells, 24u);
+    EXPECT_EQ(allBorrowedCalls, 24u);
     RecordProperty("directory_cells", cells);
     RecordProperty("borrowed_scope_calls", allBorrowedCalls);
 #endif
@@ -718,12 +704,6 @@ struct CachingOwnershipProbe : SourceAccessor
         return {{"entry", tRegular}};
     }
 
-    void
-    readDirectory(const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &)> callback) override
-    {
-        callback(*this, path);
-    }
-
     void readDirectoryWithEntries(
         const CanonPath & path,
         std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
@@ -1022,7 +1002,6 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
         MissingStat,
         Stat,
         Directory,
-        DirectoryScope,
         DirectoryEntries,
         Link,
         Display,
@@ -1038,7 +1017,6 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
         Point::MissingStat,
         Point::Stat,
         Point::Directory,
-        Point::DirectoryScope,
         Point::DirectoryEntries,
         Point::Link,
         Point::Display,
@@ -1048,7 +1026,7 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
         Point::KnownEntry,
     };
 
-    /* Fourteen callback points × caller retains/releases its owner ×
+    /* Thirteen callback points × caller retains/releases its owner ×
        normal/exceptional return. A cache miss also needs the wrapper to
        survive its child call; a tail delegation only needs the child. */
     for (auto point : points)
@@ -1121,13 +1099,6 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
                             accessor->readDirectory(path),
                             (SourceAccessor::DirEntries{{"entry", SourceAccessor::tRegular}}));
                         break;
-                    case Point::DirectoryScope:
-                        accessor->readDirectory(path, [&](SourceAccessor & scoped, const CanonPath & relative) {
-                            callback();
-                            EXPECT_EQ(scoped.number, childNumber);
-                            EXPECT_EQ(relative, path);
-                        });
-                        break;
                     case Point::DirectoryEntries:
                         accessor->readDirectoryWithEntries(
                             path,
@@ -1179,7 +1150,7 @@ TEST(CachingSourceAccessor, delegatedCallbacksKeepSelectedOwnersAlive)
 TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
 {
     enum class Event { Stat, Directory, Read, Link, Display, Scope, Sink, Filter };
-    enum class Operation { Stat, Scope, Entries, Resolve, Dump };
+    enum class Operation { Stat, Entries, Resolve, Dump };
     enum class Ownership { Borrowed, Retained, Released };
 
     struct CallbackStopped
@@ -1265,7 +1236,6 @@ TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
     const Case cases[]{
         {Operation::Stat, "plain", "regular"},
         {Operation::Stat, "missing", "missing"},
-        {Operation::Scope, "dir", "scope"},
         {Operation::Entries, "dir", "file,link,"},
         {Operation::Resolve, "dir/file", "/dir/file"},
         {Operation::Resolve, "missing/file", "/missing/file"},
@@ -1317,13 +1287,6 @@ TEST(SourceAccessor, compoundDefaultsOwnTheirCallbackContinuations)
                     } catch (FileNotFound &) {
                         return "missing";
                     }
-                case Operation::Scope:
-                    accessor->readDirectory(path, [&](SourceAccessor & scoped, const CanonPath & relative) {
-                        observe(Event::Scope);
-                        EXPECT_EQ(&scoped, accessor);
-                        EXPECT_EQ(relative, path);
-                    });
-                    return "scope";
                 case Operation::Entries: {
                     std::string names;
                     accessor->readDirectoryWithEntries(

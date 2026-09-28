@@ -106,6 +106,13 @@ public:
     ref<SourceAccessor> getFSAccessor(bool requireValidPath = true) override;
     std::shared_ptr<SourceAccessor> getFSAccessor(const StorePath & path, bool requireValidPath = true) override;
 
+    /** Valid objects visible through the filesystem, including lower layers.
+     * Unlike queryAllValidPaths(), this is not an ownership enumeration for GC. */
+    virtual StorePathSet queryVisibleValidPaths()
+    {
+        return queryAllValidPaths();
+    }
+
     /**
      * Creates symlink from the `gcRoot` to the `storePath` and
      * registers the `gcRoot` as a permanent GC root. The `gcRoot`

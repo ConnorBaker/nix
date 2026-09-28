@@ -159,8 +159,20 @@ static ValidPathInfo lowerPathInfo(Store & lower, const StorePath & path)
     auto object = objectHashOf(*lower.requireStoreObjectAccessor(path), CanonPath::root);
     res.objectHash = ObjectHash::of(object.root);
     if (!res.narSize)
-        res.narSize = object.narSize;
+        res.narSize = object.narSize.value();
     return res;
+}
+
+StorePathSet LocalOverlayStore::queryVisibleValidPaths()
+{
+    auto paths = LocalStore::queryAllValidPaths();
+    paths.merge(lowerStore->queryVisibleValidPaths());
+    return paths;
+}
+
+bool LocalOverlayStore::mayHaveValidPaths()
+{
+    return LocalStore::mayHaveValidPaths() || lowerStore->mayHaveValidPaths();
 }
 
 bool LocalOverlayStore::isValidPathUncached(const StorePath & path)

@@ -44,7 +44,7 @@ nix_err nix_libexpr_init(nix_c_context * context)
 nix_err nix_expr_eval_from_string(
     nix_c_context * context, EvalState * state, const char * expr, const char * path, nix_value * value)
 {
-    return nix_c_boundary(context, state, [&] {
+    return nix_c_boundary(context, [&] {
         nix::Expr * parsedExpr = state->state.parseExprFromString(expr, state->state.rootPath(nix::CanonPath(path)));
         state->state.eval(parsedExpr, *value->value);
         state->state.forceValue(*value->value, nix::noPos);
@@ -53,7 +53,7 @@ nix_err nix_expr_eval_from_string(
 
 nix_err nix_value_call(nix_c_context * context, EvalState * state, Value * fn, nix_value * arg, nix_value * value)
 {
-    return nix_c_boundary(context, state, [&] {
+    return nix_c_boundary(context, [&] {
         state->state.callFunction(*fn->value, *arg->value, *value->value, nix::noPos);
         state->state.forceValue(*value->value, nix::noPos);
     });
@@ -62,7 +62,7 @@ nix_err nix_value_call(nix_c_context * context, EvalState * state, Value * fn, n
 nix_err nix_value_call_multi(
     nix_c_context * context, EvalState * state, nix_value * fn, size_t nargs, nix_value ** args, nix_value * value)
 {
-    return nix_c_boundary(context, state, [&] {
+    return nix_c_boundary(context, [&] {
         std::vector<nix::Value *> internal_args;
         internal_args.reserve(nargs);
         for (size_t i = 0; i < nargs; i++)
@@ -74,12 +74,12 @@ nix_err nix_value_call_multi(
 
 nix_err nix_value_force(nix_c_context * context, EvalState * state, nix_value * value)
 {
-    return nix_c_boundary(context, state, [&] { state->state.forceValue(*value->value, nix::noPos); });
+    return nix_c_boundary(context, [&] { state->state.forceValue(*value->value, nix::noPos); });
 }
 
 nix_err nix_value_force_deep(nix_c_context * context, EvalState * state, nix_value * value)
 {
-    return nix_c_boundary(context, state, [&] { state->state.forceValueDeep(*value->value); });
+    return nix_c_boundary(context, [&] { state->state.forceValueDeep(*value->value); });
 }
 
 nix_eval_state_builder * nix_eval_state_builder_new(nix_c_context * context, Store * store)
@@ -154,26 +154,30 @@ EvalState * nix_eval_state_build(nix_c_context * context, nix_eval_state_builder
             std::make_shared<nix::EvalState>(builder->lookupPath, builder->store, *fetchSettings, *settings);
         auto & stateRef = *ownedState;
         void * p = ::operator new(sizeof(EvalState), static_cast<std::align_val_t>(alignof(EvalState)));
-        return new (p) EvalState{stateRef, std::move(fetchSettings), std::move(settings), std::move(ownedState)};
+        return new (p) EvalState{
+            stateRef,
+            builder->readOnlyMode.get_ptr(),
+            std::move(fetchSettings),
+            std::move(settings),
+            std::move(ownedState)};
     }
     NIXC_CATCH_ERRS_NULL
 }
 
 EvalState * nix_state_create(nix_c_context * context, const char ** lookupPath_c, Store * store)
 {
-    auto builder = nix_eval_state_builder_new(context, store);
-    if (builder == nullptr)
+    auto builder = std::unique_ptr<nix_eval_state_builder, decltype(&nix_eval_state_builder_free)>(
+        nix_eval_state_builder_new(context, store), nix_eval_state_builder_free);
+    if (!builder)
         return nullptr;
 
-    if (nix_eval_state_builder_load(context, builder) != NIX_OK)
+    if (nix_eval_state_builder_load(context, builder.get()) != NIX_OK)
         return nullptr;
 
-    if (nix_eval_state_builder_set_lookup_path(context, builder, lookupPath_c) != NIX_OK)
+    if (nix_eval_state_builder_set_lookup_path(context, builder.get(), lookupPath_c) != NIX_OK)
         return nullptr;
 
-    auto * state = nix_eval_state_build(context, builder);
-    nix_eval_state_builder_free(builder);
-    return state;
+    return nix_eval_state_build(context, builder.get());
 }
 
 void nix_state_free(EvalState * state)

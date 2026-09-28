@@ -227,7 +227,7 @@ struct CountingRestoreHooks : RestoreSinkHooks
 {
     std::unique_ptr<RestoreSinkHooks> inner;
     /* Atomic: the parallel copy creates files on its workers as well as on
-       the walking thread (`MaterialisingVisitor::copyChildren`, `08` K17),
+       the walking thread (`HashingVisitor::orderedChildren`, `08` K17),
        so a plain counter is a data race and the count a test asserts is
        not well defined.  Found by the thread-sanitised run of `05` section
        5. */
@@ -335,36 +335,71 @@ protected:
         ASSERT_TRUE(hold.ingestion);
         ASSERT_FALSE(hold.ingestion->id);
         auto projection = hold.takeProjection();
-        auto & rows = projection.regular;
-        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
-        SQLiteTxn txn(db);
-        SQLiteStmt ingestion{db, "insert into Ingestions(path, hold) values (null, ?);"};
+        auto state = store->_state->lock();
+        SQLiteTxn txn(state->db);
+        SQLiteStmt ingestion{state->db, "insert into Ingestions(path, hold) values (null, ?);"};
         ingestion.use().apply(hold.directory().filename().string()).exec();
-        auto id = static_cast<uint64_t>(sqlite3_last_insert_rowid(db));
-        SQLiteStmt insert{
-            db, "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);"};
-        for (auto & row : rows)
-            insert.use()
-                .apply(row.id.hash, row.id.hashSize)
-                .apply(int64_t(row.executable))
-                .apply(static_cast<int64_t>(row.ino))
-                .apply(static_cast<int64_t>(row.dev))
-                .apply(static_cast<int64_t>(id))
-                .apply(row.name)
-                .apply(static_cast<int64_t>(row.size))
-                .exec();
-        SQLiteStmt auxiliary{db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, 0, ?);"};
-        for (auto & value : projection.auxiliary)
-            auxiliary.use()
-                .apply(static_cast<int64_t>(value.entry.mode))
-                .apply(value.entry.hash.hash, value.entry.hash.hashSize)
-                .apply(static_cast<int64_t>(id))
-                .apply(reinterpret_cast<const unsigned char *>(value.body.data()), value.body.size())
-                .exec();
+        auto id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
+        store->insertBlobRows(*state, id, projection.regular);
+        store->insertAuxiliaryRows(*state, id, projection.auxiliary);
         txn.commit();
         hold.ingestion->id = id;
     }
 
+    /* Fixture roots such as <store>/t1 are not StorePaths. Give them validity
+       and ingestion ownership without inventing a production publication API.
+       Actual row/chunk insertion remains the production operation under test. */
+    void recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
+    {
+        if (!hold.ingestion)
+            return;
+        auto projection = hold.takeProjection();
+        auto logical = (std::filesystem::path(store->config->storeDir) / root.filename()).string();
+        auto ingestion = hold.ingestion->id;
+        retrySQLite<void>([&] {
+            auto state = store->_state->lock();
+            SQLiteTxn txn(state->db);
+            auto id = ingestion;
+            SQLiteStmt name{state->db, "update Ingestions set path = ? where id = ?"};
+            if (!id) {
+                SQLiteStmt fresh{state->db, "insert into Ingestions(path, hold) values (null, ?)"};
+                fresh.use().apply(hold.directory().filename().string()).exec();
+                id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
+            } else
+                name.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
+            store->insertBlobRows(*state, *id, projection.regular);
+            store->insertAuxiliaryRows(*state, *id, projection.auxiliary);
+            SQLiteStmt valid{state->db, "select id from ValidPaths where path = ?"};
+            if (!valid.use().apply(logical).next()) {
+                SQLiteStmt insert{
+                    state->db, "insert into ValidPaths(path, hash, registrationTime, narSize) values (?, ?, ?, 0)"};
+                insert.use()
+                    .apply(logical)
+                    .apply("git:sha256:0000000000000000000000000000000000000000000000000000000000000000")
+                    .apply(int64_t(time(nullptr)))
+                    .exec();
+            }
+            SQLiteStmt previous{state->db, "delete from Ingestions where path = ?"};
+            previous.use().apply(logical).exec();
+            name.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
+            txn.commit();
+            hold.ingestion->id = id;
+        });
+    }
+
+public:
+    static uint64_t blobRowCount(LocalStore & store, bool executable)
+    {
+        return retrySQLite<uint64_t>([&]() -> uint64_t {
+            auto state = store._state->lock();
+            SQLiteStmt query{state->db, "select count(*) from Blobs where exec = ?"};
+            auto use = query.use();
+            use.apply(int64_t(executable ? 1 : 0));
+            return use.next() ? static_cast<uint64_t>(use.getInt(0)) : 0;
+        });
+    }
+
+protected:
     ObjectHashSink::Result
     restore(const std::filesystem::path & dst, std::string_view nar, RepairFlag repair = NoRepair)
     {
@@ -382,7 +417,7 @@ protected:
            registration covers, so the fixture registers the destination
            under its own name and writes them -- otherwise no blob would
            have a holder and every restore would write every file. */
-        store->recordBlobsAtPath(hold, dst);
+        recordBlobsAtPath(hold, dst);
         filesCreated = hooks.regularFilesCreated;
         return r;
     }
@@ -528,7 +563,7 @@ protected:
         store->beginIngestion(hold, path);
         for (auto & value : values)
             hold.addAuxiliary(std::move(value));
-        store->recordBlobsAtPath(hold, path);
+        recordBlobsAtPath(hold, path);
         return *hold.ingestion->id;
     }
 
@@ -575,7 +610,7 @@ protected:
     {
         auto hold = store->objects.hold();
         auto result = store->enterIntoObjects(p, NoRepair, hold, nullptr, &stats, &inodes);
-        store->recordBlobsAtPath(hold, p);
+        recordBlobsAtPath(hold, p);
         return result;
     }
 
@@ -659,7 +694,7 @@ protected:
            fixture registers the destination under its own name and writes
            them -- otherwise the files this route wrote would hold no blob
            and the next materialisation would write them again. */
-        store->recordBlobsAtPath(hold, dst);
+        recordBlobsAtPath(hold, dst);
         filesCreated = hooks.regularFilesCreated;
         return r;
     }
@@ -915,8 +950,8 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
     EXPECT_EQ(count("blobs"), 4u);
     EXPECT_EQ(count("blobs-x"), 1u);
     EXPECT_EQ(count("trees"), 3u);
-    EXPECT_EQ(store->blobRowCount(false), 3u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 3u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
     auto one = merkle::blobId("one");
     EXPECT_TRUE(hasBlob(one, false));
     EXPECT_TRUE(hasBlob(one, true));
@@ -971,8 +1006,8 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
     EXPECT_EQ(count("blobs"), 4u);
     EXPECT_EQ(count("blobs-x"), 1u);
     EXPECT_EQ(count("trees"), 3u);
-    EXPECT_EQ(store->blobRowCount(false), 6u);
-    EXPECT_EQ(store->blobRowCount(true), 2u);
+    EXPECT_EQ(blobRowCount(*store, false), 6u);
+    EXPECT_EQ(blobRowCount(*store, true), 2u);
     for (auto & rel : {"a", "d/b", "d/e/c", "d/e/x", "empty"})
         EXPECT_EQ(st(t2 / rel).st_ino, st(t1 / rel).st_ino) << rel;
     /* Four, not five -- `t1/a`, `t1/d/e/c`, `t2/a`, `t2/d/e/c`
@@ -993,7 +1028,7 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
     EXPECT_EQ(st(t3).st_ino, st(t1 / "d/b").st_ino);
     EXPECT_EQ(filesCreated, 0u); /* linked by its full path: the store held "two" */
     EXPECT_EQ(count("blobs"), 4u);
-    EXPECT_EQ(store->blobRowCount(false), 7u);
+    EXPECT_EQ(blobRowCount(*store, false), 7u);
 
     /* Each registered projection owns its auxiliary values. Removing one
        donor cannot revoke another donor's values; the last invalidation can. */
@@ -1007,8 +1042,8 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjects)
     forgetFixturePath(t3);
     store->sweepStaleBlobRows();
     EXPECT_EQ(auxiliaryRowCount(), 0u);
-    EXPECT_EQ(store->blobRowCount(false), 0u);
-    EXPECT_EQ(store->blobRowCount(true), 0u);
+    EXPECT_EQ(blobRowCount(*store, false), 0u);
+    EXPECT_EQ(blobRowCount(*store, true), 0u);
     EXPECT_EQ(readFile(t1 / "a"), "one") << "metadata collection does not remove the path's bytes";
 }
 
@@ -1025,8 +1060,8 @@ TEST_F(LocalStoreObjectsTest, oneChangedFileWritesOneFile)
     EXPECT_EQ(filesCreated, 3u);
     EXPECT_EQ(count("blobs"), 3u); /* "one", "two", the symlink's "b" */
     EXPECT_EQ(count("blobs-x"), 1u);
-    EXPECT_EQ(store->blobRowCount(false), 2u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 2u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
 
     auto t2 = realStoreDir / "c2";
     auto r2 = restore(t2, nar("TWO"));
@@ -1034,8 +1069,8 @@ TEST_F(LocalStoreObjectsTest, oneChangedFileWritesOneFile)
     EXPECT_EQ(filesCreated, 1u);
     EXPECT_EQ(count("blobs"), 4u);
     EXPECT_EQ(count("blobs-x"), 1u);
-    EXPECT_EQ(store->blobRowCount(false), 4u);
-    EXPECT_EQ(store->blobRowCount(true), 2u);
+    EXPECT_EQ(blobRowCount(*store, false), 4u);
+    EXPECT_EQ(blobRowCount(*store, true), 2u);
     EXPECT_EQ(readFile(t2 / "d/b"), "TWO");
     EXPECT_EQ(st(t2 / "d/b").st_ino, st(blobFileOf(merkle::blobId("TWO"), false)).st_ino);
     EXPECT_NE(st(t2 / "d/b").st_ino, st(t1 / "d/b").st_ino);
@@ -1074,8 +1109,8 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjectsStreamsLargeFiles)
     EXPECT_EQ(r1.root, gitHash(t1));
     EXPECT_EQ(r1.narSize, nar.size());
     EXPECT_EQ(filesCreated, 3u);
-    EXPECT_EQ(store->blobRowCount(false), 2u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 2u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
 
     auto bigId = merkle::blobId(big);
     EXPECT_TRUE(hasBlob(bigId, false));
@@ -1103,8 +1138,8 @@ TEST_F(LocalStoreObjectsTest, restoreThroughObjectsStreamsLargeFiles)
     EXPECT_EQ(st(t1 / "big").st_nlink, 2u);
     EXPECT_EQ(count("blobs"), 2u);
     EXPECT_EQ(count("blobs-x"), 1u);
-    EXPECT_EQ(store->blobRowCount(false), 4u);
-    EXPECT_EQ(store->blobRowCount(true), 2u);
+    EXPECT_EQ(blobRowCount(*store, false), 4u);
+    EXPECT_EQ(blobRowCount(*store, true), 2u);
     StringSink again;
     dumpPath(t2, again);
     EXPECT_EQ(again.s, nar);
@@ -1267,7 +1302,7 @@ TEST_F(LocalStoreObjectsTest, repairRelinksAFreshFileOverACorruptBlob)
     writePlainTree(fresh, "one");
     auto freshInode = st(fresh / "a").st_ino;
     auto r = store->enterPath(fresh, Repair, hold);
-    store->recordBlobsAtPath(hold, fresh);
+    recordBlobsAtPath(hold, fresh);
     EXPECT_EQ(r.root, gitHash(fresh));
     EXPECT_EQ(readFile(fresh / "a"), "one");
     EXPECT_EQ(st(fresh / "a").st_ino, freshInode);
@@ -1347,7 +1382,7 @@ TEST_F(LocalStoreObjectsTest, everyBuildModeEntersWithItsRepairFlag)
         auto freshInode = st(fresh / "a").st_ino;
         auto hold = store->objects.hold();
         store->enterPath(fresh, enterRepairFlagOf(mode), hold);
-        store->recordBlobsAtPath(hold, fresh);
+        recordBlobsAtPath(hold, fresh);
 
         /* What the mode must leave, said per mode and not through the flag
            under test: `--repair` alone hashes the blob's holder and
@@ -1430,8 +1465,8 @@ TEST_F(LocalStoreObjectsTest, enterIntoObjectsAndMigrate)
     EXPECT_EQ(root2, root);
     EXPECT_EQ(again.filesLinked, 0u);
     EXPECT_EQ(again.filesEntered, 0u);
-    EXPECT_EQ(store->blobRowCount(false), 1u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 1u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
     /* One lower: the blob's canonical file is a store path's own, so there is
      * no link into `.objects/blobs` beside it (K8) */
     EXPECT_EQ(st(p / "a").st_nlink, 2u);
@@ -1509,7 +1544,7 @@ TEST_F(LocalStoreObjectsTest, sharingWitnessSurvivesDonorCollection)
     auto holder = add("holder");
     auto sharer = add("sharer");
     ASSERT_EQ(blobFileOf(id, false), store->toRealPath(holder) / "a");
-    ASSERT_EQ(store->blobRowCount(false), 2u);
+    ASSERT_EQ(blobRowCount(*store, false), 2u);
     ASSERT_EQ(st(store->toRealPath(sharer) / "a").st_ino, st(store->toRealPath(holder) / "a").st_ino)
         << "the second ingestion linked the holder";
     ASSERT_EQ(st(store->toRealPath(holder) / "a").st_nlink, 2u);
@@ -1531,7 +1566,7 @@ TEST_F(LocalStoreObjectsTest, sharingWitnessSurvivesDonorCollection)
     store->collectGarbage(options, results);
     ASSERT_FALSE(store->isValidPath(holder));
     store->sweepStaleBlobRows();
-    EXPECT_EQ(store->blobRowCount(false), 1u) << "only the collected path's candidate is removed";
+    EXPECT_EQ(blobRowCount(*store, false), 1u) << "only the collected path's candidate is removed";
     EXPECT_TRUE(hasBlob(id, false)) << "the surviving path still records its own holder";
     EXPECT_EQ(readFile(store->toRealPath(sharer) / "a"), "shared");
     EXPECT_EQ(st(store->toRealPath(sharer) / "a").st_nlink, 1u);
@@ -1541,7 +1576,7 @@ TEST_F(LocalStoreObjectsTest, sharingWitnessSurvivesDonorCollection)
     OptimiseStats stats;
     store->optimiseStore(stats);
     EXPECT_EQ(stats.filesEntered, 0u) << "the surviving path retained its witness";
-    EXPECT_EQ(store->blobRowCount(false), 1u) << "optimisation replaces this path's previous projection";
+    EXPECT_EQ(blobRowCount(*store, false), 1u) << "optimisation replaces this path's previous projection";
     EXPECT_EQ(blobFileOf(id, false), store->toRealPath(sharer) / "a");
     EXPECT_EQ(st(blobFileOf(id, false)).st_ino, survivingInode) << "the same inode: nothing was rewritten";
 
@@ -1549,7 +1584,7 @@ TEST_F(LocalStoreObjectsTest, sharingWitnessSurvivesDonorCollection)
     auto later = add("later");
     EXPECT_EQ(st(store->toRealPath(later) / "a").st_ino, survivingInode);
     EXPECT_EQ(st(store->toRealPath(sharer) / "a").st_nlink, 2u);
-    EXPECT_EQ(store->blobRowCount(false), 2u);
+    EXPECT_EQ(blobRowCount(*store, false), 2u);
 }
 
 /* A tree added under the git method: its content address is the root the
@@ -1662,7 +1697,7 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
     ASSERT_EQ(count("trees"), 2u);
     /* One symlink value and two regular-holder keys. */
     ASSERT_EQ(count("blobs"), 3u);
-    ASSERT_EQ(store->blobRowCount(false), 2u);
+    ASSERT_EQ(blobRowCount(*store, false), 2u);
     /* `a` left as the store leaves a file it could not link.  Before, that
        left its blob file at the store's link alone, kept only by the tree
        that names it; now the file *was* the blob's holder, so replacing it
@@ -1671,7 +1706,7 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
        blob nowhere, which is what `--verify --repair` puts back. */
     unlinkInPlace(store->toRealPath(info.path) / "a");
     ASSERT_FALSE(hasBlob(merkle::blobId("one"), false)) << "the row is forgotten, not the file removed";
-    ASSERT_EQ(store->blobRowCount(false), 1u);
+    ASSERT_EQ(blobRowCount(*store, false), 1u);
     ASSERT_EQ(count("blobs"), 2u);
 
     /* The race lost: the root tree is gone. */
@@ -1699,7 +1734,7 @@ TEST_F(LocalStoreObjectsTest, sweepAndVerifyOnALiveRootWhoseTreeIsMissing)
        at one link, the holder being the file itself (`08` K8). */
     EXPECT_EQ(blobFileOf(merkle::blobId("one"), false), store->toRealPath(info.path) / "a");
     EXPECT_EQ(st(store->toRealPath(info.path) / "a").st_nlink, 1u);
-    EXPECT_EQ(store->blobRowCount(false), 2u) << "repair replaces the path's previous projection";
+    EXPECT_EQ(blobRowCount(*store, false), 2u) << "repair replaces the path's previous projection";
     EXPECT_FALSE(store->verifyStore(/*checkContents=*/true, NoRepair));
 
     swept = objects.sweep();
@@ -1885,7 +1920,7 @@ TEST_F(LocalStoreObjectsTest, deadHoldIsReleasedBySweep)
     store->sweepStaleBlobRows();
     EXPECT_EQ(swept.holds, 1u);
     EXPECT_EQ(auxiliaryRowCount(), rows);
-    EXPECT_GT(store->blobRowCount(false), 0u);
+    EXPECT_GT(blobRowCount(*store, false), 0u);
     dropLock(*hold);
     swept = objects.sweep();
     store->sweepStaleBlobRows();
@@ -1893,7 +1928,7 @@ TEST_F(LocalStoreObjectsTest, deadHoldIsReleasedBySweep)
     EXPECT_EQ(count("tmp"), 0u);
     EXPECT_EQ(auxiliaryRowCount(), 0u);
     EXPECT_FALSE(hasTree(r.root.hash));
-    EXPECT_EQ(store->blobRowCount(false), 0u);
+    EXPECT_EQ(blobRowCount(*store, false), 0u);
     EXPECT_EQ(readFile(dead / "a"), "one");
     hold.reset();
 }
@@ -1920,14 +1955,14 @@ TEST_F(LocalStoreObjectsTest, sweepGoesOnPastAHoldItCannotRemove)
     EXPECT_EQ(swept.treesRemoved, 1u) << "an unremovable lease does not stop bounded legacy cleanup";
     EXPECT_FALSE(pathExists(legacy));
     EXPECT_EQ(auxiliaryRowCount(), rows);
-    EXPECT_GT(store->blobRowCount(false), 0u);
+    EXPECT_GT(blobRowCount(*store, false), 0u);
     objects.failHoldRemoval = nullptr;
     swept = objects.sweep();
     store->sweepStaleBlobRows();
     EXPECT_EQ(swept.holds, 0u);
     EXPECT_EQ(count("tmp"), 0u);
     EXPECT_EQ(auxiliaryRowCount(), 0u);
-    EXPECT_EQ(store->blobRowCount(false), 0u);
+    EXPECT_EQ(blobRowCount(*store, false), 0u);
     hold.reset();
 }
 
@@ -2053,15 +2088,15 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsRespectBothJournalModes)
             auto hooks =
                 makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
             auto result = store->restoreThroughObjects(dst, source, false, hooks.get(), hold, NoRepair);
-            EXPECT_EQ(store->blobRowCount(false), 0u);
+            EXPECT_EQ(blobRowCount(*store, false), 0u);
             EXPECT_EQ(auxiliaryRowCount(), 0u);
             store->endIngestion(hold, path);
-            EXPECT_GT(store->blobRowCount(false), 0u);
+            EXPECT_GT(blobRowCount(*store, false), 0u);
             EXPECT_GT(auxiliaryRowCount(), 0u);
             EXPECT_TRUE(hasTree(result.root.hash))
                 << "completed builder bytes are authenticated without physical-holder validity";
             ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
-            info.narSize = result.narSize;
+            info.narSize = result.narSize.value();
             store->registerValidPath(info);
             EXPECT_TRUE(hasTree(result.root.hash));
             EXPECT_TRUE(hasAuxiliary(merkle::blobId("journal target"), merkle::Mode::Symlink));
@@ -2096,7 +2131,7 @@ TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLin
     }
 
     /* The rows are there and they name no path. */
-    EXPECT_GT(store->blobRowCount(false), 0u) << "the dead ingestion's rows were written";
+    EXPECT_GT(blobRowCount(*store, false), 0u) << "the dead ingestion's rows were written";
     EXPECT_FALSE(store->objects.holderOrForget(one, false, NoRepair).has_value())
         << "and `link` is not misled by one: an ingestion with no path answers nothing";
 
@@ -2112,10 +2147,10 @@ TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLin
     auto onlyDead = merkle::blobId("only-dead");
     EXPECT_TRUE(store->objects.holderOrForget(onlyDead, false, NoRepair).has_value() == false)
         << "the dead ingestion's own blob answers nothing either";
-    auto before = store->blobRowCount(false);
+    auto before = blobRowCount(*store, false);
     EXPECT_EQ(before, 3u);
     store->sweepStaleBlobRows();
-    auto after = store->blobRowCount(false);
+    auto after = blobRowCount(*store, false);
     EXPECT_EQ(after, 1u) << "only the registered ingestion's candidate remains";
     EXPECT_TRUE(store->objects.holderOrForget(one, false, NoRepair).has_value())
         << "and the surviving row is the live path's";
@@ -2171,14 +2206,14 @@ TEST_F(LocalStoreObjectsTest, aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRo
         store->restoreThroughObjects(dead, source, /*startFsync=*/false, hooks.get(), hold, NoRepair);
         stageLegacyUnregisteredRows(hold);
     }
-    ASSERT_GT(store->blobRowCount(false), 0u);
+    ASSERT_GT(blobRowCount(*store, false), 0u);
 
     store.reset();
     auto own = std::make_shared<OwnObjectSweepStore>(ref{config});
-    ASSERT_GT(own->blobRowCount(false), 0u);
+    ASSERT_GT(blobRowCount(*own, false), 0u);
     own->sweepObjects();
     EXPECT_EQ(own->ownSweeps, 1u) << "the object files were swept this store's own way";
-    EXPECT_EQ(own->blobRowCount(false), 0u) << "and the stale rows went with the collection all the same";
+    EXPECT_EQ(blobRowCount(*own, false), 0u) << "and the stale rows went with the collection all the same";
     store = own;
 }
 
@@ -2219,7 +2254,7 @@ TEST_F(LocalStoreObjectsTest, everyPathOfABatchIsItsOwnIngestion)
     /* One locked directory for the batch, and it is gone: the rows' holds
        are the same directory and remove nothing (`Hold::ownRows`). */
     EXPECT_EQ(count("tmp"), 0u);
-    EXPECT_EQ(store->blobRowCount(false), n);
+    EXPECT_EQ(blobRowCount(*store, false), n);
     for (size_t i = 0; i < n; i++) {
         ASSERT_TRUE(store->isValidPath(paths[i]));
         auto id = merkle::blobId(fmt("byte-%d", i));
@@ -2329,12 +2364,12 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     info.assertedNarHash = hashString(HashAlgorithm::SHA256, nar);
     info.narSize = nar.size();
     info.references.emplace("n5wkd9frr45pa74if5gpz9j7mifg27fh-missing-reference");
-    auto before = store->blobRowCount(false);
+    auto before = blobRowCount(*store, false);
     auto auxiliaryBefore = auxiliaryRowCount();
     StringSource failed{nar};
     EXPECT_THROW(store->addToStore(info, failed, NoRepair, NoCheckSigs), Error);
     EXPECT_FALSE(store->isValidPath(info.path));
-    EXPECT_EQ(store->blobRowCount(false), before);
+    EXPECT_EQ(blobRowCount(*store, false), before);
     EXPECT_EQ(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("uncommitted-holder"), false, NoRepair));
 
@@ -2342,7 +2377,7 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     StringSource retry{nar};
     store->addToStore(info, retry, NoRepair, NoCheckSigs);
     EXPECT_TRUE(store->isValidPath(info.path));
-    EXPECT_EQ(store->blobRowCount(false), before + 1);
+    EXPECT_EQ(blobRowCount(*store, false), before + 1);
     EXPECT_GT(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_EQ(blobFileOf(merkle::blobId("uncommitted-holder"), false), store->toRealPath(info.path) / "a");
 }
@@ -2392,7 +2427,7 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
                     auto result = store->restoreThroughObjects(
                         store->toRealPath(infos.back().path), source, false, hooks.get(), holds[i], NoRepair);
                     infos.back().objectHash = ObjectHash::of(result.root);
-                    infos.back().narSize = result.narSize;
+                    infos.back().narSize = result.narSize.value();
                 }
                 std::array<bool, 2> registered{}, auxiliaryPersisted{};
                 for (auto event : order) {
@@ -2474,7 +2509,7 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
                         auto result = store->restoreThroughObjects(
                             store->toRealPath(infos.back().path), source, false, hooks.get(), holds[i], NoRepair);
                         infos.back().objectHash = ObjectHash::of(result.root);
-                        infos.back().narSize = result.narSize;
+                        infos.back().narSize = result.narSize.value();
                     }
                     for (auto i : order)
                         store->registerValidPath(infos[i], holds[i]);
@@ -2571,7 +2606,7 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
                 makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
             auto result = store->restoreThroughObjects(roots[i], source, false, hooks.get(), holds[i], NoRepair);
             infos.back().objectHash = ObjectHash::of(result.root);
-            infos.back().narSize = result.narSize;
+            infos.back().narSize = result.narSize.value();
             store->registerValidPath(infos.back(), holds[i]);
         }
         /* A supported legacy store may have two physical representatives.
@@ -2680,7 +2715,7 @@ TEST_F(LocalStoreObjectsTest, optimiseKeepsTheCanonicalInodeWhenItsFirstHolderIs
             auto result = store->restoreThroughObjects(
                 store->toRealPath(infos.back().path), source, false, hooks.get(), holds[i], NoRepair);
             infos.back().objectHash = ObjectHash::of(result.root);
-            infos.back().narSize = result.narSize;
+            infos.back().narSize = result.narSize.value();
         }
         /* The donor is registered first and visited last. Its alias is
            visited first, before the divergent legacy holder in between. */
@@ -2813,7 +2848,7 @@ TEST_F(LocalStoreObjectsTest, everyWriterReconcilesBeforeEveryPublicationBoundar
                                 return store->enterPath(real, repair, hold);
                             }();
                             infos.back().objectHash = ObjectHash::of(result.root);
-                            infos.back().narSize = result.narSize;
+                            infos.back().narSize = result.narSize.value();
                             if (boundary == 1)
                                 store->endIngestion(hold, infos.back().path);
                         }
@@ -2869,7 +2904,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     auto result = store->restoreThroughObjects(
                         store->toRealPath(infos.back().path), source, false, hooks.get(), holds[n], NoRepair);
                     infos.back().objectHash = ObjectHash::of(result.root);
-                    infos.back().narSize = result.narSize;
+                    infos.back().narSize = result.narSize.value();
                 }
                 if (earlierId)
                     stageLegacyUnregisteredRows(holds[0]);
@@ -2940,7 +2975,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     auto result = store->restoreThroughObjects(
                         store->toRealPath(path), input, false, hooks.get(), hold, NoRepair);
                     info.objectHash = ObjectHash::of(result.root);
-                    info.narSize = result.narSize;
+                    info.narSize = result.narSize.value();
                     return info;
                 };
                 uint64_t oldIngestion;
@@ -2948,7 +2983,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     auto abandoned = store->objects.hold();
                     auto old = restoreInfo(path, treeNar({{"old", tag + "-old", 'f'}}), abandoned);
                     store->endIngestion(abandoned, path);
-                    oldIngestion = *abandoned.ingestion->id;
+                    oldIngestion = abandoned.completedIngestions.back().id;
                     if (wasValid)
                         store->registerValidPath(old, abandoned);
                 }
@@ -3119,6 +3154,144 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
     EXPECT_EQ(cases, 512u);
 }
 
+TEST_F(LocalStoreObjectsTest, completedOutputsRetainIdentityWithoutRecoveringItFromTheDatabase)
+{
+    auto path = StorePath::random("completed-identity");
+    auto sibling = StorePath::random("completed-sibling");
+    auto complete = [&](const GitObjectStore::Hold & hold, const StorePath & path, std::string bytes) {
+        deletePath(store->toRealPath(path));
+        auto nar = treeNar({{"file", std::move(bytes), 'f'}, {"link", "target", 'l'}});
+        StringSource source{nar};
+        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+        auto result = store->restoreThroughObjects(store->toRealPath(path), source, false, hooks.get(), hold, NoRepair);
+        ValidPathInfo info{path, UnkeyedValidPathInfo{*store, std::nullopt}};
+        info.objectHash = ObjectHash::of(result.root);
+        info.narSize = result.narSize.value();
+        store->endIngestion(hold, path);
+        return info;
+    };
+    auto old = store->objects.hold();
+    complete(old, path, "first");
+    auto first = old.completedIngestions.front().id;
+    complete(old, path, "replacement");
+    ASSERT_EQ(old.completedIngestions.size(), 1u);
+    EXPECT_NE(old.completedIngestions.front().id, first);
+    EXPECT_FALSE(old.ingestion);
+
+    auto current = store->objects.hold();
+    auto info = complete(current, path, "current");
+    auto currentId = current.completedIngestions.front().id;
+    auto other = complete(current, sibling, "sibling");
+    ASSERT_EQ(current.completedIngestions.size(), 2u);
+    /* Registration through a superseded hold must not remove the replacement. */
+    store->registerValidPath(info, old);
+    store->registerValidPaths({{path, info}, {sibling, other}}, &current);
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    SQLiteStmt named{db, "select id from Ingestions where path = ?"};
+    auto use = named.use();
+    use.apply(store->printStorePath(path));
+    ASSERT_TRUE(use.next());
+    EXPECT_EQ(use.getInt(0), static_cast<int64_t>(currentId));
+    EXPECT_FALSE(use.next());
+    EXPECT_TRUE(store->isValidPath(path));
+    EXPECT_TRUE(store->isValidPath(sibling));
+}
+
+TEST_F(LocalStoreObjectsTest, ingestionDeletionOwnsBothProjectionsAndRollsBackTogether)
+{
+    auto path = StorePath::random("projection-cascade");
+    auto hold = store->objects.hold();
+    auto nar = treeNar({{"file", "owned bytes", 'f'}, {"link", "target", 'l'}});
+    StringSource source{nar};
+    auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+    store->restoreThroughObjects(store->toRealPath(path), source, false, hooks.get(), hold, NoRepair);
+    store->endIngestion(hold, path);
+    auto id = static_cast<int64_t>(hold.completedIngestions.front().id);
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    auto counts = [&] {
+        SQLiteStmt query{
+            db,
+            "select (select count(*) from Blobs where ingestion = ?),"
+            " (select count(*) from AuxValues where ingestion = ?)"};
+        auto use = query.use();
+        use.apply(id).apply(id);
+        if (!use.next())
+            throw Error("missing projection counts");
+        return std::pair{use.getInt(0), use.getInt(1)};
+    };
+    auto before = counts();
+    ASSERT_GT(before.first, 0);
+    ASSERT_GT(before.second, 0);
+    SQLiteStmt remove{db, "delete from Ingestions where id = ?"};
+    {
+        SQLiteTxn txn(db);
+        remove.use().apply(id).exec();
+        EXPECT_EQ(counts(), (std::pair<int64_t, int64_t>{0, 0}));
+    }
+    EXPECT_EQ(counts(), before);
+    remove.use().apply(id).exec();
+    EXPECT_EQ(counts(), (std::pair<int64_t, int64_t>{0, 0}));
+    EXPECT_TRUE(pathExists(store->toRealPath(path) / "file"));
+}
+
+TEST_F(LocalStoreObjectsTest, cacheInstallationPreservesAStoreWithoutObjectCacheTables)
+{
+    StringSource source{treeNar({{"file", "old store bytes", 'f'}})};
+    auto path = store->addToStoreFromDump(
+        source,
+        "pre-cache-store",
+        FileSerialisationMethod::NixArchive,
+        ContentAddressMethod::Raw::NixArchive,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto before = store->queryPathInfo(path);
+    auto real = store->toRealPath(path);
+    auto dbPath = store->dbDir / "db.sqlite";
+    store.reset();
+    {
+        SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+        db.exec(
+            "drop table AuxValues; drop table Blobs; drop table Ingestions;"
+            "delete from SchemaMigrations where migration like '202609%'");
+    }
+    store = std::make_shared<LocalStore>(ref{config});
+    EXPECT_EQ(store->queryPathInfo(path)->objectHash, before->objectHash);
+    EXPECT_EQ(readFile(real / "file"), "old store bytes");
+    EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("old store bytes"), false, NoRepair));
+    auto hold = store->objects.hold();
+    store->enterPath(real, NoRepair, hold);
+    store->endIngestion(hold, path);
+    EXPECT_TRUE(store->objects.holderOrForget(merkle::blobId("old store bytes"), false, NoRepair));
+    for (unsigned reopen = 0; reopen < 2; ++reopen) {
+        store.reset();
+        {
+            SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            SQLiteStmt marker{db, "select 1 from SchemaMigrations where migration = ?"};
+            for (auto name :
+                 {"20260919-blob-index-holders",
+                  "20260921-blob-holder-candidates",
+                  "20260921-ingestion-paths",
+                  "20260924-blob-holder-without-rowid",
+                  "20260927-auxiliary-ingestion-values"}) {
+                /* This is the older writer's exact decision to skip its rebuild. */
+                auto use = marker.use();
+                EXPECT_TRUE(use.apply(name).next()) << name;
+            }
+            SQLiteStmt key{db, "pragma foreign_key_list(Blobs)"};
+            auto use = key.use();
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getStr(2), "Ingestions");
+            EXPECT_EQ(use.getStr(3), "ingestion");
+            EXPECT_EQ(use.getStr(6), "CASCADE");
+            EXPECT_FALSE(use.next());
+        }
+        store = std::make_shared<LocalStore>(ref{config});
+        EXPECT_EQ(store->queryPathInfo(path)->objectHash, before->objectHash);
+        EXPECT_TRUE(store->objects.holderOrForget(merkle::blobId("old store bytes"), false, NoRepair));
+    }
+}
+
 TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAccess)
 {
     bool savedWAL = settings.useSQLiteWAL;
@@ -3252,12 +3425,13 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                     "insert into OldBlobs select id, exec, ino, dev, ingestion, name, size from Blobs;"
                     "drop table Blobs; alter table OldBlobs rename to Blobs;"
                     "create index IndexBlobsIngestion on Blobs(ingestion);"
-                    "delete from SchemaMigrations where migration = '20260924-blob-holder-without-rowid';",
+                    "delete from SchemaMigrations where migration = '20260928-ingestion-owned-projections';",
                     candidates ? "id, exec, ingestion" : "id, exec"));
-                if (!candidates)
-                    db.exec("delete from SchemaMigrations where migration = '20260921-blob-holder-candidates'");
+                /* A legacy cache without ownership constraints may contain an
+                   orphan. It is unreadable as a holder and must not block upgrade. */
+                db.exec("insert into Blobs values (zeroblob(32), 0, 0, 0, 9223372036854775806, 'orphan', 0)");
                 expected = readRows(db);
-                ASSERT_EQ(expected.size(), candidates ? 6u : 4u);
+                ASSERT_EQ(expected.size(), candidates ? 7u : 5u);
                 txn.commit();
                 checkLayout(db, false, candidates ? 3 : 0);
             }
@@ -3289,26 +3463,27 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                 SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
                 EXPECT_EQ(readRows(db), expected);
                 checkLayout(db, false, candidates ? 3 : 0);
-                /* Fail the real migration after copy, replacement and index creation.
-                   Earlier named migrations may already have committed separately. */
+                /* Failure after replacement and index creation rolls the entire
+                   ownership migration back to the original layout. */
                 db.exec(
                     "create trigger RefuseBlobMigration before insert on SchemaMigrations "
-                    "when new.migration = '20260924-blob-holder-without-rowid' "
+                    "when new.migration = '20260928-ingestion-owned-projections' "
                     "begin select raise(abort, 'test refuses blob migration marker'); end");
             }
             EXPECT_THROW((std::make_shared<LocalStore>(ref{config})), SQLiteError);
             {
                 SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
                 EXPECT_EQ(readRows(db), expected);
-                checkLayout(db, false, 3);
+                checkLayout(db, false, candidates ? 3 : 0);
                 SQLiteStmt marker{
-                    db, "select 1 from SchemaMigrations where migration = '20260924-blob-holder-without-rowid'"};
+                    db, "select 1 from SchemaMigrations where migration = '20260928-ingestion-owned-projections'"};
                 EXPECT_FALSE(marker.use().next());
-                SQLiteStmt temporary{
-                    db, "select 1 from sqlite_master where type = 'table' and name = 'BlobsWithoutRowid'"};
+                SQLiteStmt temporary{db, "select 1 from sqlite_master where type = 'table' and name = 'OwnedBlobs'"};
                 EXPECT_FALSE(temporary.use().next());
                 db.exec("drop trigger RefuseBlobMigration");
             }
+            auto owned = expected;
+            std::erase_if(owned, [](const auto & row) { return std::get<4>(row) == 9223372036854775806LL; });
             for (unsigned reopen = 0; reopen < 2; ++reopen) {
                 store = std::make_shared<LocalStore>(ref{config});
                 checkHolders(*store);
@@ -3318,10 +3493,13 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                     checkHolders(*ro);
                 }
                 SQLite db{dbPath, {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
-                EXPECT_EQ(readRows(db), expected);
+                EXPECT_EQ(readRows(db), owned);
                 checkLayout(db, true, 3);
+                SQLiteStmt foreignKeys{db, "pragma foreign_key_check(Blobs)"};
+                EXPECT_FALSE(foreignKeys.use().next());
                 SQLiteStmt marker{
-                    db, "select count(*) from SchemaMigrations where migration = '20260924-blob-holder-without-rowid'"};
+                    db,
+                    "select count(*) from SchemaMigrations where migration = '20260928-ingestion-owned-projections'"};
                 auto use = marker.use();
                 ASSERT_TRUE(use.next());
                 EXPECT_EQ(use.getInt(0), 1);
@@ -3340,7 +3518,7 @@ TEST_F(LocalStoreObjectsTest, theSweepJudgesARowByItsIngestionsPath)
     /* Registered: kept. */
     auto named = realStoreDir / "judge1";
     restore(named, treeNar({{"a", "one", 'f'}}));
-    auto kept = store->blobRowCount(false);
+    auto kept = blobRowCount(*store, false);
     ASSERT_GT(kept, 0u);
 
     /* In flight: no path, but its hold is still there. */
@@ -3351,11 +3529,11 @@ TEST_F(LocalStoreObjectsTest, theSweepJudgesARowByItsIngestionsPath)
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
     store->restoreThroughObjects(flying, source, /*startFsync=*/false, hooks.get(), hold, NoRepair);
     stageLegacyUnregisteredRows(hold);
-    auto withFlying = store->blobRowCount(false);
+    auto withFlying = blobRowCount(*store, false);
     ASSERT_GT(withFlying, kept);
 
     store->sweepStaleBlobRows();
-    EXPECT_EQ(store->blobRowCount(false), withFlying)
+    EXPECT_EQ(blobRowCount(*store, false), withFlying)
         << "an ingestion in flight keeps its rows: its hold says it is alive";
 
     /* Its hold released without a registration: now it is a dead ingestion. */
@@ -3363,7 +3541,7 @@ TEST_F(LocalStoreObjectsTest, theSweepJudgesARowByItsIngestionsPath)
         auto releasing = std::move(hold);
     }
     store->sweepStaleBlobRows();
-    EXPECT_EQ(store->blobRowCount(false), kept) << "and once the hold is gone its rows are";
+    EXPECT_EQ(blobRowCount(*store, false), kept) << "and once the hold is gone its rows are";
     EXPECT_TRUE(store->objects.holderOrForget(merkle::blobId("one"), false, NoRepair).has_value())
         << "the registered ingestion's row is untouched";
     EXPECT_FALSE(store->objects.holderOrForget(merkle::blobId("two"), false, NoRepair).has_value());
@@ -3382,7 +3560,7 @@ TEST_F(LocalStoreObjectsTest, sweepKeepsAPlainFileRootsBlob)
     ASSERT_EQ(r.root, (merkle::TreeEntry{merkle::Mode::Regular, blob}));
     ASSERT_EQ(ObjectHash::of(r.root).hash, blob);
     /* The root is the holder: one row, no file under `blobs/`, one link. */
-    ASSERT_EQ(store->blobRowCount(false), 1u);
+    ASSERT_EQ(blobRowCount(*store, false), 1u);
     ASSERT_EQ(blobFileOf(blob, false), t);
     ASSERT_FALSE(pathExists(objects.dir / "blobs"));
     ASSERT_EQ(st(t).st_nlink, 1u);
@@ -3396,7 +3574,7 @@ TEST_F(LocalStoreObjectsTest, sweepKeepsAPlainFileRootsBlob)
        blob nowhere and the same live root is one whose object it lacks. */
     unlinkInPlace(t);
     EXPECT_FALSE(hasBlob(blob, false));
-    EXPECT_EQ(store->blobRowCount(false), 0u);
+    EXPECT_EQ(blobRowCount(*store, false), 0u);
     swept = objects.sweep();
     EXPECT_EQ(auxiliaryRowCount(), 0u) << "a plain root has no auxiliary value";
     EXPECT_EQ(swept.blobsRemoved, 0u);
@@ -3555,8 +3733,8 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
         EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
     EXPECT_EQ(relation(first), relation(firstExpected));
     EXPECT_EQ(relation(second), relation(secondExpected));
-    EXPECT_EQ(store->blobRowCount(false), 0u);
-    EXPECT_EQ(store->blobRowCount(true), 0u);
+    EXPECT_EQ(blobRowCount(*store, false), 0u);
+    EXPECT_EQ(blobRowCount(*store, true), 0u);
 }
 
 /* Pending identity is the active byte string and executable bit. Algorithm
@@ -3822,7 +4000,7 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
         StringSource source{nar};
         auto result = store->restoreThroughObjects(real, source, false, hooks.get(), hold, NoRepair);
         info.objectHash = ObjectHash::of(result.root);
-        info.narSize = result.narSize;
+        info.narSize = result.narSize.value();
         ASSERT_EQ(physicalClass(real / "file"), std::min(donorClass, otherClass));
         ASSERT_EQ(readFile(real / "file"), corrupt);
         EXPECT_THROW(store->registerValidPath(info, hold), Error);
@@ -4124,7 +4302,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
             hold.addAuxiliary({entry, body});
             EXPECT_FALSE(store->objects.readAuxiliary(entry));
             EXPECT_EQ(auxiliaryRowCount(), before);
-            store->recordBlobsAtPath(hold, path);
+            recordBlobsAtPath(hold, path);
             EXPECT_EQ(store->objects.readAuxiliary(entry), body);
             SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
             SQLiteStmt query{db, "select chunk, typeof(body), body from AuxValues where ingestion = ? order by chunk;"};
@@ -4304,7 +4482,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesBelongToEveryPublishingIngestion)
             store->beginIngestion(*hold, owners[0]);
             hold->addAuxiliary({entry, body});
             EXPECT_FALSE(store->objects.readAuxiliary(entry));
-            store->recordBlobsAtPath(*hold, owners[0]);
+            recordBlobsAtPath(*hold, owners[0]);
             publishAuxiliary(owners[1], {{entry, body}});
             EXPECT_EQ(store->objects.readAuxiliary(entry), body);
             auto first = firstCollected ? 0 : 1;
@@ -4404,7 +4582,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryVerificationRepairsOnlyCorruptIncarnation
         }
         eraseAuxiliary(entry);
         EXPECT_FALSE(store->objects.readAuxiliary(entry));
-        store->recordBlobsAtPath(pending, target);
+        recordBlobsAtPath(pending, target);
         EXPECT_EQ(store->objects.readAuxiliary(entry), body)
             << "a surviving attempt can publish its owned value after every prior incarnation was removed";
         ++cases;
@@ -4427,7 +4605,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryPublicationDoesNotCreateFilesForAnyUmask)
                 auto old = ::umask(mask);
                 Finally restoreMask{[&] { ::umask(old); }};
                 hold.addAuxiliary({entry, body});
-                store->recordBlobsAtPath(hold, path);
+                recordBlobsAtPath(hold, path);
             }
             EXPECT_EQ(store->objects.readAuxiliary(entry), body);
             EXPECT_TRUE(std::filesystem::is_empty(hold.directory()));
@@ -4739,8 +4917,8 @@ TEST_F(LocalStoreObjectsTest, executableHolderCarriesItsBitOnThePathsOwnFile)
     auto id = merkle::blobId("same");
 
     /* Two rows, one per mode; no file under either kind's directory. */
-    EXPECT_EQ(store->blobRowCount(false), 1u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 1u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
     EXPECT_FALSE(pathExists(objects.dir / "blobs"));
     EXPECT_FALSE(pathExists(objects.dir / "blobs-x"));
 
@@ -4813,11 +4991,13 @@ TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
             setWriteTime(where, 1, 1);
             auto before = st(where);
             auto name = CanonPath::fromFilename("a");
+
             struct Spelling
             {
                 std::filesystem::path root, file;
                 std::string expectedName;
             };
+
             const Spelling spellings[] = {
                 {{}, where, where.string()},
                 {where, where, ""},
@@ -4831,8 +5011,7 @@ TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
                 auto hold = objects.hold();
                 hold.setRoot(spelling.root);
                 if (route == 2)
-                    ASSERT_TRUE(objects.place(
-                        id, executable, fd.get(), name, spelling.file, before, NoRepair, hold));
+                    ASSERT_TRUE(objects.place(id, executable, fd.get(), name, spelling.file, before, NoRepair, hold));
                 else
                     objects.enterWritten(
                         id, executable, fd.get(), name, spelling.file, NoRepair, hold, /*looked=*/route == 1);
@@ -4879,7 +5058,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                         makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
                     auto result = store->restoreThroughObjects(donorRoot, source, false, hooks.get(), hold, NoRepair);
                     ValidPathInfo info{donor, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
-                    info.narSize = result.narSize;
+                    info.narSize = result.narSize.value();
                     store->registerValidPath(info, hold);
                 }
 
@@ -5203,7 +5382,7 @@ TEST_F(LocalStoreObjectsTest, enospcLeftFileIsReportedNotRepairedForever)
     EXPECT_EQ(readFile(realPath / "a"), "one") << "its bytes are its own";
 
     ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(entered.root)}};
-    info.narSize = entered.narSize;
+    info.narSize = entered.narSize.value();
     store->registerValidPath(info);
 
     /* Reported, and not repaired while the index is full: `--repair`
@@ -5575,14 +5754,10 @@ TEST_F(LocalStoreObjectsTest, versionOneSignatureWithoutAssertedNarHashIsChecked
    as the row stands -- no NAR hash to verify it against -- and alive
    given the walk (`narHashOf`), which `nix store verify` binds.  Before:
    0 either way (and no way to hand the walk in). */
-TEST_F(LocalStoreObjectsTest, theRegisteredDescriptionsNarHashIsTheWalkAndNotTheSendersClosure)
+TEST_F(LocalStoreObjectsTest, aTransferNarHashCallbackIsNeitherForcedNorRetainedByLocalRegistration)
 {
-    /* A sender's description may carry a NAR-hash thunk over bytes it still
-       holds -- the evaluator's write buffer builds one over the text it is
-       about to write (`write-buffer.cc`, `infoFor`) -- and the path-info
-       cache keeps every description registered, so those bytes would stay
-       resident for the life of the process.  What is registered carries the
-       store's own walk instead: the same hash, holding nothing. */
+    /* Replay belongs to the transfer. Cached metadata must not keep the
+       sender's bytes alive, and local publication does not need the replay. */
     StringSink nar;
     dumpString("retained", nar);
     ValidPathInfo info{
@@ -5591,15 +5766,110 @@ TEST_F(LocalStoreObjectsTest, theRegisteredDescriptionsNarHashIsTheWalkAndNotThe
             *store, ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("retained")})},
     };
     info.narSize = nar.s.size();
-    /* A thunk that answers something else: if the row kept the sender's,
-       this is what the row would say. */
-    info.lazyNarHash = [] { return hashString(HashAlgorithm::SHA256, "not this object's NAR"); };
-    StringSource source{nar.s};
-    store->addToStore(info, source, NoRepair, NoCheckSigs);
+    std::weak_ptr<std::string> retained;
+    unsigned forced = 0;
+    {
+        auto bytes = std::make_shared<std::string>(nar.s);
+        retained = bytes;
+        StringSource source{*bytes};
+        store->addToStore(info, source, NoRepair, NoCheckSigs, [bytes, &forced] {
+            forced++;
+            return hashString(HashAlgorithm::SHA256, *bytes);
+        });
+    }
 
     auto row = store->queryPathInfo(info.path);
-    ASSERT_TRUE(row->lazyNarHash.has_value());
-    EXPECT_EQ((*row->lazyNarHash)(), hashString(HashAlgorithm::SHA256, nar.s));
+    EXPECT_EQ(forced, 0u);
+    EXPECT_TRUE(retained.expired());
+    EXPECT_EQ(row->objectHash, info.objectHash);
+    EXPECT_EQ(narHashOf(*store, row->path), hashString(HashAlgorithm::SHA256, nar.s));
+}
+
+TEST_F(LocalStoreObjectsTest, convergentDestinationNamesKeepEachTransfersNarHash)
+{
+    struct RecordingDestination : LocalStore
+    {
+        unsigned transfers = 0;
+        StorePathSet destinations;
+        std::set<Hash> hashes;
+
+        explicit RecordingDestination(ref<const LocalStore::Config> config)
+            : Store{*config}
+            , LocalFSStore{*config}
+            , LocalStore{config}
+        {
+        }
+
+        /* Like the remote batch writer, consume every entry, including two
+           entries with the same destination name. No daemon is needed. */
+        void addMultipleToStore(
+            PathsSource && paths,
+            Activity &,
+            RepairFlag,
+            CheckSigsFlag,
+            const std::function<Hash(const StorePath &, const Source &)> & narHash) override
+        {
+            for (auto & [info, source] : paths) {
+                auto headerHash = narHash(info.path, *source);
+                StringSink nar;
+                copyNAR(*source, nar);
+                EXPECT_EQ(headerHash, hashString(HashAlgorithm::SHA256, nar.s));
+                hashes.insert(headerHash);
+                destinations.insert(info.path);
+                transfers++;
+            }
+        }
+    };
+
+    auto targetConfig = make_ref<LocalStoreConfig>(
+        tempStoreDir.path() / "copy-target", StoreConfig::Params{{"store", "/copy-destination"}});
+    RecordingDestination target{targetConfig};
+
+    /* The canonical CA path is renamed for the destination store. A
+       separate, input-addressed source already has that destination's
+       relative name and keeps it. Both source paths are valid, but their
+       executable modes and therefore their NAR hashes differ. */
+    const std::string bytes = "same flat content";
+    const ContentAddress ca{ContentAddressMethod::Raw::Flat, hashString(HashAlgorithm::SHA256, bytes)};
+    auto address = ContentAddressWithReferences::fromParts(ca.method, ca.hash, {});
+    auto caSourcePath = store->makeFixedOutputPathFromCA("same", address);
+    auto destinationPath = target.makeFixedOutputPathFromCA("same", address);
+    ASSERT_NE(caSourcePath, destinationPath);
+    StorePathSet paths;
+    for (bool executable : {false, true}) {
+        auto accessor = make_ref<MemorySourceAccessor>();
+        MemorySink sink{*accessor};
+        sink.createRegularFile(CanonPath::root, [&](auto & file) {
+            file(bytes);
+            if (executable)
+                file.isExecutable();
+        });
+        StringSink nar;
+        accessor->dumpPath(CanonPath::root, nar);
+        ValidPathInfo info{
+            executable ? destinationPath : caSourcePath,
+            {*store,
+             ObjectHash::of({executable ? merkle::Mode::Executable : merkle::Mode::Regular, merkle::blobId(bytes)})}};
+        if (!executable)
+            info.ca = ca;
+        info.narSize = nar.s.size();
+        StringSource source{nar.s};
+        store->addToStore(info, source, NoRepair, NoCheckSigs);
+        auto admitted = store->queryPathInfo(info.path);
+        ASSERT_FALSE(admitted->assertedNarHash);
+        ASSERT_EQ(admitted->ca.has_value(), !executable);
+        if (admitted->ca)
+            ASSERT_TRUE(admitted->isContentAddressed(*store));
+        paths.insert(info.path);
+    }
+
+    auto renamed = copyPaths(*store, target, paths, NoRepair, NoCheckSigs, NoSubstitute);
+    ASSERT_EQ(renamed.size(), 2u);
+    EXPECT_EQ(renamed.at(caSourcePath), destinationPath);
+    EXPECT_EQ(renamed.at(destinationPath), destinationPath);
+    EXPECT_EQ(target.transfers, 2u);
+    EXPECT_EQ(target.destinations.size(), 1u);
+    EXPECT_EQ(target.hashes.size(), 2u);
 }
 
 TEST_F(LocalStoreObjectsTest, versionOneSignatureOnARowVerifiesWithTheWalk)
@@ -6762,8 +7032,8 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsLinksEveryFileAndReadsNothin
     auto t1 = realStoreDir / "m1";
     auto r1 = restore(t1, nar);
     EXPECT_EQ(filesCreated, 4u);
-    EXPECT_EQ(store->blobRowCount(false), 3u);
-    EXPECT_EQ(store->blobRowCount(true), 1u);
+    EXPECT_EQ(blobRowCount(*store, false), 3u);
+    EXPECT_EQ(blobRowCount(*store, true), 1u);
 
     /* The second: the root is named and held, so the whole tree is made
        from the objects; the source is asked for the root's status alone. */
@@ -6777,7 +7047,7 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsLinksEveryFileAndReadsNothin
     EXPECT_EQ(counting->stats, 1u);
     EXPECT_EQ(r2.root, r1.root);
     EXPECT_EQ(r2.narSize, nar.size());
-    EXPECT_TRUE(r2.narSizeExact);
+    EXPECT_TRUE(r2.narSize.has_value());
     StringSink again;
     dumpPath(t2, again);
     EXPECT_EQ(again.s, nar);
@@ -6796,8 +7066,8 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsLinksEveryFileAndReadsNothin
     EXPECT_EQ(st(t2 / "d/e").st_mtime, 1);
     EXPECT_EQ(st(t2 / "d/link").st_mtime, 1);
     EXPECT_EQ(readLink(t2 / "d/link"), "b");
-    EXPECT_EQ(store->blobRowCount(false), 6u);
-    EXPECT_EQ(store->blobRowCount(true), 2u);
+    EXPECT_EQ(blobRowCount(*store, false), 6u);
+    EXPECT_EQ(blobRowCount(*store, true), 2u);
     EXPECT_EQ(count("blobs"), 4u);
     EXPECT_EQ(count("blobs-x"), 1u);
     EXPECT_EQ(count("trees"), 3u);
@@ -6811,7 +7081,7 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsLinksEveryFileAndReadsNothin
     EXPECT_EQ(r3.root, (merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("two")}));
     EXPECT_EQ(r3.narSize, narOf(*file).size());
     EXPECT_EQ(st(t3).st_ino, st(t1 / "d/b").st_ino);
-    EXPECT_EQ(store->blobRowCount(false), 7u);
+    EXPECT_EQ(blobRowCount(*store, false), 7u);
 }
 
 /* The same tree with one file changed inside `d`: the root and `d` are
@@ -7112,7 +7382,7 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
             EXPECT_EQ(st(dst / "p/a").st_ino, st(dst / "q/a").st_ino);
             EXPECT_EQ(readFile(dst / "p/a"), bytes);
             EXPECT_EQ(readFile(dst / "q/a"), bytes);
-            store->recordBlobsAtPath(hold, dst);
+            recordBlobsAtPath(hold, dst);
             auto holder = store->objects.holderOrForget(id, executable, NoRepair);
             ASSERT_TRUE(holder);
             EXPECT_EQ(holder->ino, st(dst / "q/a").st_ino);
@@ -7206,6 +7476,158 @@ TEST_F(LocalStoreObjectsTest, completedSubtreeMergesEveryAliasAndNeverRollsBackP
             EXPECT_EQ(source->reads, 1u) << "only the unnamed outer file is read; merge never becomes fallback";
         }
 }
+
+/* A valid cached subtree gets no extra depth allowance when grafted into
+   another tree. The boundary applies to every node, including leaves;
+   naming a nested directory must retain its depth relative to the root. */
+TEST_F(LocalStoreObjectsTest, cachedMaterialisationPreservesRootRelativeDepth)
+{
+    using File = MemorySourceAccessor::File;
+    auto wrap = [](File node, size_t depth) {
+        for (size_t i = 0; i < depth; ++i) {
+            File::Directory parent;
+            parent.entries.emplace("d", std::move(node));
+            node = File{std::move(parent)};
+        }
+        return node;
+    };
+
+    for (char kind : {'f', 'x', 'l', 'd'})
+        for (size_t subtreeDepth : {size_t{0}, narMaxDepth - 2, narMaxDepth - 1}) {
+            File terminal{File::Directory{}};
+            if (kind == 'l')
+                terminal = File{File::Symlink{.target = "absent-target"}};
+            else if (kind != 'd')
+                terminal = File{File::Regular{.executable = kind == 'x', .contents = "depth-boundary"}};
+            auto subtree = make_ref<MemorySourceAccessor>();
+            subtree->root = wrap(std::move(terminal), subtreeDepth);
+            auto label = fmt("cached-depth-%c-%d", kind, subtreeDepth);
+            /* Every donor is accepted by the ordinary NAR route before
+               it is reused. No invalid cached tree is manufactured. */
+            auto donor = restore(config->realStoreDir.get() / (label + "-donor"), narOf(*subtree));
+
+            for (size_t graftDepth : {size_t{0}, size_t{1}, size_t{2}}) {
+                /* Non-directory children are not TreeNamer sites. The
+                   four depth-zero cases exercise each mode at the root. */
+                if (!subtreeDepth && graftDepth)
+                    continue;
+                SCOPED_TRACE(fmt("kind=%c subtree=%d graft=%d", kind, subtreeDepth, graftDepth));
+                auto tree = make_ref<MemorySourceAccessor>();
+                tree->root = wrap(*subtree->root, graftDepth);
+                auto namedPath = CanonPath::root;
+                for (size_t i = 0; i < graftDepth; ++i)
+                    namedPath = namedPath / "d";
+                auto depth = subtreeDepth + graftDepth;
+
+                for (bool cached : {false, true}) {
+                    SCOPED_TRACE(cached);
+                    auto source = make_ref<CountingAccessor>(tree);
+                    unsigned named = 0;
+                    auto namer = [&](const CanonPath & path,
+                                     const SourceAccessor::Stat &) -> std::optional<merkle::TreeEntry> {
+                        if (cached && path == namedPath) {
+                            ++named;
+                            return donor.root;
+                        }
+                        return std::nullopt;
+                    };
+                    auto dst = config->realStoreDir.get() / fmt("%s-%d-%d", label, graftDepth, cached);
+                    if (depth >= narMaxDepth) {
+                        EXPECT_THROW(materialise(dst, SourcePath(source), namer), Error);
+                    } else {
+                        auto copied = materialise(dst, SourcePath(source), namer);
+                        auto expectedNar = narOf(*tree);
+                        EXPECT_EQ(copied.root, referenceObjectEntry(*tree, CanonPath::root));
+                        EXPECT_TRUE(copied.narSize.has_value());
+                        EXPECT_EQ(copied.narSize, expectedNar.size());
+                        StringSink actual;
+                        dumpPath(dst, actual);
+                        EXPECT_EQ(actual.s, expectedNar);
+                        EXPECT_EQ(source->stats, cached ? graftDepth + 1 : depth + 1);
+                        EXPECT_EQ(source->listings, cached ? graftDepth : depth + (kind == 'd'));
+                        EXPECT_EQ(source->reads, !cached && (kind == 'f' || kind == 'x') ? 1u : 0u);
+                        EXPECT_EQ(source->links, !cached && kind == 'l' ? 1u : 0u);
+                    }
+                    EXPECT_EQ(named, cached ? 1u : 0u);
+                }
+            }
+        }
+}
+
+#  ifdef __APPLE__
+/* Executable mode belongs to the file, even when hooks only observe it
+   or are absent. A cached file excluded from hardlinking must follow the
+   same write protocol as an ordinary copy into an application bundle. */
+TEST_F(LocalStoreObjectsTest, cachedMaterialisationPreservesExecutableModeWithoutCanonicalisingHooks)
+{
+    struct Hooks : RestoreSinkHooks
+    {
+        bool expectedExecutable;
+        unsigned files = 0;
+
+        explicit Hooks(bool executable)
+            : expectedExecutable(executable)
+        {
+        }
+
+        void directoryDone(Descriptor) override {}
+
+        void regularFileCreated(Descriptor fd, bool executable) override
+        {
+            ++files;
+            EXPECT_EQ(executable, expectedExecutable);
+            EXPECT_EQ(bool(nix::fstat(fd).st_mode & S_IXUSR), expectedExecutable);
+        }
+
+        void symlinkCreated(Descriptor, const CanonPath &) override {}
+    };
+
+    for (bool executable : {false, true}) {
+        auto tree = make_ref<MemorySourceAccessor>();
+        tree->root = MemorySourceAccessor::File::Regular{.executable = executable, .contents = "application contents"};
+        auto expectedNar = narOf(*tree);
+        auto donorPath = config->realStoreDir.get() / fmt("cached-mode-donor-%d", executable);
+        auto donor = restore(donorPath, expectedNar);
+        for (auto repair : {NoRepair, Repair})
+            for (bool observe : {false, true})
+                for (bool cached : {false, true}) {
+                    auto label = fmt("cached-mode-%d-%d-%d-%d", executable, repair, observe, cached);
+                    SCOPED_TRACE(label);
+                    auto dst = config->realStoreDir.get() / label / "Example.app/Contents/leaf";
+                    createDirs(dst.parent_path());
+                    auto source = make_ref<CountingAccessor>(tree);
+                    auto namer = [&](const CanonPath &,
+                                     const SourceAccessor::Stat &) -> std::optional<merkle::TreeEntry> {
+                        return cached ? std::optional(donor.root) : std::nullopt;
+                    };
+                    Hooks hooks{executable};
+                    auto hold = store->objects.hold();
+                    auto copied = store->materialiseThroughObjects(
+                        dst,
+                        SourcePath(source),
+                        defaultPathFilter,
+                        false,
+                        observe ? &hooks : nullptr,
+                        repair,
+                        namer,
+                        hold);
+                    EXPECT_EQ(copied.root, donor.root);
+                    EXPECT_TRUE(copied.narSize.has_value());
+                    EXPECT_EQ(copied.narSize, expectedNar.size());
+                    EXPECT_EQ(bool(st(dst).st_mode & S_IXUSR), executable);
+                    EXPECT_NE(st(dst).st_ino, st(donorPath).st_ino);
+                    EXPECT_EQ(hooks.files, observe ? 1u : 0u);
+                    EXPECT_EQ(source->stats, 1u);
+                    EXPECT_EQ(source->reads, cached ? 0u : 1u);
+                    EXPECT_EQ(source->listings, 0u);
+                    EXPECT_EQ(source->links, 0u);
+                    StringSink actual;
+                    dumpPath(dst, actual);
+                    EXPECT_EQ(actual.s, expectedNar);
+                }
+    }
+}
+#  endif
 
 /* `LocalStore::materialise` registers what `addToStore` would: the same
    path, content address, object hash and NAR size; a second call finds
@@ -7484,7 +7906,7 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_materialised_path_is_the_resto
         RC_ASSERT(filesCreated == 0u);
         RC_ASSERT(r.root == r1.root);
         RC_ASSERT(r.narSize == r1.narSize);
-        RC_ASSERT(r.narSizeExact);
+        RC_ASSERT(r.narSize.has_value());
         StringSink again;
         dumpPath(dst, again);
         RC_ASSERT(again.s == nar);
@@ -7650,7 +8072,7 @@ TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionA
 }
 
 /* The parallel copy is the sequential copy (`01` §9.10, *One route*;
-   `MaterialisingVisitor::copyChildren`): the second route walks a
+   `HashingVisitor::orderedChildren`): the second route walks a
    directory's *subdirectories* on a bounded pool, and what it makes must
    not depend on how many threads that is.  Both copies are made into the
    same store, which already holds every object, so each file is a link to
@@ -7719,7 +8141,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
             /* The summary the copy returns. */
             EXPECT_EQ(many.result.root, one.result.root) << label;
             EXPECT_EQ(many.result.narSize, one.result.narSize) << label;
-            EXPECT_EQ(many.result.narSizeExact, one.result.narSizeExact) << label;
+            EXPECT_EQ(many.result.narSize.has_value(), one.result.narSize.has_value()) << label;
             EXPECT_EQ(many.created, one.created) << label;
             EXPECT_EQ(one.result.root, r0.root) << label;
 
@@ -7890,7 +8312,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyPreservesLogicalAndPhysicalChildNames)
                 dst, SourcePath(tree), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
             EXPECT_EQ(result.root, expectedRoot);
             EXPECT_EQ(result.narSize, expectedNar.size());
-            EXPECT_TRUE(result.narSizeExact);
+            EXPECT_TRUE(result.narSize.has_value());
             StringSink actualNar;
             dumpPath(dst, actualNar);
             EXPECT_EQ(actualNar.s, expectedNar);
@@ -8777,16 +9199,16 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                      .dev = status.st_dev,
                      .size = bytes.size(),
                      .name = ""});
-                auto rowsBefore = target->blobRowCount(false);
+                auto rowsBefore = LocalStoreObjectsTest::blobRowCount(*target, false);
                 EXPECT_THROW(target->registerValidPaths(input, &hold), Error);
                 EXPECT_EQ(target->queryAllValidPaths(), before);
-                EXPECT_EQ(target->blobRowCount(false), rowsBefore);
+                EXPECT_EQ(LocalStoreObjectsTest::blobRowCount(*target, false), rowsBefore);
                 auto rows = hold.takeProjection().regular;
                 EXPECT_EQ(rows.size(), 1u);
                 if (rows.size() == 1)
                     EXPECT_EQ(rows.front().id, id);
                 EXPECT_FALSE(hold.ingestion->id.has_value());
-                EXPECT_FALSE(hold.ingestion->completed);
+                EXPECT_TRUE(hold.completedIngestions.empty());
             }
         }
     }
@@ -9022,6 +9444,72 @@ TEST_F(TempLocalStoreTest, invalidationAfterValidityBackendCannotBeUndoneByItsRe
     EXPECT_THROW(observed->queryPathInfo(path), InvalidPath);
 }
 
+TEST_F(TempLocalStoreTest, overlayAccessorListsLowerVisibleObjectsWithoutClaimingOwnership)
+{
+    const std::string contents = "lower-only visible bytes";
+    StringSource source{contents};
+    auto lowerPath = store->addToStoreFromDump(
+        source,
+        "lower-only",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    auto lowerReference = config->getReference();
+    lowerReference.params.insert_or_assign("root", tempStoreDir.path().string());
+    auto root = tempStoreDir.path() / "visible-overlay";
+    auto overlayConfig = std::make_shared<LocalOverlayStoreConfig>(
+        root,
+        StoreConfig::Params{
+            {"lower-store", lowerReference.render(true)},
+            {"upper-layer", (root / "upper").string()},
+            {"check-mount", "false"}});
+    auto overlay = std::make_shared<LocalOverlayStore>(ref{overlayConfig});
+    EXPECT_TRUE(overlay->queryAllValidPaths().empty());
+    EXPECT_TRUE(overlay->mayHaveValidPaths());
+    EXPECT_TRUE(overlay->queryVisibleValidPaths().contains(lowerPath));
+
+    /* Supply the merged physical view without requiring an OverlayFS mount
+       in the unit sandbox. Membership still comes from the actual lower DB. */
+    auto view = overlay->getFSAccessor();
+    EXPECT_TRUE(view->readDirectory(CanonPath::root).empty());
+    std::filesystem::copy_file(store->toRealPath(lowerPath), overlay->toRealPath(lowerPath));
+    auto unregistered = StorePath::random("unregistered");
+    writeFile(overlay->toRealPath(unregistered), "not registered in either layer");
+    auto entries = view->readDirectory(CanonPath::root);
+    ASSERT_EQ(entries.size(), 1u);
+    EXPECT_TRUE(entries.contains(lowerPath.to_string()));
+    unsigned calls = 0;
+    view->readDirectoryWithEntries(
+        CanonPath::root,
+        [&](SourceAccessor & scoped, const CanonPath & relative, SourceAccessor::DirectoryListing && listing) {
+            ++calls;
+            EXPECT_EQ(&scoped, view.get_ptr().get());
+            EXPECT_EQ(relative, CanonPath::root);
+            EXPECT_EQ(listing.entries(), entries);
+        });
+    EXPECT_EQ(calls, 1u);
+    /* Listing is not a validity lookup that copies lower metadata upward. */
+    EXPECT_TRUE(overlay->queryAllValidPaths().empty());
+    StringSource upperSource{std::string_view{"upper-only bytes"}};
+    auto upperPath = overlay->addToStoreFromDump(
+        upperSource,
+        "upper-only",
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256,
+        {},
+        NoRepair);
+    EXPECT_EQ(overlay->queryAllValidPaths(), StorePathSet{upperPath});
+    auto merged = view->readDirectory(CanonPath::root);
+    EXPECT_EQ(merged.size(), 2u);
+    EXPECT_TRUE(merged.contains(lowerPath.to_string()));
+    EXPECT_TRUE(merged.contains(upperPath.to_string()));
+    EXPECT_EQ(overlay->queryAllValidPaths(), StorePathSet{upperPath});
+    EXPECT_EQ(view->readFile(CanonPath(lowerPath.to_string())), contents);
+}
+
 /* Public callback behavior when the caller releases the store-wide wrapper.
    Its physical child is private, so this is behavior coverage, not a weak
    ownership observation or a deterministic negative control for the child.
@@ -9041,13 +9529,13 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
     struct RootBorrowLost
     {};
 
-    for (unsigned operation = 0; operation != 6; ++operation)
+    for (unsigned operation = 0; operation != 4; ++operation)
         for (bool release : {false, true})
             for (bool stop : {false, true}) {
                 SCOPED_TRACE(fmt("operation=%d release=%d stop=%d", operation, release, stop));
                 auto view = store->getFSAccessor().get_ptr();
                 std::weak_ptr<SourceAccessor> outer = view;
-                bool rootScope = operation >= 4;
+                bool rootScope = operation == 3;
                 auto scopedPath = rootScope ? CanonPath::root : directory;
                 unsigned entered = 0;
                 auto callback = [&] {
@@ -9086,13 +9574,6 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
                             EXPECT_EQ(size, expected.size());
                             if (operation == 0)
                                 callback();
-                        });
-                    else if (operation % 2 == 0)
-                        view->readDirectory(scopedPath, [&](SourceAccessor & child, const CanonPath & relative) {
-                            callback();
-                            auto entries = child.readDirectory(relative);
-                            checkEntries(entries);
-                            bytes = child.readFile(scopedFile(relative));
                         });
                     else
                         view->readDirectoryWithEntries(

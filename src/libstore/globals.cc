@@ -319,7 +319,7 @@ void RemovedSetting::assign(const bool & v)
        warning is the parent's, given once per top-level process
        (`Settings::configurationDiagnosedByParent`, main.cc). */
     if (v && !settings.configurationDiagnosedByParent)
-        warn("setting '%s' is ignored: %s", name, why);
+        warnOnce(haveWarned, "setting '%s' is ignored: %s", name, why);
 }
 
 void RemovedSetting::appendOrSet(bool newValue, bool append)

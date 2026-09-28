@@ -352,17 +352,6 @@ static void fetchTree(
             throw Error("input '%s' is not allowed to use the '__final' attribute", input.to_string());
     }
 
-    /* The fetcher reads whatever store paths the attributes named (a
-       `path` input is copied from the store, for instance), so they must be
-       there first.  Nothing is built: a derivation output in the context is
-       read unbuilt, as before. */
-    if (!context.empty())
-        state.flushPendingWrites();
-    /* A local input is read from the disk: if it names a pending object, the
-       object is written first, as at every dereference. */
-    if (auto p = input.getSourcePath(); p && p->is_absolute())
-        state.writePendingBeforeRead(state.rootPath(CanonPath(p->string())));
-
     auto cachedInput =
         state.inputCache->getAccessor(state.fetchSettings, *state.store, input, fetchers::UseRegistries::No);
 
@@ -569,10 +558,6 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
 
     if (who == "fetchTarball")
         url = state.settings.resolvePseudoUrl(*url);
-
-    /* A `file:` URL is read from the disk: the dereference rule. */
-    if (url->starts_with("file:///"))
-        state.writePendingBeforeRead(state.rootPath(CanonPath(url->substr(7))));
 
     state.checkURI(*url);
 

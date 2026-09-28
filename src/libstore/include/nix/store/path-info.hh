@@ -134,19 +134,11 @@ struct UnkeyedValidPathInfo
 
     /**
      * A thunk producing the NAR hash of this object: for the JSON formats
-     * before 4, whose `narHash` is required (`toJSON`), and for
-     * `lazyNarHash` below.
+     * before 4, whose `narHash` is required (`toJSON`), signatures, and
+     * transfers to old peers. The capability belongs to the operation,
+     * not to this description or a path-info cache.
      */
     using NarHashThunk = fun<Hash()>;
-
-    /**
-     * The NAR hash an old form may need, computed only when one asks
-     * (01 §9.11: the cost falls on the old peer).  Not part of the
-     * description -- neither compared nor serialised -- and forced by
-     * `CommonProto::writePathInfoHashes` alone, in the old form when
-     * `assertedNarHash` is absent; the new form's slot stays empty.
-     */
-    std::optional<NarHashThunk> lazyNarHash;
 
     UnkeyedValidPathInfo(const UnkeyedValidPathInfo & other) = default;
 

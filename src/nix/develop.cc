@@ -712,8 +712,8 @@ struct CmdDevelop : Common, MixEnvironment
             }
         }
 
-        execProgramInStore(
-            store, UseLookupPath::Use, shell, args, getEvalState()->finish(), buildEnvironment.getSystem());
+        getEvalState()->evalCaches.clear();
+        execProgramInStore(store, UseLookupPath::Use, shell, args, buildEnvironment.getSystem());
 #endif
     }
 };

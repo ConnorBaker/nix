@@ -107,15 +107,16 @@ void CommonProto::writePathInfoHashes(
     Sink & to,
     bool objectHashForm,
     const UnkeyedValidPathInfo & info,
-    const std::function<std::string(const Hash &)> & renderNarHash)
+    const std::function<std::string(const Hash &)> & renderNarHash,
+    const std::function<Hash()> * narHash)
 {
     if (objectHashForm)
         to << (info.objectHash ? info.objectHash->render() : "")
            << (info.assertedNarHash ? renderNarHash(*info.assertedNarHash) : "");
     else if (info.assertedNarHash)
         to << renderNarHash(*info.assertedNarHash);
-    else if (info.lazyNarHash)
-        to << renderNarHash((*info.lazyNarHash)());
+    else if (narHash && *narHash)
+        to << renderNarHash((*narHash)());
     else
         throw Error("sending path info to a peer speaking only the old form requires its NAR hash");
 }

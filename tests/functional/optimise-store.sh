@@ -32,6 +32,9 @@ outPath0=$(echo 'with import '"${config_nix}"'; mkDerivation { name = "foo0"; bu
 [[ $(grep -c "setting 'auto-optimise-store' is ignored" "$TEST_ROOT/auto-optimise.log") == 1 ]]
 NIX_CONFIG="auto-optimise-store = true" nix-store --version 2> "$TEST_ROOT/auto-optimise-conf.log"
 grepQuiet "setting 'auto-optimise-store' is ignored" "$TEST_ROOT/auto-optimise-conf.log"
+NIX_CONFIG=$'auto-optimise-store = true\nauto-optimise-store = true' \
+    nix-store --option auto-optimise-store true --version 2> "$TEST_ROOT/auto-optimise-repeated.log"
+[[ $(grep -c "setting 'auto-optimise-store' is ignored" "$TEST_ROOT/auto-optimise-repeated.log") == 1 ]]
 # Once per top-level process when the configuration itself says `true`
 # (the NixOS case): the build hook's child re-reads that configuration
 # and does not warn again (before, twice per `nix-build`).

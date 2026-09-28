@@ -535,8 +535,7 @@ private:
     InternalType internalType = tUninitialized;
     Payload payload;
 
-    /* The payload is `Value`'s alone: a class derived from `Value` must not
-       be able to read a string's bytes past `Value`'s friend list. */
+    /* Value owns access to its discriminated payload. */
     friend struct Value;
 
 #define NIX_VALUE_STORAGE_GET_IMPL(K, FIELD_NAME, DISCRIMINATOR) \
@@ -827,8 +826,7 @@ protected:
     }
 
 private:
-    /* The payload is `Value`'s alone: a class derived from `Value` must not
-       be able to read a string's bytes past `Value`'s friend list. */
+    /* Value owns access to its discriminated payload. */
     friend struct Value;
 
 #define NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(TYPE, MEMBER_A, MEMBER_B)                                   \
@@ -1475,19 +1473,6 @@ public:
         return SourcePath(
             ref(pathAccessor()->shared_from_this()), CanonPath(CanonPath::unchecked_t(), std::string(pathStrView())));
     }
-
-private:
-    /* The raw bytes of a string value.  Private, so that outside the
-       evaluator they are reachable only through the doors,
-       `EvalState::realise`/`emit` (01 §3, (C2); 04 §0.1): the compiler holds
-       the boundary.  The friends are the readers of the representation
-       itself, each keeping the bytes inside the evaluator or being a door. */
-    friend class EvalState;   // text extraction, coercion, comparison, and the doors
-    friend class SymbolValue; // attribute names: interned, context-free by construction
-    friend class SymbolStr;
-    friend struct ExprString; // string literals in the AST: the parser and `--parse`
-    friend class ToBeStringyExpr;
-    friend struct RawValueBytes; // tests, which check the invariants by looking at the representation
 
     const StringData & string_data() const noexcept
     {

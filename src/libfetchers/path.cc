@@ -6,7 +6,6 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/merkle-hash.hh"
-#include "nix/store/local-store.hh"
 
 namespace nix::fetchers {
 
@@ -155,12 +154,10 @@ struct PathInputScheme : InputScheme
         if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
             storePath = [&]() -> StorePath {
                 auto accessor = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
-                auto * local = dynamic_cast<LocalStore *>(&store);
-                bool fromObjects = local && local->materialisesFromObjects();
-                /* An empty local store cannot contain the destination. In
-                   every other case, name the source first to avoid copying
+                /* A store known to be empty cannot contain the destination.
+                   Otherwise name the source first to avoid copying
                    a tree the store already holds. Absence is not cached. */
-                if (!fromObjects || local->hasValidPaths()) {
+                if (store.mayHaveValidPaths()) {
                     auto named =
                         gitTreePath(store, "source", merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root));
                     store.addTempRoot(named);
@@ -174,15 +171,16 @@ struct PathInputScheme : InputScheme
                     accessor = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
                 }
                 Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
-                auto copied = fromObjects
-                                  ? local->materialise(
-                                        "source",
-                                        SourcePath(accessor),
-                                        defaultPathFilter,
-                                        NoRepair,
-                                        [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
-                                        /*callbacksPermitParallelism=*/true)
-                                  : store.addToStore("source", SourcePath(accessor), ContentAddressMethod::Raw::Git);
+                auto copied = store.addToStore(
+                    "source",
+                    SourcePath(accessor),
+                    ContentAddressMethod::Raw::Git,
+                    HashAlgorithm::SHA256,
+                    {},
+                    defaultPathFilter,
+                    NoRepair,
+                    [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
+                    /*callbacksPermitParallelism=*/true);
                 mtime = accessor->getLastModified().value();
                 return copied;
             }();

@@ -439,20 +439,20 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
                 if (auto attr = v.attrs()->get(state->symbols.create("type")))
-                    (void) state->realiseNoCtx(*attr->value, attr->pos, "");
+                    (void) state->forceStringNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("app '%s' lacks attribute 'type'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("program"))) {
                     if (attr->name == state->symbols.create("program"))
-                        (void) state->realise(*attr->value, attr->pos, "");
+                        (void) state->forceString(*attr->value, attr->pos, "");
                 } else
                     throw Error("app '%s' lacks attribute 'program'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("meta"))) {
                     state->forceAttrs(*attr->value, attr->pos, "");
                     if (auto dAttr = attr->value->attrs()->get(state->symbols.create("description")))
-                        (void) state->realiseNoCtx(*dAttr->value, dAttr->pos, "");
+                        (void) state->forceStringNoCtx(*dAttr->value, dAttr->pos, "");
                     else
                         logWarning({
                             .msg = HintFmt("app '%s' lacks attribute 'meta.description'", attrPath),
@@ -558,7 +558,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                     throw Error("template '%s' lacks attribute 'path'", attrPath);
 
                 if (auto attr = v.attrs()->get(state->symbols.create("description")))
-                    (void) state->realiseNoCtx(*attr->value, attr->pos, "");
+                    (void) state->forceStringNoCtx(*attr->value, attr->pos, "");
                 else
                     throw Error("template '%s' lacks attribute 'description'", attrPath);
 

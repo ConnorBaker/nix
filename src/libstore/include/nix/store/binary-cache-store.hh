@@ -234,11 +234,19 @@ public:
 
     std::optional<StorePath> queryPathFromHashPart(const std::string & hashPart) override;
 
-    void
-    addToStore(const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addToStore(
+        const ValidPathInfo & info,
+        Source & narSource,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash = {}) override;
 
-    void
-    addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addMultipleToStore(
+        PathsSource && pathsToCopy,
+        Activity & act,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash(const StorePath &, const Source &)> & narHash = {}) override;
 
     StorePath addToStoreFromDump(
         Source & dump,
@@ -256,7 +264,9 @@ public:
         HashAlgorithm hashAlgo,
         const StorePathSet & references,
         PathFilter & filter,
-        RepairFlag repair) override;
+        RepairFlag repair,
+        TreeNamer namer,
+        bool callbacksPermitParallelism) override;
 
     void registerDrvOutputUnchecked(const Realisation & info) override;
 

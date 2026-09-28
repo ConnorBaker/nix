@@ -169,7 +169,7 @@ public:
                 auto object = objectHashOf(*accessor, CanonPath::root);
                 auto info =
                     std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo{*this, ObjectHash::of(object.root)});
-                info->narSize = object.narSize;
+                info->narSize = object.narSize.value();
                 info->ca = ContentAddress{
                     .method = ContentAddressMethod::Raw::Text,
                     .hash = hashString(
@@ -211,7 +211,12 @@ public:
         unsupported("queryPathFromHashPart");
     }
 
-    void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override
+    void addToStore(
+        const ValidPathInfo & info,
+        Source & source,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash = {}) override
     {
         if (config->readOnly)
             unsupported("addToStore");
@@ -298,7 +303,7 @@ public:
                 }),
             ObjectHash::of(object.root));
 
-        info.narSize = object.narSize;
+        info.narSize = object.narSize.value();
 
         auto path = info.path;
         auto accessor = make_ref<MemorySourceAccessor>(std::move(*temp));

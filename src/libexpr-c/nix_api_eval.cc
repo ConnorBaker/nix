@@ -25,7 +25,6 @@ nix_get_derivation(nix_c_context * context, EvalState * state, nix_value * value
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> std::optional<nix::StorePath> {
             auto & v = check_value_in(value);
             auto maybePkg = nix::getDerivation(state->state, v, ignoreAssertionFailures);
@@ -39,7 +38,7 @@ nix_get_derivation(nix_c_context * context, EvalState * state, nix_value * value
 nix_err nix_value_auto_call_function(
     nix_c_context * context, EvalState * state, nix_value * auto_args, nix_value * fn_val, nix_value * result)
 {
-    return nix_c_boundary(context, state, [&] {
+    return nix_c_boundary(context, [&] {
         auto & fn = check_value_in(fn_val);
         auto & res = check_value_not_null(result);
         auto & b = get_bindings_or_empty(state->state, auto_args);

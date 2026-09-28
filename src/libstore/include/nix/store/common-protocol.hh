@@ -77,8 +77,8 @@ struct CommonProto
         Source & from, bool objectHashForm, const std::function<Hash(const std::string &)> & parseNarHash);
 
     /**
-     * In the old form the slot is `assertedNarHash`, else `lazyNarHash`
-     * forced here -- the one place a peer's version costs anything.
+     * In the old form the slot is `assertedNarHash`, else the operation's
+     * NAR-hash callback, forced here. The new form never calls it.
      *
      * @throws Error in the old form when the info has neither.
      */
@@ -86,7 +86,8 @@ struct CommonProto
         Sink & to,
         bool objectHashForm,
         const UnkeyedValidPathInfo & info,
-        const std::function<std::string(const Hash &)> & renderNarHash);
+        const std::function<std::string(const Hash &)> & renderNarHash,
+        const std::function<Hash()> * narHash = nullptr);
 };
 
 #define DECLARE_COMMON_SERIALISER(T)                                                                 \

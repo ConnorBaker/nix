@@ -148,13 +148,10 @@ struct LocalStore::State::Stmts
     SQLiteStmt DeleteBlob;
     SQLiteStmt QueryBlobInodes;
     SQLiteStmt QueryBlobCollisions;
-    SQLiteStmt QueryHoldIngestions;
-    SQLiteStmt DeletePathBlobs;
     SQLiteStmt DeletePathIngestions;
     SQLiteStmt NewIngestion;
     SQLiteStmt SetIngestionPath;
     SQLiteStmt QueryStaleIngestions;
-    SQLiteStmt DeleteBlobsOf;
     SQLiteStmt DeleteIngestion;
 };
 
@@ -477,10 +474,6 @@ LocalStore::LocalStore(ref<const Config> config)
             " join ValidPaths ov on ov.path = oi.path where other.id = own.id and other.exec = own.exec"
             " and (other.ino != own.ino or other.dev != own.dev))"
             " order by own.id, own.exec, donor.dev, donor.ino, donor.ingestion;");
-        state->stmts->QueryHoldIngestions.create(
-            state->db, "select id from Ingestions where path = ? and hold = ? order by id desc limit 1;");
-        state->stmts->DeletePathBlobs.create(
-            state->db, "delete from Blobs where ingestion in (select id from Ingestions where path = ?);");
         state->stmts->DeletePathIngestions.create(state->db, "delete from Ingestions where path = ?;");
         state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (?, ?);");
         state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
@@ -494,7 +487,6 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->QueryStaleIngestions.create(
             state->db,
             "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
-        state->stmts->DeleteBlobsOf.create(state->db, "delete from Blobs where ingestion = ?;");
         state->stmts->DeleteIngestion.create(state->db, "delete from Ingestions where id = ?;");
     }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
@@ -941,6 +933,14 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         return c != 0 ? c < 0 : a.executable < b.executable;
     });
     auto logical = printStorePath(path);
+    auto & completed = hold.completedIngestions;
+    auto previous =
+        std::find_if(completed.begin(), completed.end(), [&](const auto & value) { return value.path == logical; });
+    auto slot = static_cast<size_t>(previous - completed.begin());
+    /* Allocate the completion before committing. Its ownership handoff below cannot throw. */
+    GitObjectStore::Hold::CompletedIngestion completion{logical, 0};
+    if (slot == completed.size())
+        completed.reserve(completed.size() + 1);
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
@@ -956,64 +956,23 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
            Builder outputs are reconciled when their validity is committed. */
         if (isValidPath_(*state, path))
             coalesceBlobRows(*state, path, hold, *id, rows);
-        state->stmts->DeletePathBlobs.use().apply(logical).exec();
+
         state->stmts->DeletePathIngestions.use().apply(logical).exec();
         state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
         txn.commit();
-        ingestion->id = id;
-        ingestion->completed = true;
-    });
-}
-
-void LocalStore::recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
-{
-    /* Tests only.  A tree written at `root` under the store directory that is
-       not a store path: a `ValidPaths` row is made for it under its own name,
-       so that the sweep's stale-row rule judges this ingestion as it judges a
-       real one, and the ingestion is given that path. */
-    if (!hold.ingestion)
-        return;
-    auto projection = hold.takeProjection();
-    auto & rows = projection.regular;
-    auto logical = std::filesystem::path(config->storeDir) / root.filename();
-    auto ingestion = hold.ingestion->id;
-    retrySQLite<void>([&]() {
-        auto state(_state->lock());
-        SQLiteTxn txn(state->db);
-        auto id = ingestion;
-        if (!id) {
-            state->stmts->NewIngestion.use().apply("", false).apply(hold.directory().filename().string()).exec();
-            id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
-        } else
-            state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
-        insertBlobRows(*state, *id, rows);
-        insertAuxiliaryRows(*state, *id, projection.auxiliary);
-        auto valid = state->stmts->QueryValidPathId.use().apply(logical.string()).next();
-        if (!valid) {
-            auto use(state->stmts->RegisterValidPath.use());
-            use.apply(logical.string())
-                .apply("git:sha256:0000000000000000000000000000000000000000000000000000000000000000")
-                .apply(int64_t(time(nullptr)))
-                .apply("", false)
-                .apply(int64_t(0))
-                .apply(int64_t(0), false)
-                .apply("", false)
-                .apply("", false)
-                .exec();
-        }
-        state->stmts->DeletePathBlobs.use().apply(logical.string()).exec();
-        state->stmts->DeletePathIngestions.use().apply(logical.string()).exec();
-        state->stmts->SetIngestionPath.use().apply(logical.string()).apply(static_cast<int64_t>(*id)).exec();
-        txn.commit();
-        hold.ingestion->id = id;
+        completion.id = *id;
+        if (slot == completed.size())
+            completed.push_back(std::move(completion));
+        else
+            completed[slot] = std::move(completion);
+        hold.ingestion.reset();
     });
 }
 
 /* The index's own sweep (schema.sql): a row whose ingestion never got its
    path -- a copy that crashed or failed between its writes and its
-   registration -- or whose path is no longer valid, names no holder.  Two
-   statements under the GC lock, where the collector already is, and the one
-   place the cascade a foreign key would have given is replaced.  `link`
+   registration -- or whose path is no longer valid, names no holder. Removing
+   the ingestion cascades to both projections under the GC lock. `link`
    covers the window until this runs: it finds no file at the holder's name
    and forgets the row. */
 void LocalStore::sweepStaleBlobRows()
@@ -1039,24 +998,10 @@ void LocalStore::sweepStaleBlobRows()
             }
         }
         for (auto id : stale) {
-            state->stmts->DeleteBlobsOf.use().apply(static_cast<int64_t>(id)).exec();
+
             state->stmts->DeleteIngestion.use().apply(static_cast<int64_t>(id)).exec();
         }
         txn.commit();
-    });
-}
-
-uint64_t LocalStore::blobRowCount(bool executable)
-{
-    return retrySQLite<uint64_t>([&]() -> uint64_t {
-        auto state(_state->lock());
-        SQLiteStmt stmt;
-        stmt.create(state->db, "select count(*) from Blobs where exec = ?;");
-        auto use(stmt.use());
-        use.apply(int64_t(executable ? 1 : 0));
-        if (!use.next())
-            return 0;
-        return static_cast<uint64_t>(use.getInt(0));
     });
 }
 
@@ -1307,77 +1252,45 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 
-    /* The blob index (`schema.sql`, 01 section 9.10): where a regular-file
-       blob's holder is.  **Additive, so it belongs here and not in a schema
-       bump**, which is the convention the comment above states and which
-       `nixSchemaVersion` 11 is the stated exception to: 11 was bumped because
-       an existing column's *meaning* changed (`ValidPaths.hash` went from the
-       NAR hash to the object hash), so an older Nix reading such a store would
-       misread it.  Two new tables and an index change no existing column, and
-       an older Nix simply does not look at them, so no bump is owed.
-
-       The index is a *cache*: every row in it is derivable from the store's own
-       paths, and `nix-store --optimise` rebuilds it by walking them.  So a
-       migration that changes its shape may drop it and make it again rather
-       than alter it in place -- which is what this one does, under a name of
-       its own, because a store made by an earlier build of this work has the
-       tables in an older shape and `create table if not exists` would leave
-       them so.  Sharing is not lost by it: the paths keep their files, and the
-       next ingestion or `nix-store --optimise` records the rows again. */
+    /* Baseline stores have no object cache; current stores have ingestion-owned
+       candidates and auxiliary values. Install the current tables directly and
+       add the missing regular-row ownership constraint in one transaction.
+       Old cache layouts have the same columns, so their eligible rows survive
+       without replaying intermediate development layouts. Orphan candidates
+       can never be holders and are discarded. ValidPaths is never rebuilt. */
     maybeUpgrade(
-        "20260919-blob-index-holders",
-        "drop table if exists Blobs;"
-        "\ndrop table if exists Ingestions;"
-        "\ncreate table Ingestions ("
-        " id integer primary key autoincrement not null,"
-        " path text, hold text);"
-        "\ncreate table Blobs ("
-        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
-        " ingestion integer not null, name text not null, size integer not null,"
-        " primary key (id, exec));"
-        "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
-
-    /* Candidate ownership is per ingestion. Preserve existing holders
-       while allowing concurrent ingestions to publish independently. */
-    maybeUpgrade(
-        "20260921-blob-holder-candidates",
-        "create table BlobCandidates ("
-        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
-        " ingestion integer not null, name text not null, size integer not null,"
-        " primary key (id, exec, ingestion));"
-        "\ninsert into BlobCandidates select id, exec, ino, dev, ingestion, name, size from Blobs;"
-        "\ndrop table Blobs;"
-        "\nalter table BlobCandidates rename to Blobs;"
-        "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
-
-    maybeUpgrade(
-        "20260921-ingestion-paths", "create index if not exists IndexIngestionsPath on Ingestions(path, hold)");
-
-    /* A candidate is identified by its complete key; no consumer uses a
-       separate rowid. Preserve every candidate while removing that B-tree. */
-    maybeUpgrade(
-        "20260924-blob-holder-without-rowid",
-        "create table BlobsWithoutRowid ("
+        "20260928-ingestion-owned-projections",
+        "create table if not exists Ingestions ("
+        " id integer primary key autoincrement not null, path text, hold text);"
+        "\ncreate table if not exists Blobs ("
         " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
         " ingestion integer not null, name text not null, size integer not null,"
         " primary key (id, exec, ingestion)) without rowid;"
-        "\ninsert into BlobsWithoutRowid (id, exec, ino, dev, ingestion, name, size)"
-        " select id, exec, ino, dev, ingestion, name, size from Blobs;"
-        "\ndrop table Blobs;"
-        "\nalter table BlobsWithoutRowid rename to Blobs;"
-        "\ncreate index IndexBlobsIngestion on Blobs(ingestion)");
-
-    /* Additive cache storage. The foreign key also lets an older writer's
-       existing ingestion deletion remove these derived values. */
-    maybeUpgrade(
-        "20260927-auxiliary-ingestion-values",
-        "create table if not exists AuxValues ("
+        "\ncreate table OwnedBlobs ("
+        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
+        " ingestion integer not null references Ingestions(id) on delete cascade,"
+        " name text not null, size integer not null, primary key (id, exec, ingestion)) without rowid;"
+        "\ninsert into OwnedBlobs select b.id, b.exec, b.ino, b.dev, b.ingestion, b.name, b.size"
+        " from Blobs b join Ingestions i on i.id = b.ingestion;"
+        "\ndrop table Blobs; alter table OwnedBlobs rename to Blobs;"
+        "\ncreate index IndexBlobsIngestion on Blobs(ingestion);"
+        "\ncreate index if not exists IndexIngestionsPath on Ingestions(path, hold);"
+        "\ncreate table if not exists AuxValues ("
         " kind integer not null check(kind in (16384, 40960)),"
         " id blob not null check(typeof(id) = 'blob' and length(id) = 32),"
         " ingestion integer not null references Ingestions(id) on delete cascade,"
         " chunk integer not null check(chunk >= 0), body blob not null,"
         " primary key(kind, id, ingestion, chunk)) without rowid;"
-        "\ncreate index if not exists IndexAuxValuesIngestion on AuxValues(ingestion)");
+        "\ncreate index if not exists IndexAuxValuesIngestion on AuxValues(ingestion);"
+        /* Older schema-11 writers must see their layouts as already installed.
+           Replaying their rebuilds would remove the ownership FK while leaving
+           this migration's marker present on the subsequent upgrade. */
+        "\ninsert or ignore into SchemaMigrations(migration) values"
+        " ('20260919-blob-index-holders'),"
+        " ('20260921-blob-holder-candidates'),"
+        " ('20260921-ingestion-paths'),"
+        " ('20260924-blob-holder-without-rowid'),"
+        " ('20260927-auxiliary-ingestion-values')");
 
     return ret;
 }
@@ -1605,8 +1518,8 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
 
     info.objectHash = ObjectHash::of(object->root);
     if (info.narSize == 0)
-        info.narSize = object->narSize;
-    recordObjectHash(path, *info.objectHash, object->narSize);
+        info.narSize = object->narSize.value();
+    recordObjectHash(path, *info.objectHash, object->narSize.value());
     return OldRowWalk::Migrated;
 }
 
@@ -1801,7 +1714,7 @@ StorePathSet LocalStore::queryAllValidPaths()
     });
 }
 
-bool LocalStore::hasValidPaths()
+bool LocalStore::mayHaveValidPaths()
 {
     return retrySQLite<bool>([&] {
         auto state(_state->lock());
@@ -1938,26 +1851,19 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
     };
 
     std::vector<Publication> publications;
-    if (ingestion) {
-        auto projection = hold->takeProjection();
-        if (!ingestion->completed) {
+    if (hold) {
+        if (ingestion) {
             assert(infos.size() == 1);
-            publications.push_back({infos.begin()->first, ingestion->id, std::move(projection)});
+            publications.push_back({infos.begin()->first, ingestion->id, hold->takeProjection()});
         } else {
-            /* A builder uses one hold for several completed outputs. Their
-               individually named ingestions remain private until this
-               transaction publishes the corresponding valid paths. */
-            assert(projection.regular.empty() && projection.auxiliary.empty());
-            retrySQLite<void>([&] {
-                publications.clear();
-                auto state(_state->lock());
-                for (auto & [path, _] : infos) {
-                    auto use(state->stmts->QueryHoldIngestions.use());
-                    use.apply(printStorePath(path)).apply(hold->directory().filename().string());
-                    if (use.next())
-                        publications.push_back({path, static_cast<uint64_t>(use.getInt(0)), {}});
-                }
-            });
+            for (auto & [path, _] : infos) {
+                auto logical = printStorePath(path);
+                for (auto & completed : hold->completedIngestions)
+                    if (completed.path == logical) {
+                        publications.push_back({path, completed.id, {}});
+                        break;
+                    }
+            }
         }
         for (auto & publication : publications)
             std::sort(
@@ -1987,16 +1893,24 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            stable row ids. Retain each lookup through reference insertion. */
         std::map<StorePath, uint64_t> pathIds;
         std::vector<uint64_t> ingestionIds;
-        for (auto & publication : publications) {
-            auto id = publication.ingestion;
+        for (auto publication = publications.begin(); publication != publications.end();) {
+            auto id = publication->ingestion;
             if (!id) {
                 state->stmts->NewIngestion.use().apply("", false).apply(hold->directory().filename().string()).exec();
                 id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
-            } else
+            } else {
                 state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
+                /* Another completed output may have replaced this old ID. Its
+                   current projection must survive registration of the old hold. */
+                if (!ingestion && sqlite3_changes(state->db) == 0) {
+                    publication = publications.erase(publication);
+                    continue;
+                }
+            }
             ingestionIds.push_back(*id);
-            insertBlobRows(*state, *id, publication.projection.regular);
-            insertAuxiliaryRows(*state, *id, publication.projection.auxiliary);
+            insertBlobRows(*state, *id, publication->projection.regular);
+            insertAuxiliaryRows(*state, *id, publication->projection.auxiliary);
+            ++publication;
         }
 
         for (auto & [_, i] : infos) {
@@ -2045,7 +1959,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         for (size_t n = 0; n < publications.size(); ++n)
             if (updated.contains(publications[n].path)) {
                 auto logical = printStorePath(publications[n].path);
-                state->stmts->DeletePathBlobs.use().apply(logical).exec();
+
                 state->stmts->DeletePathIngestions.use().apply(logical).exec();
                 state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(ingestionIds[n])).exec();
             }
@@ -2062,7 +1976,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                     if (state->stmts->QueryValidPaths.use().next())
                         coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].projection.regular);
                     auto logical = printStorePath(path);
-                    state->stmts->DeletePathBlobs.use().apply(logical).exec();
+
                     state->stmts->DeletePathIngestions.use().apply(logical).exec();
                     state->stmts->SetIngestionPath.use()
                         .apply(logical)
@@ -2077,7 +1991,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference)).exec();
         }
         txn.commit();
-        if (ingestion && !ingestion->completed && !publications.empty())
+        if (ingestion && !publications.empty())
             ingestion->id = ingestionIds.front();
         /* A description becomes cacheable only with the committed path
            and references. A rejected reference or cycle rolls the SQL
@@ -2136,7 +2050,11 @@ std::shared_ptr<GitObjectStore::Hold> LocalStore::acquireIngestionHold()
 }
 
 void LocalStore::addMultipleToStore(
-    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+    PathsSource && pathsToCopy,
+    Activity & act,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
     /* Keep the shared directory alive across this batch. Every writer
        acquires its own lease as well: another overlapping batch or direct
@@ -2155,10 +2073,15 @@ void LocalStore::addMultipleToStore(
     bool small = std::all_of(pathsToCopy.begin(), pathsToCopy.end(), [](const auto & p) {
         return p.second->isInMemory() && p.first.narSize && p.first.narSize <= (1 << 20);
     });
-    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, small ? 1 : 0);
+    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, small ? 1 : 0, narHash);
 }
 
-void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
+void LocalStore::addToStore(
+    const ValidPathInfo & info,
+    Source & source,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash()> & narHash)
 {
     /* Something must name the content, or nothing below verifies it: the
        path's own content address, the sender's object hash, or its NAR
@@ -2261,17 +2184,8 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                    size the sink computed, and without the sender's NAR-hash
                    assertion, which is checked against the tee below. */
                 ValidPathInfo toRegister{info};
-                /* The sender's thunk may hold the object's bytes -- the
-                   evaluator's write buffer builds one over the text it
-                   still has (`write-buffer.cc`, `infoFor`) -- and the
-                   path-info cache keeps every description registered, so
-                   those bytes would stay resident for the life of the
-                   process.  The object is in the store now, so the walk
-                   names it: the same hash, holding nothing (01 §9.11, the
-                   cost falls on the old peer). */
-                toRegister.lazyNarHash = [this, path = info.path] { return narHashOf(*this, path); };
                 toRegister.objectHash = ObjectHash::of(restored.root);
-                toRegister.narSize = restored.narSize;
+                toRegister.narSize = restored.narSize.value();
                 toRegister.assertedNarHash = std::nullopt;
 
                 /* The content address first, then the sender's object hash,
@@ -2352,12 +2266,12 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
                 /* The sink's size is the NAR's length (`merkle::nar`, pinned
                    against `dumpPath`), so no tee is needed for this check. */
-                if (info.narSize != 0 && restored.narSize != info.narSize)
+                if (info.narSize != 0 && restored.narSize.value() != info.narSize)
                     throw Error(
                         "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
                         printStorePath(info.path),
                         info.narSize,
-                        restored.narSize);
+                        restored.narSize.value());
 
                 /* The deferred signature check: the description with the
                    stream's NAR hash and size in place of the assertion it
@@ -2365,7 +2279,7 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
                 if (checkSigsAfterRestore) {
                     ValidPathInfo described{info};
                     described.assertedNarHash = streamNarHash;
-                    described.narSize = restored.narSize;
+                    described.narSize = restored.narSize.value();
                     if (pathInfoIsUntrusted(described)) {
                         deletePath(realPath);
                         throw Error(
@@ -2394,6 +2308,58 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
 
             outputLock.setDeletion(true);
         }
+    }
+}
+
+StorePath LocalStore::addToStorePrepared(
+    std::string_view name,
+    ContentAddressWithReferences desc,
+    RepairFlag repair,
+    fun<std::pair<ObjectHashSink::Result, const GitObjectStore::Hold &>(const std::filesystem::path &)> populate)
+{
+    auto dstPath = makeFixedOutputPathFromCA(name, desc);
+    addTempRoot(dstPath);
+    if (repair || !isValidPath(dstPath)) {
+        auto realPath = toRealPath(dstPath);
+        PathLocks outputLock({realPath});
+        // Another writer may have published while we acquired the lock.
+        if (repair || !isValidPathUncached(dstPath)) {
+            deletePath(realPath);
+            auto [result, hold] = populate(realPath);
+            if (config->getLocalSettings().fsyncStorePaths) {
+                recursiveSync(realPath);
+                syncParent(realPath);
+            }
+            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
+            info.narSize = result.narSize.value();
+            registerValidPath(info, hold);
+        } else
+            invalidatePathInfoCacheFor(dstPath);
+        outputLock.setDeletion(true);
+    }
+    return dstPath;
+}
+
+bool LocalStore::moveIntoStore(
+    const std::filesystem::path & from,
+    const std::filesystem::path & to,
+    AutoDelete & staging,
+    RestoreSinkHooks * hooks)
+{
+    try {
+        // The staged root is already read-only.
+        movePath(from, to);
+        return true;
+    } catch (const SystemError & e) {
+        if (!e.is(std::errc::cross_device_link))
+            throw;
+        // Overlayfs can require a copy even within the same store directory.
+        warn("can't rename %s as %s, copying instead", PathFmt(from), PathFmt(to));
+        RestoreSink copySink{/*startFsync=*/false, hooks};
+        copySink.dstPath = to;
+        copyRecursive(*makeFSSourceAccessor(from), CanonPath::root, copySink, CanonPath::root);
+        staging.deletePath();
+        return false;
     }
 }
 
@@ -2551,101 +2517,43 @@ StorePath LocalStore::addToStoreFromDump(
             .self = false,
         });
 
-    auto dstPath = makeFixedOutputPathFromCA(name, desc);
-
-    addTempRoot(dstPath);
-
-    if (repair || !isValidPath(dstPath)) {
-
-        /* The first check above is an optimisation to prevent
-           unnecessary lock acquisition. */
-
-        auto realPath = toRealPath(dstPath);
-
-        PathLocks outputLock({realPath});
-
-        /* The path may have been created by another process in the meantime, so check again. */
-        if (repair || !isValidPathUncached(dstPath)) {
-
-            deletePath(realPath);
-
-            if (inMemoryAndDontNeedRestore) {
-                /* Before the restore, for the same reason, and after the
-                   validity check: an add whose path is valid already
-                   restores nothing and runs no collection (master's
-                   order; `LocalStoreAutoGCTest`). */
-                autoGC();
-                hold.emplace(objects.hold());
-
-                StringSource dumpSource{dump};
-                /* Restore from the buffer in memory. */
-                auto fim = hashMethod.getFileIngestionMethod();
-                switch (fim) {
-                case FileIngestionMethod::NixArchive:
-                    restored = restoreThroughObjects(
-                        realPath,
-                        dumpSource,
-                        localSettings.fsyncStorePaths,
-                        canonicalisingRestoreHooks.get(),
-                        *hold,
-                        repair);
-                    break;
-                case FileIngestionMethod::Flat:
-                    restorePath(
-                        realPath,
-                        dumpSource,
-                        (FileSerialisationMethod) fim,
-                        localSettings.fsyncStorePaths,
-                        canonicalisingRestoreHooks.get());
-                    break;
-                case FileIngestionMethod::Git:
-                    // not a serialisation method: unreachable
-                    assert(false);
-                }
-            } else {
-                /* Move the temporary path we restored above. */
-                try {
-                    /* movePath and not renameFile because at this point the top-level directory is
-                       read-only. */
-                    movePath(tempPath, realPath);
-                } catch (const SystemError & e) {
-                    if (!e.is(std::errc::cross_device_link))
-                        throw;
-
-                    /* Apparently this can happen even on the same filesystem (and the paths that are renamed above
-                       are on the same filesystem) with overlayfs https://github.com/NixOS/nix/issues/6262.
-                       Since we couldn't rename, this won't be atomic and we have to gradually copy to the realPath. */
-                    warn("can't rename %s as %s, copying instead", PathFmt(tempPath), PathFmt(realPath));
-                    RestoreSink copySink{/*startFsync=*/false, /*hooks=*/canonicalisingRestoreHooks.get()};
-                    copySink.dstPath = realPath;
-                    copyRecursive(*makeFSSourceAccessor(tempPath), CanonPath::root, copySink, CanonPath::root);
-                    delTempDir->deletePath();
-                    /* Copied plainly: not in the object store; the walk below enters it. */
-                    restored = std::nullopt;
-                }
+    auto populate =
+        [&](const std::filesystem::path & realPath) -> std::pair<ObjectHashSink::Result, const GitObjectStore::Hold &> {
+        if (inMemoryAndDontNeedRestore) {
+            // An already valid buffered path needs neither a write nor autoGC.
+            autoGC();
+            hold.emplace(objects.hold());
+            StringSource dumpSource{dump};
+            auto fim = hashMethod.getFileIngestionMethod();
+            switch (fim) {
+            case FileIngestionMethod::NixArchive:
+                restored = restoreThroughObjects(
+                    realPath,
+                    dumpSource,
+                    localSettings.fsyncStorePaths,
+                    canonicalisingRestoreHooks.get(),
+                    *hold,
+                    repair);
+                break;
+            case FileIngestionMethod::Flat:
+                restorePath(
+                    realPath,
+                    dumpSource,
+                    (FileSerialisationMethod) fim,
+                    localSettings.fsyncStorePaths,
+                    canonicalisingRestoreHooks.get());
+                break;
+            case FileIngestionMethod::Git:
+                // Git is not a serialisation method.
+                assert(false);
             }
+        } else if (!moveIntoStore(tempPath, realPath, *delTempDir, canonicalisingRestoreHooks.get()))
+            restored.reset();
 
-            /* A NAR went through the sink, which entered the object store
-               and computed the root; a flat file or a plain copy is entered
-               now, by the one walk that also computes it. */
-            auto result = restored ? *restored : enterPath(realPath, repair, *hold);
-
-            if (localSettings.fsyncStorePaths) {
-                recursiveSync(realPath);
-                syncParent(realPath);
-            }
-
-            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
-            info.narSize = result.narSize;
-            registerValidPath(info, *hold);
-        } else
-            // We may have a negative cache entry for this path, so get rid of it.
-            invalidatePathInfoCacheFor(dstPath);
-
-        outputLock.setDeletion(true);
-    }
-
-    return dstPath;
+        // A flat restore or cross-device copy needs its new physical projection.
+        return {restored ? *restored : enterPath(realPath, repair, *hold), *hold};
+    };
+    return addToStorePrepared(name, std::move(desc), repair, std::ref(populate));
 }
 
 /* Create a temporary directory in the store that won't be
@@ -2787,8 +2695,8 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
 
                     /* Fill in missing narSize fields (from old stores). */
                     if (info->narSize == 0) {
-                        printInfo("updating size field on '%s' to %s", printStorePath(i), current.narSize);
-                        info->narSize = current.narSize;
+                        printInfo("updating size field on '%s' to %s", printStorePath(i), current.narSize.value());
+                        info->narSize = current.narSize.value();
                         updatePathInfo(*_state->lock(), *info);
                     }
 

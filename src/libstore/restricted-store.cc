@@ -91,7 +91,9 @@ public:
         HashAlgorithm hashAlgo,
         const StorePathSet & references,
         PathFilter & filter,
-        RepairFlag repair) override
+        RepairFlag repair,
+        TreeNamer namer,
+        bool callbacksPermitParallelism) override
     {
         throw Error("addToStore");
     }
@@ -100,7 +102,8 @@ public:
         const ValidPathInfo & info,
         Source & narSource,
         RepairFlag repair = NoRepair,
-        CheckSigsFlag checkSigs = CheckSigs) override;
+        CheckSigsFlag checkSigs = CheckSigs,
+        const std::function<Hash()> & narHash = {}) override;
 
     StorePath addToStoreFromDump(
         Source & dump,
@@ -245,9 +248,13 @@ RestrictedStore::queryPartialDerivationOutputMap(const StorePath & path, Store *
 }
 
 void RestrictedStore::addToStore(
-    const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs)
+    const ValidPathInfo & info,
+    Source & narSource,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash()> & narHash)
 {
-    next->addToStore(info, narSource, repair, checkSigs);
+    next->addToStore(info, narSource, repair, checkSigs, narHash);
     goal.addDependency(info.path);
 }
 

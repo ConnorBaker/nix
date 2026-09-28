@@ -88,14 +88,6 @@ public:
         return inner->readDirectory(path);
     }
 
-    void readDirectory(
-        const CanonPath & dirPath,
-        std::function<void(SourceAccessor & subdirAccessor, const CanonPath & subdirRelPath)> callback) override
-    {
-        auto inner = next;
-        return inner->readDirectory(dirPath, std::move(callback));
-    }
-
     std::string readLink(const CanonPath & path) override
     {
         std::shared_ptr<Caches> observed;

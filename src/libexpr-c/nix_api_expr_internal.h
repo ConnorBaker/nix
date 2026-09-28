@@ -28,6 +28,7 @@ struct EvalState
 {
     nix::EvalState & state;
     // Owned resources; null for temporary wrappers created in C API callbacks.
+    std::shared_ptr<bool> ownedReadOnlyMode;
     std::unique_ptr<nix::fetchers::Settings> ownedFetchSettings;
     std::unique_ptr<nix::EvalSettings> ownedSettings;
     std::shared_ptr<nix::EvalState> ownedState;
@@ -46,13 +47,8 @@ struct ListBuilder
 struct nix_value
 {
     nix::Value * value;
-    /**
-     * The evaluator the value belongs to.  Ideally we would take in EvalState as an argument when we need it, but we
-     * don't want to make changes to the stable C api, so we stuff it into the nix_value that will get passed in to the
-     * relevant functions: allocation needs its memory, and `nix_get_string` needs a door (`EvalState::realise`), which
-     * writes the pending store objects a string may name before its text reaches C.
-     */
-    nix::EvalState * state;
+    /** Memory for allocations associated with this value. */
+    nix::EvalMemory * mem;
 };
 
 struct nix_string_return
@@ -109,18 +105,9 @@ inline nix::Value & check_value_in(nix_value * value)
     return v;
 }
 
-/**
- * The C API's boundary with the evaluator: every entry point that receives one
- * runs its body here, and whatever evaluation left pending is written before
- * control returns to C, after a return and after a throw (04-derivation.md,
- * section 1.2).  An error is stored in `context` as `NIXC_CATCH_ERRS` does; a
- * failing write after an error leaves the first error standing and the objects
- * pending.  A `void` body yields `NIX_OK` or the error code; any other yields
- * its result, or a value-initialised one after a failure (a heap result whose
- * write then failed is not released).
- */
+/** Convert C++ failures to C errors, publishing results only on success. */
 template<typename Body>
-auto nix_c_boundary(nix_c_context * context, EvalState * state, Body && body)
+auto nix_c_boundary(nix_c_context * context, Body && body)
 {
     using Result = std::invoke_result_t<Body>;
     if (context)
@@ -128,22 +115,15 @@ auto nix_c_boundary(nix_c_context * context, EvalState * state, Body && body)
     try {
         if constexpr (std::is_void_v<Result>) {
             body();
-            state->state.flushPendingWrites();
             return NIX_OK;
         } else {
             static_assert(
                 !std::is_same_v<Result, nix_err>,
                 "a body returning nix_err would yield NIX_OK on failure; return void and let the boundary report");
             Result result = body();
-            state->state.flushPendingWrites();
             return result;
         }
     } catch (...) {
-        try {
-            state->state.flushPendingWrites();
-        } catch (...) {
-            /* The first error stands. */
-        }
         if constexpr (std::is_void_v<Result>)
             return nix_context_error(context);
         else {
@@ -153,14 +133,11 @@ auto nix_c_boundary(nix_c_context * context, EvalState * state, Body && body)
     }
 }
 
-/**
- * The boundary in two phases: `produce` allocates the object handed to C from
- * what `evaluate` returned only after the write, so a failing write leaks
- * nothing; a null or empty `evaluate` result (a soft failure already in
- * `context`) is mapped to null.
- */
+/** Keep evaluation and result allocation separate: no C handle is published
+ * until evaluation succeeds. A soft failure is passed to `produce`, which
+ * preserves the error and maps it to the API's empty result. */
 template<typename Evaluate, typename Produce>
-auto nix_c_boundary(nix_c_context * context, EvalState * state, Evaluate && evaluate, Produce && produce)
+auto nix_c_boundary(nix_c_context * context, Evaluate && evaluate, Produce && produce)
 {
     using Result = std::invoke_result_t<Produce, std::invoke_result_t<Evaluate>>;
     static_assert(!std::is_same_v<Result, nix_err>, "an object-producing boundary does not return nix_err");
@@ -168,14 +145,8 @@ auto nix_c_boundary(nix_c_context * context, EvalState * state, Evaluate && eval
         context->last_err_code = NIX_OK;
     try {
         auto evaluated = evaluate();
-        state->state.flushPendingWrites();
         return produce(std::move(evaluated));
     } catch (...) {
-        try {
-            state->state.flushPendingWrites();
-        } catch (...) {
-            /* The first error stands. */
-        }
         nix_context_error(context);
         return Result{};
     }

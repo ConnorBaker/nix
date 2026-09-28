@@ -172,7 +172,6 @@ sources = files(
   'value-to-xml.cc',
   'value.cc',
   'value/context.cc',
-  'write-buffer.cc',
 )
 
 subdir('include/nix/expr')

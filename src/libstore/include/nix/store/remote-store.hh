@@ -108,10 +108,19 @@ public:
         const StorePathSet & references = StorePathSet(),
         RepairFlag repair = NoRepair) override;
 
-    void addToStore(const ValidPathInfo & info, Source & nar, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addToStore(
+        const ValidPathInfo & info,
+        Source & nar,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash = {}) override;
 
-    void
-    addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addMultipleToStore(
+        PathsSource && pathsToCopy,
+        Activity & act,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash(const StorePath &, const Source &)> & narHash = {}) override;
 
     void registerDrvOutputUnchecked(const Realisation & info) override;
 

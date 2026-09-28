@@ -430,9 +430,11 @@ std::pair<std::optional<ObjectHash>, std::optional<Hash>> WorkerProto::readPathI
 void WorkerProto::writePathInfoHashes(WriteConn conn, const UnkeyedValidPathInfo & info)
 {
     CommonProto::writePathInfoHashes(
-        conn.to, conn.version.features.contains(WorkerProto::featureObjectHash), info, [](const Hash & h) {
-            return h.to_string(HashFormat::Base16, false);
-        });
+        conn.to,
+        conn.version.features.contains(WorkerProto::featureObjectHash),
+        info,
+        [](const Hash & h) { return h.to_string(HashFormat::Base16, false); },
+        conn.narHash);
 }
 
 UnkeyedValidPathInfo WorkerProto::Serialise<UnkeyedValidPathInfo>::read(const StoreDirConfig & store, ReadConn conn)

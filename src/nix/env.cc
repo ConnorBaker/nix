@@ -85,9 +85,8 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         for (auto & path : outPaths)
             todo.push(path);
 
-        /* Finished before the environment is replaced: the final write may
-           open a store connection that needs it.  Only store reads follow. */
-        auto finished = state->finish();
+        /* Persist evaluator caches before replacing the process environment. */
+        state->evalCaches.clear();
 
         setEnviron();
 
@@ -123,7 +122,7 @@ struct CmdShell : InstallablesCommand, MixEnvironment
         for (auto & arg : command)
             args.push_back(arg);
 
-        execProgramInStore(store, UseLookupPath::Use, *command.begin(), args, std::move(finished));
+        execProgramInStore(store, UseLookupPath::Use, *command.begin(), args);
     }
 };
 

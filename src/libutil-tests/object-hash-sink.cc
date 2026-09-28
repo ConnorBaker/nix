@@ -23,6 +23,7 @@
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/file-descriptor.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/tree-traversal.hh"
@@ -87,6 +88,109 @@ TEST(ObjectHashSink, complex_tree_matches_reference_and_nar_length)
     checkBothRoutes(complexTree());
 }
 
+/* A visitor's worker count cannot extend a push callback's lifetime.
+   Every create call consumes its borrowed callback before returning,
+   including when a directory is nested inside another push callback. */
+TEST(ObjectHashSink, everyWorkerWidthConsumesPushCallbacksImmediately)
+{
+    auto source = make_ref<MemorySourceAccessor>();
+    source->addFile(CanonPath("nested/leaf"), "abc");
+    source->open(CanonPath("exec"), File{File::Regular{.executable = true, .contents = ""}});
+    source->open(CanonPath("link"), File{File::Symlink{.target = "nested/leaf"}});
+    source->open(CanonPath("empty"), File{File::Directory{}});
+    const auto expected = expectedRoot(source);
+    const auto nar = narOf(*source);
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool warmed : {false, true}) {
+            SCOPED_TRACE(fmt("workers=%d warmed=%d", workers, warmed));
+            HashingVisitor visitor{workers};
+            if (warmed) {
+                /* The same visitor retains a pool after this branching pull
+                   whenever its width permits concurrent children. */
+                auto warm = objectHashOf(*source, CanonPath::root, defaultPathFilter, visitor);
+                EXPECT_EQ(warm.root, expected);
+                EXPECT_EQ(warm.narSize, nar.size());
+            }
+            ObjectHashSink sink{visitor};
+            bool rootDone = false;
+            EXPECT_NO_THROW(
+                sink.createDirectory(CanonPath::root, [&](FileSystemObjectSink & dir, const CanonPath & path) {
+                    bool nestedDone = false;
+                    dir.createDirectory(path / "nested", [&](FileSystemObjectSink & nested, const CanonPath & under) {
+                        bool read = false;
+                        nested.createRegularFile(under / "leaf", [&](CreateRegularFileSink & file) {
+                            read = true;
+                            file.preallocateContents(3);
+                            file("abc");
+                        });
+                        if (!read)
+                            throw std::logic_error("push returned before consuming a regular file");
+                        nestedDone = true;
+                    });
+                    /* Abort collection before a deferred visitor could invoke
+                       an expired callback, so a regression fails without UB. */
+                    if (!nestedDone)
+                        throw std::logic_error("push returned before consuming a nested directory");
+                    bool executableRead = false;
+                    dir.createRegularFile(path / "exec", [&](CreateRegularFileSink & file) {
+                        executableRead = true;
+                        file.isExecutable();
+                        file.preallocateContents(0);
+                    });
+                    if (!executableRead)
+                        throw std::logic_error("push returned before consuming an executable");
+                    dir.createSymlink(path / "link", "nested/leaf");
+                    bool emptyDone = false;
+                    dir.createDirectory(
+                        path / "empty", [&](FileSystemObjectSink &, const CanonPath &) { emptyDone = true; });
+                    if (!emptyDone)
+                        throw std::logic_error("push returned before consuming an empty directory");
+                    rootDone = true;
+                }));
+            if (!rootDone)
+                continue;
+            auto pushed = sink.finish();
+            EXPECT_EQ(pushed.root, expected);
+            EXPECT_EQ(pushed.narSize, nar.size());
+            ++cases;
+
+            /* The parser supplies the same immediate protocol for every root
+               mode; ordinary pull and the independent tree hash are oracles. */
+            for (auto root :
+                 {CanonPath::root,
+                  CanonPath("nested/leaf"),
+                  CanonPath("exec"),
+                  CanonPath("link"),
+                  CanonPath("empty")}) {
+                SCOPED_TRACE(root.abs());
+                auto bytes = narOf(*source, root);
+                auto pulled = objectHashOf(*source, root);
+                HashingVisitor parsedVisitor{workers};
+                if (warmed) {
+                    auto warm = objectHashOf(*source, CanonPath::root, defaultPathFilter, parsedVisitor);
+                    EXPECT_EQ(warm.root, expected);
+                    EXPECT_EQ(warm.narSize, nar.size());
+                }
+                ObjectHashSink parsedSink{parsedVisitor};
+                StringSource input{bytes};
+                std::optional<ObjectHashSink::Result> parsed;
+                EXPECT_NO_THROW({
+                    parseDump(parsedSink, input);
+                    parsed = parsedSink.finish();
+                });
+                if (!parsed)
+                    continue;
+                EXPECT_EQ(parsed->root, referenceObjectEntry(*source, root));
+                EXPECT_EQ(parsed->root, pulled.root);
+                EXPECT_EQ(parsed->narSize, pulled.narSize);
+                EXPECT_EQ(parsed->narSize, bytes.size());
+                ++cases;
+            }
+        }
+    EXPECT_EQ(cases, 96u);
+}
+
 /* A visitor may use its callback's owned state after a recursive visit.
    Every directory keeps that same callback for its later siblings. */
 TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
@@ -97,6 +201,7 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
 
         HashedNode directory(const CanonPath & path, Children children) override
         {
+            EXPECT_FALSE(children.canDefer);
             return HashingVisitor::directory(path, [&](auto each) {
                 struct Context
                 {
@@ -125,7 +230,7 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
     parseDump(sink, input);
     auto actual = sink.finish();
     EXPECT_EQ(actual.root, expected);
-    EXPECT_TRUE(actual.narSizeExact);
+    EXPECT_TRUE(actual.narSize.has_value());
     EXPECT_EQ(actual.narSize, nar.size());
     EXPECT_EQ(visitor.completed, 10u);
 }
@@ -315,6 +420,7 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
 
         std::string directory(const CanonPath &, Children children) override
         {
+            EXPECT_TRUE(children.canDefer);
             std::vector<std::pair<std::string, fun<std::string()>>> pending;
             children([&](std::string_view name, bool isDirectory, fun<std::string()> visit) {
                 EXPECT_EQ(isDirectory, directories);
@@ -453,8 +559,8 @@ TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
         for (bool failPrefix : {false, true})
             for (size_t count = 2; count <= 4; ++count)
                 for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
-                    SCOPED_TRACE(fmt(
-                        "workers=%d count=%d throwIndex=%d failPrefix=%d", workers, count, throwIndex, failPrefix));
+                    SCOPED_TRACE(
+                        fmt("workers=%d count=%d throwIndex=%d failPrefix=%d", workers, count, throwIndex, failPrefix));
                     std::atomic<size_t> active{0}, started{0}, completed{0}, childFailures{0};
                     std::vector<size_t> predicates, consumed;
                     std::string failure;
@@ -494,8 +600,7 @@ TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
                     EXPECT_EQ(started.load(), inlineFailure ? 1 : throwIndex);
                     EXPECT_EQ(completed.load(), inlineFailure ? 1 : throwIndex);
                     EXPECT_EQ(
-                        childFailures.load(),
-                        failPrefix ? std::min(throwIndex, std::max<size_t>(workers - 1, 1)) : 0u);
+                        childFailures.load(), failPrefix ? std::min(throwIndex, std::max<size_t>(workers - 1, 1)) : 0u);
                     ++cases;
                 }
     }
@@ -647,7 +752,7 @@ TEST(ObjectHashSink, permittedPullFoldMatchesSerialAndNarAcrossTheFiniteMetadata
                         auto actual = objectHashOf(*source, root, copied);
                         EXPECT_EQ(actual.root, reference.root);
                         EXPECT_EQ(actual.root, pushed.root);
-                        EXPECT_TRUE(actual.narSizeExact);
+                        EXPECT_TRUE(actual.narSize.has_value());
                         EXPECT_EQ(actual.narSize, nar.size());
                         ++cases;
                     }
@@ -671,32 +776,42 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
         for (auto first : outcomes)
             for (auto second : outcomes) {
                 HashingVisitor visitor{workers};
-                visitor.directory(CanonPath("warm"), [&](auto each) {
-                    each("directory", true, [&] { return empty; });
-                    each("file", false, [&] { return file; });
-                });
+                /* These synthetic visits borrow state outside each entire
+                   directory call, so they have the pull driver's lifetime. */
+                visitor.directory(
+                    CanonPath("warm"),
+                    HashingVisitor::Children{
+                        [&](auto each) {
+                            each("directory", true, [&] { return empty; });
+                            each("file", false, [&] { return file; });
+                        },
+                        /*canDefer=*/true});
                 const std::array selected{first, second};
                 const std::array names{"first", "second"};
                 std::atomic<size_t> active{0}, started{0}, completed{0};
                 std::string failure, message;
                 try {
-                    visitor.directory(CanonPath("checked"), [&](auto each) {
-                        for (size_t i = 0; i < selected.size(); ++i)
-                            each(names[i], false, [&, i] {
-                                ++active;
-                                ++started;
-                                Finally done{[&] {
-                                    --active;
-                                    ++completed;
-                                }};
-                                if (selected[i] == Outcome::ReadFailure)
-                                    throw std::runtime_error(names[i]);
-                                auto node = file;
-                                if (selected[i] == Outcome::FoldFailure)
-                                    node.entry.hash = Hash{HashAlgorithm::SHA1};
-                                return node;
-                            });
-                    });
+                    visitor.directory(
+                        CanonPath("checked"),
+                        HashingVisitor::Children{
+                            [&](auto each) {
+                                for (size_t i = 0; i < selected.size(); ++i)
+                                    each(names[i], false, [&, i] {
+                                        ++active;
+                                        ++started;
+                                        Finally done{[&] {
+                                            --active;
+                                            ++completed;
+                                        }};
+                                        if (selected[i] == Outcome::ReadFailure)
+                                            throw std::runtime_error(names[i]);
+                                        auto node = file;
+                                        if (selected[i] == Outcome::FoldFailure)
+                                            node.entry.hash = Hash{HashAlgorithm::SHA1};
+                                        return node;
+                                    });
+                            },
+                            /*canDefer=*/true});
                 } catch (const Error & e) {
                     failure = "fold";
                     message = e.what();
@@ -729,15 +844,23 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
     const auto expected = expectedRoot(source);
     for (size_t workers = 1; workers <= 8; ++workers) {
         HashingVisitor visitor{workers};
-        auto result = visitor.directory(CanonPath::root, [&](auto each) {
-            each("directory", false, [&] {
-                return visitor.directory(CanonPath("directory"), [&](auto nested) {
-                    nested("a", true, [&] { return file; });
-                    nested("b", true, [&] { return file; });
-                });
-            });
-            each("file", false, [&] { return file; });
-        });
+        auto result = visitor.directory(
+            CanonPath::root,
+            HashingVisitor::Children{
+                [&](auto each) {
+                    each("directory", false, [&] {
+                        return visitor.directory(
+                            CanonPath("directory"),
+                            HashingVisitor::Children{
+                                [&](auto nested) {
+                                    nested("a", true, [&] { return file; });
+                                    nested("b", true, [&] { return file; });
+                                },
+                                /*canDefer=*/true});
+                    });
+                    each("file", false, [&] { return file; });
+                },
+                /*canDefer=*/true});
         EXPECT_EQ(result.entry, expected);
         ASSERT_TRUE(result.narSize);
         EXPECT_EQ(merkle::nar::root(*result.narSize), narOf(*source).size());
@@ -1025,6 +1148,90 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
     EXPECT_FALSE(modeOf(tmpDir / "dir/sub/f") & S_IXUSR);
 }
 
+/* Failure preserves the original exception and closes the writer. Bytes
+   buffered before a read failure still reach the file; completion hooks run
+   only after a successful read, with flushed bytes and a live descriptor. */
+TEST(RestoreSink, regularFileFailuresFlushAndCloseWithoutRepeatingCompletion)
+{
+    struct Failure
+    {};
+
+    struct Hooks : RestoreSinkHooks
+    {
+        std::function<void(Descriptor, bool)> completed;
+
+        void directoryDone(Descriptor) override {}
+
+        void symlinkCreated(Descriptor, const CanonPath &) override {}
+
+        void regularFileCreated(Descriptor fd, bool executable) override
+        {
+            completed(fd, executable);
+        }
+    };
+
+    auto tmpDir = createTempDir();
+    AutoDelete delTmpDir(tmpDir, /*recursive=*/true);
+    const std::string bytes = "buffered bytes";
+    size_t cases = 0;
+    for (bool lazy : {false, true})
+        for (bool hookFailure : {false, true})
+            for (bool nested : {false, true})
+                for (bool executable : {false, true}) {
+                    SCOPED_TRACE(
+                        testing::Message() << "lazy=" << lazy << " hookFailure=" << hookFailure << " nested=" << nested
+                                           << " executable=" << executable);
+                    auto failure = std::make_exception_ptr(Failure{});
+                    Descriptor observed = INVALID_DESCRIPTOR;
+                    size_t hookCalls = 0;
+                    Hooks hooks;
+                    RestoreSink sink(/*startFsync=*/false, &hooks);
+                    sink.dstPath = tmpDir / std::to_string(cases++);
+                    if (nested)
+                        sink.createDirectory(CanonPath::root);
+                    auto path = nested ? CanonPath("/file") : CanonPath::root;
+                    auto file = nested ? sink.dstPath / "file" : sink.dstPath;
+                    hooks.completed = [&](Descriptor fd, bool seenExecutable) {
+                        ++hookCalls;
+                        EXPECT_EQ(fd, observed);
+                        EXPECT_EQ(getFileSize(fd), bytes.size());
+                        EXPECT_EQ(readFile(file), bytes);
+#ifndef _WIN32
+                        EXPECT_EQ(seenExecutable, executable);
+#else
+                        EXPECT_FALSE(seenExecutable);
+#endif
+                        std::rethrow_exception(failure);
+                    };
+                    auto write = [&](CreateRegularFileSink & crf) {
+                        observed = dynamic_cast<FdSink &>(crf).fd;
+                        if (executable)
+                            crf.isExecutable();
+                        crf(bytes);
+                        EXPECT_EQ(getFileSize(observed), 0u) << "the bytes still need flushing";
+                        if (!hookFailure)
+                            std::rethrow_exception(failure);
+                    };
+                    try {
+                        if (lazy) {
+                            auto writer = sink.beginRegularFile(path);
+                            write(*writer);
+                            writer->finish();
+                        } else
+                            sink.createRegularFile(path, write);
+                        ADD_FAILURE() << "the injected exception was lost";
+                    } catch (...) {
+                        EXPECT_EQ(std::current_exception(), failure);
+                    }
+                    EXPECT_NE(observed, INVALID_DESCRIPTOR);
+                    EXPECT_EQ(hookCalls, hookFailure ? 1u : 0u);
+                    /* Check closure before opening the file could reuse its descriptor. */
+                    EXPECT_THROW(getFileSize(observed), SystemError);
+                    EXPECT_EQ(readFile(file), bytes);
+                }
+    EXPECT_EQ(cases, 16u);
+}
+
 /* A `FileSystemObjectSink` of one's own, composed over `RestoreSink`, is
    handed every level: the sub-sink `createDirectory`'s callback gives back
    is the sink the directory's children are created on, so a composite that
@@ -1222,7 +1429,12 @@ TEST(ObjectHashSink, known_answers_without_reading)
         std::vector<CanonPath> asked;
         std::vector<CanonPath> finished;
 
-        HashedNode node(const CanonPath & p, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
+        HashedNode node(
+            SourceAccessor &,
+            const CanonPath &,
+            const CanonPath & p,
+            const SourceAccessor::Stat & st,
+            fun<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tDirectory)
                 return descend();
@@ -1249,7 +1461,7 @@ TEST(ObjectHashSink, known_answers_without_reading)
 
     auto r = objectHashOf(*guarded, CanonPath::root, defaultPathFilter, memo);
     EXPECT_EQ(r.root, expected);
-    EXPECT_FALSE(r.narSizeExact);
+    EXPECT_FALSE(r.narSize.has_value());
     /* The root and every directory not beneath the answered one were asked;
        nothing beneath `a` was. */
     EXPECT_EQ(
@@ -1283,7 +1495,7 @@ TEST(ObjectHashSink, known_answers_without_reading)
     memo.answer = [&](const CanonPath &) -> std::optional<Hash> { return expected.hash; };
     auto rRoot = objectHashOf(*guarded, CanonPath::root, defaultPathFilter, memo);
     EXPECT_EQ(rRoot.root, expected);
-    EXPECT_FALSE(rRoot.narSizeExact);
+    EXPECT_FALSE(rRoot.narSize.has_value());
     EXPECT_EQ(memo.asked, (std::vector<CanonPath>{CanonPath::root}));
     EXPECT_EQ(guarded->reads, 0u);
 
@@ -1298,7 +1510,12 @@ TEST(ObjectHashSink, known_answers_without_reading)
         {
         }
 
-        HashedNode node(const CanonPath & p, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
+        HashedNode node(
+            SourceAccessor &,
+            const CanonPath &,
+            const CanonPath & p,
+            const SourceAccessor::Stat & st,
+            fun<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tRegular)
                 return descend();
@@ -1312,7 +1529,7 @@ TEST(ObjectHashSink, known_answers_without_reading)
 
     auto rFiles = objectHashOf(*plain, CanonPath::root, defaultPathFilter, fileMemo);
     EXPECT_EQ(rFiles.root, expected);
-    EXPECT_TRUE(rFiles.narSizeExact);
+    EXPECT_TRUE(rFiles.narSize.has_value());
     EXPECT_EQ(rFiles.narSize, nar.size());
 }
 
@@ -1397,6 +1614,207 @@ struct Arbitrary<nix::GenTree>
 } // namespace rc
 
 namespace nix {
+
+/* A tee composes each sink's directory scope, including when only one
+   side returns a new sink rooted at /. A failed child unwinds both scopes
+   without reporting either enclosing directory as complete. */
+TEST(TeeFileSystemObjectSink, composesEveryDirectoryConventionAndUnwindsBothScopes)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "scoped RestoreSink directories and their hooks require Unix descriptors";
+#else
+    struct Failure
+    {};
+
+    struct Hooks : RestoreSinkHooks
+    {
+        std::vector<std::string> & events;
+        std::string side;
+
+        Hooks(std::vector<std::string> & events, std::string side)
+            : events(events)
+            , side(std::move(side))
+        {
+        }
+
+        void directoryDone(Descriptor) override
+        {
+            events.push_back(side + "directory");
+        }
+
+        void regularFileCreated(Descriptor, bool) override
+        {
+            events.push_back(side + "file");
+        }
+
+        void symlinkCreated(Descriptor, const CanonPath &) override
+        {
+            events.push_back(side + "symlink");
+        }
+    };
+
+    auto tmpDir = createTempDir();
+    AutoDelete delTmpDir(tmpDir, /*recursive=*/true);
+    size_t cases = 0;
+    for (bool physicalA : {false, true})
+        for (bool physicalB : {false, true})
+            for (bool fail : {false, true}) {
+                SCOPED_TRACE(
+                    testing::Message() << "physicalA=" << physicalA << " physicalB=" << physicalB << " fail=" << fail);
+                auto directory = tmpDir / std::to_string(cases++);
+                createDirs(directory);
+                auto a = make_ref<MemorySourceAccessor>(), b = make_ref<MemorySourceAccessor>();
+                MemorySink memoryA{*a}, memoryB{*b};
+                std::vector<std::string> events;
+                Hooks hooksA{events, "a:"}, hooksB{events, "b:"};
+                RestoreSink restoreA{/*startFsync=*/false, &hooksA}, restoreB{/*startFsync=*/false, &hooksB};
+                restoreA.dstPath = directory / "a";
+                restoreB.dstPath = directory / "b";
+                FileSystemObjectSink & sinkA = physicalA ? static_cast<FileSystemObjectSink &>(restoreA) : memoryA;
+                FileSystemObjectSink & sinkB = physicalB ? static_cast<FileSystemObjectSink &>(restoreB) : memoryB;
+                TeeFileSystemObjectSink tee{sinkA, sinkB};
+                auto failure = std::make_exception_ptr(Failure{});
+                std::exception_ptr observed;
+                size_t directories = 0, files = 0;
+                try {
+                    tee.createDirectory(CanonPath::root, [&](FileSystemObjectSink & root, const CanonPath & base) {
+                        ++directories;
+                        root.createDirectory(base / "nested", [&](FileSystemObjectSink & nested, const CanonPath & n) {
+                            ++directories;
+                            nested.createDirectory(n / "deep", [&](FileSystemObjectSink & deep, const CanonPath & d) {
+                                ++directories;
+                                deep.createRegularFile(d / "file", [&](CreateRegularFileSink & file) {
+                                    ++files;
+                                    file("payload");
+                                });
+                                deep.createSymlink(d / "link", "file");
+                                if (fail)
+                                    std::rethrow_exception(failure);
+                            });
+                        });
+                        root.createRegularFile(base / "tail", [&](CreateRegularFileSink & file) {
+                            ++files;
+                            file("after");
+                        });
+                    });
+                } catch (...) {
+                    observed = std::current_exception();
+                }
+                EXPECT_EQ(observed, fail ? failure : std::exception_ptr{});
+                EXPECT_EQ(directories, 3u);
+                EXPECT_EQ(files, fail ? 1u : 2u) << "the producer runs once for both outputs";
+
+                auto expected = make_ref<MemorySourceAccessor>();
+                expected->addFile(CanonPath("/nested/deep/file"), "payload");
+                expected->open(CanonPath("/nested/deep/link"), File{File::Symlink{.target = "file"}});
+                if (!fail)
+                    expected->addFile(CanonPath("/tail"), "after");
+                auto nar = narOf(*expected);
+                EXPECT_EQ(physicalA ? narOf(*makeFSSourceAccessor(restoreA.dstPath)) : narOf(*a), nar);
+                EXPECT_EQ(physicalB ? narOf(*makeFSSourceAccessor(restoreB.dstPath)) : narOf(*b), nar);
+
+                std::vector<std::string> expectedEvents;
+                const std::array physical{physicalA, physicalB};
+                auto completed = [&](std::string_view event, bool reverse) {
+                    for (auto side : reverse ? std::array{1u, 0u} : std::array{0u, 1u})
+                        if (physical[side])
+                            expectedEvents.push_back(std::string(side ? "b:" : "a:") + std::string(event));
+                };
+                completed("file", true);
+                completed("symlink", false);
+                if (!fail) {
+                    completed("directory", true);
+                    completed("directory", true);
+                    completed("file", true);
+                    completed("directory", true);
+                }
+                EXPECT_EQ(events, expectedEvents);
+            }
+    EXPECT_EQ(cases, 8u);
+#endif
+}
+
+/* Each endpoint may set or clear skipContents initially and after each
+   metadata callback. Their six observed bits vary independently. Metadata
+   reaches both; bytes are omitted only for the endpoints currently skipping. */
+TEST(TeeFileSystemObjectSink, observesSkipContentsAfterEveryMetadataStage)
+{
+    struct Endpoint : NullFileSystemObjectSink
+    {
+        unsigned stages;
+        size_t files = 0, executable = 0, sizes = 0;
+        std::string bytes;
+
+        explicit Endpoint(unsigned stages)
+            : stages(stages)
+        {
+        }
+
+        void createRegularFile(const CanonPath &, fun<void(CreateRegularFileSink &)> produce) override
+        {
+            ++files;
+
+            struct File : CreateRegularFileSink
+            {
+                Endpoint & endpoint;
+
+                explicit File(Endpoint & endpoint)
+                    : endpoint(endpoint)
+                {
+                    skipContents = endpoint.stages & 1;
+                }
+
+                void isExecutable() override
+                {
+                    ++endpoint.executable;
+                    skipContents = endpoint.stages & 2;
+                }
+
+                void preallocateContents(uint64_t size) override
+                {
+                    ++endpoint.sizes;
+                    EXPECT_EQ(size, 3u);
+                    skipContents = endpoint.stages & 4;
+                }
+
+                void operator()(std::string_view data) override
+                {
+                    endpoint.bytes += data;
+                }
+            } file{*this};
+
+            produce(file);
+        }
+    };
+
+    size_t checked = 0;
+    for (unsigned aStages = 0; aStages < 8; ++aStages)
+        for (unsigned bStages = 0; bStages < 8; ++bStages) {
+            SCOPED_TRACE(testing::Message() << "aStages=" << aStages << " bStages=" << bStages);
+            Endpoint a{aStages}, b{bStages};
+            TeeFileSystemObjectSink tee{a, b};
+            size_t produced = 0;
+            tee.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
+                ++produced;
+                EXPECT_EQ(file.skipContents, bool(aStages & bStages & 1));
+                file.isExecutable();
+                EXPECT_EQ(file.skipContents, bool(aStages & bStages & 2));
+                file.preallocateContents(3);
+                EXPECT_EQ(file.skipContents, bool(aStages & bStages & 4));
+                if (!file.skipContents)
+                    file("abc");
+            });
+            EXPECT_EQ(produced, 1u);
+            for (auto * endpoint : {&a, &b}) {
+                EXPECT_EQ(endpoint->files, 1u);
+                EXPECT_EQ(endpoint->executable, 1u);
+                EXPECT_EQ(endpoint->sizes, 1u);
+                EXPECT_EQ(endpoint->bytes, endpoint->stages & 4 ? "" : "abc");
+            }
+            ++checked;
+        }
+    EXPECT_EQ(checked, 64u);
+}
 
 /* `copyRecursive` under both directory-callback conventions: the base
    class's (`MemorySink`: the same sink, the full path) and `RestoreSink`'s

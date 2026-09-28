@@ -314,7 +314,6 @@ EvalState::EvalState(
           })}
     , store(store)
     , buildStore(buildStore ? buildStore : store)
-    , writeBuffer(*store)
     , inputCache(fetchers::InputCache::create())
     , debugRepl(nullptr)
     , debugStop(false)
@@ -396,105 +395,7 @@ EvalState::EvalState(
     }
 }
 
-EvalState::~EvalState()
-{
-    /* Whatever evaluation created belongs to the store on exit, whatever the
-       caller did.  A destructor cannot report failure; commands flush before
-       this and see errors there. */
-    if (!writeBuffer.empty()) {
-        try {
-            flushPendingWrites();
-        } catch (...) {
-            ignoreExceptionInDestructor();
-        }
-    }
-}
-
-FinishedEvaluation EvalState::finish()
-{
-    evalCaches.clear();
-    flushPendingWrites();
-    return {};
-}
-
-void EvalState::flushPendingWrites()
-{
-    if (writeBuffer.empty())
-        return;
-    writeBuffer.flush();
-}
-
-RealisedString EvalState::realise(Value & v, NixStringContext * context)
-{
-    assert(v.type() == nString);
-    /* Everything pending is written, whatever this string's own provenance
-       says: a context-free text may still name a pending path, and only a
-       total write makes its bytes safe to let out. */
-    flushPendingWrites();
-    if (context && v.context())
-        copyContext(v, *context);
-    return RealisedString(BackedStringView(v.string_view()));
-}
-
-RealisedString EvalState::realise(std::string bytes)
-{
-    flushPendingWrites();
-    return RealisedString(BackedStringView(std::move(bytes)));
-}
-
-RealisedString EvalState::realise(Value & v, const PosIdx pos, std::string_view errorCtx)
-{
-    forceString(v, pos, errorCtx);
-    return realise(v);
-}
-
-RealisedString EvalState::realiseNoCtx(Value & v, const PosIdx pos, std::string_view errorCtx)
-{
-    forceStringNoCtx(v, pos, errorCtx);
-    return realise(v);
-}
-
-RealisedString EvalState::emit(Value & v, NixStringContext * context)
-{
-    assert(v.type() == nString);
-    flushPendingWrites();
-    if (v.context()) {
-        /* A command's output: the mounted inputs this string names are in Δ. */
-        NixStringContext own;
-        copyContext(v, own);
-        ensureLazyPathsCopied(own);
-        if (context)
-            context->insert(own.begin(), own.end());
-    }
-    return RealisedString(BackedStringView(v.string_view()));
-}
-
-RealisedString EvalState::emit(std::string bytes, const NixStringContext & context)
-{
-    flushPendingWrites();
-    ensureLazyPathsCopied(context);
-    return RealisedString(BackedStringView(std::move(bytes)));
-}
-
-RealisedString EvalState::coerceAndEmit(
-    const PosIdx pos,
-    Value & v,
-    NixStringContext & context,
-    std::string_view errorCtx,
-    bool coerceMore,
-    bool copyToStore)
-{
-    auto s = coerceToString(pos, v, context, errorCtx, coerceMore, copyToStore);
-    flushPendingWrites();
-    ensureLazyPathsCopied(context);
-    return RealisedString(std::move(s));
-}
-
-RealisedString EvalState::realise(const StorePath & path)
-{
-    flushPendingWrites();
-    return RealisedString(BackedStringView(store->printStorePath(path)));
-}
+EvalState::~EvalState() = default;
 
 void EvalState::allowPathLegacy(const std::string & path)
 {
@@ -924,9 +825,6 @@ void EvalState::runDebugRepl(const Error * error, const Env & env, const Expr & 
     // Make sure we have a debugger to run and we're not already in a debugger.
     if (!debugRepl || inDebugger)
         return;
-
-    /* The debugger shows whatever the user asks for. */
-    flushPendingWrites();
 
     auto dts = [&]() -> std::unique_ptr<DebugTraceStacker> {
         if (error && expr.getPos()) {
@@ -2826,37 +2724,15 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
                     .debugThrow();
             return rootPath(CanonPath(path));
         });
-    writePendingBeforeRead(path);
     return path;
-}
-
-void EvalState::writePendingBeforeRead(const SourcePath & path)
-{
-    if (writeBuffer.empty() || path.accessor != rootFS)
-        return;
-    auto abs = path.path.abs();
-    if (!store->isInStore(abs))
-        return;
-    /* The store object the path is in, if the name is well-formed at all. */
-    if (auto object = store->maybeParseStorePath(abs.substr(0, abs.find('/', store->storeDir.size() + 1))))
-        writePendingBeforeRead(*object);
-}
-
-void EvalState::writePendingBeforeRead(const StorePath & path)
-{
-    if (writeBuffer.contains(path))
-        flushPendingWrites();
 }
 
 StorePath
 EvalState::coerceToStorePath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
 {
     auto path = coerceToString(pos, v, context, errorCtx, false, false, true).toOwned();
-    if (auto storePath = store->maybeParseStorePath(path)) {
-        /* A bare store path leaves the typed world here, to be dereferenced. */
-        writePendingBeforeRead(*storePath);
+    if (auto storePath = store->maybeParseStorePath(path))
         return *storePath;
-    }
     error<EvalError>("path '%1%' is not in the Nix store", path).withTrace(pos, errorCtx).debugThrow();
 }
 
@@ -2883,14 +2759,6 @@ std::pair<SingleDerivedPath, std::string_view> EvalState::coerceToSingleDerivedP
             [&](NixStringContextElem::Built && b) -> SingleDerivedPath { return std::move(b); },
         },
         ((NixStringContextElem &&) *context.begin()).raw);
-    /* A derived path leaves the typed world here, to be dereferenced. */
-    writePendingBeforeRead(
-        std::visit(
-            overloaded{
-                [](const SingleDerivedPath::Opaque & o) { return o.path; },
-                [](const SingleDerivedPath::Built & b) { return b.drvPath->getBaseStorePath(); },
-            },
-            derivedPath.raw()));
     return {
         std::move(derivedPath),
         std::move(s),

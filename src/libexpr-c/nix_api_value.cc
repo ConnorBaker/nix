@@ -25,7 +25,7 @@ static nix_value * new_nix_value(nix::Value * v, nix::EvalState & state)
 {
     nix_value * ret = new (state.mem.allocBytes(sizeof(nix_value))) nix_value{
         .value = v,
-        .state = &state,
+        .mem = &state.mem,
     };
     nix_gc_incref(nullptr, ret);
     return ret;
@@ -144,7 +144,10 @@ nix_err nix_register_primop(nix_c_context * context, PrimOp * primOp)
 
 nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)
 {
-    return nix_c_boundary(context, state, [&] { return new_nix_value(state->state.allocValue(), state->state); });
+    return nix_c_boundary(
+        context,
+        [&] { return state->state.allocValue(); },
+        [&](nix::Value * value) { return new_nix_value(value, state->state); });
 }
 
 ValueType nix_get_type(nix_c_context * context, const nix_value * value)
@@ -218,9 +221,7 @@ nix_get_string(nix_c_context * context, const nix_value * value, nix_get_string_
         check_value_in(value);
         auto & v = *value->value;
         assert(v.type() == nix::nString);
-        /* The C API's exit for a string's text is a door: the pending objects
-           the text may name are written before C sees it. */
-        call_nix_get_string_callback(value->state->realise(v).view(), callback, user_data);
+        call_nix_get_string_callback(v.string_view(), callback, user_data);
     }
     NIXC_CATCH_ERRS
 }
@@ -232,9 +233,6 @@ const char * nix_get_path_string(nix_c_context * context, const nix_value * valu
     try {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nPath);
-        /* A path's text leaves to C: as at every door, whatever is pending is
-           written first, since C may read the path. */
-        value->state->flushPendingWrites();
         // NOTE (from @yorickvP)
         // v._path.path should work but may not be how Eelco intended it.
         // Long-term this function should be rewritten to copy some data into a
@@ -311,7 +309,6 @@ nix_value * nix_get_list_byidx(nix_c_context * context, const nix_value * value,
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             assert(v.type() == nix::nList);
@@ -332,7 +329,6 @@ nix_get_list_byidx_lazy(nix_c_context * context, const nix_value * value, EvalSt
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             assert(v.type() == nix::nList);
@@ -350,7 +346,6 @@ nix_value * nix_get_attr_byname(nix_c_context * context, const nix_value * value
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             assert(v.type() == nix::nAttrs);
@@ -371,7 +366,6 @@ nix_get_attr_byname_lazy(nix_c_context * context, const nix_value * value, EvalS
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             assert(v.type() == nix::nAttrs);
@@ -389,7 +383,7 @@ nix_get_attr_byname_lazy(nix_c_context * context, const nix_value * value, EvalS
 
 bool nix_has_attr_byname(nix_c_context * context, const nix_value * value, EvalState * state, const char * name)
 {
-    return nix_c_boundary(context, state, [&] {
+    return nix_c_boundary(context, [&] {
         auto & v = check_value_in(value);
         assert(v.type() == nix::nAttrs);
         nix::Symbol s = state->state.symbols.create(name);
@@ -412,7 +406,6 @@ nix_get_attr_byidx(nix_c_context * context, nix_value * value, EvalState * state
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             collapse_attrset_layer_chain_if_needed(v, state);
@@ -433,7 +426,6 @@ nix_value * nix_get_attr_byidx_lazy(
 {
     return nix_c_boundary(
         context,
-        state,
         [&]() -> nix::Value * {
             auto & v = check_value_in(value);
             collapse_attrset_layer_chain_if_needed(v, state);
@@ -451,7 +443,7 @@ nix_value * nix_get_attr_byidx_lazy(
 
 const char * nix_get_attr_name_byidx(nix_c_context * context, nix_value * value, EvalState * state, unsigned int i)
 {
-    return nix_c_boundary(context, state, [&]() -> const char * {
+    return nix_c_boundary(context, [&]() -> const char * {
         auto & v = check_value_in(value);
         collapse_attrset_layer_chain_if_needed(v, state);
         if (i >= v.attrs()->size()) {
@@ -481,14 +473,14 @@ nix_err nix_init_string(nix_c_context * context, nix_value * value, const char *
         context->last_err_code = NIX_OK;
     try {
         auto & v = check_value_out(value);
-        v.mkString(std::string_view(str), value->state->mem);
+        v.mkString(std::string_view(str), *value->mem);
     }
     NIXC_CATCH_ERRS
 }
 
 nix_err nix_init_path_string(nix_c_context * context, EvalState * s, nix_value * value, const char * str)
 {
-    return nix_c_boundary(context, s, [&] {
+    return nix_c_boundary(context, [&] {
         auto & v = check_value_out(value);
         v.mkPath(s->state.rootPath(nix::CanonPath(str)), s->state.mem);
     });
@@ -556,7 +548,6 @@ ListBuilder * nix_make_list_builder(nix_c_context * context, EvalState * state, 
 {
     return nix_c_boundary(
         context,
-        state,
         [&] { return state->state.buildList(capacity); },
         [](nix::ListBuilder builder) -> ListBuilder * {
             return new
@@ -637,7 +628,6 @@ BindingsBuilder * nix_make_bindings_builder(nix_c_context * context, EvalState *
 {
     return nix_c_boundary(
         context,
-        state,
         [&] { return state->state.buildBindings(capacity); },
         [](nix::BindingsBuilder bb) -> BindingsBuilder * {
             return new
@@ -673,7 +663,6 @@ nix_realised_string * nix_string_realise(nix_c_context * context, EvalState * st
 {
     return nix_c_boundary(
         context,
-        state,
         [&] {
             auto & v = check_value_in(value);
             nix::StorePathSet storePaths;

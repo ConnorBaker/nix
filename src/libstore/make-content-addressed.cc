@@ -66,10 +66,10 @@ std::map<StorePath, StorePath> makeContentAddressed(Store & srcStore, Store & ds
             info.objectHash = ObjectHash::of(objectHashOfNar(rewritten).root);
         }
         info.narSize = sink.s.size();
-        info.lazyNarHash = [&nar = sink2.s] { return hashString(HashAlgorithm::SHA256, nar); };
 
         StringSource source(sink2.s);
-        dstStore.addToStore(info, source);
+        dstStore.addToStore(
+            info, source, NoRepair, CheckSigs, [&] { return hashString(HashAlgorithm::SHA256, sink2.s); });
 
         remappings.insert_or_assign(std::move(path), std::move(info.path));
     }

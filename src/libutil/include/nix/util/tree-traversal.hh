@@ -44,7 +44,7 @@ struct NodeVisitor
      * it: a listing that gives no type says `false`, and the push driver,
      * which has no listing, says `false` for every child.  It exists so
      * that a visitor which may walk siblings on a pool can tell which of
-     * them are worth one (`MaterialisingVisitor::copyChildren`,
+     * them are worth one (`HashingVisitor::orderedChildren`,
      * `01` §9.10), without a `lstat` a child.
      *
      * The pull driver permits holding a child's `visit` until later in
@@ -52,18 +52,46 @@ struct NodeVisitor
      * directory returns. The push driver requires immediate consumption:
      * its child's bytes and callback captures exist only during `each`.
      */
-    using Children = fun<void(fun<void(std::string_view name, bool isDirectory, fun<Result()> visit)>)>;
+    struct Children
+    {
+        using Each = fun<void(std::string_view name, bool isDirectory, fun<Result()> visit)>;
+        fun<void(Each)> each;
+        /* Lifetime permission, distinct from permission for concurrent
+           observations. Push producers borrow each visit only until Each
+           returns; pull producers lend it through the directory scope. */
+        bool canDefer;
+
+        template<typename F>
+            requires(!std::is_same_v<std::remove_cvref_t<F>, Children>)
+        Children(F && each, bool canDefer = false)
+            : each(std::forward<F>(each))
+            , canDefer(canDefer)
+        {
+        }
+
+        void operator()(Each callback) const
+        {
+            each(std::move(callback));
+        }
+    };
 
     virtual ~NodeVisitor() = default;
 
     /**
      * Around one node, after its stat and before its contents are read.
+     * `accessor` and `from` are the same scoped source used for that stat;
+     * `path` is the visitor's logical coordinate. They outlive `descend`.
      * Return an already known summary or call `descend` exactly once and
      * return its result. The continuation is synchronous and must not be
      * retained. Its scope can carry a memo key without shared visitor state.
      * Never called by the push driver, which cannot skip a NAR's bytes.
      */
-    virtual Result node(const CanonPath & path, const SourceAccessor::Stat & st, fun<Result()> descend)
+    virtual Result node(
+        SourceAccessor & accessor,
+        const CanonPath & from,
+        const CanonPath & path,
+        const SourceAccessor::Stat & st,
+        fun<Result()> descend)
     {
         return descend();
     }
@@ -92,10 +120,17 @@ struct NodeVisitor
  * applied to `path / <entry>` and never to `path` itself, a rejected
  * directory's descendants never asked about (01 §7.1), a tree deeper than
  * `narMaxDepth` refused, and with `use-case-hack` off an on-disk name
- * carrying the suffix refused.  Returns the root's result.
+ * carrying the suffix refused. Returns the root's result. `logicalRoot`
+ * continues an enclosing traversal at that logical path and depth, while
+ * source reads and filter arguments remain relative to `path`.
  */
 template<typename Result>
-Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & filter, NodeVisitor<Result> & v)
+Result traverse(
+    SourceAccessor & accessor,
+    const CanonPath & path,
+    PathFilter & filter,
+    NodeVisitor<Result> & v,
+    const CanonPath & logicalRoot = CanonPath::root)
 {
     /* `from` is the node in `acc`'s coordinates (a `readDirectory` callback
        may scope the accessor to a subdirectory); `to` is the node relative
@@ -171,14 +206,17 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                                 for (auto & [name, type] : entries)
                                     child(name, name, type);
                         };
-                        result = v.directory(to, std::ref(children));
+                        result = v.directory(to, {std::ref(children), true});
                     };
                     acc.readDirectoryWithEntries(from, std::ref(directory));
                     assert(result);
                     return std::move(*result);
                 };
                 /* At the accessor root, the walk already owns this prefix. */
-                return path.abs().size() == 1 && path.abs()[0] == '/' ? visitDirectory(to) : visitDirectory(path / to);
+                if (filter.get_fn().target<AllPaths>())
+                    return visitDirectory(CanonPath::root);
+                auto relative = logicalRoot.isRoot() ? to : to.removePrefix(logicalRoot);
+                return path.isRoot() ? visitDirectory(relative) : visitDirectory(path / relative);
             }
 
             case SourceAccessor::tChar:
@@ -190,8 +228,8 @@ Result traverse(SourceAccessor & accessor, const CanonPath & path, PathFilter & 
                 throw Error("file '%1%' has an unsupported type of %2%", from, st.typeString());
             }
         };
-        return v.node(to, st, std::ref(descend));
-    }(accessor, path, CanonPath::root, 0);
+        return v.node(acc, from, to, st, std::ref(descend));
+    }(accessor, path, logicalRoot, std::ranges::distance(logicalRoot));
 }
 
 /**

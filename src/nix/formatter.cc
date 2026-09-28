@@ -94,12 +94,12 @@ struct CmdFormatterRun : MixFormatter, MixJSON
         StringMap env = getEnv();
         env["PRJ_ROOT"] = flakeDir.string();
 
+        evalState->evalCaches.clear();
         execProgramInStore(
             store,
             UseLookupPath::DontUse,
             app.program.string(),
             programArgs,
-            evalState->finish(),
             std::nullopt, // Use default system
             env);
     };

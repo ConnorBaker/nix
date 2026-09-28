@@ -93,7 +93,7 @@ static nlohmann::json pathInfoToJSON(Store & store, const StorePathSet & storePa
            states.  `nix-shell` prepares this against whatever store it
            was given, a daemon without the object hash included, whose
            description is completed by one walk (`Store::queryObjectHash`). */
-        jsonPath["objectHash"] = store.queryObjectHash(storePath).render();
+        jsonPath["objectHash"] = store.queryObjectHash(*info).render();
         jsonPath["narSize"] = info->narSize;
 
         {

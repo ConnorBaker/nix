@@ -66,6 +66,11 @@ public:
     HashedNode directory(const CanonPath & path, Children children) override;
 
 protected:
+    /** Run permitted pull visits on the shared pool, joining them inside
+     * this callback's scope and delivering results in admission order.
+     * Width one preserves immediate, borrowed push consumption. */
+    Children orderedChildren(Children children);
+
     /** The directory summary and its encoding, for a consumer that publishes the body. */
     std::pair<HashedNode, std::string> hashDirectory(const CanonPath & path, Children children);
 };
@@ -88,19 +93,10 @@ struct ObjectHashSink : FileSystemObjectSink
         merkle::TreeEntry root;
 
         /**
-         * The length of the NAR `dumpPath` serialises the tree to.  Exact
-         * only while `narSizeExact` holds.
+         * The exact length of the NAR `dumpPath` serialises the tree to,
+         * absent when a skipped node supplied no size.
          */
-        uint64_t narSize;
-
-        /**
-         * False when a node was answered by a visitor's `node` without
-         * its size (a directory from the fetchers' memo).  No store route
-         * does that; the memo reads the root alone.  Read by the tests
-         * alone (`libutil-tests/object-hash-sink.cc`), as the invariant's
-         * witness.
-         */
-        bool narSizeExact = true;
+        std::optional<uint64_t> narSize;
 
         static Result of(const HashedNode & root);
     };
@@ -163,17 +159,30 @@ private:
  * with a sink forwarding `isExecutable`, `preallocateContents` and the
  * bytes (not to an inner sink that set `skipContents`; the composite skips
  * only when both do); `b`'s file is complete when `a`'s function returns.
- * Both must follow the base class's directory callback convention (same
- * sink, full path), and the composite hands back itself and the path.
+ * A directory callback receives a scoped composite under `/`; each inner
+ * sink and its returned path remain live for that scope.
  */
 struct TeeFileSystemObjectSink : FileSystemObjectSink
 {
     FileSystemObjectSink & a;
     FileSystemObjectSink & b;
 
-    TeeFileSystemObjectSink(FileSystemObjectSink & a, FileSystemObjectSink & b)
+private:
+    const CanonPath & aRoot;
+    const CanonPath & bRoot;
+
+    TeeFileSystemObjectSink(
+        FileSystemObjectSink & a, FileSystemObjectSink & b, const CanonPath & aRoot, const CanonPath & bRoot)
         : a(a)
         , b(b)
+        , aRoot(aRoot)
+        , bRoot(bRoot)
+    {
+    }
+
+public:
+    TeeFileSystemObjectSink(FileSystemObjectSink & a, FileSystemObjectSink & b)
+        : TeeFileSystemObjectSink(a, b, CanonPath::root, CanonPath::root)
     {
     }
 

@@ -11,22 +11,13 @@ namespace nix {
 namespace fetchers {
 struct PublicKey;
 struct Settings;
+struct Cache;
 } // namespace fetchers
 
 struct GitAccessorOptions
 {
     bool exportIgnore = false;
     bool smudgeLfs = false;
-    /**
-     * For a commit accessor with `exportIgnore`: whether no attributes
-     * source the filter consults names `export-ignore`, so that the filter
-     * is the identity and the accessor returned is the inner one, with its
-     * names and without an attribute lookup per path.  The caller answers
-     * it (`treeMentionsAttribute`, `attributesOutsideTheTreeMention`),
-     * since the tree's part of the answer is a function of the commit and
-     * worth keeping across processes.
-     */
-    bool exportIgnoreHidesNothing = false;
 };
 
 struct GitRepo
@@ -140,8 +131,13 @@ struct GitRepo
      */
     virtual bool attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev) = 0;
 
-    virtual ref<SourceAccessor>
-    getAccessor(const Hash & rev, const GitAccessorOptions & options, std::string displayPrefix) = 0;
+    /** Construct the commit view, proving any export-filter elision here.
+     * The optional cache memoizes only immutable facts about the commit. */
+    virtual ref<SourceAccessor> getAccessor(
+        const Hash & rev,
+        const GitAccessorOptions & options,
+        std::string displayPrefix,
+        std::shared_ptr<fetchers::Cache> cache = nullptr) = 0;
 
     /** Retains a fixed workdir observation; callers must not mutate it through another alias. */
     virtual ref<SourceAccessor> getAccessor(

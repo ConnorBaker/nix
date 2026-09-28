@@ -27,7 +27,9 @@ void printAmbiguous(
         printLiteralBool(str, v.boolean());
         break;
     case nString:
-        printLiteralString(str, state.realise(v, context).view());
+        if (context)
+            copyContext(v, *context);
+        printLiteralString(str, v.string_view());
         break;
     case nPath:
         str << v.path().to_string(); // !!! escaping?

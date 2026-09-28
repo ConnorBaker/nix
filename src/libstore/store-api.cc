@@ -9,6 +9,7 @@
 #include "nix/store/derivation/resolution.hh"
 #include "nix/store/derivation/aterm.hh"
 #include "nix/store/store-api.hh"
+#include "nix/store/local-store.hh"
 #include "nix/store/build.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/outputs-query.hh"
@@ -187,6 +188,34 @@ StorePath Store::followLinksToStorePath(std::string_view path) const
     return toStorePath(followLinksToStore(path).string()).first;
 }
 
+StorePath Store::addTextToStore(
+    std::string_view name, std::string_view contents, const StorePathSet & references, RepairFlag repair)
+{
+    auto path = makeFixedOutputPathFromCA(
+        name, TextInfo{.hash = hashString(HashAlgorithm::SHA256, contents), .references = references});
+
+    // Root before testing validity: an existing referrer protects its closure.
+    addTempRoot(path);
+    if (isValidPath(path) && !repair)
+        return path;
+
+    // Publication can trigger GC, including in an older remote daemon.
+    for (const auto & reference : references)
+        addTempRoot(reference);
+
+    StringSource source(contents);
+    auto written = addToStoreFromDump(
+        source,
+        name,
+        FileSerialisationMethod::Flat,
+        ContentAddressMethod::Raw::Text,
+        HashAlgorithm::SHA256,
+        references,
+        repair);
+    assert(written == path);
+    return path;
+}
+
 StorePath Store::addToStore(
     std::string_view name,
     const SourcePath & path,
@@ -194,8 +223,14 @@ StorePath Store::addToStore(
     HashAlgorithm hashAlgo,
     const StorePathSet & references,
     PathFilter & filter,
-    RepairFlag repair)
+    RepairFlag repair,
+    TreeNamer namer,
+    bool callbacksPermitParallelism)
 {
+    if (method == ContentAddressMethod::Raw::Git && hashAlgo == HashAlgorithm::SHA256 && references.empty())
+        if (auto local = dynamic_cast<LocalStore *>(this); local && local->materialisesFromObjects())
+            return local->materialise(name, path, filter, repair, std::move(namer), callbacksPermitParallelism);
+
     FileSerialisationMethod fsm;
     switch (method.getFileIngestionMethod()) {
     case FileIngestionMethod::Flat:
@@ -221,13 +256,23 @@ StorePath Store::addToStore(
     return storePath.value();
 }
 
-void Store::addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+void Store::addMultipleToStore(
+    PathsSource && pathsToCopy,
+    Activity & act,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
-    addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, 0);
+    addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, 0, narHash);
 }
 
 void Store::addMultipleToStore(
-    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs, size_t maxThreads)
+    PathsSource && pathsToCopy,
+    Activity & act,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    size_t maxThreads,
+    const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
     /* A batch of one has no order to find and nothing to run in parallel,
        and `processGraph` below would build a thread pool and a graph for
@@ -245,9 +290,12 @@ void Store::addMultipleToStore(
                worker destroys its own: a `SinkToSource` holds a coroutine
                stack, and a peer's source a connection lock. */
             auto source = std::move(source_);
+            std::function<Hash()> hashForPath;
+            if (narHash)
+                hashForPath = [&] { return narHash(one.path, *source); };
             act.progress(0, 1, 1, 0);
             try {
-                addToStore(one, *source, repair, checkSigs);
+                addToStore(one, *source, repair, checkSigs, hashForPath);
             } catch (Error & e) {
                 /* As the graph's worker below: with `keep-going` a failure
                    is reported and counted, and this call does not throw. */
@@ -265,7 +313,7 @@ void Store::addMultipleToStore(
     std::atomic<size_t> nrFailed{0};
     std::atomic<uint64_t> nrRunning{0};
 
-    using PathWithInfo = std::pair<ValidPathInfo, std::unique_ptr<Source>>;
+    using PathWithInfo = PathsSource::value_type;
 
     uint64_t bytesExpected = 0;
 
@@ -309,12 +357,15 @@ void Store::addMultipleToStore(
                stack frame are run; this includes
                LegacySSHStore::narFromPath()'s connection lock. */
             auto source = std::move(source_);
+            std::function<Hash()> hashForPath;
+            if (narHash)
+                hashForPath = [&] { return narHash(info.path, *source); };
 
             if (!isValidPath(info.path)) {
                 MaintainCount<decltype(nrRunning)> mc(nrRunning);
                 showProgress();
                 try {
-                    addToStore(info, *source, repair, checkSigs);
+                    addToStore(info, *source, repair, checkSigs, hashForPath);
                 } catch (Error & e) {
                     nrFailed++;
                     if (!settings.getWorkerSettings().keepGoing)
@@ -331,31 +382,9 @@ void Store::addMultipleToStore(
         maxThreads);
 }
 
-/*
-The aim of this function is to compute in one pass the correct ValidPathInfo for
-the files that we are trying to add to the store. To accomplish that in one
-pass, given the different kind of inputs that we can take (normal nar archives,
-nar archives with non SHA-256 hashes, and flat files), we set up a net of sinks
-and aliases. Also, since the dataflow is obfuscated by this, we include here a
-graphviz diagram:
-
-digraph graphname {
-    node [shape=box]
-    fileSource -> narSink
-    narSink [style=dashed]
-    narSink -> caHashSink [style = dashed, label = "Recursive && !SHA-256"]
-    narSink -> narHashSink [style = dashed, label = "Recursive && SHA-256"]
-    fileSource -> parseSink
-    parseSink [style=dashed]
-    parseSink-> fileSink [style = dashed, label = "Flat"]
-    parseSink -> objectSink [style = dashed, label = "Recursive or Git"]
-    fileSink -> caHashSink
-}
-
-For the git method under SHA-256 the content address is the object hash of
-the root `objectSink` computed from the same stream, so this is one walk of
-the source to name it and one to add it.
-*/
+/* Compute the object hash and content address in one walk. The address
+   hashes the NAR for NAR addressing, regular-file bytes for flat/text,
+   or uses the root's object hash for Git. */
 ValidPathInfo Store::addToStoreSlow(
     std::string_view name,
     const SourcePath & srcPath,
@@ -366,15 +395,7 @@ ValidPathInfo Store::addToStoreSlow(
 {
     checkIngestionAlgorithm(method.getFileIngestionMethod(), hashAlgo);
 
-    /* The NAR stream is hashed only where the result is used: it is the
-       content hash under the NAR method with SHA-256.  Under the NAR method
-       with another algorithm the stream is the content hash's input
-       instead. */
-    bool narHashIsCA = method == ContentAddressMethod::Raw::NixArchive && hashAlgo == HashAlgorithm::SHA256;
-    bool caFromNar = method == ContentAddressMethod::Raw::NixArchive && hashAlgo != HashAlgorithm::SHA256;
-    std::optional<HashSink> narHashSink;
-    if (narHashIsCA)
-        narHashSink.emplace(HashAlgorithm::SHA256);
+    bool caFromNar = method == ContentAddressMethod::Raw::NixArchive;
     HashSink caHashSink{hashAlgo};
 
     /* Note that fileSink and narSink must never both write to caHashSink;
@@ -382,8 +403,6 @@ ValidPathInfo Store::addToStoreSlow(
        latter feeds it only under the NAR method. */
     RegularFileSink fileSink{caHashSink};
     LambdaSink narSink{[&](std::string_view data) {
-        if (narHashSink)
-            (*narHashSink)(data);
         if (caFromNar)
             caHashSink(data);
     }};
@@ -413,13 +432,8 @@ ValidPathInfo Store::addToStoreSlow(
     /* We extract the result of the computation from the sinks by calling
        finish; the NAR size is the object sink's. */
     auto object = objectSink.finish();
-    std::optional<Hash> narHash;
-    if (narHashSink)
-        narHash = narHashSink->finish().hash;
-
-    auto hash = narHashIsCA                                ? *narHash
-                : method == ContentAddressMethod::Raw::Git ? merkle::objectHash(object.root)
-                                                           : caHashSink.finish().hash;
+    auto objectHash = ObjectHash::of(object.root);
+    auto hash = method == ContentAddressMethod::Raw::Git ? objectHash.hash : caHashSink.finish().hash;
 
     if (expectedCAHash && expectedCAHash != hash)
         throw Error("hash mismatch for '%s'", srcPath);
@@ -434,35 +448,32 @@ ValidPathInfo Store::addToStoreSlow(
                 .others = references,
                 .self = false,
             }),
-        ObjectHash::of(object.root));
-    info.narSize = object.narSize;
+        objectHash);
+    info.narSize = object.narSize.value();
 
     if (!isValidPath(info.path)) {
         /* For a peer speaking only the old forms: the NAR hash computed
            above when it is the address, else one more walk. */
-        auto described = info;
-        described.lazyNarHash = [&]() -> Hash {
-            if (narHash)
-                return *narHash;
+        auto source = sinkToSource([&](Sink & scratchpadSink) { srcPath.dumpPath(scratchpadSink); });
+        addToStore(info, *source, NoRepair, CheckSigs, [&]() -> Hash {
+            if (caFromNar && hashAlgo == HashAlgorithm::SHA256)
+                return hash;
             HashSink sink{HashAlgorithm::SHA256};
             srcPath.dumpPath(sink);
             return sink.finish().hash;
-        };
-        auto source = sinkToSource([&](Sink & scratchpadSink) { srcPath.dumpPath(scratchpadSink); });
-        addToStore(described, *source);
+        });
     }
 
     return info;
 }
 
-ObjectHash Store::queryObjectHash(const StorePath & path)
+ObjectHash Store::queryObjectHash(const ValidPathInfo & info)
 {
-    auto info = queryPathInfo(path);
-    if (info->objectHash)
-        return *info->objectHash;
+    if (info.objectHash)
+        return *info.objectHash;
     /* The peer described the path by its NAR hash alone (the shim): the
        object hash is the walk's, over the object it holds. */
-    return ObjectHash::of(objectHashOf(*requireStoreObjectAccessor(path), CanonPath::root).root);
+    return ObjectHash::of(objectHashOf(*requireStoreObjectAccessor(info.path), CanonPath::root).root);
 }
 
 Hash narHashOf(Store & store, const StorePath & path)
@@ -472,11 +483,15 @@ Hash narHashOf(Store & store, const StorePath & path)
     return sink.finish().hash;
 }
 
-std::optional<std::pair<std::string, std::string>> Store::contentMismatch(const ValidPathInfo & info)
+std::optional<std::pair<std::string, std::string>>
+Store::contentMismatch(const ValidPathInfo & info, SourceAccessor * accessor)
 {
     if (info.objectHash) {
         auto current = ObjectHash::of(
-            objectHashOf(*requireStoreObjectAccessor(info.path, /*requireValidPath=*/false), CanonPath::root).root);
+            objectHashOf(
+                accessor ? *accessor : *requireStoreObjectAccessor(info.path, /*requireValidPath=*/false),
+                CanonPath::root)
+                .root);
         if (current == *info.objectHash)
             return std::nullopt;
         return std::pair{info.objectHash->render(), current.render()};
@@ -684,7 +699,7 @@ bool Store::isValidPath(const StorePath & storePath)
 bool Store::isValidPathUncached(const StorePath & path)
 {
     try {
-        queryPathInfo(path);
+        queryPathInfoAfterCacheMiss(path);
         return true;
     } catch (InvalidPath &) {
         return false;
@@ -700,6 +715,11 @@ ref<const ValidPathInfo> Store::queryPathInfo(const StorePath & storePath)
         throw InvalidPath("path '%s' is not valid", printStorePath(storePath));
     }
 
+    return queryPathInfoAfterCacheMiss(storePath);
+}
+
+ref<const ValidPathInfo> Store::queryPathInfoAfterCacheMiss(const StorePath & storePath)
+{
     std::promise<ref<const ValidPathInfo>> promise;
 
     queryPathInfoAfterCacheMiss(storePath, {[&](std::future<ref<const ValidPathInfo>> result) {
@@ -1063,27 +1083,16 @@ void copyStorePath(
 
     uint64_t total = 0;
 
-    // recompute store path on the chance dstStore does it differently
-    if (info->ca && info->references.empty()) {
+    // Prepare the destination description once, retaining the source info otherwise.
+    if ((info->ca && info->references.empty()) || info->ultimate) {
         auto info2 = make_ref<ValidPathInfo>(*info);
-        info2->path =
-            dstStore.makeFixedOutputPathFromCA(info->path.name(), info->contentAddressWithReferences().value());
-        if (dstStore.storeDir == srcStore.storeDir)
-            assert(info->path == info2->path);
-        info = info2;
-    }
-
-    if (info->ultimate) {
-        auto info2 = make_ref<ValidPathInfo>(*info);
+        if (info->ca && info->references.empty()) {
+            info2->path =
+                dstStore.makeFixedOutputPathFromCA(info->path.name(), info->contentAddressWithReferences().value());
+            if (dstStore.storeDir == srcStore.storeDir)
+                assert(info->path == info2->path);
+        }
         info2->ultimate = false;
-        info = info2;
-    }
-
-    /* For a destination speaking only the old forms: the shim's walk of
-       the source, when its writer asks. */
-    if (!info->assertedNarHash) {
-        auto info2 = make_ref<ValidPathInfo>(*info);
-        info2->lazyNarHash = [&srcStore, storePath] { return narHashOf(srcStore, storePath); };
         info = info2;
     }
 
@@ -1106,7 +1115,7 @@ void copyStorePath(
                 srcStore.config.getHumanReadableURI());
         });
 
-    dstStore.addToStore(*info, *source, repair, checkSigs);
+    dstStore.addToStore(*info, *source, repair, checkSigs, [&] { return narHashOf(srcStore, storePath); });
 }
 
 std::map<StorePath, StorePath> copyPaths(
@@ -1181,6 +1190,7 @@ std::map<StorePath, StorePath> copyPaths(
         pathsMap.insert_or_assign(path, path);
 
     Store::PathsSource pathsToCopy;
+    std::map<const Source *, StorePath> sourcePaths;
 
     auto computeStorePathForDst = [&](const ValidPathInfo & currentPathInfo) -> StorePath {
         auto storePathForSrc = currentPathInfo.path;
@@ -1208,8 +1218,6 @@ std::map<StorePath, StorePath> copyPaths(
 
         ValidPathInfo infoForDst = *info;
         infoForDst.path = storePathForDst;
-        if (!infoForDst.assertedNarHash)
-            infoForDst.lazyNarHash = [&srcStore, missingPath] { return narHashOf(srcStore, missingPath); };
 
         auto source = sinkToSource([&, narSize = info->narSize](Sink & sink) {
             // We can reasonably assume that the copy will happen whenever we
@@ -1234,10 +1242,16 @@ std::map<StorePath, StorePath> copyPaths(
 
             srcStore.narFromPath(missingPath, tee);
         });
+        if (storePathForDst != missingPath)
+            sourcePaths.emplace(source.get(), missingPath);
         pathsToCopy.emplace_back(std::move(infoForDst), std::move(source));
     }
 
-    dstStore.addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs);
+    dstStore.addMultipleToStore(
+        std::move(pathsToCopy), act, repair, checkSigs, [&](const StorePath & path, const Source & source) {
+            auto original = sourcePaths.find(&source);
+            return narHashOf(srcStore, original == sourcePaths.end() ? path : original->second);
+        });
 
     return pathsMap;
 }

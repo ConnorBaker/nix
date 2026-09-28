@@ -559,11 +559,11 @@ bool Worker::pathContentsGood(const StorePath & path)
     printInfo("checking path '%s'...", store.printStorePath(path));
     auto info = store.queryPathInfo(path);
     bool res = false;
-    if (store.getFSAccessor(path, /*requireValidPath=*/false)) {
+    if (auto accessor = store.getFSAccessor(path, /*requireValidPath=*/false)) {
         /* The content hash recomputed from the files against the info's;
            an info with neither hash (a store that could not migrate it) is
            taken as good, as the null NAR hash was. */
-        res = (!info->objectHash && !info->assertedNarHash) || !store.contentMismatch(*info);
+        res = (!info->objectHash && !info->assertedNarHash) || !store.contentMismatch(*info, accessor.get());
     }
     pathContentsGoodCache.insert_or_assign(path, res);
     if (!res)

@@ -5,7 +5,7 @@
 #include "nix/util/archive.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/object-hash-sink.hh"
-#include "nix/store/local-store.hh"
+#include "nix/store/store-api.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <mutex>
@@ -286,7 +286,12 @@ struct MemoVisitor : HashingVisitor
         return root.path.isRoot() ? lookupAt(to) : lookupAt(root.path / to);
     }
 
-    HashedNode node(const CanonPath & to, const SourceAccessor::Stat & st, fun<HashedNode()> descend) override
+    HashedNode node(
+        SourceAccessor &,
+        const CanonPath &,
+        const CanonPath & to,
+        const SourceAccessor::Stat & st,
+        fun<HashedNode()> descend) override
     {
         std::optional<fetchers::Cache::Key> key;
         /* Symlinks are named only when recorded; filtered directories
@@ -461,73 +466,59 @@ std::pair<StorePath, Hash> fetchToStore2(
     auto filter2 = filter ? *filter : defaultPathFilter;
 
     auto [storePath, hash] =
-        mode == FetchMode::DryRun
-            ? [&]() {
-                  if (method == ContentAddressMethod::Raw::Git) {
-                      /* Repair reads the tree itself, bypassing known entries
-                         and subtree memo rows as well as the root caches. */
-                      auto hash = merkle::objectHash(
-                          repair ? objectHashOf(*path.accessor, path.path, filter2).root
-                                 : gitTreeHashMemoised(settings, path, filter2, filter != nullptr, rootName));
-                      auto storePath = gitTreePath(store, name, hash);
-                      debug(
-                          "named '%s' as '%s' (tree hash '%s')",
-                          path,
-                          store.printStorePath(storePath),
-                          hash.to_string(HashFormat::SRI, true));
-                      return std::make_pair(std::move(storePath), hash);
-                  }
-                  // FIXME: we may have already computed this above.
-                  auto [storePath, hash] =
-                      store.computeStorePath(name, path, method, HashAlgorithm::SHA256, {}, filter2);
-                  debug(
-                      "hashed '%s' to '%s' (hash '%s')",
-                      path,
-                      store.printStorePath(storePath),
-                      hash.to_string(HashFormat::SRI, true));
-                  return std::make_pair(std::move(storePath), hash);
-              }()
-            : [&]() {
-                  // FIXME: ideally addToStore() would return the hash
-                  // right away (like computeStorePath()).
-                  auto storePath = [&] {
-                      /* The second route of 01 §9.10, and the one place it is
-                         decided: under the git method, a local store that
-                         materialises from its own objects copies what the
-                         naming names and the store holds by `linkat` alone,
-                         reading from the accessor only what the store lacks;
-                         the namer is the naming's own memo lookup.  Every
-                         other case is the one route, a NAR dump into
-                         `addToStoreFromDump`. */
-                      if (method == ContentAddressMethod::Raw::Git)
-                          if (auto local = dynamic_cast<LocalStore *>(&store);
-                              local && local->materialisesFromObjects()) {
-                              MemoVisitor memo{settings, path, filter != nullptr, rootName};
-                              return local->materialise(
-                                  name,
-                                  path,
-                                  filter2,
-                                  repair,
-                                  [&](const CanonPath & to, const SourceAccessor::Stat & st) {
-                                      return repair ? std::nullopt : memo.lookup(to, st);
-                                  },
-                                  /*callbacksPermitParallelism=*/true);
-                          }
-                      return store.addToStore(name, path, method, HashAlgorithm::SHA256, {}, filter2, repair);
-                  }();
-                  auto info = store.queryPathInfo(storePath);
-                  assert(info->references.empty());
-                  if (!info->ca || info->ca->method != method)
-                      throw Error("path '%s' lacks a CA field", store.printStorePath(storePath));
-                  auto hash = info->ca->hash;
-                  printMsg(
-                      lvlChatty,
-                      "copied source '%s' -> '%s' (hash '%s')",
-                      path,
-                      store.printStorePath(storePath),
-                      hash.to_string(HashFormat::SRI, true));
-                  return std::make_pair(std::move(storePath), hash);
-              }();
+        mode == FetchMode::DryRun ? [&]() {
+            if (method == ContentAddressMethod::Raw::Git) {
+                /* Repair reads the tree itself, bypassing known entries
+                   and subtree memo rows as well as the root caches. */
+                auto hash = merkle::objectHash(
+                    repair ? objectHashOf(*path.accessor, path.path, filter2).root
+                           : gitTreeHashMemoised(settings, path, filter2, filter != nullptr, rootName));
+                auto storePath = gitTreePath(store, name, hash);
+                debug(
+                    "named '%s' as '%s' (tree hash '%s')",
+                    path,
+                    store.printStorePath(storePath),
+                    hash.to_string(HashFormat::SRI, true));
+                return std::make_pair(std::move(storePath), hash);
+            }
+            // FIXME: we may have already computed this above.
+            auto [storePath, hash] = store.computeStorePath(name, path, method, HashAlgorithm::SHA256, {}, filter2);
+            debug(
+                "hashed '%s' to '%s' (hash '%s')",
+                path,
+                store.printStorePath(storePath),
+                hash.to_string(HashFormat::SRI, true));
+            return std::make_pair(std::move(storePath), hash);
+        }()
+                                  : [&]() {
+                                        // FIXME: ideally addToStore() would return the hash
+                                        // right away (like computeStorePath()).
+                                        MemoVisitor memo{settings, path, filter != nullptr, rootName};
+                                        auto storePath = store.addToStore(
+                                            name,
+                                            path,
+                                            method,
+                                            HashAlgorithm::SHA256,
+                                            {},
+                                            filter2,
+                                            repair,
+                                            [&](const CanonPath & to, const SourceAccessor::Stat & st) {
+                                                return repair ? std::nullopt : memo.lookup(to, st);
+                                            },
+                                            /*callbacksPermitParallelism=*/true);
+                                        auto info = store.queryPathInfo(storePath);
+                                        assert(info->references.empty());
+                                        if (!info->ca || info->ca->method != method)
+                                            throw Error("path '%s' lacks a CA field", store.printStorePath(storePath));
+                                        auto hash = info->ca->hash;
+                                        printMsg(
+                                            lvlChatty,
+                                            "copied source '%s' -> '%s' (hash '%s')",
+                                            path,
+                                            store.printStorePath(storePath),
+                                            hash.to_string(HashFormat::SRI, true));
+                                        return std::make_pair(std::move(storePath), hash);
+                                    }();
 
     act.result(resFetchToStore, store.printStorePath(storePath));
 

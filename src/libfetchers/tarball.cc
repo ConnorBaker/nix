@@ -87,9 +87,9 @@ DownloadFileResult downloadFile(
             },
             ObjectHash{.hash = merkle::blobId(res.data)});
         info.narSize = sink.s.size();
-        info.lazyNarHash = [&nar = sink.s] { return hashString(HashAlgorithm::SHA256, nar); };
         auto source = StringSource{sink.s};
-        store.addToStore(info, source, NoRepair, NoCheckSigs);
+        store.addToStore(
+            info, source, NoRepair, NoCheckSigs, [&nar = sink.s] { return hashString(HashAlgorithm::SHA256, nar); });
         storePath = std::move(info.path);
     }
 

@@ -93,25 +93,37 @@ public:
 class RestoreSinkHooks;
 
 /**
- * A regular file `RestoreSink` is creating, open in two phases: returned
- * by `RestoreSink::beginRegularFile`, fed as any `CreateRegularFileSink`,
- * and completed by `finish()`, which flushes and runs the sink's hooks
- * (`08` §1.6: the composite opens a file lazily through this).  The
- * descriptor closes with the object.
+ * A file owned by `RestoreSink` while it is written. `finish()` flushes
+ * and runs the completion hook; destruction closes the descriptor.
+ * The callback form keeps the writer on its stack. `beginRegularFile`
+ * returns an owned writer when creation and completion have separate scopes.
  */
-struct RegularFileWriter : CreateRegularFileSink
+struct RegularFileWriter final : CreateRegularFileSink, FdSink
 {
 private:
+    friend struct RestoreSink;
+
     void anchor() override;
 
+    AutoCloseFD file;
+    bool startFsync;
+    bool executable = false;
+    bool finished = false;
+    RestoreSinkHooks * hooks;
+
+    RegularFileWriter(bool startFsync, RestoreSinkHooks * hooks, AutoCloseFD file);
+
 public:
-    virtual ~RegularFileWriter() = default;
+    ~RegularFileWriter() override;
 
     /**
      * Flush the bytes written and run `RestoreSinkHooks::regularFileCreated`.
      * Once.
      */
-    virtual void finish() = 0;
+    void finish();
+
+    void isExecutable() override;
+    void preallocateContents(uint64_t size) override;
 };
 
 /**
@@ -123,6 +135,11 @@ private:
     void anchor() override;
 
     RestoreSinkHooks * hooks = nullptr;
+
+    AutoCloseFD openRegularFile(const CanonPath & path) const;
+#ifndef _WIN32
+    AutoCloseFD openRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name) const;
+#endif
 
 public:
     std::filesystem::path dstPath;
@@ -164,9 +181,9 @@ public:
     void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override;
 
     /**
-     * Open the regular file at `path` for writing, without writing it:
-     * `createRegularFile(path, f)` is `auto w = beginRegularFile(path);
-     * f(*w); w->finish();`.
+     * Open the regular file at `path` for writing, without writing it.
+     * The owner writes it and calls `finish()` once, with the same file
+     * operations as the stack-owned callback form `createRegularFile`.
      */
     std::unique_ptr<RegularFileWriter> beginRegularFile(const CanonPath & path);
 

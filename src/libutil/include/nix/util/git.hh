@@ -71,6 +71,14 @@ uint64_t parseBlob(Source & source);
 void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo);
 
 /**
+ * Parse a borrowed, complete tree body without its Git header. Require
+ * canonical octal modes and strictly increasing keys in Git's tree order.
+ * The sink still owns name and object-domain validation. A noncanonical
+ * encoding is rejected after all entries, preserving the sink's errors.
+ */
+void parseTreeBody(merkle::DirectorySink & sink, std::string_view body, HashAlgorithm hashAlgo);
+
+/**
  * A line from the output of `git ls-remote --symref`.
  *
  * These can be of two kinds:

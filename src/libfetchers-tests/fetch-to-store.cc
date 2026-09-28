@@ -10,6 +10,7 @@
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/archive.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
 #include "nix/store/store-open.hh"
@@ -105,6 +106,98 @@ TEST(FixedSetFilter, namesByTheInnerNameAndTheAdmittedSet)
     EXPECT_EQ(w5->getFingerprint(CanonPath("keep")).value().second, std::string("whole"));
 }
 
+TEST(FixedSetFilter, subtreeNamesIgnoreOnlyEntriesOutsideThatSubtree)
+{
+    auto tree = make_ref<MemorySourceAccessor>();
+    for (auto path : {"a/keep", "a/drop", "a!/sibling", "b/other"})
+        tree->addFile(CanonPath(path), path);
+    tree->fingerprint = "same immutable tree";
+    const std::set<CanonPath> kept{CanonPath::root, CanonPath("a"), CanonPath("a/keep"), CanonPath("a/drop")};
+    auto withSiblings = kept;
+    for (auto path : {"a!", "a!/sibling", "b", "b/other"})
+        withSiblings.emplace(path);
+    auto pruned = kept;
+    pruned.erase(CanonPath("a/drop"));
+    auto first = makeFixedSetFilteringSourceAccessor(SourcePath(tree), kept);
+    auto second = makeFixedSetFilteringSourceAccessor(SourcePath(tree), withSiblings);
+    auto third = makeFixedSetFilteringSourceAccessor(SourcePath(tree), pruned);
+    EXPECT_EQ(first->readDirectory(CanonPath("a")), second->readDirectory(CanonPath("a")));
+    EXPECT_EQ(first->getFingerprint(CanonPath("a")), second->getFingerprint(CanonPath("a")));
+    EXPECT_NE(first->getFingerprint(CanonPath::root), second->getFingerprint(CanonPath::root));
+    EXPECT_NE(first->getFingerprint(CanonPath("a")), third->getFingerprint(CanonPath("a")));
+    EXPECT_EQ(first->getFingerprint(CanonPath("a/keep")), third->getFingerprint(CanonPath("a/keep")));
+    EXPECT_EQ(first->readFile(CanonPath("a/keep")), third->readFile(CanonPath("a/keep")));
+}
+
+TEST(FilteringSourceAccessor, physicalPathsRequireTheSameRenderedSubtree)
+{
+    auto root = createTempDir();
+    AutoDelete cleanup(root, true);
+    createDirs(root / "sub");
+    writeFile(root / "sub/keep", "kept bytes");
+    writeFile(root / "sub/drop", "excluded bytes");
+    writeFile(root / "outside", "outside bytes");
+    auto physical = makeFSSourceAccessor(root);
+    std::set<CanonPath> admitted{CanonPath::root, CanonPath("sub"), CanonPath("sub/keep")};
+#ifndef _WIN32
+    createSymlink("keep", root / "sub/link");
+    admitted.emplace("sub/link");
+#endif
+    auto all = admitted;
+    all.emplace("sub/drop");
+    all.emplace("outside");
+    auto complete = makeFixedSetFilteringSourceAccessor(SourcePath(physical), all);
+    auto pruned = makeFixedSetFilteringSourceAccessor(SourcePath(physical), admitted);
+    EXPECT_EQ(complete->readDirectory(CanonPath("sub")), physical->readDirectory(CanonPath("sub")));
+    EXPECT_FALSE(pruned->readDirectory(CanonPath("sub")).contains("drop"));
+    EXPECT_FALSE(pruned->readDirectory(CanonPath::root).contains("outside"));
+    /* A finite membership set does not prove all future physical children
+       admitted, even when it currently happens to contain the whole tree. */
+    for (auto view : {complete, pruned}) {
+        EXPECT_FALSE(view->getPhysicalPath(CanonPath::root));
+        EXPECT_FALSE(view->getPhysicalPath(CanonPath("sub")));
+        EXPECT_EQ(view->getPhysicalPath(CanonPath("sub/keep")), root / "sub/keep");
+        EXPECT_EQ(view->readFile(CanonPath("sub/keep")), readFile(root / "sub/keep"));
+#ifndef _WIN32
+        EXPECT_EQ(view->getPhysicalPath(CanonPath("sub/link")), root / "sub/link");
+        EXPECT_EQ(view->readLink(CanonPath("sub/link")), "keep");
+#endif
+    }
+    EXPECT_THROW(pruned->getPhysicalPath(CanonPath("sub/drop")), RestrictedPathError);
+    auto subtree = makeFixedSetFilteringSourceAccessor(SourcePath(physical, CanonPath("sub")), admitted);
+    EXPECT_FALSE(subtree->getPhysicalPath(CanonPath::root));
+    EXPECT_EQ(subtree->getPhysicalPath(CanonPath("keep")), root / "sub/keep");
+    auto rejected = makeFixedSetFilteringSourceAccessor(SourcePath(physical), {});
+    EXPECT_THROW(rejected->getPhysicalPath(CanonPath::root), RestrictedPathError);
+
+    auto deny = [](const CanonPath &) { return RestrictedPathError("denied"); };
+    auto prefixes = AllowListSourceAccessor::create(physical, {CanonPath("sub")}, {}, deny);
+    EXPECT_FALSE(prefixes->getPhysicalPath(CanonPath::root));
+    EXPECT_EQ(prefixes->getPhysicalPath(CanonPath("sub")), root / "sub");
+    EXPECT_THROW(prefixes->getPhysicalPath(CanonPath("outside")), RestrictedPathError);
+    prefixes->allowPrefix(CanonPath::root);
+    EXPECT_EQ(prefixes->getPhysicalPath(CanonPath::root), root);
+
+    struct Predicate final : FilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        using FilteringSourceAccessor::FilteringSourceAccessor;
+
+        bool isAllowed(const CanonPath & path) override
+        {
+            return path.isRoot() || path.isWithin(CanonPath("sub"));
+        }
+    };
+
+    auto predicate = make_ref<Predicate>(SourcePath(physical), deny);
+    /* The abstract predicate has no whole-subtree proof to forward. */
+    EXPECT_FALSE(predicate->getPhysicalPath(CanonPath::root));
+    EXPECT_FALSE(predicate->getPhysicalPath(CanonPath("sub")));
+    EXPECT_EQ(predicate->getPhysicalPath(CanonPath("sub/keep")), root / "sub/keep");
+    EXPECT_THROW(predicate->getPhysicalPath(CanonPath("outside")), RestrictedPathError);
+}
+
 TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
 {
     using Components = std::vector<std::string>;
@@ -124,6 +217,7 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
     struct Observed : MemorySourceAccessor
     {
         enum Outcome { Named, Unnamed, Missing, Throwing } outcome;
+
         size_t names = 0, stats = 0;
         std::optional<CanonPath> requested;
 
@@ -146,6 +240,7 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
             return std::nullopt;
         }
     };
+
     auto inner = make_ref<Observed>();
 
     /* The oracle compares component lists, independently of CanonPath's
@@ -157,9 +252,8 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
                 initial.insert(canon(domain[i]));
         for (size_t added = 0; added <= domain.size(); ++added) {
             SCOPED_TRACE(fmt("subset %d, added %d", subset, added));
-            auto accessor = AllowListSourceAccessor::create(inner, initial, {}, [](const CanonPath & path) {
-                return RestrictedPathError("denied '%s'", path);
-            });
+            auto accessor = AllowListSourceAccessor::create(
+                inner, initial, {}, [](const CanonPath & path) { return RestrictedPathError("denied '%s'", path); });
             if (added < domain.size())
                 accessor->allowPrefix(canon(domain[added]));
             for (auto & query : queries) {
@@ -208,13 +302,15 @@ TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
             throw Error("unexpected inner naming");
         }
     };
+
     size_t errors = 0;
     const auto exact = CanonPath("a/b");
     auto accessor = AllowListSourceAccessor::create(make_ref<NoNaming>(), {}, {exact}, [&](const CanonPath &) {
         ++errors;
         return RestrictedPathError("denied");
     });
-    for (auto & path : {CanonPath::root, CanonPath("a"), exact, CanonPath("a/b/c"), CanonPath("a!"), CanonPath("other")}) {
+    for (auto & path :
+         {CanonPath::root, CanonPath("a"), exact, CanonPath("a/b/c"), CanonPath("a!"), CanonPath("other")}) {
         EXPECT_EQ(accessor->isAllowed(path), path == exact);
         if (path == exact)
             EXPECT_NO_THROW(accessor->checkAccess(path));
@@ -839,7 +935,8 @@ TEST_F(FetchToStoreLocalTest, positiveRootNamingIsObservedOnceForEveryRootKindAn
                name, or another name for the same tree. Only equality
                chooses the root-only memo scope. */
             for (size_t state = 0; state < 3; ++state) {
-                SCOPED_TRACE(fmt("kind=%d copy=%d state=%d", static_cast<RawMode>(kind), mode == FetchMode::Copy, state));
+                SCOPED_TRACE(
+                    fmt("kind=%d copy=%d state=%d", static_cast<RawMode>(kind), mode == FetchMode::Copy, state));
                 fetchers::Settings settings;
                 auto tree = make_ref<ObservedNames>();
                 tree->name = fmt("observed-positive-root-%d", serial++);
@@ -874,7 +971,8 @@ TEST_F(FetchToStoreLocalTest, positiveRootNamingIsObservedOnceForEveryRootKindAn
                    object hash, which recovers plain-file/directory entries. */
                 auto row = settings.getCache()->lookup(
                     makeSourcePathToHashCacheKey(tree->name, ContentAddressMethod::Raw::Git, root));
-                bool recorded = mode == FetchMode::DryRun || kind == merkle::Mode::Regular || kind == merkle::Mode::Directory;
+                bool recorded =
+                    mode == FetchMode::DryRun || kind == merkle::Mode::Regular || kind == merkle::Mode::Directory;
                 ASSERT_EQ(row.has_value(), recorded);
                 if (row) {
                     EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entry.hash);
@@ -1072,7 +1170,7 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
             auto destinationConfig = std::make_shared<LocalStoreConfig>(
                 tempStoreDir.path() / fmt("destination-%d-%d", size, workers), StoreConfig::Params{});
             auto destination = std::make_shared<LocalStore>(ref{destinationConfig});
-            ASSERT_FALSE(destination->hasValidPaths());
+            ASSERT_FALSE(destination->mayHaveValidPaths());
             for (size_t state = 0; state < 3; ++state) {
                 SCOPED_TRACE(fmt("state=%d (empty miss, populated hit, populated miss)", state));
                 if (state == 2)
@@ -1081,7 +1179,7 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
                     auto bad = inputDir / "nested/d7/unsupported";
                     ASSERT_EQ(mkfifo(bad.c_str(), 0600), 0);
                     EXPECT_THROW(input.getAccessor(fetchSettings, *destination), Error);
-                    EXPECT_EQ(destination->hasValidPaths(), state != 0);
+                    EXPECT_EQ(destination->mayHaveValidPaths(), state != 0);
                     std::filesystem::remove(bad);
                 }
                 HashSink expected{HashAlgorithm::SHA256};
@@ -1090,7 +1188,7 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
                 HashSink actual{HashAlgorithm::SHA256};
                 accessor->dumpPath(CanonPath::root, actual);
                 EXPECT_EQ(actual.finish().hash, expected.finish().hash);
-                EXPECT_TRUE(destination->hasValidPaths());
+                EXPECT_TRUE(destination->mayHaveValidPaths());
             }
         }
     }

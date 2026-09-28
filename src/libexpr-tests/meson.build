@@ -65,7 +65,7 @@ sources = files(
   'value/context.cc',
   'value/print.cc',
   'value/value.cc',
-  'write-buffer.cc',
+  'text-store.cc',
 )
 
 include_dirs = [ include_directories('.') ]

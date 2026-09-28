@@ -162,12 +162,13 @@ public:
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();
-        for (auto & accessor : accessors) {
-            auto p = accessor->getPhysicalPath(path);
-            if (p)
-                return p;
-        }
-        return std::nullopt;
+        auto selected = owner(path);
+        if (!selected)
+            return std::nullopt;
+        auto & [own, st] = *selected;
+        if (st.type == tDirectory && !laterDirectories(path, *own).empty())
+            return std::nullopt;
+        return own->getPhysicalPath(path);
     }
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override

@@ -357,7 +357,11 @@ ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
 }
 
 void BinaryCacheStore::addToStore(
-    const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs)
+    const ValidPathInfo & info,
+    Source & narSource,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash()> & narHash)
 {
     if (!repair && isValidPath(info.path))
         return;
@@ -368,7 +372,11 @@ void BinaryCacheStore::addToStore(
 }
 
 void BinaryCacheStore::addMultipleToStore(
-    PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs)
+    PathsSource && pathsToCopy,
+    Activity & act,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
     /* Index the paths to copy by store path so the graph nodes below
        can look up each path's info (NAR size, references) and source. */
@@ -657,7 +665,9 @@ StorePath BinaryCacheStore::addToStore(
     HashAlgorithm hashAlgo,
     const StorePathSet & references,
     PathFilter & filter,
-    RepairFlag repair)
+    RepairFlag repair,
+    TreeNamer namer,
+    bool callbacksPermitParallelism)
 {
     /* FIXME: Make BinaryCacheStore::addToStoreCommon support
        non-recursive+sha256 so we can just use the default

@@ -100,7 +100,7 @@ HashedNode HashingVisitor::symlink(const CanonPath &, const std::string & target
 
 HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 {
-    return hashDirectory(path, std::move(children)).first;
+    return hashDirectory(path, orderedChildren(std::move(children))).first;
 }
 
 std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath & path, Children children)
@@ -122,12 +122,26 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
         size = nextSize;
         sizeExact &= child.narSize.has_value();
     };
-    if (workers == 1)
-        children([&](std::string_view name, bool, fun<HashedNode()> visit) {
-            auto child = visit();
-            consume(std::string(name), child);
-        });
-    else {
+    children([&](std::string_view name, bool, fun<HashedNode()> visit) {
+        auto child = visit();
+        consume(std::string(name), child);
+    });
+
+    auto body = merkle::serialiseTree(tree);
+    return {
+        HashedNode{
+            .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
+            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
+        },
+        std::move(body),
+    };
+}
+
+HashingVisitor::Children HashingVisitor::orderedChildren(Children children)
+{
+    if (workers == 1 || !children.canDefer)
+        return children;
+    return [this, children = std::move(children)](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
         struct Child
         {
             std::string name;
@@ -135,7 +149,6 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             fun<HashedNode()> visit;
             std::optional<HashedNode> node;
         };
-
         boost::container::small_vector<
             Child,
             1,
@@ -150,26 +163,18 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & child) { return child.subdirectory; });
         if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
+        auto run = [&](size_t i) { kids[i].node = kids[i].visit(); };
+        auto consume = [&](size_t i) {
+            auto & child = kids[i];
+            each(child.name, child.subdirectory, [&] { return std::move(child.node.value()); });
+        };
         if (canFork)
-            pool->ordered(
-                kids.size(),
-                [&](size_t i) { return kids[i].subdirectory; },
-                [&](size_t i) { kids[i].node = kids[i].visit(); },
-                [&](size_t i) { consume(std::move(kids[i].name), *kids[i].node); });
+            pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
         else
-            for (auto & child : kids) {
-                auto node = child.visit();
-                consume(std::move(child.name), node);
+            for (size_t i = 0; i < kids.size(); ++i) {
+                run(i);
+                consume(i);
             }
-    }
-
-    auto body = merkle::serialiseTree(tree);
-    return {
-        HashedNode{
-            .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
-            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
-        },
-        std::move(body),
     };
 }
 
@@ -177,8 +182,7 @@ ObjectHashSink::Result ObjectHashSink::Result::of(const HashedNode & root)
 {
     return {
         .root = root.entry,
-        .narSize = merkle::nar::root(root.narSize.value_or(0)),
-        .narSizeExact = root.narSize.has_value(),
+        .narSize = root.narSize.transform([](uint64_t size) { return merkle::nar::root(size); }),
     };
 }
 
@@ -242,20 +246,16 @@ ObjectHashSink::Result ObjectHashSink::finish()
 
 void TeeFileSystemObjectSink::createDirectory(const CanonPath & path)
 {
-    a.createDirectory(path);
-    b.createDirectory(path);
+    a.createDirectory(aRoot / path);
+    b.createDirectory(bRoot / path);
 }
 
 void TeeFileSystemObjectSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
 {
-    /* Both inner sinks follow the base class's convention -- the callback
-       is handed the same sink and the directory's full path -- so the
-       composite does too. */
-    a.createDirectory(path, [&](FileSystemObjectSink &, const CanonPath & aRel) {
-        b.createDirectory(path, [&](FileSystemObjectSink &, const CanonPath & bRel) {
-            if (aRel != path || bRel != path)
-                throw Error("tee sink: a sink renamed directory '%s' ('%s', '%s')", path, aRel, bRel);
-            callback(*this, path);
+    a.createDirectory(aRoot / path, [&](FileSystemObjectSink & aDir, const CanonPath & aRel) {
+        b.createDirectory(bRoot / path, [&](FileSystemObjectSink & bDir, const CanonPath & bRel) {
+            TeeFileSystemObjectSink directory{aDir, bDir, aRel, bRel};
+            callback(directory, CanonPath::root);
         });
     });
 }
@@ -278,12 +278,14 @@ void TeeFileSystemObjectSink::createRegularFile(const CanonPath & path, fun<void
         {
             a.isExecutable();
             b.isExecutable();
+            skipContents = a.skipContents && b.skipContents;
         }
 
         void preallocateContents(uint64_t size) override
         {
             a.preallocateContents(size);
             b.preallocateContents(size);
+            skipContents = a.skipContents && b.skipContents;
         }
 
         void operator()(std::string_view data) override
@@ -295,8 +297,8 @@ void TeeFileSystemObjectSink::createRegularFile(const CanonPath & path, fun<void
         }
     };
 
-    a.createRegularFile(path, [&](CreateRegularFileSink & aFile) {
-        b.createRegularFile(path, [&](CreateRegularFileSink & bFile) {
+    a.createRegularFile(aRoot / path, [&](CreateRegularFileSink & aFile) {
+        b.createRegularFile(bRoot / path, [&](CreateRegularFileSink & bFile) {
             TeeRegularFile both{aFile, bFile};
             func(both);
         });
@@ -305,8 +307,8 @@ void TeeFileSystemObjectSink::createRegularFile(const CanonPath & path, fun<void
 
 void TeeFileSystemObjectSink::createSymlink(const CanonPath & path, const std::string & target)
 {
-    a.createSymlink(path, target);
-    b.createSymlink(path, target);
+    a.createSymlink(aRoot / path, target);
+    b.createSymlink(bRoot / path, target);
 }
 
 ObjectHashSink::Result objectHashOfNar(Source & source)

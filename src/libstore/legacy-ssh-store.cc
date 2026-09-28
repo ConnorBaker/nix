@@ -197,7 +197,12 @@ void LegacySSHStore::queryPathInfoUncached(
     }
 }
 
-void LegacySSHStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
+void LegacySSHStore::addToStore(
+    const ValidPathInfo & info,
+    Source & source,
+    RepairFlag repair,
+    CheckSigsFlag checkSigs,
+    const std::function<Hash()> & narHash)
 {
     debug("adding path '%s' to remote host '%s'", printStorePath(info.path), config->authority.host);
 
@@ -206,9 +211,11 @@ void LegacySSHStore::addToStore(const ValidPathInfo & info, Source & source, Rep
     conn->to << ServeProto::Command::AddToStoreNar << printStorePath(info.path)
              << (info.deriver ? printStorePath(*info.deriver) : "");
     CommonProto::writePathInfoHashes(
-        conn->to, conn->remoteVersion >= ServeProto::objectHashSince, info, [](const Hash & h) {
-            return h.to_string(HashFormat::Base16, false);
-        });
+        conn->to,
+        conn->remoteVersion >= ServeProto::objectHashSince,
+        info,
+        [](const Hash & h) { return h.to_string(HashFormat::Base16, false); },
+        &narHash);
     ServeProto::write(*this, *conn, info.references);
     conn->to << info.registrationTime << info.narSize << info.ultimate;
     ServeProto::write(*this, *conn, info.sigs);

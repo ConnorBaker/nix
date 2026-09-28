@@ -297,7 +297,7 @@ public:
 
     /** Whether any path is registered, without enumerating the set.
      * A false answer is not retained across another store operation. */
-    bool hasValidPaths();
+    bool mayHaveValidPaths() override;
 
     /**
      * The row, migrated (`migratedPathInfo`): a schema-10 row is given
@@ -335,7 +335,12 @@ public:
     bool pathInfoIsUntrusted(const ValidPathInfo &) override;
     bool realisationIsUntrusted(const Realisation &) override;
 
-    void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addToStore(
+        const ValidPathInfo & info,
+        Source & source,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash = {}) override;
 
     /**
      * Keep a lease on one protecting directory across the batch. Each
@@ -344,8 +349,12 @@ public:
      * The final lease releases the directory, after every writer has
      * finished publishing its path or failed (`08` K16).
      */
-    void
-    addMultipleToStore(PathsSource && pathsToCopy, Activity & act, RepairFlag repair, CheckSigsFlag checkSigs) override;
+    void addMultipleToStore(
+        PathsSource && pathsToCopy,
+        Activity & act,
+        RepairFlag repair,
+        CheckSigsFlag checkSigs,
+        const std::function<Hash(const StorePath &, const Source &)> & narHash = {}) override;
 
 private:
     /** Concurrent ingestions may share a protecting directory, but each
@@ -353,6 +362,23 @@ private:
     Sync<std::weak_ptr<GitObjectStore::Hold>> ingestionHold;
 
     std::shared_ptr<GitObjectStore::Hold> acquireIngestionHold();
+
+    /** Publish a content-addressed path. Populate is called only under its
+     * output lock when writing is necessary and must return an exact NAR size;
+     * its hold is borrowed through registration from the caller's scope. */
+    StorePath addToStorePrepared(
+        std::string_view name,
+        ContentAddressWithReferences desc,
+        RepairFlag repair,
+        fun<std::pair<ObjectHashSink::Result, const GitObjectStore::Hold &>(const std::filesystem::path &)> populate);
+
+    /** Install a staged tree, preserving its inodes when true. A cross-device
+     * copy completes and removes the staging directory before returning false. */
+    static bool moveIntoStore(
+        const std::filesystem::path & from,
+        const std::filesystem::path & to,
+        AutoDelete & staging,
+        RestoreSinkHooks * hooks);
 
 public:
 
@@ -515,31 +541,18 @@ public:
         Sink * rootContents = nullptr);
 
     /**
-     * What the naming of a source knows about the tree being copied, as
-     * the copy from the store's own objects consults it (01 §9.10, the
-     * second route; `04` §1.7): the entry -- mode and identifier -- of
-     * the node at `path`, relative to the tree's root, when the naming
-     * has one (a memo row), else nullopt.  Consulted for the root and
-     * for directories; never for a file inside a directory the store
-     * lacks, which is read as the one route reads it.  What it answers
-     * is trusted as the naming trusted it: the tree copied is the tree
-     * named, within the memo's own window (01 §2.2).
-     */
-    using TreeNamer = fun<std::optional<merkle::TreeEntry>(const CanonPath & path, const SourceAccessor::Stat & st)>;
-
-    /**
      * Whether a copy from an accessor may be made from the store's own
      * objects (01 §9.10, the second route): a store that owns its object
      * store (`ownsObjectStore`), on a system where the object store
      * links -- not Windows, where it shares nothing and the `*at` calls
      * the materialisation rests on have no counterpart.  The one
-     * predicate the route is taken under; `fetchToStore2` asks it.
+     * predicate the route is taken under; `Store::addToStore` asks it.
      */
     bool materialisesFromObjects() const;
 
     /**
      * How many threads `materialiseThroughObjects` walks a directory's
-     * *subdirectories* on (`MaterialisingVisitor::copyChildren`; `08`
+     * *subdirectories* on (`HashingVisitor::orderedChildren`; `08`
      * K17).  Not a setting: what the copy makes does not depend on it
      * (01 §10, *no settings, single codepath*), so there is no decision
      * for a user to make; the size is the machine's processor count
@@ -831,14 +844,6 @@ private:
         uint64_t ingestion,
         std::vector<GitObjectStore::Hold::Row> & rows);
 
-public:
-
-    void recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root);
-
-    /** How many blobs the index holds under a mode (the suites' `count`). */
-    uint64_t blobRowCount(bool executable);
-
-private:
     /** The object store's index, `objects.index` (the constructor installs it). */
     GitObjectStore::Index blobIndex;
 

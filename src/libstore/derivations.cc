@@ -99,47 +99,20 @@ static auto infoForDerivation(const StoreDirConfig & store, const Derivation & d
        held during a garbage collection). */
     auto suffix = std::string(drv.name) + drvExtension;
     auto contents = unparse(drv, store);
-    auto hash = hashString(HashAlgorithm::SHA256, contents);
-    auto ca = TextInfo{.hash = hash, .references = references};
-    return std::tuple{
-        suffix,
-        contents,
-        references,
-        store.makeFixedOutputPathFromCA(suffix, ca),
-    };
+    return std::tuple{std::move(suffix), std::move(contents), std::move(references)};
 }
 
 StorePath computeStorePath(const StoreDirConfig & store, const Derivation & drv)
 {
-    auto [_suffix, _contents, _references, path] = infoForDerivation(store, drv);
-    return path;
+    auto [suffix, contents, references] = infoForDerivation(store, drv);
+    return store.makeFixedOutputPathFromCA(
+        suffix, TextInfo{.hash = hashString(HashAlgorithm::SHA256, contents), .references = std::move(references)});
 }
 
 StorePath Store::writeDerivation(const Derivation & drv, RepairFlag repair)
 {
-    auto [suffix, contents, references, path] = infoForDerivation(*this, drv);
-
-    /* In case the derivation is already valid, we bail out early since that's
-       faster. But we need to make sure that the derivation has a corresponding
-       temproot. It is added by the remote in addToStoreFromDump, but we'd like
-       to avoid sending a lot of drv contents to the daemon. */
-    addTempRoot(path);
-
-    if (isValidPath(path) && !repair)
-        return path;
-
-    StringSource s{contents};
-    auto path2 = addToStoreFromDump(
-        s,
-        suffix,
-        FileSerialisationMethod::Flat,
-        ContentAddressMethod::Raw::Text,
-        HashAlgorithm::SHA256,
-        references,
-        repair);
-    assert(path2 == path);
-
-    return path;
+    auto [suffix, contents, references] = infoForDerivation(*this, drv);
+    return addTextToStore(suffix, contents, references, repair);
 }
 
 // FIXME: remove

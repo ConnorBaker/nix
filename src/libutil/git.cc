@@ -43,14 +43,11 @@ uint64_t parseBlob(Source & source)
     return *size;
 }
 
-void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo)
+static void parseTreeEntries(
+    merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo, uint64_t left, bool requireCanonical)
 {
-    auto sizeStr = getStringUntil(source, 0);
-    auto leftOpt = string2Int<uint64_t>(sizeStr);
-    if (!leftOpt)
-        throw Error("invalid tree size '%s'", sizeStr);
-    auto left = *leftOpt;
-
+    std::optional<std::string> previous;
+    bool canonical = true;
     while (left) {
         std::string perms = getStringUntil(source, ' ');
         left -= perms.size();
@@ -65,6 +62,8 @@ void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hash
         if (!modeOpt)
             throw Error("unknown Git permission: %o", rawMode);
         auto mode = std::move(*modeOpt);
+        if (requireCanonical)
+            canonical &= ptr == perms.data() + perms.size() && perms.front() != '0';
 
         std::string name = getStringUntil(source, '\0');
         left -= name.size();
@@ -83,7 +82,32 @@ void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hash
         std::copy_n(hashs, hashSize, hash.hash);
 
         sink.insertChild(name, TreeEntry{.mode = mode, .hash = hash});
+        if (requireCanonical) {
+            if (mode == Mode::Directory)
+                name += '/';
+            canonical &= !previous || *previous < name;
+            previous = std::move(name);
+        }
     }
+    /* Preserve the sink's validation and truncated-input errors before a
+       canonicality rejection, as parsing followed by re-encoding did. */
+    if (!canonical)
+        throw Error("tree body is not its canonical encoding");
+}
+
+void parseTree(merkle::DirectorySink & sink, Source & source, HashAlgorithm hashAlgo)
+{
+    auto sizeStr = getStringUntil(source, 0);
+    auto left = string2Int<uint64_t>(sizeStr);
+    if (!left)
+        throw Error("invalid tree size '%s'", sizeStr);
+    parseTreeEntries(sink, source, hashAlgo, *left, false);
+}
+
+void parseTreeBody(merkle::DirectorySink & sink, std::string_view body, HashAlgorithm hashAlgo)
+{
+    StringSource source{body};
+    parseTreeEntries(sink, source, hashAlgo, body.size(), true);
 }
 
 ObjectType parseObjectType(Source & source)

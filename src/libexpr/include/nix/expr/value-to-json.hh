@@ -15,7 +15,8 @@ nlohmann::json printValueAsJSON(
 
 /**
  * The rendered document as a string, with the provenance of what it renders
- * accumulated in `context`, for a sink to `emit` or a value to be made from.
+ * accumulated in `context`. Command outputs copy its mounted inputs before delivery;
+ * values retain the context for their consumers.
  * The serialiser is pure: it hands out no stream.
  */
 std::string renderValueAsJSON(

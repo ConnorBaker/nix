@@ -664,9 +664,8 @@ static void main_nix_build(int argc, char ** argv)
 
         auto envPtrs = stringsToCharPtrs(envStrs);
 
-        /* Finished before the environment is replaced: the final write may
-           open a store connection that needs it.  Nothing evaluates after. */
-        auto finished = state->finish();
+        /* Persist evaluator caches before replacing the process environment. */
+        state->evalCaches.clear();
 
         environ = envPtrs.data();
 
@@ -676,7 +675,7 @@ static void main_nix_build(int argc, char ** argv)
 
         logger->stop();
 
-        execvpAfterEvaluation(requireCString(shell.value()), argPtrs.data(), std::move(finished));
+        execvp(requireCString(shell.value()), argPtrs.data());
 
         throw SysError("executing shell '%s'", *shell);
     }
@@ -746,7 +745,6 @@ static void main_nix_build(int argc, char ** argv)
     }
 
     /* Written before the command ends, and a failure is the command's failure. */
-    state->flushPendingWrites();
 }
 
 static RegisterLegacyCommand r_nix_build("nix-build", main_nix_build);

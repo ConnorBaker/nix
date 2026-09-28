@@ -142,10 +142,7 @@ struct AttrDb
 
             // Seal the attribute names: we now know the complete set.
             auto upsertAttribute(state->upsertAttribute.use());
-            upsertAttribute.apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::FullAttrs)
-                .apply(0, false);
+            upsertAttribute.apply(key.first).apply(symbols[key.second]).apply(AttrType::FullAttrs).apply(0, false);
             upsertAttribute.next();
             auto rowId = (AttrId) upsertAttribute.getInt(0);
             assert(rowId);
@@ -618,8 +615,7 @@ std::string AttrCursor::getString()
     if (v.type() != nString && v.type() != nPath)
         root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
 
-    /* The text leaves the evaluator without its provenance: a door. */
-    return v.type() == nString ? root->state.realise(v).toOwned() : root->state.realise(v.path().to_string()).toOwned();
+    return v.type() == nString ? std::string(v.string_view()) : v.path().to_string();
 }
 
 string_t AttrCursor::getStringWithContext()
@@ -658,10 +654,11 @@ string_t AttrCursor::getStringWithContext()
 
     if (v.type() == nString) {
         NixStringContext context;
-        auto text = root->state.realise(v, &context).toOwned();
+        copyContext(v, context);
+        auto text = std::string(v.string_view());
         return {std::move(text), std::move(context)};
     } else if (v.type() == nPath)
-        return {root->state.realise(v.path().to_string()).toOwned(), {}};
+        return {v.path().to_string(), {}};
     else
         root->state.error<TypeError>("'%s' is not a string but %s", getAttrPathStr(), showType(v)).debugThrow();
 }
@@ -732,7 +729,7 @@ std::vector<std::string> AttrCursor::getListOfStrings()
     std::vector<std::string> res;
 
     for (auto elem : v.listView())
-        res.push_back(root->state.realiseNoCtx(*elem, noPos, "while evaluating an attribute for caching").toOwned());
+        res.emplace_back(root->state.forceStringNoCtx(*elem, noPos, "while evaluating an attribute for caching"));
 
     if (root->db)
         cachedValue = {root->db->setListOfStrings(getKey(), res), res};
@@ -789,8 +786,6 @@ StorePath AttrCursor::forceDerivation()
             /* The eval cache contains 'drvPath', but the actual path has
                been garbage-collected. So force it to be regenerated. */
             aDrvPath->forceValue();
-            /* The regenerated derivation may be pending in the write buffer. */
-            root->state.flushPendingWrites();
             if (!root->state.store->isValidPath(drvPath))
                 throw Error(
                     "don't know how to recreate store derivation '%s'!", root->state.store->printStorePath(drvPath));

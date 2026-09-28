@@ -66,9 +66,6 @@ static inline Value * mkString(EvalState & state, const std::csub_match & match)
 
 std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMaybe, bool isIFD, const PosIdx pos)
 {
-    /* The text leaves for a consumer that reads and builds: written totally,
-       whatever the string's own provenance says, as at every door. */
-    flushPendingWrites();
     nix::NixStringContext stringContext;
     auto rawStr = coerceToString(noPos, s, stringContext, "while realising a string").toOwned();
     auto rewrites = realiseContext(stringContext, storePathsOutMaybe, isIFD);
@@ -78,11 +75,6 @@ std::string EvalState::realiseString(Value & s, StorePathSet * storePathsOutMayb
 
 StringMap EvalState::realiseContext(const NixStringContext & context, StorePathSet * maybePathsOut, bool isIFD)
 {
-    /* Realisation reads the store and builds, so everything the context names
-       must be there first; an empty context names nothing. */
-    if (!context.empty())
-        flushPendingWrites();
-
     std::vector<DerivedPath::Built> drvs;
     StringMap res;
 
@@ -190,11 +182,8 @@ SourcePath EvalState::realisePath(
                 ensureLazyPathsCopied(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
-        if (resolveSymlinks) {
-            /* The target may be another store object, which the read must find as well. */
+        if (resolveSymlinks)
             path = path.resolveSymlinks(*resolveSymlinks);
-            writePendingBeforeRead(path);
-        }
         return path;
     } catch (Error & e) {
         e.addTrace(nullptr, "while realising the context of path '%s'", path);
@@ -528,9 +517,6 @@ void prim_exec(EvalState & state, CallSite callSite, Value * const * args, Value
     }
 
     state.ensureLazyPathsCopied(context);
-    /* The program runs outside the evaluator: whatever is pending is written
-       first, as at every door, whatever the strings' own provenance says. */
-    program = state.realise(std::move(program)).toOwned();
     auto output = runProgram(program, true, toOsStrings(std::move(commandArgs)));
     Expr * parsed;
     try {
@@ -1336,7 +1322,7 @@ static void prim_trace(EvalState & state, CallSite callSite, Value * const * arg
 {
     state.forceValue(*args[0], noPos);
     if (args[0]->type() == nString)
-        printError("trace: %1%", state.realise(*args[0]));
+        printError("trace: %1%", args[0]->string_view());
     else
         printError("trace: %1%", ValuePrinter(state, *args[0]));
     if (state.settings.builtinsTraceDebugger) {
@@ -1368,8 +1354,7 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
     // We only accept a string argument for now. The use case for pretty printing a value is covered by `trace`.
     // By rejecting non-strings we allow future versions to add more features without breaking existing code.
     state.forceString(*args[0], noPos, "while evaluating the first argument; the message passed to builtins.warn");
-    auto msg = state.realise(*args[0]);
-    auto msgStr = msg.view();
+    auto msgStr = args[0]->string_view();
 
     {
         ErrorInfo info{
@@ -1796,6 +1781,20 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         drv.structuredAttrs = std::move(*jsonObject);
     }
 
+    /* A mounted copy can collect garbage before we reach publication.
+       Protect every actual input first, including deep derivation closures. */
+    if (!state.settings.isReadOnly())
+        for (const auto & c : context)
+            std::visit(
+                overloaded{
+                    [&](const NixStringContextElem::Opaque & o) { state.store->addTempRoot(o.path); },
+                    [&](const NixStringContextElem::DrvDeep & d) { state.store->addTempRoot(d.drvPath); },
+                    [&](const NixStringContextElem::Built & b) {
+                        state.store->addTempRoot(b.drvPath->getBaseStorePath());
+                    },
+                },
+                c.raw);
+
     /* Everything in the context of the strings in the derivation
        attributes should be added as dependencies of the resulting
        derivation. */
@@ -1809,8 +1808,6 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                    available when the builder runs. */
                 [&](const NixStringContextElem::DrvDeep & d) {
                     /* !!! This doesn't work if readOnlyMode is set. */
-                    /* The closure is computed from the store, so pending objects must be there. */
-                    state.flushPendingWrites();
                     StorePathSet refs;
                     state.store->computeFSClosure(d.drvPath, refs);
                     for (auto & j : refs) {
@@ -1834,9 +1831,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                         });
                 },
                 [&](const NixStringContextElem::Opaque & o) {
-                    /* Enqueueing may flush at the memory bound, or return
-                       an already-valid derivation. In both cases the
-                       mounted view must first agree with its stored name. */
+                    /* Even an already-valid derivation must verify the
+                       current mounted view before reusing its name. */
                     state.ensureLazyPathCopied(o.path);
                     drv.inputs.insert(SingleDerivedPath::Opaque{o.path});
                 },
@@ -1949,8 +1945,8 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
        Unless we are in read-only mode, that is, in which case we do not
        write anything. Users commonly do this to speed up evaluation in
        contexts where they don't actually want to build anything. */
-    auto drvPath = settings.readOnlyMode ? computeStorePath(*state.store, drv)
-                                         : state.writeBuffer.addDerivation(drv, state.repair);
+    auto drvPath = state.settings.isReadOnly() ? computeStorePath(*state.store, drv)
+                                               : state.store->writeDerivation(drv, state.repair);
     auto drvPathS = state.store->printStorePath(drvPath);
 
     printMsg(lvlChatty, "instantiated '%1%' -> '%2%'", drvName, drvPathS);
@@ -2065,11 +2061,11 @@ static void prim_storePath(EvalState & state, CallSite callSite, Value * const *
     if (!state.store->isInStore(sourcePath.path.abs()))
         state.error<EvalError>("path '%1%' is not in the Nix store", sourcePath).atPos(noPos).debugThrow();
     auto storePath = state.store->toStorePath(sourcePath.path.abs()).first;
-    /* A bare store path leaves the evaluator here and is dereferenced by the
-       store: whatever is pending must be there first. */
-    state.flushPendingWrites();
-    if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))) && !settings.readOnlyMode)
-        state.store->getBuilder()->ensurePath(storePath);
+    if (!state.settings.isReadOnly()) {
+        state.store->addTempRoot(storePath);
+        if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))))
+            state.store->getBuilder()->ensurePath(storePath);
+    }
     context.insert(NixStringContextElem::Opaque{.path = storePath});
     v.mkString(sourcePath.path.abs(), context, state.mem);
 }
@@ -2800,12 +2796,17 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
 
     StorePathSet refs;
 
+    for (const auto & c : context)
+        if (auto p = std::get_if<NixStringContextElem::Opaque>(&c.raw))
+            refs.insert(p->path);
+    // Protect all references before a mounted copy can collect garbage.
+    if (!state.settings.isReadOnly())
+        for (const auto & reference : refs)
+            state.store->addTempRoot(reference);
+
     for (auto c : context) {
         if (auto p = std::get_if<NixStringContextElem::Opaque>(&c.raw)) {
-            /* Discharge the mounted reference before a threshold flush or
-               an already-valid result can discharge this text's write. */
             state.ensureLazyPathCopied(p->path);
-            refs.insert(p->path);
         } else
             state
                 .error<EvalError>(
@@ -2817,13 +2818,13 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
                 .debugThrow();
     }
 
-    auto storePath = settings.readOnlyMode ? state.store->makeFixedOutputPathFromCA(
-                                                 name,
-                                                 TextInfo{
-                                                     .hash = hashString(HashAlgorithm::SHA256, contents),
-                                                     .references = std::move(refs),
-                                                 })
-                                           : state.writeBuffer.addText(name, contents, refs, state.repair);
+    auto storePath = state.settings.isReadOnly() ? state.store->makeFixedOutputPathFromCA(
+                                                       name,
+                                                       TextInfo{
+                                                           .hash = hashString(HashAlgorithm::SHA256, contents),
+                                                           .references = refs,
+                                                       })
+                                                 : state.store->addTextToStore(name, contents, refs, state.repair);
 
     /* Note: we don't need to add `context' to the context of the
        result, since `storePath' itself has references to the paths

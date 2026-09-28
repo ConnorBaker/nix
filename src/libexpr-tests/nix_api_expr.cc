@@ -52,8 +52,6 @@ TEST_F(nix_api_expr_test, nix_eval_state_lookup_path)
     ASSERT_EQ(0, strcmp(pathStr, nixpkgs.string().c_str()));
 
     nix_gc_decref(nullptr, value);
-    /* Text extraction is a realisation boundary and requires the
-       evaluator to remain alive (nix_get_path_string's contract). */
     nix_state_free(state);
 }
 
@@ -737,9 +735,7 @@ TEST_F(nix_api_expr_test, nix_expr_thunk_re_evaluation_after_deployment)
 
 namespace nixC {
 
-/* The C boundary (doc/lazy-store/04-derivation.md, section 1.2, the C API
-   row): what evaluation left pending is written before control returns to C,
-   whether the entry point returns a value or stores an error. */
+/* Eager publication is observable through both successful and failed C calls. */
 class nix_api_boundary_test : public nix_api_expr_test
 {
 protected:
@@ -772,8 +768,7 @@ protected:
         return valid;
     }
 
-    /* Evaluate inside the evaluator, through no C boundary, so that what the
-       expression creates stays pending. */
+    /* Evaluate directly to check that publication belongs to the producer. */
     void evaluateInside(const std::string & expr, nix::Value & v)
     {
         auto & s = state->state;
@@ -781,13 +776,13 @@ protected:
         s.forceValue(v, nix::noPos);
     }
 
-    /* A derivation created inside the evaluator, still pending; its path text, read raw. */
-    std::string pendingDerivationPathText(const std::string & name)
+    /* A derivation created without a C wrapper. */
+    std::string derivationPathText(const std::string & name)
     {
         nix::Value v;
         evaluateInside(
             "(derivation { name = \"" + name + "\"; system = \"x86_64-linux\"; builder = \"/bin/sh\"; }).drvPath", v);
-        return std::string(nix::RawValueBytes::view(v));
+        return std::string((v).string_view());
     }
 };
 
@@ -806,11 +801,7 @@ TEST_F(nix_api_boundary_test, error_text_names_only_written_objects)
 
 TEST_F(nix_api_boundary_test, an_attribute_name_names_only_written_objects)
 {
-    /* The exit that is neither a string door nor a coercion: an attribute's
-       name, which the boundary's write on the returned path covers.  The
-       object is made pending, and its path text learnt, inside the evaluator
-       and through no boundary. */
-    auto text = pendingDerivationPathText("named");
+    auto text = derivationPathText("named");
     auto attrs = "{ \"" + text + "\" = 1; }";
     ASSERT_EQ(nix_expr_eval_from_string(ctx, state, attrs.c_str(), ".", value), NIX_OK);
     const char * name = nix_get_attr_name_byidx(ctx, value, state, 0);
@@ -821,8 +812,8 @@ TEST_F(nix_api_boundary_test, an_attribute_name_names_only_written_objects)
 
 TEST_F(nix_api_boundary_test, a_path_values_text_names_only_written_objects)
 {
-    /* The path door: a path value built inside the evaluator, read by C. */
-    auto text = pendingDerivationPathText("pathed");
+    /* A path value built inside the evaluator, read by C. */
+    auto text = derivationPathText("pathed");
     evaluateInside("/. + \"" + text + "\"", *value->value);
     const char * path = nix_get_path_string(ctx, value);
     assert_ctx_ok();
@@ -832,7 +823,7 @@ TEST_F(nix_api_boundary_test, a_path_values_text_names_only_written_objects)
 
 TEST_F(nix_api_boundary_test, a_returned_value_names_only_written_objects)
 {
-    /* The success path, read through the string door. */
+    /* The success path, read as an ordinary string. */
     auto expr = R"((derivation { name = "returned"; system = "x86_64-linux"; builder = "/bin/sh"; }).drvPath)";
     ASSERT_EQ(nix_expr_eval_from_string(ctx, state, expr, ".", value), NIX_OK);
     std::string text;
@@ -840,6 +831,40 @@ TEST_F(nix_api_boundary_test, a_returned_value_names_only_written_objects)
     assert_ctx_ok();
     ASSERT_EQ(derivationPathIn(text, "returned"), text);
     EXPECT_TRUE(isValid(text));
+}
+
+TEST_F(nix_api_expr_test, built_state_retains_readonly_setting_after_builder_free)
+{
+    auto * builder = nix_eval_state_builder_new(ctx, store);
+    assert_ctx_ok();
+    auto * built = nix_eval_state_build(ctx, builder);
+    assert_ctx_ok();
+    ASSERT_NE(built, nullptr);
+    nix_eval_state_builder_free(builder);
+    EXPECT_TRUE(built->state.settings.isReadOnly());
+    auto * output = nix_alloc_value(ctx, built);
+    ASSERT_NE(output, nullptr);
+    EXPECT_EQ(nix_expr_eval_from_string(ctx, built, "builtins.toFile \"readonly-c\" \"content\"", ".", output), NIX_OK);
+    auto path = built->state.store->parseStorePath(output->value->string_view());
+    EXPECT_FALSE(built->state.store->isValidPath(path));
+    nix_gc_decref(nullptr, output);
+    nix_state_free(built);
+}
+
+TEST_F(nix_api_expr_test, failed_evaluation_does_not_publish_a_result_handle)
+{
+    bool produced = false;
+    auto * result = nix_c_boundary(
+        ctx,
+        []() -> nix::Value * { throw nix::Error("evaluation failed before allocation"); },
+        [&](nix::Value * evaluated) {
+            produced = true;
+            (void) evaluated;
+            return nix_alloc_value(ctx, state);
+        });
+    EXPECT_EQ(result, nullptr);
+    EXPECT_FALSE(produced);
+    EXPECT_EQ(nix_err_code(ctx), NIX_ERR_NIX_ERROR);
 }
 
 } // namespace nixC

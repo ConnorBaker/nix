@@ -9,6 +9,7 @@
  * Plain round trips through a `StringSink`/`StringSource`, no golden files.
  */
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 
 #include "nix/store/worker-protocol.hh"
 #include "nix/store/worker-protocol-impl.hh"
@@ -65,11 +66,14 @@ protected:
         .features = {},
     };
 
-    std::string write(const WorkerProto::Version & version, const UnkeyedValidPathInfo & info)
+    std::string write(
+        const WorkerProto::Version & version,
+        const UnkeyedValidPathInfo & info,
+        const std::function<Hash()> & narHash = {})
     {
         StringSink to;
         WorkerProto::Serialise<UnkeyedValidPathInfo>::write(
-            store, WorkerProto::WriteConn{.to = to, .version = version}, info);
+            store, WorkerProto::WriteConn{.to = to, .version = version, .narHash = &narHash}, info);
         return std::move(to.s);
     }
 
@@ -173,24 +177,67 @@ TEST_F(ObjectHashWorkerProto, write_without_feature_throws_without_assertedNarHa
     EXPECT_THROW(write(withoutFeature, info), Error);
 }
 
-/* Without the feature, an info with no asserted NAR hash but a lazy one is
+/* Without the feature, an info with no asserted NAR hash but a transfer callback is
    written in the old form with the thunk's value, forced here and nowhere
    else; with the feature the slot stays empty and the thunk is never
    forced -- the wire of two new peers does not change. */
-TEST_F(ObjectHashWorkerProto, lazy_nar_hash_is_forced_by_the_old_form_alone)
+TEST_F(ObjectHashWorkerProto, transfer_nar_hash_is_forced_by_the_old_form_alone)
 {
     auto info = baseInfo(store, objectHash());
     unsigned forced = 0;
-    info.lazyNarHash = [&] {
+    auto narHashFor = [&] {
         forced++;
         return narHash();
     };
-    EXPECT_EQ(write(withoutFeature, info), oldForm(info, narHashBase16));
+    EXPECT_EQ(write(withoutFeature, info, narHashFor), oldForm(info, narHashBase16));
     EXPECT_EQ(forced, 1u);
 
     auto plain = baseInfo(store, objectHash());
-    EXPECT_EQ(write(withFeature, info), write(withFeature, plain));
+    EXPECT_EQ(write(withFeature, info, narHashFor), write(withFeature, plain));
     EXPECT_EQ(forced, 1u);
+
+    info.assertedNarHash = narHash();
+    EXPECT_EQ(write(withoutFeature, info, narHashFor), oldForm(info, narHashBase16));
+    EXPECT_EQ(forced, 1u) << "the sender's assertion takes precedence";
+}
+
+TEST_F(ObjectHashWorkerProto, transfer_nar_hash_errors_belong_to_the_old_form)
+{
+    auto info = baseInfo(store, objectHash());
+    auto fail = []() -> Hash { throw Error("NAR replay failed"); };
+    EXPECT_NO_THROW(write(withFeature, info, fail));
+    EXPECT_THAT(
+        [&] { write(withoutFeature, info, fail); },
+        ::testing::ThrowsMessage<Error>(::testing::HasSubstr("NAR replay failed")));
+}
+
+TEST_F(ObjectHashWorkerProto, keyed_batch_serialisation_preserves_the_transfer_capability)
+{
+    for (bool objectHashForm : {false, true}) {
+        auto version = objectHashForm ? withFeature : withoutFeature;
+        /* AddMultipleToStore fixes the number while preserving the feature set. */
+        version.number = {.major = 1, .minor = 16};
+        ValidPathInfo info{StorePath{"g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-object"}, baseInfo(store, objectHash())};
+        unsigned forced = 0;
+        std::function<Hash()> replay = [&] {
+            forced++;
+            return narHash();
+        };
+        StringSink to;
+        WorkerProto::Serialise<ValidPathInfo>::write(store, {.to = to, .version = version, .narHash = &replay}, info);
+        StringSource from{to.s};
+        auto readInfo = WorkerProto::Serialise<ValidPathInfo>::read(store, {.from = from, .version = version});
+        EXPECT_EQ(forced, objectHashForm ? 0u : 1u);
+        EXPECT_EQ(readInfo.path, info.path);
+        EXPECT_EQ(readInfo.references, info.references);
+        EXPECT_EQ(readInfo.narSize, info.narSize);
+        EXPECT_EQ(readInfo.objectHash.has_value(), objectHashForm);
+        EXPECT_EQ(readInfo.assertedNarHash.has_value(), !objectHashForm);
+        if (!objectHashForm) {
+            ASSERT_TRUE(readInfo.assertedNarHash.has_value());
+            EXPECT_EQ(*readInfo.assertedNarHash, narHash());
+        }
+    }
 }
 
 /* Without the feature, an info with an asserted NAR hash is written in the

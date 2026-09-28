@@ -272,8 +272,12 @@ static void prim_appendContext(EvalState & state, CallSite callSite, Value * con
         if (!state.store->isStorePath(name))
             state.error<EvalError>("context key '%s' is not a store path", name).atPos(i.pos).debugThrow();
         auto namePath = state.store->parseStorePath(name);
-        if (!settings.readOnlyMode)
+        if (!state.settings.isReadOnly()) {
+            // Protect validation and arbitrary flag evaluation from GC.
+            // The root remains even if validation fails or no flag selects it.
+            state.store->addTempRoot(namePath);
             state.store->getBuilder()->ensurePath(namePath);
+        }
         state.forceAttrs(*i.value, i.pos, "while evaluating the value of a string context");
 
         if (auto attr = i.value->attrs()->get(sPath)) {
