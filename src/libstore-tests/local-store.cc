@@ -227,7 +227,7 @@ struct CountingRestoreHooks : RestoreSinkHooks
 {
     std::unique_ptr<RestoreSinkHooks> inner;
     /* Atomic: the parallel copy creates files on its workers as well as on
-       the walking thread (`HashingVisitor::orderedChildren`, `08` K17),
+       the walking thread (`HashingVisitor::hashDirectory`, `08` K17),
        so a plain counter is a data race and the count a test asserts is
        not well defined.  Found by the thread-sanitised run of `05` section
        5. */
@@ -8288,7 +8288,7 @@ TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionA
 }
 
 /* The parallel copy is the sequential copy (`01` §9.10, *One route*;
-   `HashingVisitor::orderedChildren`): the second route walks a
+   `HashingVisitor::hashDirectory`): the second route walks a
    directory's *subdirectories* on a bounded pool, and what it makes must
    not depend on how many threads that is.  Both copies are made into the
    same store, which already holds every object, so each file is a link to

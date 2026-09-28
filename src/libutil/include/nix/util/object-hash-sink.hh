@@ -66,11 +66,6 @@ public:
     HashedNode directory(const CanonPath & path, Children children) override;
 
 protected:
-    /** Run permitted pull visits on the shared pool, joining them inside
-     * this callback's scope and delivering results in admission order.
-     * Width one preserves immediate, borrowed push consumption. */
-    Children orderedChildren(Children children);
-
     /** The directory summary and its encoding, for a consumer that publishes the body. */
     std::pair<HashedNode, std::string> hashDirectory(const CanonPath & path, Children children);
 };

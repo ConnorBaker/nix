@@ -44,7 +44,7 @@ struct NodeVisitor
      * it: a listing that gives no type says `false`, and the push driver,
      * which has no listing, says `false` for every child.  It exists so
      * that a visitor which may walk siblings on a pool can tell which of
-     * them are worth one (`HashingVisitor::orderedChildren`,
+     * them are worth one (`HashingVisitor::hashDirectory`,
      * `01` §9.10), without a `lstat` a child.
      *
      * The pull driver permits holding a child's `visit` until later in

@@ -100,7 +100,7 @@ HashedNode HashingVisitor::symlink(const CanonPath &, const std::string & target
 
 HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 {
-    return hashDirectory(path, orderedChildren(std::move(children))).first;
+    return hashDirectory(path, std::move(children)).first;
 }
 
 std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath & path, Children children)
@@ -108,7 +108,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
-    auto consume = [&](std::string && name, const HashedNode & child) {
+    auto consume = [&](std::string && name, HashedNode && child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
@@ -122,26 +122,12 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
         size = nextSize;
         sizeExact &= child.narSize.has_value();
     };
-    children([&](std::string_view name, bool, fun<HashedNode()> visit) {
-        auto child = visit();
-        consume(std::string(name), child);
-    });
-
-    auto body = merkle::serialiseTree(tree);
-    return {
-        HashedNode{
-            .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
-            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
-        },
-        std::move(body),
-    };
-}
-
-HashingVisitor::Children HashingVisitor::orderedChildren(Children children)
-{
-    if (workers == 1 || !children.canDefer)
-        return children;
-    return [this, children = std::move(children)](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+    if (workers == 1 || !children.canDefer) {
+        children([&](std::string_view name, bool, fun<HashedNode()> visit) {
+            auto child = visit();
+            consume(std::string(name), std::move(child));
+        });
+    } else {
         struct Child
         {
             std::string name;
@@ -164,17 +150,26 @@ HashingVisitor::Children HashingVisitor::orderedChildren(Children children)
         if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
         auto run = [&](size_t i) { kids[i].node = kids[i].visit(); };
-        auto consume = [&](size_t i) {
+        auto fold = [&](size_t i) {
             auto & child = kids[i];
-            each(child.name, child.subdirectory, [&] { return std::move(child.node.value()); });
+            consume(std::move(child.name), std::move(child.node.value()));
         };
         if (canFork)
-            pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, consume);
+            pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, fold);
         else
             for (size_t i = 0; i < kids.size(); ++i) {
                 run(i);
-                consume(i);
+                fold(i);
             }
+    }
+
+    auto body = merkle::serialiseTree(tree);
+    return {
+        HashedNode{
+            .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
+            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
+        },
+        std::move(body),
     };
 }
 

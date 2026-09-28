@@ -207,7 +207,7 @@ struct ObjectStoreVisitor : HashingVisitor
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
-        return publishDirectory(hashDirectory(path, orderedChildren(std::move(children))));
+        return publishDirectory(hashDirectory(path, std::move(children)));
     }
 
     HashedNode publishDirectory(std::pair<HashedNode, std::string> result)
@@ -593,13 +593,14 @@ struct LinkingVisitor : ObjectStoreVisitor
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto target = at(path);
-        return publishDirectory(hashDirectory(path, [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
-            target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
-                assert(rel.isRoot());
-                Scope scope{sub, currentFrame().diskName};
-                orderedChildren(std::move(children))(std::move(each));
-            });
-        }));
+        std::optional<std::pair<HashedNode, std::string>> result;
+        target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
+            assert(rel.isRoot());
+            Scope scope{sub, currentFrame().diskName};
+            result = hashDirectory(path, std::move(children));
+        });
+        assert(result);
+        return publishDirectory(std::move(*result));
     }
 
     HashedNode symlink(const CanonPath & path, const std::string & target) override
@@ -1092,7 +1093,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
 #else
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = dst;
-    /* The copy's subdirectories go on a small pool (`orderedChildren`): the
+    /* The copy's subdirectories go on a small pool (`hashDirectory`): the
        machine's width, capped to bound filesystem and index contention.
        Git repository reads remain serialized by their accessor; filesystem
        scopes permit independent reads.  Not a setting: what the copy makes does not

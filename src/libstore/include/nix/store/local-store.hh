@@ -533,7 +533,7 @@ public:
 
     /**
      * How many threads `materialiseThroughObjects` walks a directory's
-     * *subdirectories* on (`HashingVisitor::orderedChildren`; `08`
+     * *subdirectories* on (`HashingVisitor::hashDirectory`; `08`
      * K17).  Not a setting: what the copy makes does not depend on it
      * (01 §10, *no settings, single codepath*), so there is no decision
      * for a user to make; the size is the machine's processor count
