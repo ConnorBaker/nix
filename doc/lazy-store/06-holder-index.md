@@ -10,8 +10,9 @@ built, what each variant measured, and what decided it. The decision is taken
 and section 6 records it with its gate; this document is the design space and
 the measurements, and the invariants and laws as they now stand are
 `08-store-model.md` and `01-specification.md` section 9.10. Where section 2
-below differs from those — it is the proposal as it was put, with a foreign
-key's cascade the implementation does not have — the proposal is what it records.
+below differs from those, it records the proposal as it was put. Its direct
+`ValidPaths` cascade is distinct from today's `Ingestions` ownership: deleting
+an ingestion now cascades both regular and auxiliary rows.
 
 The current index retains candidates keyed by `(id, exec, ingestion)`, including
 a path's own witness when its file was linked from another path. Collecting the
@@ -679,16 +680,15 @@ What the design buys, and what it costs, in one place:
 | files under the store root | **half** (40 041 against 80 041) | **half** (40 041 against 80 041) |
 | the database | 1.85 GiB at 10⁷ blobs, opened by every command | the same |
 
-The one measured statement that stands whatever else changes: **the `linkat`
-cannot be removed by moving the blob-to-file map into the database unless the
-writer leaves the store's one connection**, because the map is written while the
-copy reads it, on the same lock, whether or not anything is shared.
+For the measured incremental-publication design, a separate writer met the
+gate. This does not constrain the current route, which retains the complete
+projection privately and publishes it after traversal.
 
 ## 7. What is left
 
-The decision is taken (section 6) and the structural work is done; what remains is
-the merge quality that follows it.  Items are struck from this list as they land,
-so its length is the honest measure of what is left.
+The following list records what was done or pending for the measured holder
+prototype. Its separate writer, schema and overlay status are historical;
+current ownership and publication obligations are in `01` and `08`.
 
 **Done, with the measurement or the mutation that pins each.**
 

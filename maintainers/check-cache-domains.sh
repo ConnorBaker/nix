@@ -116,7 +116,7 @@ hgRev
 sourcePathToHash
 tarball
 treeAddress
-treeMentionsAttribute
+treeContainsAttribute
 EOF
     )" \
     "$(printf '%s\n' "$scanned" | awk -F'\t' '$1 == "DOM" { print $3 }')"
@@ -124,7 +124,7 @@ EOF
 # ---------------------------------------------------------------------------
 # 2. Every consumer of the rows the specification names is declared:
 #    `sourcePathToHash` and `treeAddress` (the memos of 01 section 9.9),
-#    `treeMentionsAttribute` (the export-ignore answer), and the two rows
+#    `treeContainsAttribute` (the constructor-owned immutable tree fact), and the two rows
 #    that carry a `treeHash` attribute.
 # ---------------------------------------------------------------------------
 compare "the consumers of a fetcher-cache row have changed:" \
@@ -139,7 +139,7 @@ treeAddress	src/libexpr/primops/fetchTree.cc
 treeAddress	src/libfetchers/fetch-to-store.cc
 treeAddress	src/libfetchers/fetchers.cc
 treeAddress	src/libfetchers/include/nix/fetchers/fetch-to-store.hh
-treeMentionsAttribute	src/libfetchers/git.cc
+treeContainsAttribute	src/libfetchers/git-utils.cc
 gitRevToTreeHash	src/libfetchers/github.cc
 tarball	src/libfetchers/tarball.cc
 EOF
@@ -147,7 +147,7 @@ EOF
     "$(
         consumers_of sourcePathToHash makeSourcePathToHashCacheKey recordRootEntry
         consumers_of treeAddress lookupTreeAddress recordTreeAddress
-        consumers_of treeMentionsAttribute
+        consumers_of treeContainsAttribute
         consumers_of gitRevToTreeHash
         consumers_of tarball
     )"
@@ -162,7 +162,7 @@ compare "the readers of a fetcher-cache row's attributes have changed:" \
     "$(
         cat <<'EOF'
 hash	src/libfetchers/fetch-to-store.cc
-mentions	src/libfetchers/git.cc
+mentions	src/libfetchers/git-utils.cc
 mode	src/libfetchers/fetch-to-store.cc
 treeHash	src/libfetchers/fetchers.cc
 treeHash	src/libfetchers/github.cc
@@ -194,10 +194,10 @@ self_test() {
     # 3. a consumer of `treeAddress` in a file not on the list
     printf '\nstatic void planted3() { lookupTreeAddress(settings, h); }\n' \
         >> "$tmp/src/libfetchers/tarball.cc"
-    # 4. a consumer of `treeMentionsAttribute` in a file not on the list, its
+    # 4. a consumer of `treeContainsAttribute` in a file not on the list, its
     #    literal on the line after the brace -- the shape a line-by-line
     #    check would miss
-    printf '\nstatic void planted4() { Cache::Key k{\n    "treeMentionsAttribute", {{"rev", r}}}; }\n' \
+    printf '\nstatic void planted4() { Cache::Key k{\n    "treeContainsAttribute", {{"rev", r}}}; }\n' \
         >> "$tmp/src/libfetchers/github.cc"
     # 5. a reader of the `treeHash` attribute in a file not on the list
     printf '\nstatic void planted5() { getStrAttr(attrs, "treeHash"); }\n' \
@@ -212,7 +212,7 @@ self_test() {
 > plantedDomain
 > sourcePathToHash	src/libfetchers/git.cc
 > treeAddress	src/libfetchers/tarball.cc
-> treeMentionsAttribute	src/libfetchers/github.cc
+> treeContainsAttribute	src/libfetchers/github.cc
 > treeHash	src/libfetchers/mercurial.cc
 EOF
     if [[ $rc -ne 1 || -n $missing ]]; then

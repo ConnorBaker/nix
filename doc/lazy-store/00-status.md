@@ -1,10 +1,12 @@
 # Lazy-store status
 
+Current source publishes evaluator Text objects eagerly and shares the store publication and traversal machinery. The completed measurements below describe revision 407f, before those architectural changes.
+
 Measured revision **407f5d23e8470e01b1c4b52fbfe02db5ce09de14** retains the three cache synchronization changes and withdraws the Pending flat-set substitution. All nine fixed-base wall medians are lower, with **72/75 faster pairs**; the direct comparison against e38 is mixed: **seven lower separate medians, four lower paired ratios and 35/75 faster pairs**. CPU and peak-memory costs remain explicit in the [performance report](09-performance.md).
 
 ## Semantic model
 
-A source denotes a filesystem tree: regular-file bytes and executable bit, a symlink target, or a finite directory map. Its SHA-256 object hash is computed from that tree, including the synthetic wrappers for executable and symlink roots. Source store paths also depend on their name, ingestion method and references. The evaluator buffers pending text objects within a byte bound and flushes them before their paths escape; a successful flush requires every pending object to be valid.
+A source denotes a filesystem tree: regular-file bytes and executable bit, a symlink target, or a finite directory map. Its SHA-256 object hash is computed from that tree, including the synthetic wrappers for executable and symlink roots. Source store paths also depend on their name, ingestion method and references. In writable evaluation, Text producers publish their objects before returning their paths, including unobserved objects. Read-only evaluation computes their addresses without writing.
 
 Regular-file contents live in store paths. The database retains candidate holders per object, mode and ingestion; lookup requires a registered valid path. Reuse checks physical metadata and records the recipient's own witness, and publication reconciles inode classes before exposing candidates. Directory bodies and symlink targets are owned metadata in `AuxValues`, published with the same completed ingestion. Every reused body becomes part of the recipient's projection. Locked ingestion leases protect completed outputs before validity registration; whole-store collection removes stale projections after dead-lease cleanup, without an auxiliary mark graph. Upper-only overlay authority and regular-file sharing are unchanged (`08-store-model.md`).
 
@@ -14,7 +16,7 @@ Completed evaluator requests are a separate kind of fact: the result of an earli
 
 The [specification](01-specification.md), [implementation derivation](04-derivation.md) and [store model](08-store-model.md) define these contracts. Changes are vetted against the [reasoning and design guidance](/home/connorbaker/ExtPackages/denotational-design/reasoning-and-design-guidance.md): enumerate finite domains, derive operations from their meanings, and retain external checks that can reject the implementation.
 
-## Current implementation and evidence
+## Retained implementation and revision-specific evidence
 
 Three private SQLite caches omit their connection mutex because existing owner locks or exclusive construction/destruction already serialize operations and cleanup. Returned values are owned; allocator, shared-Btree, file and WAL locking remain. This does not change SQLite's global threading mode. Instrumentation and allocation-failure traces can differ.
 

@@ -1,5 +1,7 @@
 # Evaluation performance and preserved behavior
 
+This report records the revisions named below. It predates eager Text publication and the shared traversal/publication refactor; these timings and compiled-code findings do not measure that implementation.
+
 Measured **407f5d23e8470e01b1c4b52fbfe02db5ce09de14** retains three cache synchronization flags relative to **e38b9b3327f827e58fbf00f3419362042a8cdda0**. The Pending flat-set experiment was withdrawn. Fixed-base wall results improve across the nine cases; the direct incremental results remain mixed.
 
 ## Protocol and all eighteen measurements
