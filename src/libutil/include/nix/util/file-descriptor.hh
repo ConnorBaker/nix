@@ -269,6 +269,8 @@ public:
     Descriptor get() const noexcept;
     explicit operator bool() const noexcept;
     Descriptor release() noexcept;
+    /** Relinquish ownership and attempt to close once, throwing on failure.
+     * Never retry an identifier that the operating system may have reused. */
     void close();
 
     /**

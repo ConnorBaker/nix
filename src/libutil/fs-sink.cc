@@ -196,11 +196,15 @@ void RegularFileWriter::finish()
     flush();
     if (hooks)
         hooks->regularFileCreated(file.get(), executable);
+    if (startFsync)
+        file.startFsync();
+    fd = INVALID_DESCRIPTOR;
+    file.close();
 }
 
 RegularFileWriter::~RegularFileWriter()
 {
-    /* Flush before the owned descriptor closes and FdSink is destroyed. */
+    /* Flush an unfinished write before its owned descriptor closes. */
     try {
         flush();
     } catch (...) {

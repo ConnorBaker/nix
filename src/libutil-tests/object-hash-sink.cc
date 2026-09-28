@@ -1110,7 +1110,11 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
         (*writer)("hel");
         (*writer)("lo");
         EXPECT_TRUE(hooks.files.empty());
+        auto fd = writer->fd;
         writer->finish();
+        EXPECT_EQ(writer->fd, INVALID_DESCRIPTOR);
+        EXPECT_THROW(getFileSize(fd), SystemError);
+        EXPECT_EQ(writer->written, 5u);
         ASSERT_EQ(hooks.files.size(), 1u);
         EXPECT_TRUE(hooks.files[0].second);
         /* Flushed by `finish`: readable before the writer is destroyed. */
@@ -1134,7 +1138,11 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
                 EXPECT_EQ(sub.dstPath, tmpDir / "dir" / "sub");
                 auto writer = sub.beginRegularFile(CanonPath("/f"));
                 (*writer)("plain");
+                auto fd = writer->fd;
                 writer->finish();
+                EXPECT_EQ(writer->fd, INVALID_DESCRIPTOR);
+                EXPECT_THROW(getFileSize(fd), SystemError);
+                EXPECT_EQ(writer->written, 5u);
                 sub.createRegularFile(CanonPath("/g"), [](CreateRegularFileSink & crf) { crf("plain"); });
             });
         });

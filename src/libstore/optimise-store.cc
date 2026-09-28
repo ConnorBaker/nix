@@ -1043,7 +1043,7 @@ struct MaterialisingVisitor : LinkingVisitor
 
 ObjectHashSink::Result LocalStore::restoreThroughObjects(
     const std::filesystem::path & path,
-    Source & source,
+    fun<void(FileSystemObjectSink &)> produce,
     bool startFsync,
     RestoreSinkHooks * hooks,
     const GitObjectStore::Hold & hold,
@@ -1055,7 +1055,7 @@ ObjectHashSink::Result LocalStore::restoreThroughObjects(
     LinkingVisitor linking{objects, hold, restore, repair, rootContents};
     ObjectHashSink adapter{linking};
     beginIngestion(hold, path);
-    parseDump(adapter, source);
+    produce(adapter);
     auto result = adapter.finish();
     objects.putRootTree(result.root, hold);
     return result;

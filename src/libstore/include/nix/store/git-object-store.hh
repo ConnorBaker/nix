@@ -152,11 +152,14 @@ public:
     std::function<bool(const std::filesystem::path &)> failPlaceWithNoSpace;
 
     /**
-     * Called inside `Hold`'s constructor at the one instant a hold is
+     * Called while constructing the physical lease at the one instant it is
      * visible under `tmp/` and not yet locked -- after the directory is
      * made and opened, before the `flock` -- so that a sweep's removal of
      * a hold in that window can be driven from one thread
-     * (`05-validation.md` section 7).  Empty in every build but a test's.
+     * (`05-validation.md` section 7). Captured when the hold is made and
+     * called when its directory is first needed. Clearing this member does
+     * not disarm existing holds; captured references must outlive first use.
+     * Empty outside tests.
      */
     std::function<void()> atHoldMade;
 
@@ -267,12 +270,13 @@ public:
         bool looked = true);
 
     /**
-     * A private pending projection and a shared ingestion lease. The lease
-     * directory's lock tells GC that completed-but-unpublished SQL rows still
+     * A private pending projection and a shared, on-demand ingestion lease. The lease
+     * directory's lock tells GC that completed-but-not-yet-valid SQL rows still
      * belong to an in-flight ingestion. Its lifetime also covers regular-file
      * coalescing pins. Auxiliary bytes are owned in memory, not by hard links.
-     * Nothing waits on a lease: GC only tries its lock. Own-row views share
-     * the physical lease but never pending values or ingestion identity.
+     * GC only tries the lease lock; concurrent first acquisition synchronizes
+     * through the shared memo. Own-row views share that acquisition, never
+     * pending values or ingestion identity.
      */
     class Hold
     {
@@ -295,27 +299,16 @@ public:
 
     private:
         std::unique_ptr<Pending> pending;
-        std::shared_ptr<Lease> lease;
-        Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade);
-        explicit Hold(std::shared_ptr<Lease> lease);
+        fun<std::shared_ptr<Lease>()> lease;
+        explicit Hold(fun<std::shared_ptr<Lease>()> lease);
 
     public:
         /**
-         * A hold over the same directory with a projection of its own.
-         *
-         * A batch shares one locked lease directory for the whole of
-         * `addMultipleToStore` (K16), but each of its paths
-         * registers separately and is therefore its own ingestion: its own
-         * `Ingestions` row, its own root (a row's name is relative to the
-         * path that holds it, `schema.sql`), and its own pending projection.
-         * The batch's paths can be copied concurrently by
-         * `Store::addMultipleToStore`. A row written against another path's
-         * ingestion names a file that does not exist, or -- the sizes
-         * agreeing -- one with the wrong bytes.
-         *
-         * The directory and its lock survive until the last view is
-         * released. Regular witnesses, auxiliary bytes and ingestion identity
-         * remain private to each view.
+         * A private projection sharing this hold's on-demand physical lease.
+         * Speculative copy attempts can discard their pending values without
+         * exposing witnesses whose files fallback will remove. Once created,
+         * the directory and lock survive until the last view is released; witnesses,
+         * auxiliary bytes and ingestion identity remain private to each view.
          */
         Hold ownRows() const;
 
@@ -409,7 +402,7 @@ public:
         ~Hold();
     };
 
-    /** A fresh empty locked lease, retried if GC removed it before locking. */
+    /** A fresh projection; its shared lease is created only when its directory is needed. */
     Hold hold() const;
 
     /** Stage the synthetic directory body of an executable or symlink root. */

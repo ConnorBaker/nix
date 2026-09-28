@@ -286,17 +286,15 @@ Descriptor AutoCloseFD::get() const noexcept
 
 void AutoCloseFD::close()
 {
-    if (fd != INVALID_DESCRIPTOR) {
+    if (auto owned = release(); owned != INVALID_DESCRIPTOR) {
         if (
 #ifdef _WIN32
-            ::CloseHandle(fd)
+            !::CloseHandle(owned)
 #else
-            ::close(fd)
+            ::close(owned) == -1
 #endif
-            == -1)
-            /* This should never happen. */
-            throw NativeSysError("closing file descriptor %1%", fd);
-        fd = INVALID_DESCRIPTOR;
+        )
+            throw NativeSysError("closing file descriptor %1%", owned);
     }
 }
 

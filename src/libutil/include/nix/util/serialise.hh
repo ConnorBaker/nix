@@ -120,13 +120,6 @@ public:
      */
     virtual size_t read(char * data, size_t len) = 0;
 
-    /** True when every remaining byte is already in memory. Scheduling
-     * hint only; a false answer may also denote buffered data. */
-    virtual bool isInMemory() const
-    {
-        return false;
-    }
-
     virtual bool good()
     {
         return true;
@@ -331,11 +324,6 @@ class StringSource : public RestartableSource
     std::shared_ptr<const std::string> sOwned;
 
 public:
-    bool isInMemory() const override
-    {
-        return true;
-    }
-
     std::string_view s;
     size_t pos;
 

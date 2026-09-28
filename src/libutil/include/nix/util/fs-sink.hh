@@ -93,8 +93,8 @@ public:
 class RestoreSinkHooks;
 
 /**
- * A file owned by `RestoreSink` while it is written. `finish()` flushes
- * and runs the completion hook; destruction closes the descriptor.
+ * A file owned by `RestoreSink` while it is written. `finish()` flushes,
+ * runs the completion hook and closes it; destruction cleans up unfinished writes.
  * The callback form keeps the writer on its stack. `beginRegularFile`
  * returns an owned writer when creation and completion have separate scopes.
  */
@@ -117,8 +117,9 @@ public:
     ~RegularFileWriter() override;
 
     /**
-     * Flush the bytes written and run `RestoreSinkHooks::regularFileCreated`.
-     * Once.
+     * Flush, run `RestoreSinkHooks::regularFileCreated`, start write-back
+     * if requested, and close, reporting errors to the caller. Once; after
+     * successful completion the descriptor is invalid.
      */
     void finish();
 

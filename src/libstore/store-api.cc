@@ -263,22 +263,8 @@ void Store::addMultipleToStore(
     CheckSigsFlag checkSigs,
     const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
-    addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, 0, narHash);
-}
-
-void Store::addMultipleToStore(
-    PathsSource && pathsToCopy,
-    Activity & act,
-    RepairFlag repair,
-    CheckSigsFlag checkSigs,
-    size_t maxThreads,
-    const std::function<Hash(const StorePath &, const Source &)> & narHash)
-{
-    /* A batch of one has no order to find and nothing to run in parallel,
-       and `processGraph` below would build a thread pool and a graph for
-       it: an evaluation that emits each derivation as it names it flushes
-       one object at a time (`nix-instantiate`), so this is the common
-       shape, not a corner. */
+    /* A singleton has no inter-path order or parallel work; avoid building
+       a dependency graph and worker pool. */
     if (pathsToCopy.size() == 1) {
         auto & [info, source_] = pathsToCopy.front();
         act.setExpected(actCopyPath, info.narSize);
@@ -378,8 +364,7 @@ void Store::addMultipleToStore(
 
             nrDone++;
             showProgress();
-        },
-        maxThreads);
+        });
 }
 
 /* Compute the object hash and content address in one walk. The address

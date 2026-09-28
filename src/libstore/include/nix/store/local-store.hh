@@ -342,27 +342,7 @@ public:
         CheckSigsFlag checkSigs,
         const std::function<Hash()> & narHash = {}) override;
 
-    /**
-     * Keep a lease on one protecting directory across the batch. Each
-     * path has its own ingestion and each writer retains its own lease,
-     * so overlapping batches or direct adds can finish independently.
-     * The final lease releases the directory, after every writer has
-     * finished publishing its path or failed (`08` K16).
-     */
-    void addMultipleToStore(
-        PathsSource && pathsToCopy,
-        Activity & act,
-        RepairFlag repair,
-        CheckSigsFlag checkSigs,
-        const std::function<Hash(const StorePath &, const Source &)> & narHash = {}) override;
-
 private:
-    /** Concurrent ingestions may share a protecting directory, but each
-     * keeps its own rows and a strong lease until registration completes. */
-    Sync<std::weak_ptr<GitObjectStore::Hold>> ingestionHold;
-
-    std::shared_ptr<GitObjectStore::Hold> acquireIngestionHold();
-
     /** Publish a content-addressed path. Populate is called only under its
      * output lock when writing is necessary and must return an exact NAR size;
      * its hold is borrowed through registration from the caller's scope. */
@@ -515,25 +495,26 @@ public:
      * -- after a build, and for a flat file or a plain copy
      * `addToStoreFromDump` wrote -- and return what that walk computed,
      * the root's entry and the NAR size, for the caller to register
-     * (`ValidPathInfo::objectHash`, the database's fact).  `hold` keeps
-     * the objects written from a concurrent sweep until the caller has
-     * registered (`GitObjectStore::Hold`; `08` K16): the caller makes it
-     * before the walk and lets it go after the registration.
+     * (`ValidPathInfo::objectHash`, the database's fact). `hold` owns the
+     * pending projection until publication and acquires a physical lease
+     * only when needed (`GitObjectStore::Hold`; `08` K16). The caller keeps
+     * it through registration; physical paths retain their normal roots.
      */
     ObjectHashSink::Result
     enterPath(const std::filesystem::path & path, RepairFlag repair, const GitObjectStore::Hold & hold);
 
     /**
-     * Restore a NAR into `path` through the store's composite (`08` §1.6;
-     * 01 §9.10, "Ingestion writes only what the store lacks").  The caller
-     * registers the root's object hash.  `hooks->regularFileCreated` fires
-     * only for the files written, not for those linked.  `hold` keeps the
-     * objects written from a concurrent sweep until the caller has
-     * registered (`GitObjectStore::Hold`; `08` K16).
+     * Call the filesystem-node producer once synchronously to restore into
+     * `path` through the store's composite (`08` §1.6; 01 §9.10). NAR callers
+     * parse their stream; buffered Flat callers emit one regular file.
+     * The caller registers the root's object hash. `regularFileCreated`
+     * fires only for files written, not linked. `hold` owns the pending
+     * projection through publication and acquires its shared physical
+     * lease only when needed (`GitObjectStore::Hold`; `08` K16).
      */
     ObjectHashSink::Result restoreThroughObjects(
         const std::filesystem::path & path,
-        Source & source,
+        fun<void(FileSystemObjectSink &)> produce,
         bool startFsync,
         RestoreSinkHooks * hooks,
         const GitObjectStore::Hold & hold,
@@ -571,9 +552,9 @@ public:
      * where it holds them, and through the composite of
      * `restoreThroughObjects` where it does not (01 §9.10, the second
      * route; `08` §1.6, `MaterialisingVisitor`): a node `namer` names
-     * whose objects the store holds -- each directory's body in `trees/`,
-     * verified against its identifier as it is read, each blob's file in
-     * `blobs/` -- is made on disk by `mkdirat`, `linkat` and `symlinkat`
+     * whose objects the store holds -- verified owned auxiliary bodies
+     * and registered regular-file holders -- is made on disk by `mkdirat`,
+     * `linkat` and `symlinkat`
      * without reading the accessor; a node it does not name, or whose
      * objects the store lacks or holds corrupt, is read from the
      * accessor and written through the one route's visitor, which links
@@ -581,9 +562,9 @@ public:
      * `restoreThroughObjects` on the accessor's NAR (law 2), same
      * hooks: `hooks->regularFileCreated` fires for the files written and
      * for none linked.  The caller registers the root's object hash.
-     * `hold` keeps the objects written, and the store's objects the copy
-     * is made from, from a concurrent sweep until then
-     * (`GitObjectStore::Hold`; `08` K16).
+     * `hold` owns the recipient's pending witnesses and acquired auxiliary
+     * bytes through publication (`GitObjectStore::Hold`; `08` K16). A later
+     * child acquisition can still miss after collection and trigger fallback.
      *
      * Callbacks run sequentially on the caller thread unless
      * `callbacksPermitParallelism` is true. Opting in permits hooks to run

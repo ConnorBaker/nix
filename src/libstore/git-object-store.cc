@@ -5,6 +5,7 @@
 #include "nix/util/file-system-at.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/logging.hh"
+#include "nix/util/memo.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/strings.hh"
@@ -192,7 +193,7 @@ static size_t shardOf(const Hash & id)
 
 const std::filesystem::path & GitObjectStore::Hold::directory() const
 {
-    return lease->dir;
+    return lease()->dir;
 }
 
 void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
@@ -292,12 +293,6 @@ static std::string nameUnderRoot(const std::filesystem::path & where, const std:
     return w.size() == r.size() ? std::string() : w.substr(r.size() + (r.back() != '/'));
 }
 
-GitObjectStore::Hold::Hold(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
-    : pending(std::make_unique<Pending>())
-    , lease(std::make_shared<Lease>(tmp, atHoldMade))
-{
-}
-
 GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
 {
     /* GC may remove the empty directory before its lock is acquired.
@@ -331,7 +326,7 @@ GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std:
     }
 }
 
-GitObjectStore::Hold::Hold(std::shared_ptr<Lease> lease)
+GitObjectStore::Hold::Hold(fun<std::shared_ptr<Lease>()> lease)
     : pending(std::make_unique<Pending>())
     , lease(std::move(lease))
 {
@@ -394,7 +389,9 @@ GitObjectStore::Hold::Lease::~Lease()
 
 GitObjectStore::Hold GitObjectStore::hold() const
 {
-    return Hold(dir / "tmp", atHoldMade);
+    return Hold(memo<std::shared_ptr<Hold::Lease>>([tmp = dir / "tmp", atHoldMade = atHoldMade] {
+        return std::make_shared<Hold::Lease>(tmp, atHoldMade);
+    }));
 }
 
 #ifndef _WIN32

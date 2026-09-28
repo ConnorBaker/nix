@@ -751,15 +751,6 @@ public:
         CheckSigsFlag checkSigs = CheckSigs,
         const std::function<Hash(const StorePath &, const Source &)> & narHash = {});
 
-    /** The same dependency graph with a caller-selected worker bound. */
-    void addMultipleToStore(
-        PathsSource && pathsToCopy,
-        Activity & act,
-        RepairFlag repair,
-        CheckSigsFlag checkSigs,
-        size_t maxThreads,
-        const std::function<Hash(const StorePath &, const Source &)> & narHash = {});
-
     /** Optional producer-established canonical entry for the rendered,
      * filtered subtree, addressed relative to the copy's root. Only
      * consulted for the root and directories; a missing answer causes an

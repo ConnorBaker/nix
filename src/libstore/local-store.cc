@@ -941,12 +941,13 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     GitObjectStore::Hold::CompletedIngestion completion{logical, 0};
     if (slot == completed.size())
         completed.reserve(completed.size() + 1);
+    auto holdName = hold.directory().filename().string();
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
         auto id = ingestion->id;
         if (!id) {
-            state->stmts->NewIngestion.use().apply("", false).apply(hold.directory().filename().string()).exec();
+            state->stmts->NewIngestion.use().apply("", false).apply(holdName).exec();
             id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
         } else
             state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
@@ -1896,7 +1897,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         for (auto publication = publications.begin(); publication != publications.end();) {
             auto id = publication->ingestion;
             if (!id) {
-                state->stmts->NewIngestion.use().apply("", false).apply(hold->directory().filename().string()).exec();
+                // This projection and its validity become visible together.
+                state->stmts->NewIngestion.use().apply("", false).apply("", false).exec();
                 id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
             } else {
                 state->stmts->SetIngestionPath.use().apply("", false).apply(static_cast<int64_t>(*id)).exec();
@@ -2039,43 +2041,6 @@ bool LocalStore::realisationIsUntrusted(const Realisation & realisation)
     return config->requireSigs && !realisation.checkSignatures(realisation.id, getPublicKeys());
 }
 
-std::shared_ptr<GitObjectStore::Hold> LocalStore::acquireIngestionHold()
-{
-    auto weak = ingestionHold.lock();
-    if (auto hold = weak->lock())
-        return hold;
-    auto hold = std::make_shared<GitObjectStore::Hold>(objects.hold());
-    *weak = hold;
-    return hold;
-}
-
-void LocalStore::addMultipleToStore(
-    PathsSource && pathsToCopy,
-    Activity & act,
-    RepairFlag repair,
-    CheckSigsFlag checkSigs,
-    const std::function<Hash(const StorePath &, const Source &)> & narHash)
-{
-    /* Keep the shared directory alive across this batch. Every writer
-       acquires its own lease as well: another overlapping batch or direct
-       add may outlive this call. A batch with nothing to write makes none. */
-    std::shared_ptr<GitObjectStore::Hold> hold;
-    for (auto & [info, _] : pathsToCopy)
-        if (repair || !isValidPath(info.path)) {
-            hold = acquireIngestionHold();
-            break;
-        }
-    /* Small local objects spend their time in pathname operations and the
-       same registration connection. Spreading them over a CPU-sized pool
-       serialises on that lock anyway, with a handoff for each lookup.
-       Large streams still overlap their reads and writes. This changes no
-       graph ordering, error handling or registration boundary. */
-    bool small = std::all_of(pathsToCopy.begin(), pathsToCopy.end(), [](const auto & p) {
-        return p.second->isInMemory() && p.first.narSize && p.first.narSize <= (1 << 20);
-    });
-    Store::addMultipleToStore(std::move(pathsToCopy), act, repair, checkSigs, small ? 1 : 0, narHash);
-}
-
 void LocalStore::addToStore(
     const ValidPathInfo & info,
     Source & source,
@@ -2132,12 +2097,9 @@ void LocalStore::addToStore(
                    `autoGC()` runs before the restore*). */
                 autoGC();
 
-                /* The directory protects every overlapping writer until
-                   the last lease ends. This path's rows and ingestion
-                   identity are its own, and finish before its lease ends. */
-                auto holdLease = acquireIngestionHold();
-                auto ownHold = holdLease->ownRows();
-                const GitObjectStore::Hold & hold = ownHold;
+                /* This publication owns its projection and any physical lease
+                   it needs until registration or failure completes. */
+                auto hold = objects.hold();
 
                 /* A NAR hash the sender asserted is verified on a tee of
                    the stream and never stored (01 section 9.11); the same
@@ -2173,7 +2135,7 @@ void LocalStore::addToStore(
 
                 auto restored = restoreThroughObjects(
                     realPath,
-                    *restoreSource,
+                    [&](FileSystemObjectSink & sink) { parseDump(sink, *restoreSource); },
                     config->getLocalSettings().fsyncStorePaths,
                     canonicalisingRestoreHooks.get(),
                     hold,
@@ -2450,8 +2412,8 @@ StorePath LocalStore::addToStoreFromDump(
     std::filesystem::path tempPath;
     std::filesystem::path tempDir;
     AutoCloseFD tempDirFd;
-    /* The sink's result when a NAR was restored through it; a flat file
-       or a plain copy is entered by one walk below instead. */
+    /* The result of the composite restore; a staged flat file or a
+       cross-device copy needs its physical projection below instead. */
     std::optional<ObjectHashSink::Result> restored;
 
     /* If the methods don't match, our streaming hash of the dump is the
@@ -2488,7 +2450,12 @@ StorePath LocalStore::addToStoreFromDump(
 
         if (dumpMethod == FileSerialisationMethod::NixArchive)
             restored = restoreThroughObjects(
-                tempPath, bothSource, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get(), *hold, repair);
+                tempPath,
+                [&](FileSystemObjectSink & sink) { parseDump(sink, bothSource); },
+                localSettings.fsyncStorePaths,
+                canonicalisingRestoreHooks.get(),
+                *hold,
+                repair);
         else
             restorePath(
                 tempPath, bothSource, dumpMethod, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get());
@@ -2524,33 +2491,25 @@ StorePath LocalStore::addToStoreFromDump(
             autoGC();
             hold.emplace(objects.hold());
             StringSource dumpSource{dump};
-            auto fim = hashMethod.getFileIngestionMethod();
-            switch (fim) {
-            case FileIngestionMethod::NixArchive:
-                restored = restoreThroughObjects(
-                    realPath,
-                    dumpSource,
-                    localSettings.fsyncStorePaths,
-                    canonicalisingRestoreHooks.get(),
-                    *hold,
-                    repair);
-                break;
-            case FileIngestionMethod::Flat:
-                restorePath(
-                    realPath,
-                    dumpSource,
-                    (FileSerialisationMethod) fim,
-                    localSettings.fsyncStorePaths,
-                    canonicalisingRestoreHooks.get());
-                break;
-            case FileIngestionMethod::Git:
-                // Git is not a serialisation method.
-                assert(false);
-            }
+            restored = restoreThroughObjects(
+                realPath,
+                [&](FileSystemObjectSink & sink) {
+                    if (dumpMethod == FileSerialisationMethod::NixArchive)
+                        parseDump(sink, dumpSource);
+                    else
+                        sink.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
+                            file.preallocateContents(dump.size());
+                            file(dump);
+                        });
+                },
+                localSettings.fsyncStorePaths,
+                canonicalisingRestoreHooks.get(),
+                *hold,
+                repair);
         } else if (!moveIntoStore(tempPath, realPath, *delTempDir, canonicalisingRestoreHooks.get()))
             restored.reset();
 
-        // A flat restore or cross-device copy needs its new physical projection.
+        // A staged flat restore or cross-device copy needs its new physical projection.
         return {restored ? *restored : enterPath(realPath, repair, *hold), *hold};
     };
     return addToStorePrepared(name, std::move(desc), repair, std::ref(populate));
