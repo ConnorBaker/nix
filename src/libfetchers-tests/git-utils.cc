@@ -37,6 +37,7 @@
 #include <gtest/gtest.h>
 #include "nix/util/serialise.hh"
 
+#include <git2/attr.h>
 #include <git2/blob.h>
 #include <git2/commit.h>
 #include <git2/config.h>
@@ -2078,7 +2079,6 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
 
     auto repo = openRepo();
     auto raw = repo->getAccessor(rev1, {}, "");
-    EXPECT_FALSE(repo->treeMentionsAttribute(rev1, "export-ignore"));
     auto wrapped = repo->getAccessor(rev1, {.exportIgnore = true}, "");
     /* The filter is left out, so the accessor is the inner one and the
        root's name is the tree's, as with `exportIgnore = false`. */
@@ -2107,7 +2107,6 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     write("dirty/c", "c");
     auto rev2 = commit({"clean/.gitattributes", "dirty/c"}, "two");
     auto repo2 = openRepo();
-    EXPECT_TRUE(repo2->treeMentionsAttribute(rev2, "export-ignore"));
     auto wrapped2 = repo2->getAccessor(rev2, {.exportIgnore = true}, "");
     wrapped2->fingerprint = "whole";
     EXPECT_EQ(wrapped2->getFingerprint(CanonPath("clean/a")), (std::pair{CanonPath("clean/a"), std::string("whole")}));
@@ -2122,24 +2121,20 @@ TEST_F(GitUtilsTest, exportIgnoreWrapperPassesNamesThroughWhenItHidesNothing)
     git_repository_free(rawRepo);
 }
 
-/* When no attributes source names `export-ignore`, the filter is the
-   identity and is left out: the accessor is the inner one, for a commit and
-   for the working directory, and the tree is named alike with and without
-   `exportIgnore`. */
+/* A commit with no export-ignore bytes needs no filter. A working tree
+   retains the native lookup and renders the same files in this case. */
 TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
 {
     git_repository * rawRepo = nullptr;
     ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
     write("sub/a", "a");
     write("top", "t");
-    /* Attributes, none of them export-ignore; a comment naming it is a comment. */
-    write(".gitattributes", "# not export-ignore\n*.lock linguist-generated\n* text=auto eol=lf\n");
+    /* Unrelated attributes permit the conservative absence proof. */
+    write(".gitattributes", "# unrelated attributes\n*.lock linguist-generated\n* text=auto eol=lf\n");
     auto rev = commitPaths(rawRepo, {"sub/a", "top", ".gitattributes"}, "one");
     git_repository_free(rawRepo);
 
     auto repo = openRepo();
-    EXPECT_FALSE(repo->treeMentionsAttribute(rev, "export-ignore"));
-    EXPECT_FALSE(repo->attributesOutsideTheTreeMention("export-ignore", rev));
     auto raw = repo->getAccessor(rev, {}, "");
     auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "");
     EXPECT_TRUE(typeid(*filtered) == typeid(*raw)) << typeid(*filtered).name();
@@ -2148,9 +2143,10 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
     auto wd = repo->getWorkdirInfo();
     auto notAllowed = [](const CanonPath & path) { return RestrictedPathError("no"); };
     auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed);
-    EXPECT_TRUE(
-        typeid(*workdir) == typeid(*repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, notAllowed)))
-        << typeid(*workdir).name();
+    auto rawWorkdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, notAllowed);
+    EXPECT_FALSE(typeid(*workdir) == typeid(*rawWorkdir));
+    EXPECT_EQ(workdir->readDirectory(CanonPath::root), rawWorkdir->readDirectory(CanonPath::root));
+    EXPECT_EQ(workdir->readFile(CanonPath("sub/a")), rawWorkdir->readFile(CanonPath("sub/a")));
 
     /* The same tree, the same name and path. */
     nix::initLibStore(/*loadConfig=*/false);
@@ -2160,6 +2156,50 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
     auto [pFiltered, hFiltered] = fetchToStore2(settings, *store, SourcePath(filtered), FetchMode::DryRun, "src");
     EXPECT_EQ(hFiltered, hRaw);
     EXPECT_EQ(pFiltered, pRaw);
+}
+
+TEST_F(GitUtilsTest, exportIgnoreLiteralInACommentConservativelyKeepsTheFilter)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo = [&]() { git_repository_free(rawRepo); };
+    write("keep", "k");
+    write(".gitattributes", "# export-ignore\n* text=auto\n");
+    auto rev = commitPaths(rawRepo, {"keep", ".gitattributes"}, "comment only");
+    auto repo = openRepo();
+    auto raw = repo->getAccessor(rev, {}, "");
+    auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "");
+    EXPECT_FALSE(typeid(*filtered) == typeid(*raw));
+    EXPECT_EQ(filtered->readDirectory(CanonPath::root), raw->readDirectory(CanonPath::root));
+    EXPECT_EQ(filtered->readFile(CanonPath("keep")), raw->readFile(CanonPath("keep")));
+}
+
+TEST_F(GitUtilsTest, exportIgnoreDoesNotReuseTheOldAttributeParserMemo)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo = [&]() { git_repository_free(rawRepo); };
+    write("hide", "h");
+    write("keep", "k");
+    std::string attributes = "hide export-ignore";
+    attributes += '\0';
+    attributes += "junk\n";
+    write(".gitattributes", attributes);
+    auto rev = commitPaths(rawRepo, {"hide", "keep", ".gitattributes"}, "NUL assignment terminator");
+    /* Avoid an external root macro source so only the immutable proof is tested. */
+    std::filesystem::remove(tmpDir / ".gitattributes");
+    Settings settings;
+    auto cache = settings.getCache();
+    Cache::Key oldKey{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+    cache->upsert(oldKey, {{"mentions", Explicit<bool>{false}}});
+    auto repo = openRepo();
+    auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_FALSE(filtered->pathExists(CanonPath("hide")));
+    EXPECT_EQ(filtered->readFile(CanonPath("keep")), "k");
+    Cache::Key newKey{"treeContainsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+    auto memo = cache->lookup(newKey);
+    ASSERT_TRUE(memo);
+    EXPECT_TRUE(getBoolAttr(*memo, "mentions"));
 }
 
 TEST_F(GitUtilsTest, exportFilterConstructionRechecksExternalSourcesAfterAnImmutableMemoHit)
@@ -2177,7 +2217,7 @@ TEST_F(GitUtilsTest, exportFilterConstructionRechecksExternalSourcesAfterAnImmut
     auto raw = repo->getAccessor(rev, {}, "");
     auto first = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
     EXPECT_EQ(first->getFingerprint(CanonPath::root), raw->getFingerprint(CanonPath::root));
-    Cache::Key key{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+    Cache::Key key{"treeContainsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
     auto memo = cache->lookup(key);
     ASSERT_TRUE(memo);
     EXPECT_FALSE(getBoolAttr(*memo, "mentions"));
@@ -2215,16 +2255,16 @@ TEST_F(GitUtilsTest, exportIgnoreDeclaredAnywhereKeepsTheFilter)
     write("sub/keep2", "k");
     auto rev0 = commitPaths(rawRepo, {"hide", "keep", "sub/hide2", "sub/keep2"}, "one");
 
-    /* Independently inspect the sources and the view constructed without a memo. */
+    /* Observe constructor elision separately from the rendered tree. */
     auto fetch = [&](const Hash & rev) {
         auto repo = openRepo();
-        bool hidesNothing = !repo->treeMentionsAttribute(rev, "export-ignore")
-                            && !repo->attributesOutsideTheTreeMention("export-ignore", rev);
-        return std::pair{hidesNothing, repo->getAccessor(rev, {.exportIgnore = true}, "")};
+        auto raw = repo->getAccessor(rev, {}, "");
+        auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "");
+        return std::pair{typeid(*filtered) == typeid(*raw), filtered};
     };
     auto expectFiltered = [&](const Hash & rev, const char * hidden, const char * kept, const char * source) {
-        auto [hidesNothing, acc] = fetch(rev);
-        EXPECT_FALSE(hidesNothing) << source;
+        auto [filterOmitted, acc] = fetch(rev);
+        EXPECT_FALSE(filterOmitted) << source;
         EXPECT_FALSE(acc->pathExists(CanonPath(hidden))) << source << ": " << hidden;
         EXPECT_TRUE(acc->pathExists(CanonPath(kept))) << source << ": " << kept;
     };
@@ -2274,13 +2314,78 @@ TEST_F(GitUtilsTest, exportIgnoreDeclaredAnywhereKeepsTheFilter)
     setAttributesFile("~/attrs");
     expectFiltered(rev0, "hide", "keep", "core.attributesFile");
     setAttributesFile(nullptr);
+
+    /* Configuration selection is not general get_path parsing: null/empty
+       inhibit XDG; relative paths use the workdir; only "~/" expands. */
+    auto configFile = gitDir / "config";
+    auto originalConfig = readFile(configFile);
+    Finally restoreConfig = [&]() { writeFile(configFile, originalConfig); };
+    auto configure = [&](std::optional<std::string> value, bool nullValue = false) {
+        writeFile(configFile, originalConfig + (nullValue ? "\n[core]\nattributesFile\n" : ""));
+        if (value) {
+            git_config * config = nullptr;
+            ASSERT_EQ(git_config_open_ondisk(&config, configFile.string().c_str()), 0);
+            ASSERT_EQ(git_config_set_string(config, "core.attributesfile", value->c_str()), 0);
+            git_config_free(config);
+        }
+    };
+    auto expectSelection = [&](bool mentions, bool hidden) {
+        auto [filterOmitted, acc] = fetch(rev0);
+        EXPECT_EQ(!filterOmitted, mentions);
+        EXPECT_EQ(!acc->pathExists(CanonPath("hide")), hidden);
+        EXPECT_EQ(acc->readFile(CanonPath("keep")), "k");
+        if (!mentions)
+            EXPECT_TRUE(acc->getFingerprint(CanonPath::root));
+    };
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_XDG, xdg.string().c_str()), 0);
+    configure(std::nullopt);
+    expectSelection(true, true);
+    configure(std::nullopt, true);
+    expectSelection(false, false);
+    configure("");
+    expectSelection(false, false);
+    write("attributes-relative", "hide export-ignore\n");
+    write("~", "hide export-ignore\n");
+    write("~other/attrs", "hide export-ignore\n");
+    for (auto value : {"attributes-relative", "~", "~other/attrs"}) {
+        SCOPED_TRACE(value);
+        configure(value);
+        expectSelection(true, true);
+    }
+    write("attributes-clean", "# no rules\n");
+    for (auto value : {"attributes-clean", "missing-attributes"}) {
+        SCOPED_TRACE(value);
+        configure(value);
+        expectSelection(false, false);
+    }
+#ifndef _WIN32
+    /* This proof deliberately declines DOS/UNC/backslash spellings;
+       native Windows paths remain accepted by the retained libgit2 view. */
+    writeFile(home / "attrs", "# no rules\n");
+    for (auto & value : std::vector<std::string>{(home / "attrs").string(), "~/attrs"}) {
+        configure(value);
+        expectSelection(false, false);
+    }
+#endif
+    for (auto value : {"x:/attrs", "\\attrs", "//server/attrs"}) {
+        configure(value);
+        auto [filterOmitted, acc] = fetch(rev0);
+        EXPECT_FALSE(filterOmitted);
+        EXPECT_FALSE(acc->getFingerprint(CanonPath::root));
+    }
+    configure("~/attrs");
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_HOMEDIR, (home / "missing").string().c_str()), 0);
+    auto [knownAbsent, unknownView] = fetch(rev0);
+    EXPECT_FALSE(knownAbsent);
+    EXPECT_FALSE(unknownView->getFingerprint(CanonPath::root));
+    writeFile(configFile, originalConfig);
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_XDG, nullptr), 0);
     ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_HOMEDIR, oldHome.ptr), 0);
     git_buf_dispose(&oldHome);
 
     /* A nested .gitattributes in the commit. */
     write("sub/.gitattributes", "hide2 export-ignore\n");
     auto rev1 = commitPaths(rawRepo, {"sub/.gitattributes"}, "two");
-    EXPECT_TRUE(openRepo()->treeMentionsAttribute(rev1, "export-ignore"));
     expectFiltered(rev1, "sub/hide2", "sub/keep2", "nested .gitattributes in the commit");
 
     /* CRLF line endings, blanks to libgit2. */
@@ -2294,11 +2399,104 @@ TEST_F(GitUtilsTest, exportIgnoreDeclaredAnywhereKeepsTheFilter)
     expectFiltered(rev3, "hide", "keep", "-export-ignore beside a rule");
     write(".gitattributes", "keep -export-ignore\n");
     auto rev4 = commitPaths(rawRepo, {".gitattributes"}, "five");
-    auto [hidesNothing, acc] = fetch(rev4);
-    EXPECT_FALSE(hidesNothing);
+    auto [filterOmitted, acc] = fetch(rev4);
+    EXPECT_FALSE(filterOmitted);
     EXPECT_TRUE(acc->pathExists(CanonPath("hide")));
 
     git_repository_free(rawRepo);
+}
+
+TEST_F(GitUtilsTest, exportIgnoreSearchPathProofDeclinesUnsharedSyntax)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo = [&]() { git_repository_free(rawRepo); };
+    write("keep", "k");
+    auto rev = commitPaths(rawRepo, {"keep"}, "search-path domain");
+    auto scratch = std::filesystem::path(git_repository_path(rawRepo)) / "search-proof";
+    createDirs(scratch / "first");
+    createDirs(scratch / "second");
+    git_buf oldXdg = GIT_BUF_INIT, oldSystem = GIT_BUF_INIT;
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, GIT_CONFIG_LEVEL_XDG, &oldXdg), 0);
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, GIT_CONFIG_LEVEL_SYSTEM, &oldSystem), 0);
+    Finally restore = [&]() {
+        git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_XDG, oldXdg.ptr);
+        git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_SYSTEM, oldSystem.ptr);
+        git_buf_dispose(&oldXdg);
+        git_buf_dispose(&oldSystem);
+    };
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_XDG, ""), 0);
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, GIT_CONFIG_LEVEL_SYSTEM, ""), 0);
+    for (auto level : {GIT_CONFIG_LEVEL_XDG, GIT_CONFIG_LEVEL_SYSTEM}) {
+        auto first = (scratch / "first").generic_string();
+        auto second = (scratch / "second").generic_string();
+        for (auto [search, unknown] : std::vector<std::pair<std::string, bool>>{
+                 {"", false},
+                 {first, false},
+                 {first + GIT_PATH_LIST_SEPARATOR + second, false},
+                 {"relative-attributes", true},
+                 {first + "\\" + GIT_PATH_LIST_SEPARATOR + second, true}}) {
+            SCOPED_TRACE(search);
+            ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, level, search.c_str()), 0);
+            auto repo = openRepo();
+            auto raw = repo->getAccessor(rev, {}, "");
+            auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "");
+            EXPECT_EQ(typeid(*filtered) != typeid(*raw), unknown);
+            EXPECT_EQ(filtered->readFile(CanonPath("keep")), "k");
+        }
+        ASSERT_EQ(git_libgit2_opts(GIT_OPT_SET_SEARCH_PATH, level, ""), 0);
+    }
+}
+
+TEST_F(GitUtilsTest, exportIgnoreAbsenceProofAgreesWithEveryAssignmentTerminatorByte)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    write("hide", "h");
+    write("keep", "k");
+    auto rev = commitPaths(rawRepo, {"hide", "keep"}, "attribute byte domain");
+    auto attributes = std::filesystem::path(git_repository_path(rawRepo)) / "info" / "attributes";
+    git_repository_free(rawRepo);
+    createDirs(attributes.parent_path());
+
+    unsigned cases = 0;
+    for (const char * prefix : {"", "-", "!"}) {
+        SCOPED_TRACE(prefix);
+        for (unsigned byte = 0; byte != 256; ++byte) {
+            SCOPED_TRACE(byte);
+            std::string contents = "hide ";
+            contents += prefix;
+            contents += "export-ignore";
+            contents += static_cast<char>(byte);
+            contents += "suffix\n";
+            writeFile(attributes, contents);
+
+            /* Both the raw index and this commit have no .gitattributes.
+               Their native source sets therefore agree for this fixture.
+               Fresh handles avoid reusing attribute rules between cells. */
+            git_repository * native = nullptr;
+            ASSERT_EQ(git_repository_open(&native, tmpDir.string().c_str()), 0);
+            Finally closeNative = [&]() { git_repository_free(native); };
+            const char * value = nullptr;
+            ASSERT_EQ(
+                git_attr_get(
+                    &value, native, GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_NO_SYSTEM, "hide", "export-ignore"),
+                0);
+            bool hidden = GIT_ATTR_IS_TRUE(value);
+            if (*prefix == '\0' && byte == 0)
+                EXPECT_TRUE(hidden); // NUL ends the native assignment before the suffix.
+
+            auto repo = openRepo();
+            auto view = repo->getAccessor(rev, {.exportIgnore = true}, "");
+            bool visible = view->pathExists(CanonPath("hide"));
+            EXPECT_EQ(visible, !hidden);
+            if (visible)
+                EXPECT_EQ(view->readFile(CanonPath("hide")), "h");
+            EXPECT_EQ(view->readFile(CanonPath("keep")), "k");
+            ++cases;
+        }
+    }
+    EXPECT_EQ(cases, 768u);
 }
 
 /* The tree a commit accessor names is the commit's, so the attributes that
@@ -2336,12 +2534,12 @@ TEST_F(GitUtilsTest, committedRevIgnoresTheWorkdirsUncommittedGitattributes)
     write("sub/deep/keep3", "k");
     auto rev = commitPaths(rawRepo, {"sub/hide2", "sub/keep2", "sub/deep/hide3", "sub/deep/keep3"}, "one");
 
-    /* Inspect the source facts independently of the accessor's own decision. */
+    /* Observe constructor elision separately from the forced native view. */
     auto fetch = [&](const Hash & r) {
         auto repo = openRepo();
-        bool hidesNothing = !repo->treeMentionsAttribute(r, "export-ignore")
-                            && !repo->attributesOutsideTheTreeMention("export-ignore", r);
-        return std::pair{hidesNothing, repo->getAccessor(r, {.exportIgnore = true}, "")};
+        auto raw = repo->getAccessor(r, {}, "");
+        auto filtered = repo->getAccessor(r, {.exportIgnore = true}, "");
+        return std::pair{typeid(*filtered) == typeid(*raw), filtered};
     };
     /* A harmless attribute source requires a real filter at construction.
        Remove it before querying: the lookup must still ignore uncommitted
@@ -2355,8 +2553,8 @@ TEST_F(GitUtilsTest, committedRevIgnoresTheWorkdirsUncommittedGitattributes)
         return accessor;
     };
     auto expectKept = [&](const char * source) {
-        auto [hidesNothing, acc] = fetch(rev);
-        EXPECT_TRUE(hidesNothing) << source;
+        auto [filterOmitted, acc] = fetch(rev);
+        EXPECT_TRUE(filterOmitted) << source;
         for (auto p : {"sub/hide2", "sub/keep2", "sub/deep/hide3", "sub/deep/keep3"})
             EXPECT_TRUE(acc->pathExists(CanonPath(p))) << source << ": " << p;
         auto filtered = forced(rev);
@@ -2411,8 +2609,6 @@ TEST_F(GitUtilsTest, committedRevHonoursInfoAttributes)
     git_repository_free(rawRepo);
 
     auto repo = openRepo();
-    EXPECT_FALSE(repo->treeMentionsAttribute(rev, "export-ignore"));
-    EXPECT_TRUE(repo->attributesOutsideTheTreeMention("export-ignore", rev));
     auto acc = repo->getAccessor(rev, {.exportIgnore = true}, "");
     EXPECT_FALSE(acc->pathExists(CanonPath("hide")));
     EXPECT_TRUE(acc->pathExists(CanonPath("keep")));
@@ -2447,16 +2643,13 @@ TEST_F(GitUtilsTest, workdirExportIgnoreSources)
     auto workdirAccessor = [&]() {
         auto repo = openRepo();
         auto wd = repo->getWorkdirInfo();
-        return std::pair{
-            repo->attributesOutsideTheTreeMention("export-ignore", std::nullopt),
-            repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed)};
+        return repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed);
     };
 
     /* info/attributes. */
     writeFile(gitDir / "info" / "attributes", "hide2 export-ignore\n");
     {
-        auto [mentions, acc] = workdirAccessor();
-        EXPECT_TRUE(mentions) << "info/attributes";
+        auto acc = workdirAccessor();
         EXPECT_FALSE(acc->pathExists(CanonPath("sub/hide2"))) << "info/attributes";
         EXPECT_TRUE(acc->pathExists(CanonPath("sub/keep2"))) << "info/attributes";
     }
@@ -2467,8 +2660,7 @@ TEST_F(GitUtilsTest, workdirExportIgnoreSources)
     stage("sub/.gitattributes", true);
     std::filesystem::remove(tmpDir / "sub" / ".gitattributes");
     {
-        auto [mentions, acc] = workdirAccessor();
-        EXPECT_TRUE(mentions) << "index .gitattributes";
+        auto acc = workdirAccessor();
         EXPECT_FALSE(acc->pathExists(CanonPath("sub/hide2"))) << "index .gitattributes";
         EXPECT_TRUE(acc->pathExists(CanonPath("sub/keep2"))) << "index .gitattributes";
     }
@@ -2478,8 +2670,7 @@ TEST_F(GitUtilsTest, workdirExportIgnoreSources)
        lookup, so the filter is the identity and both names stand. */
     write("sub/.gitattributes", "hide2 export-ignore\n");
     {
-        auto [mentions, acc] = workdirAccessor();
-        EXPECT_FALSE(mentions) << "workdir-only .gitattributes";
+        auto acc = workdirAccessor();
         EXPECT_TRUE(acc->pathExists(CanonPath("sub/hide2"))) << "workdir-only .gitattributes";
     }
     std::filesystem::remove(tmpDir / "sub" / ".gitattributes");

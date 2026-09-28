@@ -23,6 +23,7 @@
 #include "nix/fetchers/fetch-to-store.hh"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <sstream>
 #include <streambuf>
 #include <typeinfo>
@@ -602,9 +603,10 @@ TEST_F(TextStoreTest, eagerWriteErrorsAreNotSuppressedAndRetryPreservesTheComple
                     }
 }
 
-// Compare producer expressions to already materialized literals carrying the
-// same context. This keeps the full builtin input domain without a second
-// copy of the implementation selected by a buffering threshold.
+// Compare producer expressions to materialized literals with the same context.
+// Cover callable names outside the exclusion set and three selected input shapes.
+// Reach each primitive's declared arity; lambdas retain the one/two-argument
+// probes because their curried arity can depend on evaluation.
 TEST_F(TextStoreTest, everyBuiltinAgreesOnProducedAndMaterializedInputs)
 {
     struct Outcome
@@ -649,10 +651,17 @@ TEST_F(TextStoreTest, everyBuiltinAgreesOnProducedAndMaterializedInputs)
         state.forceValue(*attr.value, noPos);
         if (attr.value->type() != nFunction || skipped.contains(name))
             continue;
+        auto * primitive = attr.value;
+        size_t supplied = 0;
+        while (primitive->isPrimOpApp()) {
+            ++supplied;
+            primitive = primitive->primOpApp().left;
+        }
+        auto maxArity = primitive->isPrimOp() ? std::max<size_t>(2, primitive->primOp()->arity - supplied) : 2;
         for (const auto & [produced, materialized] : inputs)
-            for (int arity : {1, 2}) {
+            for (size_t arity = 1; arity <= maxArity; ++arity) {
                 std::string lhs = "builtins." + name, rhs = lhs;
-                for (int i = 0; i < arity; ++i) {
+                for (size_t i = 0; i < arity; ++i) {
                     lhs += " " + produced;
                     rhs += " " + materialized;
                 }

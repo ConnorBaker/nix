@@ -104,33 +104,6 @@ struct GitRepo
 
     virtual bool hasObject(const Hash & oid) = 0;
 
-    /**
-     * Whether any `.gitattributes` file in the tree of `rev`, at any depth,
-     * names `attribute`.  One walk of the tree, reading only those blobs; a
-     * function of the commit.  Any failure to read answers yes.
-     */
-    virtual bool treeMentionsAttribute(const Hash & rev, std::string_view attribute) = 0;
-
-    /**
-     * Whether an attributes source other than the tree being named that
-     * libgit2 consults for this repository names `attribute`.  For both
-     * accessors: `info/attributes`; `core.attributesFile`, or the user's
-     * `git/attributes` when it is unset; the system's `gitattributes`,
-     * whose rules `GIT_ATTR_CHECK_NO_SYSTEM` excludes but whose macro
-     * definitions load regardless; and the working directory's root
-     * `.gitattributes`, likewise loaded for macros whatever the flags.
-     * For the working-directory accessor, which asks with
-     * `GIT_ATTR_CHECK_INDEX_ONLY`, also the index's `.gitattributes`
-     * entries.  For the commit accessor that is all: its lookup runs
-     * against an empty index and reads no per-directory source but the
-     * commit's own tree, which `treeMentionsAttribute` answers for, so
-     * neither the working directory nor the index is read here — `rev` is
-     * given for that accessor and absent for the working directory's.
-     * Derived from libgit2's `attr.c` (`attr_setup`, `attr_decide_sources`,
-     * `collect_attr_files`); any failure to read answers yes.
-     */
-    virtual bool attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev) = 0;
-
     /** Construct the commit view, proving any export-filter elision here.
      * The optional cache memoizes only immutable facts about the commit. */
     virtual ref<SourceAccessor> getAccessor(

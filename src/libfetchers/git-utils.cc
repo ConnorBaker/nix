@@ -766,10 +766,12 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
      */
     ref<GitSourceAccessor> getRawAccessor(const Hash & rev, const GitAccessorOptions & options);
 
-    bool treeMentionsAttribute(const Hash & rev, std::string_view attribute) override;
+private:
+    bool treeMentionsAttribute(const Hash & rev, std::string_view attribute);
 
-    bool attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev) override;
+    bool attributesOutsideTheTreeMention(std::string_view attribute);
 
+public:
     ref<SourceAccessor> getAccessor(
         const Hash & rev,
         const GitAccessorOptions & options,
@@ -1298,31 +1300,13 @@ public:
     }
 };
 
-/* Whether a line of an attributes file assigns one of `names` — set,
-   unset (`-name`), unspecified (`!name`) or valued (`name=v`) — or defines
-   a macro (`[attr]m ...`) that does.  Tokenised as libgit2 parses
-   (`attr_file.c`, `git_attr_fnmatch__parse`, `git_attr_assignment__parse`):
-   a line whose first non-blank character is `#` is a comment, blanks are
-   `git__isspace`'s, the first token is the pattern, one `-` or `!` is a
-   prefix.  A `#` token later in a line ends its assignments; this reads
-   on, so a trailing comment naming an attribute counts.  Conservative in
-   that direction only. */
-static bool attributesMention(std::string_view contents, const std::set<std::string> & names)
+/* Attribute names are copied as contiguous bytes by libgit2, including
+   those introduced by user-defined macros. Absence of these bytes is a
+   sufficient proof for export-ignore; comments, longer names and bytes
+   after NUL may conservatively retain the native filter. */
+static bool attributesMention(std::string_view contents, std::string_view attribute)
 {
-    for (auto & line : tokenizeString<std::vector<std::string>>(std::string(contents), "\n")) {
-        auto tokens = tokenizeString<std::vector<std::string>>(line, " \t\r\f\v");
-        if (tokens.empty() || tokens[0][0] == '#')
-            continue;
-        for (size_t i = 1; i < tokens.size(); ++i) {
-            std::string_view attr = tokens[i];
-            if (attr[0] == '-' || attr[0] == '!')
-                attr.remove_prefix(1);
-            attr = attr.substr(0, attr.find('='));
-            if (names.contains(std::string(attr)))
-                return true;
-        }
-    }
-    return false;
+    return contents.find(attribute) != contents.npos;
 }
 
 static std::string_view blobContents(const Blob & blob)
@@ -1330,19 +1314,19 @@ static std::string_view blobContents(const Blob & blob)
     return std::string_view((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
 }
 
-/* Whether the attributes file at `file`, if there is one, mentions one of
-   `names`.  libgit2 treats a file it cannot stat or that is a directory as
+/* Whether the attributes file at `file`, if there is one, contains the bytes of
+   `attribute`.  libgit2 treats a file it cannot stat or that is a directory as
    absent (`attr_file.c`, `GIT_ATTR_FILE_SOURCE_FILE`); one that exists but
    cannot be read answers yes here, which keeps a filter and so libgit2's
    own answer. */
-static bool attributesFileMentions(const std::filesystem::path & file, const std::set<std::string> & names)
+static bool attributesFileMentions(const std::filesystem::path & file, std::string_view attribute)
 {
     std::error_code ec;
     auto status = std::filesystem::status(file, ec);
     if (ec || !std::filesystem::exists(status) || std::filesystem::is_directory(status))
         return false;
     try {
-        return attributesMention(readFile(file), names);
+        return attributesMention(readFile(file), attribute);
     } catch (SysError &) {
         return true;
     }
@@ -1351,46 +1335,74 @@ static bool attributesFileMentions(const std::filesystem::path & file, const std
 /* The directories of one of libgit2's search paths (`git_libgit2_opts`,
    `GIT_OPT_GET_SEARCH_PATH`), as it resolved them at initialisation or was
    told since; the same list `git_sysdir_find_in_dirlist` walks. */
-static std::vector<std::filesystem::path> gitSearchPath(git_config_level_t level)
+static std::optional<std::vector<std::filesystem::path>> gitSearchPath(git_config_level_t level)
 {
-    std::vector<std::filesystem::path> dirs;
     git_buf buf = GIT_BUF_INIT;
-    if (git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, level, &buf) == 0) {
-        for (auto & dir : tokenizeString<std::vector<std::string>>(
-                 std::string_view(buf.ptr, buf.size), std::string(1, GIT_PATH_LIST_SEPARATOR)))
-            dirs.push_back(dir);
-        git_buf_dispose(&buf);
-    }
+    Finally cleanup = [&]() { git_buf_dispose(&buf); };
+    if (git_libgit2_opts(GIT_OPT_GET_SEARCH_PATH, level, &buf))
+        return std::nullopt;
+    auto paths = std::string_view(buf.ptr, buf.size);
+    /* Do not reinterpret escaped separators or native backslash syntax. */
+    if (paths.find('\\') != paths.npos)
+        return std::nullopt;
+    std::vector<std::filesystem::path> dirs;
+    for (auto & dir : tokenizeString<std::vector<std::string>>(paths, std::string(1, GIT_PATH_LIST_SEPARATOR)))
+        if (auto path = std::filesystem::path(dir); path.is_absolute() && !dir.starts_with("//"))
+            dirs.push_back(std::move(path));
+        else
+            return std::nullopt;
     return dirs;
 }
 
-/* The attributes files libgit2 reads for a repository besides the
-   `.gitattributes` of the tree being read (libgit2 `attr.c`, `attr_setup`
-   and `collect_attr_files`): `info/attributes`, in the common directory;
-   `core.attributesFile`, `~/` expanded, or the user's `attributes` along
-   the XDG search path when it is unset; the system's `gitattributes`,
-   whose rules `GIT_ATTR_CHECK_NO_SYSTEM` excludes but whose macro
-   definitions `attr_setup` loads regardless; and, with a working
-   directory, its root `.gitattributes`, likewise loaded for macros
-   whatever the lookup's flags. */
-static std::vector<std::filesystem::path> attributesFilesOutsideTheTree(GitRepoImpl & repo)
+/* A conservative superset of the attribute sources. Unknown configuration
+   or path syntax must retain libgit2's filter, never establish absence. */
+static std::optional<std::vector<std::filesystem::path>> attributesFilesOutsideTheTree(GitRepoImpl & repo)
 {
     std::vector<std::filesystem::path> files;
     git_buf buf = GIT_BUF_INIT;
-    if (git_repository_item_path(&buf, repo, GIT_REPOSITORY_ITEM_INFO) == 0) {
-        files.push_back(std::filesystem::path(buf.ptr) / "attributes");
-        git_buf_dispose(&buf);
-    } else
-        files.push_back(std::filesystem::path(git_repository_path(repo)) / "info" / "attributes");
+    Finally cleanup = [&]() { git_buf_dispose(&buf); };
+    if (git_repository_item_path(&buf, repo, GIT_REPOSITORY_ITEM_INFO))
+        return std::nullopt;
+    files.push_back(std::filesystem::path(buf.ptr) / "attributes");
+    git_buf_dispose(&buf);
+
     GitConfig config;
-    if (!git_repository_config_snapshot(Setter(config), repo))
-        if (git_config_get_path(&buf, config.get(), "core.attributesfile") == 0) {
-            files.push_back(std::filesystem::path(buf.ptr));
-            git_buf_dispose(&buf);
+    if (git_repository_config_snapshot(Setter(config), repo))
+        return std::nullopt;
+    std::unique_ptr<git_config_entry, Deleter<git_config_entry_free>> entry;
+    auto error = git_config_get_entry(Setter(entry), config.get(), "core.attributesfile");
+    if (error == GIT_ENOTFOUND) {
+        auto dirs = gitSearchPath(GIT_CONFIG_LEVEL_XDG);
+        if (!dirs)
+            return std::nullopt;
+        /* libgit2 chooses the first existing file. Checking all candidates
+           is conservative; a later mention can only retain the filter. */
+        for (auto & dir : *dirs)
+            files.push_back(dir / "attributes");
+    } else if (error)
+        return std::nullopt;
+    else if (entry->value && *entry->value) {
+        std::string_view value(entry->value);
+        /* attrcache.c expands only "~/". Bare "~" and "~name" are literal.
+           Other libgit2/native rooting differences are left to its filter. */
+        if (value.starts_with("~/")) {
+            if (git_config_parse_path(&buf, entry->value))
+                return std::nullopt;
+            value = std::string_view(buf.ptr, buf.size);
         }
-    for (auto & dir : gitSearchPath(GIT_CONFIG_LEVEL_XDG))
-        files.push_back(dir / "attributes");
-    for (auto & dir : gitSearchPath(GIT_CONFIG_LEVEL_SYSTEM))
+        if (value.find_first_of(":\\") != value.npos || value.starts_with("//"))
+            return std::nullopt;
+        auto file = std::filesystem::path(value);
+        if (!value.starts_with('/'))
+            if (auto workdir = git_repository_workdir(repo))
+                file = std::filesystem::path(workdir) / file;
+        files.push_back(std::move(file));
+    }
+    /* Present null/empty values select no file and inhibit XDG fallback. */
+    auto dirs = gitSearchPath(GIT_CONFIG_LEVEL_SYSTEM);
+    if (!dirs)
+        return std::nullopt;
+    for (auto & dir : *dirs)
         files.push_back(dir / "gitattributes");
     if (auto workdir = git_repository_workdir(repo))
         files.push_back(std::filesystem::path(workdir) / ".gitattributes");
@@ -1428,7 +1440,6 @@ forEachTreeEntry(GitRepoImpl & repo, const Hash & rev, fun<bool(const char * roo
 
 bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attribute)
 {
-    std::set<std::string> names{std::string(attribute)};
     return forEachTreeEntry(*this, rev, [&](const char *, const git_tree_entry * entry) {
         if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB
             || std::string_view(git_tree_entry_name(entry)) != ".gitattributes")
@@ -1436,42 +1447,19 @@ bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attri
         Blob blob;
         if (git_blob_lookup(Setter(blob), *this, git_tree_entry_id(entry)))
             return true;
-        return attributesMention(blobContents(blob), names);
+        return attributesMention(blobContents(blob), attribute);
     });
 }
 
-bool GitRepoImpl::attributesOutsideTheTreeMention(std::string_view attribute, std::optional<Hash> rev)
+bool GitRepoImpl::attributesOutsideTheTreeMention(std::string_view attribute)
 {
-    std::set<std::string> names{std::string(attribute)};
-    for (auto & file : attributesFilesOutsideTheTree(*this))
-        if (attributesFileMentions(file, names))
-            return true;
-
-    /* For a commit that is the whole list: the only per-directory source of
-       the commit accessor's lookup is the commit's own tree, which
-       `treeMentionsAttribute` answers for, and neither the working
-       directory's `.gitattributes` nor the index's takes part
-       (`GitExportIgnoreSourceAccessor`, its empty index). */
-    if (rev)
-        return false;
-
-    /* The working-directory accessor asks with `GIT_ATTR_CHECK_INDEX_ONLY`,
-       whose per-directory source is the index's `.gitattributes`, read as
-       blobs (`attr_file.c`, `GIT_ATTR_FILE_SOURCE_INDEX`); a bare
-       repository's index is empty. */
-    Index index;
-    if (git_repository_index(Setter(index), *this))
+    auto files = attributesFilesOutsideTheTree(*this);
+    if (!files)
         return true;
-    for (size_t i = 0, n = git_index_entrycount(index.get()); i < n; ++i) {
-        auto * entry = git_index_get_byindex(index.get(), i);
-        if (baseNameOf(entry->path) != ".gitattributes")
-            continue;
-        Blob blob;
-        if (git_blob_lookup(Setter(blob), *this, &entry->id))
+    for (auto & file : *files)
+        if (attributesFileMentions(file, attribute))
             return true;
-        if (attributesMention(blobContents(blob), names))
-            return true;
-    }
+
     return false;
 }
 
@@ -1782,9 +1770,9 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
     /* Only the immutable tree fact may be memoized. External attribute
        sources are observed for every view before deciding to omit a filter. */
     auto mentionsExportIgnore = [&] {
-        if (attributesOutsideTheTreeMention("export-ignore", rev))
+        if (attributesOutsideTheTreeMention("export-ignore"))
             return true;
-        fetchers::Cache::Key key{"treeMentionsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
+        fetchers::Cache::Key key{"treeContainsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
         if (cache)
             if (auto result = cache->lookup(key))
                 return fetchers::getBoolAttr(*result, "mentions");
@@ -1847,10 +1835,10 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
        index flags can suppress comparisons, and clean filters can equate
        different bytes. Keep the working tree as the source of its contents
        and decline to name subtrees by HEAD. */
-    /* The filter asks with `GIT_ATTR_CHECK_INDEX_ONLY`: the index's
-       `.gitattributes` and the files outside the tree.  When none names
-       `export-ignore` it is the identity and is not applied. */
-    if (options.exportIgnore && attributesOutsideTheTreeMention("export-ignore", std::nullopt))
+    /* This shared repository may already have cached attribute sources or
+       macros. Keep its native lookup instead of proving absence from a
+       fresh scan of files that may no longer describe that cache. */
+    if (options.exportIgnore)
         fileAccessor = make_ref<GitExportIgnoreSourceAccessor>(self, fileAccessor, std::nullopt);
     return fileAccessor;
 }

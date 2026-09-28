@@ -1179,8 +1179,8 @@ TEST(RestoreSink, regularFileFailuresFlushAndCloseWithoutRepeatingCompletion)
             for (bool nested : {false, true})
                 for (bool executable : {false, true}) {
                     SCOPED_TRACE(
-                        testing::Message() << "lazy=" << lazy << " hookFailure=" << hookFailure << " nested=" << nested
-                                           << " executable=" << executable);
+                        ::testing::Message() << "lazy=" << lazy << " hookFailure=" << hookFailure
+                                             << " nested=" << nested << " executable=" << executable);
                     auto failure = std::make_exception_ptr(Failure{});
                     Descriptor observed = INVALID_DESCRIPTOR;
                     size_t hookCalls = 0;
@@ -1660,7 +1660,8 @@ TEST(TeeFileSystemObjectSink, composesEveryDirectoryConventionAndUnwindsBothScop
         for (bool physicalB : {false, true})
             for (bool fail : {false, true}) {
                 SCOPED_TRACE(
-                    testing::Message() << "physicalA=" << physicalA << " physicalB=" << physicalB << " fail=" << fail);
+                    ::testing::Message() << "physicalA=" << physicalA << " physicalB=" << physicalB
+                                         << " fail=" << fail);
                 auto directory = tmpDir / std::to_string(cases++);
                 createDirs(directory);
                 auto a = make_ref<MemorySourceAccessor>(), b = make_ref<MemorySourceAccessor>();
@@ -1790,7 +1791,7 @@ TEST(TeeFileSystemObjectSink, observesSkipContentsAfterEveryMetadataStage)
     size_t checked = 0;
     for (unsigned aStages = 0; aStages < 8; ++aStages)
         for (unsigned bStages = 0; bStages < 8; ++bStages) {
-            SCOPED_TRACE(testing::Message() << "aStages=" << aStages << " bStages=" << bStages);
+            SCOPED_TRACE(::testing::Message() << "aStages=" << aStages << " bStages=" << bStages);
             Endpoint a{aStages}, b{bStages};
             TeeFileSystemObjectSink tee{a, b};
             size_t produced = 0;
