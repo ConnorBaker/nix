@@ -3,6 +3,7 @@
 #include "nix/util/sync.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <type_traits>
 
 namespace nix {
 
@@ -24,28 +25,37 @@ class CachingSourceAccessor : public SourceAccessor
        state, never the new view's cache. No child runs under the lock. */
     Sync<std::shared_ptr<Caches>> caches{std::make_shared<Caches>()};
 
-    /* An observation may supply a cacheable fact. The value can itself be
-       optional: no fingerprint is a fact, while no stat is not. */
+    /* Keep the observation's result: no fingerprint is a cacheable fact,
+       while no stat supplies no fact to cache. */
     template<typename Map, typename Observe>
-    std::optional<typename Map::mapped_type>
-    cached(Map Caches::* table, const CanonPath & path, Observe && observe)
+    std::invoke_result_t<Observe> cached(Map Caches::* table, const CanonPath & path, Observe && observe)
     {
+        using Value = typename Map::mapped_type;
+        using Result = std::invoke_result_t<Observe>;
         std::shared_ptr<Caches> observed;
         {
             auto state = caches.lock();
             auto & entries = (**state).*table;
             if (auto i = entries.find(path); i != entries.end())
-                return std::optional<typename Map::mapped_type>{std::in_place, i->second};
+                return Result{i->second};
             observed = *state;
         }
 
         auto owner = weak_from_this().lock();
-        auto fact = observe();
+        auto value = observe();
+        auto fact = [&]() -> const Value * {
+            if constexpr (std::is_same_v<Result, Value>)
+                return &value;
+            else {
+                static_assert(std::is_same_v<Result, std::optional<Value>>);
+                return value ? &*value : nullptr;
+            }
+        }();
         if (fact) {
             auto state = caches.lock();
             ((*observed).*table).emplace(path, *fact);
         }
-        return fact;
+        return value;
     }
 
     void anchor() override {};
@@ -70,7 +80,7 @@ public:
 
     Stat lstat(const CanonPath & path) override
     {
-        return *cached(&Caches::lstat, path, [&] { return std::make_optional(next->lstat(path)); });
+        return cached(&Caches::lstat, path, [&] { return next->lstat(path); });
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -81,7 +91,7 @@ public:
 
     std::string readLink(const CanonPath & path) override
     {
-        return *cached(&Caches::readLink, path, [&] { return std::make_optional(next->readLink(path)); });
+        return cached(&Caches::readLink, path, [&] { return next->readLink(path); });
     }
 
     void readDirectoryWithEntries(
@@ -120,7 +130,7 @@ public:
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
-        return *cached(&Caches::fingerprint, path, [&] { return std::make_optional(next->getFingerprint(path)); });
+        return cached(&Caches::fingerprint, path, [&] { return next->getFingerprint(path); });
     }
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
