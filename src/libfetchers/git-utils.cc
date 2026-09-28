@@ -406,27 +406,25 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         if (git_repository_open(Setter(repo), path.string().c_str()))
             throw GitError("opening Git repository %s", PathFmt(path));
 
-        GitConfig config;
-        if (git_repository_config(Setter(config), *this))
-            throw GitError("getting Git repository config");
+        if (options.dontFindDeltas) {
+            GitConfig config;
+            if (git_repository_config(Setter(config), *this))
+                throw GitError("getting Git repository config");
 
-        /* Create an in-memory configuration so that we can set config options without modifying the
-           config file on-disk. */
-        git_config_backend_memory_options configOpts = GIT_CONFIG_BACKEND_MEMORY_OPTIONS_INIT;
-        configOpts.backend_type = "nix";
+            /* Override delta search without modifying the config file on disk. */
+            git_config_backend_memory_options configOpts = GIT_CONFIG_BACKEND_MEMORY_OPTIONS_INIT;
+            configOpts.backend_type = "nix";
+            const char * configValues[] = {"pack.window=0"};
 
-        std::vector<const char *> configValues;
-        if (options.dontFindDeltas)
-            configValues.push_back("pack.window=0");
+            GitConfigBackend memBackend;
+            if (git_config_backend_from_values(Setter(memBackend), configValues, 1, &configOpts))
+                throw GitError("creating an in-memory Git config");
 
-        GitConfigBackend memBackend;
-        if (git_config_backend_from_values(Setter(memBackend), configValues.data(), configValues.size(), &configOpts))
-            throw GitError("creating an in-memory Git config");
+            if (git_config_add_backend(config.get(), memBackend.get(), GIT_CONFIG_LEVEL_APP, *this, /*force=*/false))
+                throw GitError("adding the in-memory Git configuration backend");
 
-        if (git_config_add_backend(config.get(), memBackend.get(), GIT_CONFIG_LEVEL_APP, *this, /*force=*/false))
-            throw GitError("adding the in-memory Git configuration backend");
-
-        memBackend.release();
+            memBackend.release();
+        }
 
         ObjectDb odb;
         if (options.packfilesOnly) {

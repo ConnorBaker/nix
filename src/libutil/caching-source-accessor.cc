@@ -24,6 +24,30 @@ class CachingSourceAccessor : public SourceAccessor
        state, never the new view's cache. No child runs under the lock. */
     Sync<std::shared_ptr<Caches>> caches{std::make_shared<Caches>()};
 
+    /* An observation may supply a cacheable fact. The value can itself be
+       optional: no fingerprint is a fact, while no stat is not. */
+    template<typename Map, typename Observe>
+    std::optional<typename Map::mapped_type>
+    cached(Map Caches::* table, const CanonPath & path, Observe && observe)
+    {
+        std::shared_ptr<Caches> observed;
+        {
+            auto state = caches.lock();
+            auto & entries = (**state).*table;
+            if (auto i = entries.find(path); i != entries.end())
+                return std::optional<typename Map::mapped_type>{std::in_place, i->second};
+            observed = *state;
+        }
+
+        auto owner = weak_from_this().lock();
+        auto fact = observe();
+        if (fact) {
+            auto state = caches.lock();
+            ((*observed).*table).emplace(path, *fact);
+        }
+        return fact;
+    }
+
     void anchor() override {};
 
 public:
@@ -41,45 +65,12 @@ public:
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
-        std::shared_ptr<Caches> observed;
-        {
-            auto state = caches.lock();
-            if (auto i = (*state)->lstat.find(path); i != (*state)->lstat.end())
-                return i->second;
-            observed = *state;
-        }
-
-        auto owner = weak_from_this().lock();
-        auto st = next->maybeLstat(path);
-        if (!st)
-            return std::nullopt;
-
-        /* Never evict, the evaluator better keep positive lookups cached. */
-        {
-            auto state = caches.lock();
-            observed->lstat.emplace(path, *st);
-        }
-        return st;
+        return cached(&Caches::lstat, path, [&] { return next->maybeLstat(path); });
     }
 
     Stat lstat(const CanonPath & path) override
     {
-        std::shared_ptr<Caches> observed;
-        {
-            auto state = caches.lock();
-            if (auto i = (*state)->lstat.find(path); i != (*state)->lstat.end())
-                return i->second;
-            observed = *state;
-        }
-
-        auto owner = weak_from_this().lock();
-        auto st = next->lstat(path);
-        /* Never evict, the evaluator better keep positive lookups cached. */
-        {
-            auto state = caches.lock();
-            observed->lstat.emplace(path, st);
-        }
-        return st;
+        return *cached(&Caches::lstat, path, [&] { return std::make_optional(next->lstat(path)); });
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -90,22 +81,7 @@ public:
 
     std::string readLink(const CanonPath & path) override
     {
-        std::shared_ptr<Caches> observed;
-        {
-            auto state = caches.lock();
-            if (auto i = (*state)->readLink.find(path); i != (*state)->readLink.end())
-                return i->second;
-            observed = *state;
-        }
-
-        auto owner = weak_from_this().lock();
-        auto target = next->readLink(path);
-        /* Never evict, the evaluator better keep positive lookups cached. */
-        {
-            auto state = caches.lock();
-            observed->readLink.emplace(path, target);
-        }
-        return target;
+        return *cached(&Caches::readLink, path, [&] { return std::make_optional(next->readLink(path)); });
     }
 
     void readDirectoryWithEntries(
@@ -144,22 +120,7 @@ public:
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
     {
-        std::shared_ptr<Caches> observed;
-        {
-            auto state = caches.lock();
-            if (auto i = (*state)->fingerprint.find(path); i != (*state)->fingerprint.end())
-                return i->second;
-            observed = *state;
-        }
-
-        auto owner = weak_from_this().lock();
-        auto identity = next->getFingerprint(path);
-        {
-            auto state = caches.lock();
-            /* No identity is not a claim that the node is absent. */
-            observed->fingerprint.emplace(path, identity);
-        }
-        return identity;
+        return *cached(&Caches::fingerprint, path, [&] { return std::make_optional(next->getFingerprint(path)); });
     }
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
