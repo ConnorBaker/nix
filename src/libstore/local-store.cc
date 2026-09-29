@@ -2155,20 +2155,16 @@ void LocalStore::addToStore(
                    is checked first"). */
                 if (info.ca) {
                     auto & specified = *info.ca;
-                    auto actualHash = ({
-                        Hash h{HashAlgorithm::SHA256}; // throwaway def to appease C++
-                        auto fim = specified.method.getFileIngestionMethod();
-                        switch (fim) {
+                    auto actualHash = [&]() -> Hash {
+                        switch (specified.method.getFileIngestionMethod()) {
                         case FileIngestionMethod::Flat:
                             if (restored.root.mode != merkle::Mode::Regular
                                 && restored.root.mode != merkle::Mode::Executable)
                                 throw Error(
                                     "flat content address requires a regular file at '%s'", printStorePath(info.path));
                             [[fallthrough]];
-                        case FileIngestionMethod::NixArchive: {
-                            h = caSink->finish().hash;
-                            break;
-                        }
+                        case FileIngestionMethod::NixArchive:
+                            return caSink->finish().hash;
                         case FileIngestionMethod::Git:
                             /* The sink's root is this identifier.  The SHA-1
                                form an older Nix made cannot be checked here
@@ -2191,20 +2187,16 @@ void LocalStore::addToStore(
                                     specified.render(),
                                     printHashAlgo(specified.hash.algo));
                             }
-                            h = merkle::objectHash(restored.root);
-                            break;
+                            return merkle::objectHash(restored.root);
                         }
-                        ContentAddress{
-                            .method = specified.method,
-                            .hash = std::move(h),
-                        };
-                    });
-                    if (specified.hash != actualHash.hash) {
+                        unreachable();
+                    }();
+                    if (specified.hash != actualHash) {
                         throw Error(
                             "ca hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
                             printStorePath(info.path),
                             specified.hash.to_string(HashFormat::Nix32, true),
-                            actualHash.hash.to_string(HashFormat::Nix32, true));
+                            actualHash.to_string(HashFormat::Nix32, true));
                     }
                 }
 

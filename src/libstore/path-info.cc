@@ -285,9 +285,7 @@ nlohmann::json UnkeyedValidPathInfo::toJSON(
                 "cannot render path info as JSON format %d: it requires a NAR hash, and none is known (use format 4, or supply the shim)",
                 static_cast<int>(format));
         }();
-        jsonObject["narHash"] = format == PathInfoJsonFormat::V1
-                                    ? static_cast<json>(narHash.to_string(HashFormat::SRI, true))
-                                    : static_cast<json>(narHash);
+        jsonObject["narHash"] = narHash;
     }
 
     jsonObject["narSize"] = narSize;
@@ -367,8 +365,7 @@ UnkeyedValidPathInfo UnkeyedValidPathInfo::fromJSON(const StoreDirConfig * store
                 if (auto * narHash = getNullable(*rawNarHash))
                     res.assertedNarHash = Hash(*narHash);
         } else {
-            res.assertedNarHash = format == PathInfoJsonFormat::V1 ? Hash::parseSRI(getString(valueAt(json, "narHash")))
-                                                                   : Hash(valueAt(json, "narHash"));
+            res.assertedNarHash = Hash(valueAt(json, "narHash"));
         }
     } catch (Error & e) {
         e.addTrace({}, "while reading key 'narHash'");
@@ -449,7 +446,7 @@ void adl_serializer<nix::UnkeyedValidPathInfo>::to_json(json & json, const nix::
 nix::ValidPathInfo adl_serializer<nix::ValidPathInfo>::from_json(const json & json0)
 {
     using namespace nix;
-    auto json = getObject(json0);
+    const auto & json = getObject(json0);
 
     return ValidPathInfo{
         valueAt(json, "path"),

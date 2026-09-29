@@ -166,12 +166,8 @@ nlohmann::json UnkeyedNarInfo::toJSON(
            been treated as bzip2. */
         if (compression)
             jsonObject["compression"] = showCompressionAlgo(*compression);
-        if (fileHash) {
-            if (format == PathInfoJsonFormat::V1)
-                jsonObject["downloadHash"] = fileHash->to_string(HashFormat::SRI, true);
-            else
-                jsonObject["downloadHash"] = *fileHash;
-        }
+        if (fileHash)
+            jsonObject["downloadHash"] = *fileHash;
         if (fileSize)
             jsonObject["downloadSize"] = fileSize;
     }
@@ -185,10 +181,6 @@ UnkeyedNarInfo UnkeyedNarInfo::fromJSON(const StoreDirConfig * store, const nloh
 
     auto & obj = getObject(json);
 
-    PathInfoJsonFormat format = PathInfoJsonFormat::V1;
-    if (auto * version = optionalValueAt(obj, "version"))
-        format = *version;
-
     if (auto * url = get(obj, "url"))
         res.url = getString(*url);
 
@@ -196,12 +188,8 @@ UnkeyedNarInfo UnkeyedNarInfo::fromJSON(const StoreDirConfig * store, const nloh
     if (auto * compression = get(obj, "compression"))
         res.compression = parseCompressionAlgo(getString(*compression));
 
-    if (auto * downloadHash = get(obj, "downloadHash")) {
-        if (format == PathInfoJsonFormat::V1)
-            res.fileHash = Hash::parseSRI(getString(*downloadHash));
-        else
-            res.fileHash = *downloadHash;
-    }
+    if (auto * downloadHash = get(obj, "downloadHash"))
+        res.fileHash = *downloadHash;
 
     if (auto * downloadSize = get(obj, "downloadSize"))
         res.fileSize = getUnsigned(*downloadSize);
