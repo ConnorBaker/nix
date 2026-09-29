@@ -1859,8 +1859,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
 
     struct Publication
     {
-        StorePath path;
-        std::optional<uint64_t> ingestion;
+        const ValidPathInfo * info;
+        uint64_t id;
         GitObjectStore::Hold::Projection projection;
     };
 
@@ -1868,13 +1868,13 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
     if (hold) {
         if (ingestion) {
             assert(infos.size() == 1);
-            publications.push_back({infos.begin()->first, ingestion->id, hold->takeProjection()});
+            publications.push_back({&infos.begin()->second, 0, hold->takeProjection()});
         } else {
-            for (auto & [path, _] : infos) {
+            for (auto & [path, info] : infos) {
                 auto logical = printStorePath(path);
                 for (auto & completed : hold->completedIngestions)
                     if (completed.path == logical) {
-                        publications.push_back({path, completed.id, {}});
+                        publications.push_back({&info, completed.id, {}});
                         break;
                     }
             }
@@ -1906,9 +1906,9 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         /* Within this transaction, the finite path/reference domain has
            stable row ids. Retain each lookup through reference insertion. */
         std::map<StorePath, uint64_t> pathIds;
-        std::vector<uint64_t> ingestionIds;
         for (auto publication = publications.begin(); publication != publications.end();) {
-            auto id = publication->ingestion;
+            /* Retry active IDs from the unchanged hold; completed IDs are stable. */
+            auto id = ingestion ? ingestion->id : std::optional(publication->id);
             if (!id) {
                 // This projection and its validity become visible together.
                 state->stmts->NewIngestion.use().apply("", false).apply("", false).exec();
@@ -1922,7 +1922,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                     continue;
                 }
             }
-            ingestionIds.push_back(*id);
+            publication->id = *id;
             insertBlobRows(*state, *id, publication->projection.regular);
             insertAuxiliaryRows(*state, *id, publication->projection.auxiliary);
             ++publication;
@@ -1967,37 +1967,35 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         /* Existing paths may have visible aliases even if this transaction
            rolls back. Reconcile all of those against committed witnesses
            before exposing any of their new candidate rows. */
-        for (size_t n = 0; n < publications.size(); ++n)
-            if (updated.contains(publications[n].path))
+        for (auto & publication : publications)
+            if (updated.contains(publication.info->path))
                 coalesceBlobRows(
-                    *state, publications[n].path, *hold, ingestionIds[n], publications[n].projection.regular);
-        for (size_t n = 0; n < publications.size(); ++n)
-            if (updated.contains(publications[n].path)) {
-                auto logical = printStorePath(publications[n].path);
+                    *state, publication.info->path, *hold, publication.id, publication.projection.regular);
+        auto publish = [&](const Publication & publication) {
+            auto logical = printStorePath(publication.info->path);
+            state->stmts->DeletePathIngestions.use().apply(logical).exec();
+            state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(publication.id)).exec();
+        };
+        for (auto & publication : publications)
+            if (updated.contains(publication.info->path))
+                publish(publication);
 
-                state->stmts->DeletePathIngestions.use().apply(logical).exec();
-                state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(ingestionIds[n])).exec();
-            }
-
+        auto nextPublication = publications.begin();
         for (auto & [path, info] : infos) {
+            auto * publication = nextPublication != publications.end() && nextPublication->info == &info
+                                     ? &*nextPublication++
+                                     : nullptr;
             if (updated.contains(path)) {
                 updatePathInfo(*state, info);
                 continue;
             }
             /* A new path is made eligible only after all its candidates
                are reconciled. Later outputs may share this finished one. */
-            for (size_t n = 0; n < publications.size(); ++n)
-                if (publications[n].path == path) {
-                    if (state->stmts->QueryValidPaths.use().next())
-                        coalesceBlobRows(*state, path, *hold, ingestionIds[n], publications[n].projection.regular);
-                    auto logical = printStorePath(path);
-
-                    state->stmts->DeletePathIngestions.use().apply(logical).exec();
-                    state->stmts->SetIngestionPath.use()
-                        .apply(logical)
-                        .apply(static_cast<int64_t>(ingestionIds[n]))
-                        .exec();
-                }
+            if (publication) {
+                if (state->stmts->QueryValidPaths.use().next())
+                    coalesceBlobRows(*state, path, *hold, publication->id, publication->projection.regular);
+                publish(*publication);
+            }
             pathIds.emplace(path, addValidPath(*state, info));
         }
         for (auto & [_, info] : infos) {
@@ -2007,7 +2005,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         }
         txn.commit();
         if (ingestion && !publications.empty())
-            ingestion->id = ingestionIds.front();
+            ingestion->id = publications.front().id;
         /* A description becomes cacheable only with the committed path
            and references. A rejected reference or cycle rolls the SQL
            back; publishing earlier would leave a false validity hit. */

@@ -327,6 +327,11 @@ protected:
        counted them; a file linked from the object store is not one. */
     unsigned filesCreated = 0;
 
+    auto lockStoreState()
+    {
+        return store->_state->lock();
+    }
+
     /* Older or concurrent writers may have persisted an unnamed projection.
        Construct that compatibility state explicitly: current ingestion keeps
        these rows in memory until its completed-path boundary. */
@@ -2428,6 +2433,142 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     EXPECT_EQ(blobRowCount(*store, false), before + 1);
     EXPECT_GT(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_EQ(blobFileOf(merkle::blobId("uncommitted-holder"), false), store->toRealPath(info.path) / "a");
+}
+
+/* A transaction-local row ID cannot become the next attempt's input. Let
+   SQLite reject publication, then consume that rolled-back ID independently. */
+TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentities)
+{
+    enum class Origin { Fresh, Staged, Completed };
+    for (auto origin : {Origin::Fresh, Origin::Staged, Origin::Completed}) {
+        SCOPED_TRACE(static_cast<int>(origin));
+        auto bytes = fmt("registration-retry-%d", static_cast<int>(origin));
+        auto hold = store->objects.hold();
+        auto path = StorePath::random(bytes);
+        StringSource source{treeNar({{"file", bytes, 'f'}, {"link", "target", 'l'}})};
+        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+        auto result = store->restoreThroughObjects(
+            store->toRealPath(path),
+            [&](FileSystemObjectSink & sink) { parseDump(sink, source); },
+            false,
+            hooks.get(),
+            hold,
+            NoRepair);
+        ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
+        info.narSize = result.narSize.value();
+        if (origin == Origin::Staged)
+            stageLegacyUnregisteredRows(hold);
+        else if (origin == Origin::Completed)
+            store->endIngestion(hold, path);
+        auto original = origin == Origin::Completed ? std::optional(hold.completedIngestions.front().id)
+                                                   : hold.ingestion->id;
+
+        SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+        struct Retry
+        {
+            sqlite3 * other;
+            unsigned attempts = 0, publications = 0;
+            int interleaved = SQLITE_ERROR;
+            int64_t rejected = 0, sentinel = 0;
+        } retry{other};
+        Finally clear{[&] {
+            auto state = lockStoreState();
+            sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+            EXPECT_EQ(
+                sqlite3_exec(state->db, "drop trigger if exists registration_retry;", nullptr, nullptr, nullptr),
+                SQLITE_OK);
+            EXPECT_EQ(
+                sqlite3_create_function_v2(
+                    state->db, "registration_retry", 1, SQLITE_UTF8, nullptr, nullptr, nullptr, nullptr, nullptr),
+                SQLITE_OK);
+        }};
+        {
+            auto state = lockStoreState();
+            ASSERT_EQ(
+                sqlite3_create_function_v2(
+                    state->db,
+                    "registration_retry",
+                    1,
+                    SQLITE_UTF8,
+                    &retry,
+                    [](sqlite3_context * context, int, sqlite3_value ** args) {
+                        auto & retry = *static_cast<Retry *>(sqlite3_user_data(context));
+                        if (++retry.publications == 1) {
+                            retry.rejected = sqlite3_value_int64(args[0]);
+                            sqlite3_result_error_code(context, SQLITE_BUSY);
+                        } else
+                            sqlite3_result_null(context);
+                    },
+                    nullptr,
+                    nullptr,
+                    nullptr),
+                SQLITE_OK);
+            state->db.exec(
+                "create temp trigger registration_retry after insert on ValidPaths begin "
+                "select registration_retry((select id from Ingestions where path = new.path)); end;");
+            ASSERT_EQ(
+                sqlite3_trace_v2(
+                    state->db,
+                    SQLITE_TRACE_STMT,
+                    [](unsigned, void * context, void * statement, void *) -> int {
+                        auto & retry = *static_cast<Retry *>(context);
+                        auto sql = sqlite3_sql(static_cast<sqlite3_stmt *>(statement));
+                        if (sql && std::string_view(sql) == "begin;" && ++retry.attempts == 2) {
+                            /* The preceding rollback has released its writer. This
+                               independent autocommit runs before the retry's BEGIN. */
+                            retry.interleaved = sqlite3_exec(
+                                retry.other,
+                                "insert into Ingestions(path) values ('registration-retry-sentinel');",
+                                nullptr,
+                                nullptr,
+                                nullptr);
+                            retry.sentinel = sqlite3_last_insert_rowid(retry.other);
+                        }
+                        return 0;
+                    },
+                    &retry),
+                SQLITE_OK);
+        }
+
+        ASSERT_NO_THROW(store->registerValidPath(info, hold));
+        ASSERT_EQ(retry.attempts, 2u);
+        ASSERT_EQ(retry.publications, 2u);
+        ASSERT_EQ(retry.interleaved, SQLITE_OK);
+        ASSERT_GT(retry.rejected, 0);
+        auto committed = origin == Origin::Completed ? hold.completedIngestions.front().id : *hold.ingestion->id;
+        if (original) {
+            EXPECT_EQ(retry.rejected, static_cast<int64_t>(*original));
+            EXPECT_EQ(committed, *original);
+            EXPECT_GT(retry.sentinel, retry.rejected);
+        } else {
+            EXPECT_EQ(retry.sentinel, retry.rejected) << "the rejected ID was consumed by another transaction";
+            EXPECT_GT(committed, static_cast<uint64_t>(retry.sentinel));
+        }
+        SQLiteStmt projection{
+            other,
+            "select path, (select count(*) from Blobs where ingestion = i.id),"
+            " (select count(*) from AuxValues where ingestion = i.id) from Ingestions i where id = ?;"};
+        {
+            auto use = projection.use();
+            use.apply(retry.sentinel);
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getStr(0), "registration-retry-sentinel");
+            EXPECT_EQ(use.getInt(1), 0);
+            EXPECT_EQ(use.getInt(2), 0);
+        }
+        {
+            auto use = projection.use();
+            use.apply(static_cast<int64_t>(committed));
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getStr(0), store->printStorePath(path));
+            EXPECT_EQ(use.getInt(1), 1);
+            EXPECT_EQ(use.getInt(2), 2);
+        }
+        EXPECT_EQ(store->queryPathInfo(path)->objectHash, info.objectHash);
+        EXPECT_EQ(readFile(store->toRealPath(path) / "file"), bytes);
+        EXPECT_TRUE(hasTree(result.root.hash));
+        EXPECT_TRUE(hasAuxiliary(merkle::blobId("target"), merkle::Mode::Symlink));
+    }
 }
 
 TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolders)

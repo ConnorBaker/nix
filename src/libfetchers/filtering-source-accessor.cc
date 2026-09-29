@@ -91,7 +91,7 @@ void FilteringSourceAccessor::readDirectoryScoped(
                           ref<SourceAccessor>(
                               std::shared_ptr<SourceAccessor>(std::shared_ptr<SourceAccessor>{}, &inner)),
                           relative),
-                      [&owner, original](const CanonPath & p) { return owner.makeNotAllowedError(original / p); })
+                      [this](const CanonPath & p) { return this->owner->makeNotAllowedError(this->original / p); })
                 , owner(&owner)
                 , original(original)
                 , admitted(admitted)

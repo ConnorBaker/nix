@@ -14,7 +14,6 @@
 #include <unordered_set>
 #include <mutex>
 #include <array>
-#include <variant>
 
 #include <atomic>
 #include <cstring>
@@ -102,8 +101,6 @@ static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
    completed path is handed to the store; handing them over retires the map. Unused shards are never allocated. */
 struct GitObjectStore::Hold::Pending
 {
-    using Value = std::variant<Row, Auxiliary>;
-
     /* Borrow the value's existing identity. Like the old binary key, Hash
        equality uses length and bytes, without an algorithm tag. */
     struct Key
@@ -124,11 +121,6 @@ struct GitObjectStore::Hold::Pending
 
         Key(const Auxiliary & object) noexcept
             : Key(object.entry.hash, object.entry.mode)
-        {
-        }
-
-        Key(const Value & value) noexcept
-            : Key(std::visit([](const auto & value) { return Key(value); }, value))
         {
         }
     };
@@ -157,8 +149,9 @@ struct GitObjectStore::Hold::Pending
     struct Shard
     {
         std::mutex mutex;
-        /** (mode, id) -> one regular witness or owned auxiliary body. */
-        std::unordered_set<Value, KeyHash, KeyEqual> byKey;
+        /* The regular and auxiliary modes are disjoint key domains. */
+        std::unordered_set<Row, KeyHash, KeyEqual> regular;
+        std::unordered_set<Auxiliary, KeyHash, KeyEqual> auxiliary;
     };
 
     /* A one-file ingestion occupies one shard. Allocate the others only
@@ -218,10 +211,10 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 {
     auto & shard = pending->shard(shardOf(row.id));
     auto lock = std::lock_guard{shard.mutex};
-    auto [i, inserted] = shard.byKey.emplace(std::in_place_type<Row>, std::move(row));
+    auto [i, inserted] = shard.regular.emplace(std::move(row));
     if (inserted)
         return std::nullopt;
-    auto & name = std::get<Row>(*i).name;
+    auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
@@ -230,7 +223,7 @@ void GitObjectStore::Hold::addAuxiliary(Auxiliary object) const
     checkAuxiliaryEntry(object.entry);
     auto & shard = pending->shard(shardOf(object.entry.hash));
     auto lock = std::lock_guard{shard.mutex};
-    shard.byKey.emplace(std::in_place_type<Auxiliary>, std::move(object));
+    shard.auxiliary.emplace(std::move(object));
 }
 
 GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
@@ -240,12 +233,10 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
     size_t regular = 0, auxiliary = 0;
     for (auto & slot : pending->shards)
-        if (auto * shard = slot.load(std::memory_order_relaxed))
-            for (const auto & value : shard->byKey)
-                if (std::holds_alternative<Row>(value))
-                    ++regular;
-                else
-                    ++auxiliary;
+        if (auto * shard = slot.load(std::memory_order_relaxed)) {
+            regular += shard->regular.size();
+            auxiliary += shard->auxiliary.size();
+        }
     Projection projection;
     /* Reserve both before extracting: failure leaves the complete relation intact. */
     projection.regular.reserve(regular);
@@ -253,15 +244,11 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     for (auto & slot : pending->shards)
         if (std::unique_ptr<Pending::Shard> shard{slot.load(std::memory_order_relaxed)}; shard) {
             slot.store(nullptr, std::memory_order_relaxed);
-            for (const auto & stored : shard->byKey) {
-                /* Moving these records preserves their fixed hash/mode keys;
-                   only the owned strings change. The set's elements are not const. */
-                auto & value = const_cast<Pending::Value &>(stored);
-                if (auto * row = std::get_if<Row>(&value))
-                    projection.regular.push_back(std::move(*row));
-                else
-                    projection.auxiliary.push_back(std::move(std::get<Auxiliary>(value)));
-            }
+            /* Moving preserves each fixed hash/mode key; only owned strings change. */
+            for (const auto & row : shard->regular)
+                projection.regular.push_back(std::move(const_cast<Row &>(row)));
+            for (const auto & object : shard->auxiliary)
+                projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
         }
     return projection;
 }
@@ -272,10 +259,10 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     if (!shard)
         return std::nullopt;
     auto lock = std::lock_guard{shard->mutex};
-    auto i = shard->byKey.find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
-    if (i == shard->byKey.end())
+    auto i = shard->regular.find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
+    if (i == shard->regular.end())
         return std::nullopt;
-    auto & name = std::get<Row>(*i).name;
+    auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 

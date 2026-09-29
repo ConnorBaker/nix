@@ -132,7 +132,6 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             std::string name;
             bool subdirectory;
             fun<HashedNode()> visit;
-            std::optional<HashedNode> node;
         };
         boost::container::small_vector<
             Child,
@@ -141,21 +140,22 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             boost::container::small_vector_options_t<
                 boost::container::growth_factor<boost::container::growth_factor_100>>>
             kids;
-        bool canFork = false;
+        bool hasSubdirectories = false;
         children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
-            kids.push_back({std::string(name), subdirectory, std::move(visit), std::nullopt});
-            canFork |= subdirectory;
+            kids.push_back({std::string(name), subdirectory, std::move(visit)});
+            hasSubdirectories |= subdirectory;
         });
-        canFork &= kids.size() > 1;
-        if (!pool && canFork)
-            pool = std::make_unique<CopyPool>(workers);
-        if (canFork)
+        if (kids.size() > 1 && hasSubdirectories) {
+            if (!pool)
+                pool = std::make_unique<CopyPool>(workers);
+            std::vector<std::optional<HashedNode>> nodes(kids.size());
+            auto fold = [&](size_t i) { consume(std::move(kids[i].name), nodes[i].value()); };
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
-                [&](size_t i) { kids[i].node = kids[i].visit(); },
-                [&](size_t i) { consume(std::move(kids[i].name), kids[i].node.value()); });
-        else
+                [&](size_t i) { nodes[i] = kids[i].visit(); },
+                std::ref(fold));
+        } else
             for (auto & child : kids)
                 consume(std::move(child.name), child.visit());
     }
