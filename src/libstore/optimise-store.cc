@@ -651,207 +651,6 @@ struct LinkingVisitor : ObjectStoreVisitor
 struct ObjectUnavailable
 {};
 
-/* A directory scope owns its verified table through all child visits.
-   Immediate children borrow it; deeper queries resolve from the root. */
-struct ObjectAccessor final : SourceAccessor
-{
-    void anchor() override {}
-
-    GitObjectStore & objects;
-    merkle::TreeEntry root;
-    RepairFlag repair;
-    const merkle::Tree * rootChildren;
-
-    ObjectAccessor(
-        GitObjectStore & objects,
-        merkle::TreeEntry root,
-        RepairFlag repair,
-        const merkle::Tree * rootChildren = nullptr)
-        : objects(objects)
-        , root(std::move(root))
-        , repair(repair)
-        , rootChildren(rootChildren)
-    {
-    }
-
-    std::string auxiliary(const merkle::TreeEntry & entry)
-    {
-        auto body = objects.readAuxiliary(entry);
-        if (!body)
-            throw ObjectUnavailable{};
-        return std::move(*body);
-    }
-
-    merkle::Tree tree(const merkle::TreeEntry & entry)
-    {
-        if (entry.mode != merkle::Mode::Directory)
-            throw NotADirectory("object %s is not a directory", GitObjectStore::idString(entry.hash));
-        merkle::Tree result;
-        try {
-            result = GitObjectStore::parseTreeBody(entry.hash, auxiliary(entry));
-        } catch (Error & e) {
-            warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
-            throw ObjectUnavailable{};
-        }
-        if (result.contains("."))
-            throw Error("synthetic root object cannot be used as a directory");
-        return result;
-    }
-
-    std::optional<merkle::TreeEntry> lookup(const CanonPath & path)
-    {
-        auto entry = root;
-        auto * children = rootChildren;
-        for (auto part : path) {
-            auto owned = children ? merkle::Tree{} : tree(entry);
-            const auto & entries = children ? *children : owned;
-            auto i = entries.find(std::string(part));
-            if (i == entries.end())
-                i = entries.find(std::string(part) + '/');
-            if (i == entries.end())
-                return std::nullopt;
-            entry = i->second;
-            children = nullptr;
-        }
-        return entry;
-    }
-
-    merkle::TreeEntry entry(const CanonPath & path)
-    {
-        auto result = lookup(path);
-        if (!result)
-            throw FileNotFound("object path '%s' is absent", path);
-        return *result;
-    }
-
-    static Stat stat(const merkle::TreeEntry & entry)
-    {
-        switch (entry.mode) {
-        case merkle::Mode::Directory:
-            return {.type = tDirectory};
-        case merkle::Mode::Regular:
-            return {.type = tRegular};
-        case merkle::Mode::Executable:
-            return {.type = tRegular, .isExecutable = true};
-        case merkle::Mode::Symlink:
-            return {.type = tSymlink};
-        }
-        throw Error("object has unsupported mode %o", static_cast<RawMode>(entry.mode));
-    }
-
-    std::optional<Stat> maybeLstat(const CanonPath & path) override
-    {
-        auto result = lookup(path);
-        return result.transform(stat);
-    }
-
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
-    {
-        auto e = entry(path);
-        auto owned = path.isRoot() && rootChildren ? merkle::Tree{} : tree(e);
-        const auto & children = path.isRoot() && rootChildren ? *rootChildren : owned;
-        DirEntries listing;
-        for (auto & [key, child] : children) {
-            auto name = child.mode == merkle::Mode::Directory ? key.substr(0, key.size() - 1) : key;
-            listing.emplace(std::move(name), stat(child).type);
-        }
-        ObjectAccessor scoped{objects, std::move(e), repair, &children};
-        callback(scoped, CanonPath::root, DirectoryListing(std::move(listing)));
-    }
-
-    DirEntries readDirectory(const CanonPath & path) override
-    {
-        DirEntries result;
-        readDirectoryWithEntries(path, [&](SourceAccessor &, const CanonPath &, DirectoryListing && listing) {
-            result = std::move(listing).filter([](const auto &) { return true; });
-        });
-        return result;
-    }
-
-    std::string readLink(const CanonPath & path) override
-    {
-        auto e = entry(path);
-        if (e.mode != merkle::Mode::Symlink)
-            throw NotASymlink("object path '%s' is not a symlink", path);
-        return auxiliary(e);
-    }
-
-    std::string readRegular(const CanonPath & path)
-    {
-        auto e = entry(path);
-        if (stat(e).type != tRegular)
-            throw NotARegularFile("object path '%s' is not a regular file", path);
-        bool executable = e.mode == merkle::Mode::Executable;
-        auto holder = objects.holderOrForget(e.hash, executable, repair);
-        if (!holder)
-            holder = objects.holderOrForget(e.hash, !executable, repair);
-        if (!holder)
-            throw ObjectUnavailable{};
-        auto bytes = nix::readFile(std::filesystem::path(holder->file));
-        if (merkle::blobId(bytes) != e.hash)
-            throw Error("blob object %s does not hash to its name", GitObjectStore::idString(e.hash));
-        return bytes;
-    }
-
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
-    {
-        auto bytes = readRegular(path);
-        sizeCallback(bytes.size());
-        sink(bytes);
-    }
-};
-
-/* Cached regular files are linked or the whole attempt misses. Only a
-   platform-forbidden link uses verified bytes through the ordinary writer. */
-struct CachedVisitor : LinkingVisitor
-{
-    CachedVisitor(GitObjectStore & objects, const GitObjectStore::Hold & hold, Frame frame, RepairFlag repair)
-        : LinkingVisitor(objects, hold, *frame.sink, repair)
-    {
-        currentFrame().diskName = frame.diskName;
-    }
-
-    HashedNode node(
-        SourceAccessor & accessor,
-        const CanonPath & from,
-        const CanonPath & path,
-        const SourceAccessor::Stat & st,
-        fun<HashedNode()> descend) override
-    {
-        if (st.type == SourceAccessor::tRegular) {
-            auto target = at(path);
-            auto where = target.path();
-            auto & cached = static_cast<ObjectAccessor &>(accessor);
-            auto entry = cached.entry(from);
-            if (linkableOnThisSystem(where)) {
-                auto [owned, dirFd, name] = target.sink.parentOf(target.name);
-                PosixStat linked;
-                if (!objects.link(entry.hash, st.isExecutable, dirFd, name, where, std::nullopt, repair, hold, &linked))
-                    throw ObjectUnavailable{};
-                return {
-                    .entry = std::move(entry),
-                    .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
-            }
-            auto bytes = cached.readRegular(from);
-            target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & writer) {
-                if (st.isExecutable)
-                    writer.isExecutable();
-                writer.preallocateContents(bytes.size());
-                writer(bytes);
-            });
-            return {.entry = std::move(entry), .narSize = merkle::nar::regular(bytes.size(), st.isExecutable)};
-        }
-        return descend();
-    }
-
-    HashedNode directory(const CanonPath & path, Children children) override
-    {
-        return LinkingVisitor::directory(path, withDiskNames(std::move(children)));
-    }
-};
-
 /* Reuse verified immutable files or named root/directory subtrees; other
    nodes descend through LinkingVisitor. Child scopes retain physical names. */
 struct MaterialisingVisitor : LinkingVisitor
@@ -892,6 +691,100 @@ struct MaterialisingVisitor : LinkingVisitor
         if (auto result = tryKnown(accessor, from, path, st))
             return std::move(*result);
         return descend();
+    }
+
+    std::string auxiliary(const merkle::TreeEntry & entry)
+    {
+        auto body = objects.readAuxiliary(entry);
+        if (!body)
+            throw ObjectUnavailable{};
+        return std::move(*body);
+    }
+
+    /* Materialise validated Merkle values directly. Directory scopes own their
+       parsed children and original bodies until all child visits complete. */
+    uint64_t materialise(
+        const merkle::TreeEntry & entry, const CanonPath & path, size_t depth, const GitObjectStore::Hold & attemptHold)
+    {
+        checkInterrupt();
+        if (depth >= narMaxDepth)
+            throw Error("path '%s' exceeds maximum NAR directory depth of %d", path, narMaxDepth);
+        auto target = at(path);
+        switch (entry.mode) {
+        case merkle::Mode::Regular:
+        case merkle::Mode::Executable: {
+            bool executable = entry.mode == merkle::Mode::Executable;
+            auto where = target.path();
+            if (linkableOnThisSystem(where)) {
+                auto [owned, dirFd, name] = target.sink.parentOf(target.name);
+                PosixStat linked;
+                if (!objects.link(
+                        entry.hash, executable, dirFd, name, where, std::nullopt, repair, attemptHold, &linked))
+                    throw ObjectUnavailable{};
+                return merkle::nar::regular(static_cast<uint64_t>(linked.st_size), executable);
+            }
+            auto holder = objects.holderOrForget(entry.hash, executable, repair);
+            if (!holder)
+                holder = objects.holderOrForget(entry.hash, !executable, repair);
+            if (!holder)
+                throw ObjectUnavailable{};
+            auto bytes = nix::readFile(std::filesystem::path(holder->file));
+            if (merkle::blobId(bytes) != entry.hash)
+                throw Error("blob object %s does not hash to its name", GitObjectStore::idString(entry.hash));
+            target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & writer) {
+                if (executable)
+                    writer.isExecutable();
+                writer.preallocateContents(bytes.size());
+                writer(bytes);
+            });
+            return merkle::nar::regular(bytes.size(), executable);
+        }
+        case merkle::Mode::Symlink: {
+            auto body = auxiliary(entry);
+            target.sink.createSymlink(target.name, body);
+            auto size = merkle::nar::symlink(body.size());
+            attemptHold.addAuxiliary({entry, std::move(body)});
+            return size;
+        }
+        case merkle::Mode::Directory: {
+            std::string body;
+            merkle::Tree tree;
+            try {
+                body = auxiliary(entry);
+                tree = GitObjectStore::parseTreeBody(entry.hash, body);
+            } catch (Error & e) {
+                warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
+                throw ObjectUnavailable{};
+            }
+            if (tree.contains("."))
+                throw Error("synthetic root object cannot be used as a directory");
+
+            /* NAR names order siblings and case-hack allocation. Transfer the
+               parsed nodes from Git's slash-suffixed keys without new nodes. */
+            std::map<std::string, merkle::TreeEntry> names;
+            while (!tree.empty()) {
+                auto child = tree.extract(tree.begin());
+                if (child.mapped().mode == merkle::Mode::Directory)
+                    child.key().pop_back();
+                names.insert(std::move(child));
+            }
+            merkle::nar::Directory size;
+            target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
+                assert(rel.isRoot());
+                CaseHackNames hack;
+                for (auto & [name, child] : names) {
+                    auto diskName = hack.diskName(name);
+                    Scope childScope{sub, &diskName};
+                    size.add(name, materialise(child, path / name, depth + 1, attemptHold));
+                }
+            });
+            /* Acquisition checked the hash; parsing checked canonical encoding.
+               Every successful child preserves its typed entry. */
+            attemptHold.addAuxiliary({entry, std::move(body)});
+            return size.finish();
+        }
+        }
+        throw Error("object has unsupported mode %o", static_cast<RawMode>(entry.mode));
     }
 
     std::optional<HashedNode>
@@ -967,12 +860,7 @@ struct MaterialisingVisitor : LinkingVisitor
                     AutoCloseFD owned{std::move(target.sink.dirFd)};
                 }
             }};
-            ObjectAccessor cached{objects, *entry, repair};
-            CachedVisitor visitor{objects, attempt ? *attempt : hold, currentFrame(), repair};
-            auto result = traverse(cached, CanonPath::root, defaultPathFilter, visitor, path);
-            if (result.entry != *entry)
-                throw Error("cached object changed its tree identity while materialising %s", PathFmt(where));
-            narSize = result.narSize;
+            narSize = materialise(*entry, path, std::ranges::distance(path), attempt ? *attempt : hold);
         } catch (ObjectUnavailable &) {
         } catch (Error & e) {
             warn(
@@ -1220,7 +1108,7 @@ LocalStore::verifyObjects(const std::filesystem::path & realPath)
 LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     const std::filesystem::path & root,
     const GitObjectStore::Hold & hold,
-    const std::vector<BlobCoalescing> & collisions)
+    std::vector<BlobCoalescing> & collisions)
 {
 #ifdef _WIN32
     return {};
@@ -1229,9 +1117,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
        Pin and verify without index calls, temp roots or auxiliary-object locks. */
     struct Winner
     {
-        const GitObjectStore::Hold::Row & row;
+        BlobCoalescing & collision;
         const GitObjectStore::Holder & holder;
-        std::filesystem::path pin;
         AutoDelete cleanup;
         std::optional<std::filesystem::path> representative;
     };
@@ -1267,7 +1154,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                         GitObjectStore::idString(row.id),
                         GitObjectStore::idString(observed));
                 selected = true;
-                result.representatives.push_back(row);
+                collision.eligible = true;
                 break;
             }
             auto pin = temporary();
@@ -1308,13 +1195,13 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             if (!inserted)
                 throw Error("one ingestion records different blobs for the same inode in %s", PathFmt(root));
             byWinnerInode.emplace(std::pair{candidate.dev, candidate.ino}, winners.size());
-            winners.push_back(Winner{row, candidate, std::move(pin), std::move(cleanup), std::nullopt});
+            winners.push_back(Winner{collision, candidate, std::move(cleanup), std::nullopt});
             break;
         }
         /* No usable donor means this file can become the holder. A file
            refused sharing is an exception, not a new canonical donor. */
         if (!selected && !refused)
-            result.representatives.push_back(row);
+            collision.eligible = true;
     }
     if (winners.empty())
         return result;
@@ -1348,13 +1235,13 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             if (existing != byWinnerInode.end()) {
                 auto & winner = winners[existing->second];
                 if (!winner.representative
-                    && GitObjectStore::validHolderMetadata(winner.holder, winner.row.executable, st))
+                    && GitObjectStore::validHolderMetadata(winner.holder, winner.collision.row.executable, st))
                     winner.representative = where;
             }
             return;
         }
         auto & winner = winners[i->second];
-        auto & row = winner.row;
+        auto & row = winner.collision.row;
         auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, where.string()};
         if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
             return;
@@ -1369,15 +1256,16 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
         auto before = statIn(dir.fd.get(), name, where);
         if (!GitObjectStore::validHolderMetadata(expected, row.executable, before))
             return;
+        const auto & pin = winner.cleanup.path();
         auto link = temporary();
         std::error_code ec;
-        std::filesystem::create_hard_link(winner.pin, link, ec);
+        std::filesystem::create_hard_link(pin, link, ec);
         if (ec) {
             if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
                 printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
                 return;
             }
-            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(winner.pin), PathFmt(link), ec.message());
+            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(pin), PathFmt(link), ec.message());
         }
         AutoDelete cleanup(link, false);
         if (::renameat(AT_FDCWD, link.c_str(), dir.fd.get(), name.rel_c_str()) == -1) {
@@ -1386,7 +1274,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
                 return;
             }
-            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), PathFmt(winner.pin), ec.message());
+            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), PathFmt(pin), ec.message());
         }
         cleanup.cancel();
         result.modified = true;
@@ -1399,7 +1287,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
        winning alias, or no representative if every replacement was refused;
        an exceptional unshared inode must not become a donor for later paths. */
     for (auto & winner : winners) {
-        auto & row = winner.row;
+        auto & row = winner.collision.row;
         if (!winner.representative)
             continue;
         auto st = maybeLstat(*winner.representative);
@@ -1413,7 +1301,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             .size = static_cast<uint64_t>(st->st_size),
             .name = *winner.representative == root ? "" : winner.representative->lexically_relative(root).string(),
         };
-        result.representatives.push_back(std::move(replacement));
+        row = std::move(replacement);
+        winner.collision.eligible = true;
     }
     return result;
 #endif

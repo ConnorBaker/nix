@@ -22,7 +22,6 @@
 
 #include <algorithm>
 #include <cstring>
-#include <iterator>
 #include <limits>
 
 #include <memory>
@@ -844,7 +843,6 @@ void LocalStore::coalesceBlobRows(
     if (collisions.empty())
         return;
     auto result = coalesceBlobs(toRealPath(path), hold, collisions);
-    auto & representatives = result.representatives;
     auto & rejected = result.rejected;
     /* SQL rollback cannot undo hard links. Retain the selected physical
        representatives in the caller's existing pending rows before SQL.
@@ -853,7 +851,6 @@ void LocalStore::coalesceBlobRows(
         auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
         return c != 0 ? c < 0 : a.executable < b.executable;
     };
-    std::sort(representatives.begin(), representatives.end(), keyLess);
     std::erase_if(rows, [&](const auto & row) {
         auto collision =
             std::lower_bound(collisions.begin(), collisions.end(), row, [&](const auto & c, const auto & r) {
@@ -861,13 +858,13 @@ void LocalStore::coalesceBlobRows(
             });
         return collision != collisions.end() && !keyLess(row, collision->row);
     });
-    rows.insert(
-        rows.end(), std::make_move_iterator(representatives.begin()), std::make_move_iterator(representatives.end()));
+    auto unchanged = rows.size();
+    rows.reserve(unchanged + std::ranges::count_if(collisions, &BlobCoalescing::eligible));
+    for (auto & collision : collisions)
+        if (collision.eligible)
+            rows.push_back(std::move(collision.row));
     /* Retry-owned rows now own the selected names; SQL borrows that range. */
-    auto selected = std::span<const GitObjectStore::Hold::Row>(rows).last(representatives.size());
-    auto represented = [&](const auto & row) {
-        return std::binary_search(selected.begin(), selected.end(), row, keyLess);
-    };
+    auto selected = std::span<const GitObjectStore::Hold::Row>(rows).subspan(unchanged);
     /* Preserve the physical facts first, then finish their durability
        before any SQL can retry. A retry may already see the winning inode
        and therefore make no further filesystem changes. */
@@ -881,7 +878,7 @@ void LocalStore::coalesceBlobRows(
             sync();
     }
     for (auto & collision : collisions)
-        if (!represented(collision.row)) {
+        if (!collision.eligible) {
             auto & row = collision.row;
             state.stmts->DeleteBlob.use()
                 .apply(row.id.hash, row.id.hashSize)

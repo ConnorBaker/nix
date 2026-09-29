@@ -113,7 +113,7 @@ struct GitObjectStore::Hold::Pending
         {
         }
 
-        auto operator<=>(const Key &) const = default;
+        bool operator==(const Key &) const = default;
     };
 
     struct KeyHash
@@ -179,8 +179,6 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     static_assert(std::is_trivially_move_constructible_v<Hash>);
     static_assert(std::is_nothrow_move_constructible_v<Row>);
     static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
-    static_assert(std::is_nothrow_move_assignable_v<Row>);
-    static_assert(std::is_nothrow_move_assignable_v<Auxiliary>);
     auto regular = pending->regular.lock();
     auto auxiliary = pending->auxiliary.lock();
     Projection projection;
@@ -194,8 +192,6 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     for (const auto & object : *auxiliary)
         projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
     auxiliary->clear();
-    std::sort(projection.regular.begin(), projection.regular.end(), std::less<Pending::Key>{});
-    std::sort(projection.auxiliary.begin(), projection.auxiliary.end(), std::less<Pending::Key>{});
     return projection;
 }
 

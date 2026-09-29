@@ -800,22 +800,22 @@ private:
     {
         GitObjectStore::Hold::Row row;
         std::vector<GitObjectStore::Holder> candidates;
+        /** The row becomes the selected own witness, or stays ineligible. */
+        bool eligible = false;
     };
 
     struct BlobCoalescingResult
     {
         bool modified = false;
-        /** Partial map on collision keys: own, selected donor, or no eligible representative. */
-        std::vector<GitObjectStore::Hold::Row> representatives;
-        /** Borrows the caller's collision set, which outlives this result. */
+        /** Borrows fixed row keys and unchanged donors; physical row fields may change. */
         std::vector<std::pair<const GitObjectStore::Hold::Row &, const GitObjectStore::Holder &>> rejected;
     };
 
-    /** Filesystem-only reconciliation of candidates whose lifetimes the caller protects. */
+    /** Reconcile each known key in place; id/mode stay fixed. The caller protects candidate lifetimes. */
     BlobCoalescingResult coalesceBlobs(
         const std::filesystem::path & root,
         const GitObjectStore::Hold & hold,
-        const std::vector<BlobCoalescing> & collisions);
+        std::vector<BlobCoalescing> & collisions);
 
     void insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows);
 

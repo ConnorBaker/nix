@@ -13,12 +13,15 @@ namespace nix::fetchers {
 template<typename Consumer>
 static decltype(auto) withAttr(const Attr & attr, Consumer && consume)
 {
-    return std::visit(
+    auto lazy = std::visit(
         overloaded{
-            [&](const LazyAttr & lazy) -> decltype(auto) { return consume(lazy->compute()); },
-            [&](const auto &) -> decltype(auto) { return consume(attr); },
+            [](const LazyAttr & lazy) { return &lazy; },
+            [](const auto &) -> const LazyAttr * { return nullptr; },
         },
         attr);
+    if (lazy)
+        return consume((*lazy)->compute());
+    return consume(attr);
 }
 
 ResolvedAttr forceAttr(const Attr & attr)

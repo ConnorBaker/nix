@@ -4014,11 +4014,11 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
     auto checkRows = [&](const Relation & expected) {
         auto rows = hold.takeProjection().regular;
         ASSERT_EQ(rows.size(), expected.size());
-        auto ordered = expected.begin();
+        auto remaining = expected;
         for (auto & row : rows) {
-            auto k = key(row.id, row.executable);
-            ASSERT_EQ(k, ordered->first);
-            const auto & first = (ordered++)->second;
+            auto entry = remaining.extract(key(row.id, row.executable));
+            ASSERT_FALSE(entry.empty());
+            const auto & first = entry.mapped();
             EXPECT_EQ(row.id.hashSize, first.id.hashSize);
             EXPECT_EQ(row.id.algo, first.id.algo);
             EXPECT_TRUE(std::equal(row.id.hash, row.id.hash + Hash::maxHashSize, first.id.hash));
@@ -4029,6 +4029,7 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
             EXPECT_EQ(row.name, first.name);
             EXPECT_FALSE(hold.pendingHolder(row.id, row.executable));
         }
+        EXPECT_TRUE(remaining.empty());
         EXPECT_TRUE(hold.takeProjection().regular.empty());
     };
 
@@ -4557,12 +4558,14 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     ASSERT_EQ(projection.auxiliary.size(), 2u * (1 + 32 * 255));
     ASSERT_EQ(projection.regular.size(), projection.auxiliary.size());
     ASSERT_EQ(projection.auxiliary.size(), expected.size());
-    auto ordered = expected.begin();
+    auto remaining = expected;
     for (auto & value : projection.auxiliary) {
         Key key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode};
-        EXPECT_EQ(key, ordered->first);
-        EXPECT_EQ(value.body, (ordered++)->second);
+        auto body = remaining.extract(key);
+        ASSERT_FALSE(body.empty());
+        EXPECT_EQ(value.body, body.mapped());
     }
+    EXPECT_TRUE(remaining.empty());
     auto isolated = privateAttempt.takeProjection();
     ASSERT_EQ(isolated.auxiliary.size(), 1u);
     EXPECT_EQ(isolated.auxiliary[0].entry, (merkle::TreeEntry{merkle::Mode::Symlink, extra}));
@@ -8307,14 +8310,25 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
     WithCaseHack on{true};
     auto hacked = std::string("a") + std::string(caseHackSuffix) + "1";
     auto realStoreDir = std::filesystem::path{config->realStoreDir.get()};
-    auto copy = [&](bool pull,
+    auto copy = [&](unsigned route,
                     const std::filesystem::path & dst,
                     const ref<MemorySourceAccessor> & tree,
                     const std::string & nar,
                     Hooks & hooks,
                     RepairFlag repair) {
         auto hold = store->objects.hold();
-        if (pull)
+        if (route == 2) {
+            auto source = make_ref<CountingAccessor>(tree);
+            Finally noSourceReads{[&] {
+                EXPECT_EQ(source->stats, 1u);
+                EXPECT_EQ(source->reads, 0u);
+                EXPECT_EQ(source->listings, 0u);
+                EXPECT_EQ(source->links, 0u);
+            }};
+            return store->materialiseThroughObjects(
+                dst, SourcePath(source), defaultPathFilter, false, &hooks, repair, everyNode(tree), hold);
+        }
+        if (route == 1)
             return store->materialiseThroughObjects(
                 dst, SourcePath(tree), defaultPathFilter, false, &hooks, repair, noNode(), hold);
         StringSource source{nar};
@@ -8323,7 +8337,10 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
     };
 
     constexpr size_t limit = 1 << 20;
-    for (char kind : {'l', 'f', 'x'})
+    /* Cached donors come last: they must not suppress any of the original
+       regular-write hooks. Only the symlink-hook cases need this extra route. */
+    for (auto [kind, held] :
+         {std::pair{'l', false}, std::pair{'f', false}, std::pair{'x', false}, std::pair{'l', true}})
         for (size_t size : {size_t{0}, size_t{1}, size_t{32767}, size_t{32768}, size_t{32769}, limit, limit + 1}) {
             if (kind == 'l' && size != 0)
                 continue;
@@ -8343,12 +8360,28 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
             auto outerNar = narOf(*outer);
             auto innerNar = narOf(*inner);
             auto outerHash = referenceObjectEntry(*outer, CanonPath::root);
+            auto innerHash = referenceObjectEntry(*inner, CanonPath::root);
+            if (held) {
+                auto outerSeed = restore(realStoreDir / "reentrant-held-outer-seed", outerNar);
+                auto innerSeed = restore(realStoreDir / "reentrant-held-inner-seed", innerNar);
+                ASSERT_EQ(outerSeed.root, outerHash);
+                ASSERT_EQ(innerSeed.root, innerHash);
+                ASSERT_EQ(outerSeed.narSize, outerNar.size());
+                ASSERT_EQ(innerSeed.narSize, innerNar.size());
+            }
             for (auto repair : {NoRepair, Repair})
-                for (bool outerPull : {false, true})
-                    for (bool innerPull : {false, true})
+                for (unsigned outerRoute : {0u, 1u, 2u})
+                    for (unsigned innerRoute : {0u, 1u, 2u})
                         for (bool fail : {false, true}) {
-                            auto label =
-                                fmt("reentrant-%c-%d-%d-%d-%d-%d", kind, size, repair, outerPull, innerPull, fail);
+                            /* 0 = push, 1 = unnamed pull, 2 = named cached.
+                               Keep the original route pairs before seeding, then
+                               add every pair with at least one cached side. */
+                            if (!held && (outerRoute == 2 || innerRoute == 2))
+                                continue;
+                            if (held && outerRoute != 2 && innerRoute != 2)
+                                continue;
+                            auto label = fmt(
+                                "reentrant-%c-%d-%d-%d-%d-%d-%d", kind, size, repair, outerRoute, innerRoute, fail, held);
                             SCOPED_TRACE(label);
                             auto outerDst = realStoreDir / (label + "-outer");
                             auto innerDst = realStoreDir / (label + "-inner");
@@ -8371,7 +8404,9 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
                                 entered = true;
                                 bool failed = false;
                                 try {
-                                    copy(innerPull, innerDst, inner, innerNar, innerHooks, repair);
+                                    auto nested = copy(innerRoute, innerDst, inner, innerNar, innerHooks, repair);
+                                    EXPECT_EQ(nested.root, innerHash);
+                                    EXPECT_EQ(nested.narSize, innerNar.size());
                                 } catch (const NestedFailure &) {
                                     failed = true;
                                 }
@@ -8413,12 +8448,14 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
                             innerHooks.onRegular = [&](Descriptor fd, bool executable) {
                                 completedRegular(true, innerHooks, fd, executable);
                             };
-                            auto result = copy(outerPull, outerDst, outer, outerNar, outerHooks, repair);
+                            auto result = copy(outerRoute, outerDst, outer, outerNar, outerHooks, repair);
                             EXPECT_TRUE(entered);
                             EXPECT_EQ(result.root, outerHash);
                             EXPECT_EQ(result.narSize, outerNar.size());
-                            EXPECT_EQ(outerHooks.regularFilesCreated, kind == 'l' ? 1u : 2u);
-                            EXPECT_EQ(innerHooks.regularFilesCreated, (kind == 'l' ? 0u : 1u) + (fail ? 0u : 1u));
+                            EXPECT_EQ(outerHooks.regularFilesCreated, held ? 0u : kind == 'l' ? 1u : 2u);
+                            EXPECT_EQ(
+                                innerHooks.regularFilesCreated,
+                                held ? 0u : (kind == 'l' ? 0u : 1u) + (fail ? 0u : 1u));
                             StringSink actual;
                             dumpPath(outerDst, actual);
                             EXPECT_EQ(actual.s, outerNar);
