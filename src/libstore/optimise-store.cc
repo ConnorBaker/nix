@@ -532,37 +532,16 @@ struct LinkingVisitor : ObjectStoreVisitor
         return {sink, std::move(name)};
     }
 
-    /* Allocate case-hacked names in listing order, before visits can run
-       concurrently. The shared hashing executor owns each decorated visit
-       until it has joined; push visitors never use this pull adapter. */
-    Children withDiskNames(Children children)
-    {
-        bool canDefer = children.canDefer;
-        return {
-            [children = std::move(children)](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
-                CaseHackNames hack;
-                children([&](std::string_view name, bool directory, fun<HashedNode()> visit) {
-                    each(
-                        name,
-                        directory,
-                        [disk = hack.diskName(name), sink = currentFrame().sink, visit = std::move(visit)] {
-                            Scope scope{*sink, &disk};
-                            return visit();
-                        });
-                });
-            },
-            canDefer};
-    }
-
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto target = at(path);
         std::optional<std::pair<HashedNode, std::string>> result;
-        target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
+        auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
             assert(rel.isRoot());
             Scope scope{sub, currentFrame().diskName};
             result = hashDirectory(path, std::move(children));
-        });
+        };
+        target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
         return publishDirectory(std::move(*result));
     }
@@ -678,7 +657,20 @@ struct MaterialisingVisitor : LinkingVisitor
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
-        return LinkingVisitor::directory(path, withDiskNames(std::move(children)));
+        // Allocate physical names in listing order, before concurrent visits.
+        auto withDiskNames = [&](Children::Each each) {
+            CaseHackNames hack;
+            children([&](std::string_view name, bool directory, fun<HashedNode()> visit) {
+                each(
+                    name,
+                    directory,
+                    [disk = hack.diskName(name), sink = currentFrame().sink, visit = std::move(visit)] {
+                        Scope scope{*sink, &disk};
+                        return visit();
+                    });
+            });
+        };
+        return LinkingVisitor::directory(path, {std::ref(withDiskNames), children.canDefer});
     }
 
     HashedNode node(
@@ -769,7 +761,7 @@ struct MaterialisingVisitor : LinkingVisitor
                 names.insert(std::move(child));
             }
             merkle::nar::Directory size;
-            target.sink.createSubdirectory(target.name, [&](RestoreSink & sub, const CanonPath & rel) {
+            auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
                 assert(rel.isRoot());
                 CaseHackNames hack;
                 for (auto & [name, child] : names) {
@@ -777,7 +769,8 @@ struct MaterialisingVisitor : LinkingVisitor
                     Scope childScope{sub, &diskName};
                     size.add(name, materialise(child, path / name, depth + 1, attemptHold));
                 }
-            });
+            };
+            target.sink.createSubdirectory(target.name, std::ref(populate));
             /* Acquisition checked the hash; parsing checked canonical encoding.
                Every successful child preserves its typed entry. */
             attemptHold.addAuxiliary({entry, std::move(body)});

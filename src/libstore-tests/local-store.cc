@@ -4,6 +4,7 @@
 #include <sqlite3.h>
 
 #include "nix/store/local-store.hh"
+#include "nix/store/build-result.hh"
 #include "nix/store/local-overlay-store.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/sqlite.hh"
@@ -2433,6 +2434,81 @@ TEST_F(LocalStoreObjectsTest, failedRegistrationPublishesNeitherPathNorPendingHo
     EXPECT_EQ(blobRowCount(*store, false), before + 1);
     EXPECT_GT(auxiliaryRowCount(), auxiliaryBefore);
     EXPECT_EQ(blobFileOf(merkle::blobId("uncommitted-holder"), false), store->toRealPath(info.path) / "a");
+}
+
+TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
+{
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get();
+    Finally restore{[&] { ttl.ttlPositive = oldPositive; }};
+    ttl.ttlPositive = 600;
+    config->pathInfoCacheSize = 8;
+    store.reset();
+    store = std::make_shared<LocalStore>(ref{config});
+    auto enter = [&](std::string_view name, const GitObjectStore::Hold & hold) {
+        ValidPathInfo info{StorePath::random(name), UnkeyedValidPathInfo{*store, std::nullopt}};
+        auto real = store->toRealPath(info.path);
+        createDirs(real);
+        writeFile(real / "file", name);
+        canonicalisePathMetaData(real, {NIX_WHEN_SUPPORT_ACLS(noAclsToIgnore)});
+        auto result = store->enterPath(real, NoRepair, hold);
+        info.objectHash = ObjectHash::of(result.root);
+        info.narSize = result.narSize.value();
+        return info;
+    };
+    auto firstHold = store->objects.hold();
+    auto first = enter("cycle-first", firstHold);
+    store->registerValidPath(first, firstHold);
+    auto outsideHold = store->objects.hold();
+    auto outside = enter("cycle-outside", outsideHold);
+    outside.references.insert(first.path);
+    store->registerValidPath(outside, outsideHold);
+    auto pending = store->objects.hold();
+    auto second = enter("cycle-second", pending);
+    store->endIngestion(pending, second.path);
+    ASSERT_FALSE(pending.ingestion);
+    ASSERT_EQ(pending.completedIngestions.size(), 1u);
+    auto validBefore = store->queryAllValidPaths();
+    auto blobsBefore = blobRowCount(*store, false);
+    auto auxiliaryBefore = auxiliaryRowCount();
+    auto cachedBefore = store->queryPathInfoFromClientCache(first.path);
+    ASSERT_TRUE(cachedBefore && *cachedBefore);
+    ASSERT_FALSE(store->queryPathInfoFromClientCache(second.path));
+    first.references = {first.path, second.path, outside.path};
+    second.references = {first.path};
+    ValidPathInfos infos{{first.path, first}, {second.path, second}};
+    try {
+        store->registerValidPaths(infos, &pending);
+        FAIL() << "accepted a two-node reference cycle";
+    } catch (const BuildError & error) {
+        EXPECT_EQ(error.status, BuildError::OutputRejected);
+        EXPECT_THAT(error.what(), ::testing::HasSubstr("cycle detected in the references"));
+    }
+    EXPECT_EQ(store->queryAllValidPaths(), validBefore);
+    EXPECT_EQ(blobRowCount(*store, false), blobsBefore);
+    EXPECT_EQ(auxiliaryRowCount(), auxiliaryBefore);
+    EXPECT_EQ(store->queryPathInfoFromClientCache(first.path), cachedBefore);
+    EXPECT_FALSE(store->queryPathInfoFromClientCache(second.path));
+    // Registration temporarily unnames the completed ingestion before checking topology.
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    SQLiteStmt named{db, "select path from Ingestions where id = ?"};
+    {
+        auto row = named.use();
+        row.apply(static_cast<int64_t>(pending.completedIngestions.front().id));
+        ASSERT_TRUE(row.next());
+        ASSERT_FALSE(row.isNull(0));
+        EXPECT_EQ(row.getStr(0), store->printStorePath(second.path));
+    }
+    store->clearPathInfoCache();
+    EXPECT_TRUE(store->queryPathInfo(first.path)->references.empty());
+    EXPECT_EQ(store->queryPathInfo(outside.path)->references, outside.references);
+    // Remove only the in-batch cycle; preserve the self edge and outside C->A edge.
+    infos.at(second.path).references.clear();
+    ASSERT_NO_THROW(store->registerValidPaths(infos, &pending));
+    EXPECT_EQ(store->queryPathInfo(first.path)->references, infos.at(first.path).references);
+    EXPECT_TRUE(store->queryPathInfo(second.path)->references.empty());
+    EXPECT_EQ(store->queryPathInfo(outside.path)->references, outside.references);
+    EXPECT_TRUE(hasBlob(merkle::blobId("cycle-second"), false));
 }
 
 /* A transaction-local row ID cannot become the next attempt's input. Let

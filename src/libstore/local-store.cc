@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <type_traits>
+#include <utility>
 
 #include <memory>
 #include <new>
@@ -908,6 +910,24 @@ void LocalStore::coalesceBlobRows(
     insertBlobRows(state, ingestion, selected);
 }
 
+/* Order each initial publication by its SQLite primary key. Ingestion is
+   constant; auxiliary chunks are already emitted in increasing ordinal order. */
+static void sortProjectionForPublication(GitObjectStore::Hold::Projection & projection, bool writeBlobs)
+{
+    static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Hold::Row>);
+    static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Auxiliary>);
+    auto bytes = [](const Hash & id) noexcept {
+        return std::string_view{reinterpret_cast<const char *>(id.hash), id.hashSize};
+    };
+    if (writeBlobs)
+        std::ranges::sort(projection.regular, {}, [&](const auto & row) noexcept {
+            return std::pair{bytes(row.id), row.executable};
+        });
+    std::ranges::sort(projection.auxiliary, {}, [&](const auto & value) noexcept {
+        return std::pair{value.entry.mode, bytes(value.entry.hash)};
+    });
+}
+
 void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath & path)
 {
     if (config->readOnly || !hold.ingestion)
@@ -916,6 +936,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
        candidates before reconciling the complete projection. */
     auto * ingestion = &*hold.ingestion;
     auto projection = hold.takeProjection();
+    sortProjectionForPublication(projection, blobRows != BlobRows::NoRows);
     auto & rows = projection.regular;
     auto logical = printStorePath(path);
     auto & completed = hold.completedIngestions;
@@ -1824,6 +1845,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         if (ingestion) {
             assert(infos.size() == 1);
             publications.push_back({&infos.begin()->second, 0, hold->takeProjection()});
+            sortProjectionForPublication(publications.back().projection, blobRows != BlobRows::NoRows);
         } else {
             for (auto & [path, info] : infos) {
                 auto logical = printStorePath(path);
@@ -1899,17 +1921,12 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             return infos.at(path).references;
         });
 
-        std::visit(
-            overloaded{
-                [&](const Cycle<StorePath> & cycle) {
-                    throw BuildError(
-                        BuildResult::Failure::OutputRejected,
-                        "cycle detected in the references of '%s' from '%s'",
-                        printStorePath(cycle.path),
-                        printStorePath(cycle.parent));
-                },
-                [](auto &) { /* Success, continue */ }},
-            topoSortResult);
+        if (auto cycle = std::get_if<Cycle<StorePath>>(&topoSortResult))
+            throw BuildError(
+                BuildResult::Failure::OutputRejected,
+                "cycle detected in the references of '%s' from '%s'",
+                printStorePath(cycle->path),
+                printStorePath(cycle->parent));
 
         /* Existing paths may have visible aliases even if this transaction
            rolls back. Reconcile all of those against committed witnesses
