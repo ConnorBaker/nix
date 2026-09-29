@@ -248,23 +248,7 @@ size_t StoreReferences::size() const
 
 ContentAddressWithReferences ContentAddressWithReferences::withoutRefs(const ContentAddress & ca) noexcept
 {
-    switch (ca.method.raw) {
-    case ContentAddressMethod::Raw::Text:
-        return TextInfo{
-            .hash = ca.hash,
-            .references = {},
-        };
-    case ContentAddressMethod::Raw::Flat:
-    case ContentAddressMethod::Raw::NixArchive:
-    case ContentAddressMethod::Raw::Git:
-        return FixedOutputInfo{
-            .method = ca.method.getFileIngestionMethod(),
-            .hash = ca.hash,
-            .references = {},
-        };
-    default:
-        assert(false);
-    }
+    return fromParts(ca.method, ca.hash, {});
 }
 
 ContentAddressWithReferences

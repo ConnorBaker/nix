@@ -116,36 +116,18 @@ std::optional<ContentAddressWithReferences> ValidPathInfo::contentAddressWithRef
     if (!ca)
         return std::nullopt;
 
-    switch (ca->method.raw) {
-    case ContentAddressMethod::Raw::Text: {
+    bool isText = ca->method == ContentAddressMethod::Raw::Text;
+    if (isText)
         assert(references.count(path) == 0);
-        return TextInfo{
-            .hash = ca->hash,
-            .references = references,
-        };
-    }
-
-    case ContentAddressMethod::Raw::Flat:
-    case ContentAddressMethod::Raw::NixArchive:
-    case ContentAddressMethod::Raw::Git:
-    default: {
-        auto refs = references;
-        bool hasSelfReference = false;
-        if (refs.count(path)) {
-            hasSelfReference = true;
-            refs.erase(path);
-        }
-        return FixedOutputInfo{
-            .method = ca->method.getFileIngestionMethod(),
-            .hash = ca->hash,
-            .references =
-                {
-                    .others = std::move(refs),
-                    .self = hasSelfReference,
-                },
-        };
-    }
-    }
+    auto refs = references;
+    bool self = !isText && refs.erase(path) != 0;
+    return ContentAddressWithReferences::fromParts(
+        ca->method,
+        ca->hash,
+        {
+            .others = std::move(refs),
+            .self = self,
+        });
 }
 
 bool ValidPathInfo::isContentAddressed(const StoreDirConfig & store) const

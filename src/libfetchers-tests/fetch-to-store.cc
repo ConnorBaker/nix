@@ -164,7 +164,11 @@ TEST(FilteringSourceAccessor, physicalPathsRequireTheSameRenderedSubtree)
 #endif
     }
     EXPECT_THROW(pruned->getPhysicalPath(CanonPath("sub/drop")), RestrictedPathError);
-    auto subtree = makeFixedSetFilteringSourceAccessor(SourcePath(physical, CanonPath("sub")), admitted);
+    std::set<CanonPath> subtreeAdmitted{CanonPath::root, CanonPath("keep")};
+#ifndef _WIN32
+    subtreeAdmitted.emplace("link");
+#endif
+    auto subtree = makeFixedSetFilteringSourceAccessor(SourcePath(physical, CanonPath("sub")), subtreeAdmitted);
     EXPECT_FALSE(subtree->getPhysicalPath(CanonPath::root));
     EXPECT_EQ(subtree->getPhysicalPath(CanonPath("keep")), root / "sub/keep");
     auto rejected = makeFixedSetFilteringSourceAccessor(SourcePath(physical), {});
@@ -555,7 +559,9 @@ RC_GTEST_PROP(FetchToStore, prop_wrapped_dump_equals_filtered_dump, ())
     walk(CanonPath::root);
 
     for (auto & q : dirs) {
-        auto wrapped = makeFixedSetFilteringSourceAccessor(SourcePath(inner, q), filteredPaths(*inner, q, filter));
+        auto accepted = filteredPaths(*inner, q, filter);
+        RC_ASSERT(accepted.contains(CanonPath::root));
+        auto wrapped = makeFixedSetFilteringSourceAccessor(SourcePath(inner, q), std::move(accepted));
         RC_ASSERT(narOf(*wrapped, CanonPath::root) == narOf(*inner, q, filter));
     }
 }

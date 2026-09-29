@@ -86,13 +86,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
        "known" so that its contents are not read, a directory is descended. */
     struct Collector : NodeVisitor<std::monostate>
     {
-        const CanonPath & root;
         std::set<CanonPath> paths;
-
-        explicit Collector(const CanonPath & root)
-            : root(root)
-        {
-        }
 
         std::monostate node(
             SourceAccessor &,
@@ -101,7 +95,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
             const SourceAccessor::Stat & st,
             fun<std::monostate()> descend) override
         {
-            paths.insert(root / path);
+            paths.insert(path);
             if (st.type == SourceAccessor::tDirectory)
                 return descend();
             return std::monostate{};
@@ -124,7 +118,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
         }
     };
 
-    Collector collector{path};
+    Collector collector;
     traverse(accessor, path, filter, collector);
     return std::move(collector.paths);
 }

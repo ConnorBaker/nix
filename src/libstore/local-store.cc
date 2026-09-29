@@ -1034,7 +1034,7 @@ void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & 
     }
 }
 
-LocalStore::~LocalStore()
+void LocalStore::waitForAutoGC()
 {
     std::shared_future<void> future;
 
@@ -1054,6 +1054,11 @@ LocalStore::~LocalStore()
         if (state->gcThread.joinable())
             state->gcThread.join();
     }
+}
+
+LocalStore::~LocalStore()
+{
+    waitForAutoGC();
 
     try {
         auto fdTempRoots(_fdTempRoots.lock());

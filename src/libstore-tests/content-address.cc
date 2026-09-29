@@ -56,6 +56,34 @@ TEST(ContentAddress, sha1GitFormIsReadable)
     EXPECT_EQ(algo, HashAlgorithm::SHA1);
 }
 
+TEST(ContentAddress, withoutRefsPreservesMethodAndHash)
+{
+    using Method = ContentAddressMethod::Raw;
+    for (auto [method, ingestion] : {
+             std::pair{Method::Text, FileIngestionMethod::Flat},
+             std::pair{Method::Flat, FileIngestionMethod::Flat},
+             std::pair{Method::NixArchive, FileIngestionMethod::NixArchive},
+             std::pair{Method::Git, FileIngestionMethod::Git},
+         }) {
+        for (auto algo : {HashAlgorithm::SHA256, HashAlgorithm::SHA1}) {
+            if (algo == HashAlgorithm::SHA1 && method != Method::Git)
+                continue;
+            ContentAddress ca{method, hashString(algo, "content")};
+            SCOPED_TRACE(ca.printMethodAlgo());
+            const auto before = ca;
+            auto actual = ContentAddressWithReferences::withoutRefs(ca);
+            EXPECT_EQ(ca, before);
+            EXPECT_EQ(ca.hash.algo, algo);
+            using Result = ContentAddressWithReferences::Raw;
+            Result expected = method == Method::Text ? Result{TextInfo{before.hash, {}}}
+                                                     : Result{FixedOutputInfo{ingestion, before.hash, {}}};
+            ca.hash = hashString(HashAlgorithm::SHA256, "changed source");
+            EXPECT_EQ(actual.raw, expected);
+            EXPECT_EQ(actual.getHash().algo, algo);
+        }
+    }
+}
+
 /* ----------------------------------------------------------------------------
  * JSON
  * --------------------------------------------------------------------------*/

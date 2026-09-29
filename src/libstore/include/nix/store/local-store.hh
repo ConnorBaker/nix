@@ -740,6 +740,9 @@ public:
 
 protected:
 
+    /** Join auto-GC before destroying members used by its virtual calls. */
+    void waitForAutoGC();
+
     void verifyPath(
         const StorePath & path,
         fun<bool(const StorePath &)> existsInStoreDir,

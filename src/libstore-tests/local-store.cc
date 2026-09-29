@@ -8711,6 +8711,95 @@ private:
     uint64_t savedMinFree = 0, savedMaxFree = 0, savedInterval = 0;
 };
 
+TEST_F(LocalStoreAutoGCTest, overlayDestructionWaitsWhileItsCollectorStillNeedsTheOverlay)
+{
+    auto lowerReference = config->getReference();
+    lowerReference.params.insert_or_assign("root", tempStoreDir.path().string());
+    auto root = tempStoreDir.path() / "overlay-shutdown";
+    auto overlayConfig = std::make_shared<LocalOverlayStoreConfig>(
+        root,
+        StoreConfig::Params{
+            {"lower-store", lowerReference.render(true)},
+            {"upper-layer", (root / "upper").string()},
+            {"check-mount", "false"}});
+    auto overlay = std::make_shared<LocalOverlayStore>(ref{overlayConfig});
+    LocalStore * raw = overlay.get();
+    auto candidate = StorePath::random("overlay-garbage");
+    auto where = overlay->toRealPath(candidate);
+    const std::string contents = "unregistered garbage";
+    writeFile(where, contents);
+
+    std::promise<void> pending, resume;
+    auto pendingFuture = pending.get_future();
+    auto resumeFuture = resume.get_future().share();
+    bool released = false, stopped = false;
+    auto release = [&] {
+        if (!released) {
+            released = true;
+            resume.set_value();
+        }
+    };
+    overlay->whileDeletionPending = [&](const StorePath & path) {
+        if (path != candidate)
+            throw Error("unexpected overlay garbage in shutdown test");
+        pending.set_value();
+        resumeFuture.wait();
+        stopped = true;
+        /* Abort before virtual deletion/sweeping or the overlay remount
+           tail. The old destructor order can then fail without accessing
+           an already-destroyed overlay member. */
+        throw Error("stop overlay collection at the shutdown lifetime boundary");
+    };
+
+    struct ObserveWait : testing::CaptureLogger
+    {
+        std::function<void()> observe;
+        std::exception_ptr failure;
+
+        void log(Verbosity, std::string_view message) noexcept override
+        {
+            if (message != "waiting for auto-GC to finish on exit...")
+                return;
+            try {
+                observe();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        }
+
+        void logEI(const ErrorInfo &) noexcept override {}
+    } observer;
+
+    bool waited = false, overlayAlive = false;
+    observer.observe = [&] {
+        waited = true;
+        /* This runs on the destructor's thread, with the worker paused.
+           RTTI observes the live subobject without touching old members. */
+        overlayAlive = dynamic_cast<LocalOverlayStore *>(raw) != nullptr;
+        release();
+    };
+    auto oldLogger = std::exchange(logger, &observer);
+    auto oldVerbosity = std::exchange(verbosity, lvlInfo);
+    Finally restoreLogging{[&] {
+        logger = oldLogger;
+        verbosity = oldVerbosity;
+    }};
+    Finally finish{[&] {
+        release();
+        overlay.reset();
+    }};
+
+    overlay->autoGC(false);
+    ASSERT_EQ(pendingFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    overlay.reset();
+    if (observer.failure)
+        std::rethrow_exception(observer.failure);
+    EXPECT_TRUE(waited);
+    EXPECT_TRUE(overlayAlive) << "collection must join before the overlay loses its derived lifetime";
+    EXPECT_TRUE(stopped);
+    EXPECT_EQ(readFile(where), contents);
+}
+
 TEST_F(LocalStoreAutoGCTest, addToStoresOwnCollectionKeepsItsObjects)
 {
     auto nar = treeWithSymlink();

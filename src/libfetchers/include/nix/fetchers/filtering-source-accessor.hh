@@ -102,8 +102,9 @@ struct AllowListSourceAccessor : public FilteringSourceAccessor
 
 /**
  * A wrapping `SourceAccessor` admitting exactly a fixed, prefix-closed
- * set of paths (`filteredPaths`, in the coordinates of `src.accessor`),
- * named by the inner tree's name and the admitted set (01 §7.1, §8.2).
+ * set of paths relative to `src.path` (`filteredPaths`), named by the
+ * inner tree's name and the admitted set (01 §7.1, §8.2). The root is
+ * `CanonPath::root`; entries are not rebased or discarded by this factory.
  * Dumping it without a filter yields the NAR the filter would.
  */
 ref<SourceAccessor> makeFixedSetFilteringSourceAccessor(const SourcePath & src, std::set<CanonPath> accepted);

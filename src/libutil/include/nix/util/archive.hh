@@ -75,8 +75,11 @@ bool isCaseHackEnabled();
 
 /**
  * The set of paths that `SourceAccessor::dumpPath(path, sink, filter)`
- * would serialise: `path` itself and, below each directory in the set,
- * the entries the filter admits.  Prefix-closed by construction: it is
+ * would serialise, relative to `path`: the root and, below each directory
+ * in the set, the entries the filter admits. Filter arguments retain
+ * dumpPath's source prefix and name-decoding rules. Returned paths keep
+ * the accessor's entry names, including any case-hack suffix.
+ * Prefix-closed by construction: it is
  * `traverse` -- the dump's own walk -- with a visitor that reads directory
  * listings and file types, not contents.
  */

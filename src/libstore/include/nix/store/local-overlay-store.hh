@@ -124,6 +124,8 @@ struct LocalOverlayStore : virtual LocalStore
 
     LocalOverlayStore(ref<const Config>);
 
+    ~LocalOverlayStore() override;
+
     StorePathSet queryVisibleValidPaths() override;
     bool mayHaveValidPaths() override;
 

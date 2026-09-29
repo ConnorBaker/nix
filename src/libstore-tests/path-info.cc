@@ -10,6 +10,64 @@ namespace nix {
 
 using nlohmann::json;
 
+TEST(PathInfoDeathTest, contentAddressConversionPreservesOwnedData)
+{
+    const StorePath path{"n5wkd9frr45pa74if5gpz9j7mifg27fh-foo"};
+    const StorePath other{"g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar"};
+    ValidPathInfo info{path, UnkeyedValidPathInfo{"/nix/store", std::nullopt}};
+    info.references = {path, other};
+    const auto withoutCa = info;
+    EXPECT_FALSE(info.contentAddressWithReferences());
+    EXPECT_EQ(info, withoutCa);
+
+    using Method = ContentAddressMethod::Raw;
+    for (auto [method, ingestion] : {
+             std::pair{Method::Text, FileIngestionMethod::Flat},
+             std::pair{Method::Flat, FileIngestionMethod::Flat},
+             std::pair{Method::NixArchive, FileIngestionMethod::NixArchive},
+             std::pair{Method::Git, FileIngestionMethod::Git},
+         }) {
+        for (auto algo : {HashAlgorithm::SHA256, HashAlgorithm::SHA1}) {
+            if (algo == HashAlgorithm::SHA1 && method != Method::Git)
+                continue;
+            for (bool hasOther : {false, true}) {
+                for (bool hasSelf : {false, true}) {
+                    info.ca = ContentAddress{method, hashString(algo, "content")};
+                    info.references = hasOther ? StorePathSet{other} : StorePathSet{};
+                    if (hasSelf)
+                        info.references.insert(path);
+                    SCOPED_TRACE(info.ca->printMethodAlgo());
+                    SCOPED_TRACE(::testing::Message() << "other=" << hasOther << " self=" << hasSelf);
+                    const auto before = info;
+#ifndef NDEBUG
+                    if (method == Method::Text && hasSelf) {
+                        EXPECT_DEATH_IF_SUPPORTED((void) info.contentAddressWithReferences(), "references.count");
+                        EXPECT_EQ(info, before);
+                        continue;
+                    }
+#endif
+                    using Result = ContentAddressWithReferences::Raw;
+                    Result expected = method == Method::Text
+                                          ? Result{TextInfo{before.ca->hash, before.references}}
+                                          : Result{FixedOutputInfo{
+                                                ingestion,
+                                                before.ca->hash,
+                                                {hasOther ? StorePathSet{other} : StorePathSet{}, hasSelf},
+                                            }};
+                    auto actual = info.contentAddressWithReferences();
+                    ASSERT_TRUE(actual);
+                    EXPECT_EQ(info, before);
+                    EXPECT_EQ(info.ca->hash.algo, algo);
+                    info.references.clear();
+                    info.ca.reset();
+                    EXPECT_EQ(actual->raw, expected);
+                    EXPECT_EQ(actual->getHash().algo, algo);
+                }
+            }
+        }
+    }
+}
+
 class PathInfoTestV1 : public CharacterizationTest, public LibStoreTest
 {
     std::filesystem::path unitTestData = getUnitTestData() / "path-info" / "json-1";

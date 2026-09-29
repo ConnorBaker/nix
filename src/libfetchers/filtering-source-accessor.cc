@@ -284,21 +284,8 @@ public:
               [](const CanonPath & path) {
                   return RestrictedPathError("access to path '%s' is forbidden: it is filtered out", path);
               })
-        , accepted(rebase(std::move(accepted), src.path))
+        , accepted(std::move(accepted))
     {
-    }
-
-    /**
-     * The set is given in the inner accessor's coordinates, as
-     * `filteredPaths()` returns it; this accessor is rooted at `prefix`.
-     */
-    static std::set<CanonPath> rebase(std::set<CanonPath> accepted, const CanonPath & prefix)
-    {
-        std::set<CanonPath> res;
-        for (auto & p : accepted)
-            if (p.isWithin(prefix))
-                res.insert(p.removePrefix(prefix));
-        return res;
     }
 
     bool isAllowed(const CanonPath & path) override

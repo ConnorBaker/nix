@@ -80,6 +80,11 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     }
 }
 
+LocalOverlayStore::~LocalOverlayStore()
+{
+    waitForAutoGC();
+}
+
 void LocalOverlayStore::registerDrvOutputUnchecked(const Realisation & info)
 {
     // First do queryRealisation on lower layer to populate DB
