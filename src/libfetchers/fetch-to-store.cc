@@ -31,21 +31,6 @@ ref<SrcToStore> fetchers::Settings::createSrcToStore()
     return make_ref<SrcToStore>();
 }
 
-/* Flat and text methods read only root bytes. Git and NAR also interpret
-   directory names, so their memo keys must include that interpretation. */
-static bool decodesDirectoryNames(ContentAddressMethod method)
-{
-    switch (method.raw) {
-    case ContentAddressMethod::Raw::Flat:
-    case ContentAddressMethod::Raw::Text:
-        return false;
-    case ContentAddressMethod::Raw::Git:
-    case ContentAddressMethod::Raw::NixArchive:
-        return true;
-    }
-    unreachable();
-}
-
 fetchers::Cache::Key
 makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod method, const CanonPath & path)
 {
@@ -53,7 +38,7 @@ makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod 
         {"fingerprint", std::string(fingerprint)}, {"method", std::string{method.render()}}, {"path", path.abs()}};
     if (method == ContentAddressMethod::Raw::Git)
         attrs.insert_or_assign("version", uint64_t(2));
-    if (decodesDirectoryNames(method))
+    if (method.getFileSerialisationMethod() == FileSerialisationMethod::NixArchive)
         attrs.insert_or_assign("caseHack", uint64_t(isCaseHackEnabled()));
     return fetchers::Cache::Key{"sourcePathToHash", std::move(attrs)};
 }
@@ -397,7 +382,7 @@ std::pair<StorePath, Hash> fetchToStore2(
             method.raw,
             store.storeDir,
             name,
-            decodesDirectoryNames(method) && isCaseHackEnabled());
+            (method.getFileSerialisationMethod() == FileSerialisationMethod::NixArchive) && isCaseHackEnabled());
 
     auto useResult = [&](SrcToStore::Result result) -> std::optional<SrcToStore::Result> {
         if (mode != FetchMode::DryRun) {

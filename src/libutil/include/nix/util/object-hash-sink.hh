@@ -132,12 +132,11 @@ struct ObjectHashSink : FileSystemObjectSink
 private:
 
     /**
-     * For each directory whose callback is running, innermost last, the
-     * visitor's per-entry function: each child delivered is handed to it
-     * under the tree's own name. The active directory call owns the function;
-     * recursive stack growth must not move a callback being invoked.
+     * The active directory lends its per-entry function for immediate child
+     * delivery. A recursive directory saves and restores this pointer without
+     * moving the enclosing callback or its owned state.
      */
-    std::vector<fun<void(std::string_view, bool, fun<HashedNode()>)> *> open;
+    NodeVisitor<HashedNode>::Children::Each * open = nullptr;
 
     std::optional<HashedNode> root;
 

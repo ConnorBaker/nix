@@ -24,6 +24,9 @@ candidates become visible; a database key alone never established inode sharing.
 The schema, concurrency claims and deleted-holder exception in the original
 proposal below are historical. Its row-count and database-size measurements
 describe that representation, not the number of retained candidates today.
+The sharded pending-set experiments below are historical too. Current pending
+values use two independently synchronized ordered sets; their cost needs
+revision-bound measurements, recorded in `09-performance.md`.
 
 The measurement drivers are `runs/linux-measure-first-entry-holder.nix` and its
 script `runs/linux-first-entry-holder.sh`,

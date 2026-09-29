@@ -9,11 +9,10 @@
 #include "nix/util/signals.hh"
 #include "nix/util/source-accessor.hh"
 #include "nix/util/strings.hh"
+#include "nix/util/sync.hh"
 #include "nix/util/util.hh"
 
-#include <unordered_set>
-#include <mutex>
-#include <array>
+#include <set>
 
 #include <atomic>
 #include <cstring>
@@ -89,16 +88,9 @@ static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
         throw Error("an auxiliary address must be a SHA-256 directory or symlink identifier");
 }
 
-/* One finite pending projection, sharded by the identifier's first byte.  The
-   copy writes a directory's files on the walking thread and its
-   subdirectories on a pool (`08` K17), so every worker records a row for
-   every regular file it writes: one mutex over the whole set is a lock taken
-   forty thousand times by eight threads, and it was the first reason the
-   parallel copy was slower than the route it replaces.
-
-   The finite map associates each typed (mode, id) with its first completed
-   regular witness or owned auxiliary body. Values stay private until the
-   completed path is handed to the store; handing them over retires the map. Unused shards are never allocated. */
+/* The finite pending map associates each typed (mode, id) with its first
+   completed regular witness or owned auxiliary body. Its disjoint key domains
+   are independent maps; values stay private until the completed-path handoff. */
 struct GitObjectStore::Hold::Pending
 {
     /* Borrow the value's existing identity. Like the old binary key, Hash
@@ -125,64 +117,22 @@ struct GitObjectStore::Hold::Pending
         }
     };
 
-    struct KeyHash
-    {
-        using is_transparent = void;
-
-        size_t operator()(Key key) const noexcept
-        {
-            return std::hash<std::string_view>{}({reinterpret_cast<const char *>(key.id.hash), key.id.hashSize})
-                   ^ static_cast<RawMode>(key.mode);
-        }
-    };
-
-    struct KeyEqual
+    struct KeyLess
     {
         using is_transparent = void;
 
         bool operator()(Key a, Key b) const noexcept
         {
-            return a.mode == b.mode && a.id == b.id;
+            auto c = std::string_view{reinterpret_cast<const char *>(a.id.hash), a.id.hashSize}.compare(
+                {reinterpret_cast<const char *>(b.id.hash), b.id.hashSize});
+            return c != 0 ? c < 0 : a.mode < b.mode;
         }
     };
 
-    struct Shard
-    {
-        std::mutex mutex;
-        /* The regular and auxiliary modes are disjoint key domains. */
-        std::unordered_set<Row, KeyHash, KeyEqual> regular;
-        std::unordered_set<Auxiliary, KeyHash, KeyEqual> auxiliary;
-    };
-
-    /* A one-file ingestion occupies one shard. Allocate the others only
-       when their identifier domain is actually used. Readers publish and
-       acquire pointers because directory workers share this Pending. */
-    std::array<std::atomic<Shard *>, 256> shards{};
+    Sync<std::set<Row, KeyLess>> regular;
+    Sync<std::set<Auxiliary, KeyLess>> auxiliary;
     std::filesystem::path root;
-
-    Shard & shard(size_t n)
-    {
-        auto * p = shards[n].load(std::memory_order_acquire);
-        if (!p) {
-            auto made = std::make_unique<Shard>();
-            if (shards[n].compare_exchange_strong(p, made.get(), std::memory_order_acq_rel))
-                p = made.release();
-        }
-        return *p;
-    }
-
-    ~Pending()
-    {
-        for (auto & shard : shards)
-            delete shard.load(std::memory_order_relaxed);
-    }
 };
-
-/* The pending shard an identifier falls in; the empty active hash uses zero. */
-static size_t shardOf(const Hash & id)
-{
-    return id.hashSize ? id.hash[0] : 0;
-}
 
 const std::filesystem::path & GitObjectStore::Hold::directory() const
 {
@@ -194,11 +144,10 @@ void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
     /* A reused hold starts a new path projection. Its previous completed
        rows have already been handed to the store; abandoned rows need no
        publication. No walking worker may outlive this boundary. */
-    for (auto & slot : pending->shards)
-        if (auto * shard = slot.load(std::memory_order_relaxed)) {
-            slot.store(nullptr, std::memory_order_relaxed);
-            delete shard;
-        }
+    auto regular = pending->regular.lock();
+    auto auxiliary = pending->auxiliary.lock();
+    regular->clear();
+    auxiliary->clear();
     pending->root = std::move(root);
 }
 
@@ -209,9 +158,8 @@ const std::filesystem::path & GitObjectStore::Hold::root() const
 
 std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 {
-    auto & shard = pending->shard(shardOf(row.id));
-    auto lock = std::lock_guard{shard.mutex};
-    auto [i, inserted] = shard.regular.emplace(std::move(row));
+    auto regular = pending->regular.lock();
+    auto [i, inserted] = regular->insert(std::move(row));
     if (inserted)
         return std::nullopt;
     auto & name = i->name;
@@ -221,9 +169,7 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
 void GitObjectStore::Hold::addAuxiliary(Auxiliary object) const
 {
     checkAuxiliaryEntry(object.entry);
-    auto & shard = pending->shard(shardOf(object.entry.hash));
-    auto lock = std::lock_guard{shard.mutex};
-    shard.auxiliary.emplace(std::move(object));
+    pending->auxiliary.lock()->insert(std::move(object));
 }
 
 GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
@@ -231,36 +177,27 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     static_assert(std::is_trivially_move_constructible_v<Hash>);
     static_assert(std::is_nothrow_move_constructible_v<Row>);
     static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
-    size_t regular = 0, auxiliary = 0;
-    for (auto & slot : pending->shards)
-        if (auto * shard = slot.load(std::memory_order_relaxed)) {
-            regular += shard->regular.size();
-            auxiliary += shard->auxiliary.size();
-        }
+    auto regular = pending->regular.lock();
+    auto auxiliary = pending->auxiliary.lock();
     Projection projection;
     /* Reserve both before extracting: failure leaves the complete relation intact. */
-    projection.regular.reserve(regular);
-    projection.auxiliary.reserve(auxiliary);
-    for (auto & slot : pending->shards)
-        if (std::unique_ptr<Pending::Shard> shard{slot.load(std::memory_order_relaxed)}; shard) {
-            slot.store(nullptr, std::memory_order_relaxed);
-            /* Moving preserves each fixed hash/mode key; only owned strings change. */
-            for (const auto & row : shard->regular)
-                projection.regular.push_back(std::move(const_cast<Row &>(row)));
-            for (const auto & object : shard->auxiliary)
-                projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
-        }
+    projection.regular.reserve(regular->size());
+    projection.auxiliary.reserve(auxiliary->size());
+    /* Moving preserves each fixed hash/mode key; only owned strings change. */
+    for (const auto & row : *regular)
+        projection.regular.push_back(std::move(const_cast<Row &>(row)));
+    regular->clear();
+    for (const auto & object : *auxiliary)
+        projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
+    auxiliary->clear();
     return projection;
 }
 
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
 {
-    auto * shard = pending->shards[shardOf(id)].load(std::memory_order_acquire);
-    if (!shard)
-        return std::nullopt;
-    auto lock = std::lock_guard{shard->mutex};
-    auto i = shard->regular.find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
-    if (i == shard->regular.end())
+    auto regular = pending->regular.lock();
+    auto i = regular->find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
+    if (i == regular->end())
         return std::nullopt;
     auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();

@@ -1,6 +1,8 @@
 #pragma once
 ///@file
 
+#include <cstring>
+
 #include "nix/util/configuration.hh"
 #include "nix/util/types.hh"
 #include "nix/util/serialise.hh"
@@ -60,7 +62,7 @@ struct Hash
     union Ctx;
 
     constexpr static size_t maxHashSize = 64;
-    size_t hashSize = 0;
+    uint16_t hashSize = 0;
     uint8_t hash[maxHashSize] = {};
 
     HashAlgorithm algo;
@@ -252,7 +254,9 @@ struct std::hash<nix::Hash>
     std::size_t operator()(const nix::Hash & hash) const noexcept
     {
         assert(hash.hashSize > sizeof(size_t));
-        return *reinterpret_cast<const std::size_t *>(&hash.hash);
+        std::size_t result;
+        std::memcpy(&result, hash.hash, sizeof(result));
+        return result;
     }
 };
 

@@ -1296,11 +1296,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 result.rejected.emplace_back(row, candidate);
                 continue;
             }
-            auto before = maybeLstat(std::filesystem::path(candidate.file));
-            if (!before || !GitObjectStore::validHolderMetadata(candidate, row.executable, *before)) {
-                result.rejected.emplace_back(row, candidate);
-                continue;
-            }
             if (candidate.ino == row.ino && candidate.dev == row.dev) {
                 /* The owned target already pins this inode. No additional
                    link is needed, including at the filesystem's link limit. */
@@ -1326,19 +1321,17 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             else
                 std::filesystem::create_hard_link(candidate.file, pin, ec);
             if (ec) {
-                if (ec == std::errc::no_such_file_or_directory) {
+                /* A stale candidate is rejected even when pinning met a link
+                   limit; a refusal applies only to a current physical holder. */
+                auto now = ec == std::errc::no_such_file_or_directory
+                               ? std::nullopt
+                               : maybeLstat(std::filesystem::path(candidate.file));
+                if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
                     result.rejected.emplace_back(row, candidate);
                     continue;
                 }
                 if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
                     refused = true;
-                    continue;
-                }
-                /* A replacement by a directory can make link fail with
-                   EPERM. Judge that stale candidate, not the link error. */
-                auto now = maybeLstat(std::filesystem::path(candidate.file));
-                if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
-                    result.rejected.emplace_back(row, candidate);
                     continue;
                 }
                 throw Error(

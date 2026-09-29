@@ -231,19 +231,7 @@ StorePath Store::addToStore(
         if (auto local = dynamic_cast<LocalStore *>(this); local && local->materialisesFromObjects())
             return local->materialise(name, path, filter, repair, std::move(namer), callbacksPermitParallelism);
 
-    FileSerialisationMethod fsm;
-    switch (method.getFileIngestionMethod()) {
-    case FileIngestionMethod::Flat:
-        fsm = FileSerialisationMethod::Flat;
-        break;
-    case FileIngestionMethod::NixArchive:
-        fsm = FileSerialisationMethod::NixArchive;
-        break;
-    case FileIngestionMethod::Git:
-        // Use NAR; Git is not a serialization method
-        fsm = FileSerialisationMethod::NixArchive;
-        break;
-    }
+    auto fsm = method.getFileSerialisationMethod();
     std::optional<StorePath> storePath;
     auto sink = sourceToSink([&](Source & source) {
         LengthSource lengthSource(source);

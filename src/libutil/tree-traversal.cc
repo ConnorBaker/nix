@@ -10,14 +10,14 @@ void copyRecursive(
 {
     struct Copy : NodeVisitor<std::monostate>
     {
-        /* The sink and the path a node's children go under: what the
-           enclosing directory's callback handed back, innermost last; the
-           root's frame is the caller's sink and `destPath`. */
-        std::vector<std::pair<FileSystemObjectSink *, CanonPath>> open;
+        /* Each synchronous directory scope owns its copied coordinate;
+           recursive calls retain their enclosing frame on the C++ stack. */
+        using Target = std::pair<FileSystemObjectSink *, CanonPath>;
+        const Target * open = nullptr;
 
         std::pair<FileSystemObjectSink &, CanonPath> at(const CanonPath & path)
         {
-            auto & [sink, under] = open.back();
+            auto & [sink, under] = *open;
             return {*sink, path.isRoot() ? under : under / *path.baseName()};
         }
 
@@ -39,15 +39,17 @@ void copyRecursive(
         {
             auto [sink, p] = at(path);
             sink.createDirectory(p, [&](FileSystemObjectSink & dirSink, const CanonPath & rel) {
-                open.emplace_back(&dirSink, rel);
-                Finally pop{[&] { open.pop_back(); }};
+                const Target target{&dirSink, rel};
+                auto previous = std::exchange(open, &target);
+                Finally restore{[&] { open = previous; }};
                 children([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
             });
             return {};
         }
     } copy;
 
-    copy.open.emplace_back(&sink, destPath);
+    const Copy::Target root{&sink, destPath};
+    copy.open = &root;
     traverse(accessor, sourcePath, defaultPathFilter, copy);
 }
 

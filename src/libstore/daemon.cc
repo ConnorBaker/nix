@@ -480,21 +480,7 @@ static void performOp(
                 // data, since we haven't sent it the error yet.
                 auto [contentAddressMethod, hashAlgo] = ContentAddressMethod::parseWithAlgo(camStr);
                 FramedSource source(conn.from);
-                FileSerialisationMethod dumpMethod;
-                switch (contentAddressMethod.getFileIngestionMethod()) {
-                case FileIngestionMethod::Flat:
-                    dumpMethod = FileSerialisationMethod::Flat;
-                    break;
-                case FileIngestionMethod::NixArchive:
-                    dumpMethod = FileSerialisationMethod::NixArchive;
-                    break;
-                case FileIngestionMethod::Git:
-                    // Use NAR; Git is not a serialization method
-                    dumpMethod = FileSerialisationMethod::NixArchive;
-                    break;
-                default:
-                    assert(false);
-                }
+                auto dumpMethod = contentAddressMethod.getFileSerialisationMethod();
                 // TODO these two steps are essentially RemoteStore::addCAToStore. Move it up to Store.
                 auto path =
                     store->addToStoreFromDump(source, name, dumpMethod, contentAddressMethod, hashAlgo, refs, repair);

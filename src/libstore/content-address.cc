@@ -134,20 +134,6 @@ FileIngestionMethod ContentAddressMethod::getFileIngestionMethod() const
     }
 }
 
-FileSerialisationMethod ContentAddressMethod::getFileSerialisationMethod() const
-{
-    switch (raw) {
-    case ContentAddressMethod::Raw::Flat:
-    case ContentAddressMethod::Raw::Text:
-        return FileSerialisationMethod::Flat;
-    case ContentAddressMethod::Raw::NixArchive:
-    case ContentAddressMethod::Raw::Git:
-        return FileSerialisationMethod::NixArchive;
-    default:
-        assert(false);
-    }
-}
-
 std::string ContentAddress::render() const
 {
     return renderPrefixModern(method) + this->hash.to_string(HashFormat::Nix32, true);

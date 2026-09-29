@@ -928,10 +928,6 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     auto * ingestion = &*hold.ingestion;
     auto projection = hold.takeProjection();
     auto & rows = projection.regular;
-    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) {
-        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
-        return c != 0 ? c < 0 : a.executable < b.executable;
-    });
     auto logical = printStorePath(path);
     auto & completed = hold.completedIngestions;
     auto previous =
@@ -1879,14 +1875,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                     }
             }
         }
-        for (auto & publication : publications)
-            std::sort(
-                publication.projection.regular.begin(),
-                publication.projection.regular.end(),
-                [](const auto & a, const auto & b) {
-                    auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
-                    return c != 0 ? c < 0 : a.executable < b.executable;
-                });
     }
 #ifndef _WIN32
     /* SQLite will fsync by default, but the new valid paths may not
@@ -2350,9 +2338,10 @@ StorePath LocalStore::addToStoreFromDump(
     RepairFlag repair,
     bool filterReferences)
 {
-    checkIngestionAlgorithm(hashMethod.getFileIngestionMethod(), hashAlgo);
+    auto ingestionMethod = hashMethod.getFileIngestionMethod();
+    checkIngestionAlgorithm(ingestionMethod, hashAlgo);
 
-    bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == hashMethod.getFileIngestionMethod();
+    bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == ingestionMethod;
 
     /* The dump's hash is the content address only when the methods match;
        under the git method the sink's root is, and the dump is not hashed. */
@@ -2419,10 +2408,12 @@ StorePath LocalStore::addToStoreFromDump(
        cross-device copy needs its physical projection below instead. */
     std::optional<ObjectHashSink::Result> restored;
 
-    /* If the methods don't match, our streaming hash of the dump is the
-       wrong sort, and we need to rehash.
-       References are also in store path, if scanning we will need to move */
-    bool inMemoryAndDontNeedRestore = inMemory && methodsMatch && !filterReferences;
+    /* A complete Flat buffer directly supplies Flat/Text or Git addresses;
+       scanned NARs and mismatched NAR methods still need parsing first. */
+    bool inMemoryAndDontNeedRestore =
+        inMemory
+        && (dumpMethod == FileSerialisationMethod::Flat ? ingestionMethod != FileIngestionMethod::NixArchive
+                                                        : methodsMatch && !filterReferences);
     auto canonicalisingRestoreHooks =
         makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
@@ -2432,6 +2423,23 @@ StorePath LocalStore::addToStoreFromDump(
        Made at the restore, on either route, so that an add whose path is
        valid already makes none. */
     std::optional<GitObjectStore::Hold> hold;
+    auto restore = [&](const std::filesystem::path & path, Source & input) {
+        return restoreThroughObjects(
+            path,
+            [&](FileSystemObjectSink & sink) {
+                if (dumpMethod == FileSerialisationMethod::NixArchive)
+                    parseDump(sink, input);
+                else
+                    sink.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
+                        file.preallocateContents(dump.size());
+                        file(dump);
+                    });
+            },
+            localSettings.fsyncStorePaths,
+            canonicalisingRestoreHooks.get(),
+            *hold,
+            repair);
+    };
 
     if (!inMemoryAndDontNeedRestore) {
         /* Before the restore, for the reason `addToStore` gives: the spilled
@@ -2452,13 +2460,7 @@ StorePath LocalStore::addToStoreFromDump(
         hold.emplace(objects.hold());
 
         if (dumpMethod == FileSerialisationMethod::NixArchive)
-            restored = restoreThroughObjects(
-                tempPath,
-                [&](FileSystemObjectSink & sink) { parseDump(sink, bothSource); },
-                localSettings.fsyncStorePaths,
-                canonicalisingRestoreHooks.get(),
-                *hold,
-                repair);
+            restored = restore(tempPath, bothSource);
         else
             restorePath(
                 tempPath, bothSource, dumpMethod, localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get());
@@ -2466,23 +2468,19 @@ StorePath LocalStore::addToStoreFromDump(
         std::string().swap(dump);
     }
 
-    StorePathSet references;
-    if (refSink.has_value()) {
-        references = refSink->getResultPaths();
-    } else {
-        references = originalReferences;
-    }
+    auto references = refSink ? refSink->getResultPaths() : originalReferences;
 
-    /* The content address: the dump's own hash when the methods match; the
-       sink's root for the git method; else a read of the restored tree. */
+    /* A deferred mismatch is exactly Flat under Git: its non-executable
+       regular root has the blob ID as its object hash, without a projection. */
     auto desc = ContentAddressWithReferences::fromParts(
         hashMethod,
-        methodsMatch ? hashSink->finish().hash
-        : (restored && hashMethod.getFileIngestionMethod() == FileIngestionMethod::Git)
+        methodsMatch                 ? hashSink->finish().hash
+        : inMemoryAndDontNeedRestore ? merkle::blobId(dump)
+        : (restored && ingestionMethod == FileIngestionMethod::Git)
             ? merkle::objectHash(restored->root)
-            : hashPath(makeFSSourceAccessor(tempPath), hashMethod.getFileIngestionMethod(), hashAlgo).first,
+            : hashPath(makeFSSourceAccessor(tempPath), ingestionMethod, hashAlgo).first,
         {
-            .others = references,
+            .others = std::move(references),
             // caller is not capable of creating a self-reference, because this is content-addressed without modulus
             .self = false,
         });
@@ -2494,21 +2492,7 @@ StorePath LocalStore::addToStoreFromDump(
             autoGC();
             hold.emplace(objects.hold());
             StringSource dumpSource{dump};
-            restored = restoreThroughObjects(
-                realPath,
-                [&](FileSystemObjectSink & sink) {
-                    if (dumpMethod == FileSerialisationMethod::NixArchive)
-                        parseDump(sink, dumpSource);
-                    else
-                        sink.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
-                            file.preallocateContents(dump.size());
-                            file(dump);
-                        });
-                },
-                localSettings.fsyncStorePaths,
-                canonicalisingRestoreHooks.get(),
-                *hold,
-                repair);
+            restored = restore(realPath, dumpSource);
         } else if (!moveIntoStore(tempPath, realPath, *delTempDir, canonicalisingRestoreHooks.get()))
             restored.reset();
 

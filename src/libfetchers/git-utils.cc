@@ -1008,24 +1008,12 @@ public:
 
         auto mode = git_tree_entry_filemode(entry);
 
-        if (mode == GIT_FILEMODE_TREE)
-            return Stat{.type = tDirectory};
-
-        else if (mode == GIT_FILEMODE_BLOB || mode == GIT_FILEMODE_BLOB_EXECUTABLE)
+        if (auto type = typeOfMode(mode))
             /* Size is optional in Stat. Reading a packed delta's header
                can inflate its delta chain; readFile announces the size
                when the caller actually needs the contents. */
-            return Stat{.type = tRegular, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
-
-        else if (mode == GIT_FILEMODE_LINK)
-            return Stat{.type = tSymlink};
-
-        else if (mode == GIT_FILEMODE_COMMIT)
-            // Treat submodules as an empty directory.
-            return Stat{.type = tDirectory};
-
-        else
-            throw Error("file '%s' has an unsupported Git file type");
+            return Stat{.type = *type, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
+        throw Error("file '%s' has an unsupported Git file type");
     }
 
     /**
@@ -1053,26 +1041,20 @@ public:
     {
         auto state(state_.lock());
 
-        return std::visit(
-            overloaded{
-                [&](const git_tree * tree) {
-                    DirEntries res;
-
-                    auto count = git_tree_entrycount(tree);
-
-                    for (size_t n = 0; n < count; ++n) {
-                        auto entry = git_tree_entry_byindex(tree, n);
-                        /* Typed from the mode the entry carries, so a
-                           consumer that wants the types (`builtins.readDir`
-                           attaches a `readFileType` lookup to every untyped
-                           entry) looks nothing up. */
-                        res.emplace(git_tree_entry_name(entry), typeOfMode(git_tree_entry_filemode(entry)));
-                    }
-
-                    return res;
-                },
-                [&](Submodule) { return DirEntries(); }},
-            getTree(*state, path));
+        DirEntries res;
+        /* A submodule renders as the empty directory; no tree is loaded. */
+        if (auto tree = getTree(*state, path)) {
+            auto count = git_tree_entrycount(tree);
+            for (size_t n = 0; n < count; ++n) {
+                auto entry = git_tree_entry_byindex(tree, n);
+                /* Typed from the mode the entry carries, so a
+                   consumer that wants the types (`builtins.readDir`
+                   attaches a `readFileType` lookup to every untyped
+                   entry) looks nothing up. */
+                res.emplace(git_tree_entry_name(entry), typeOfMode(git_tree_entry_filemode(entry)));
+            }
+        }
+        return res;
     }
 
     std::string readLink(const CanonPath & path) override
@@ -1242,10 +1224,8 @@ public:
         return entry;
     }
 
-    struct Submodule
-    {};
-
-    std::variant<const git_tree *, Submodule> getTree(State & state, const CanonPath & path)
+    /* A borrowed tree, or nullptr for the submodule's empty directory. */
+    const git_tree * getTree(State & state, const CanonPath & path)
     {
         if (path.isRoot()) {
             if (git_object_type(state.root.get()) == GIT_OBJECT_TREE)
@@ -1259,7 +1239,7 @@ public:
 
         auto entry = need(state, path);
         if (git_tree_entry_type(entry) == GIT_OBJECT_COMMIT)
-            return Submodule();
+            return nullptr;
 
         throw Error("'%s' is not a directory", showPath(path));
     }
@@ -1282,13 +1262,8 @@ public:
             notExpected();
 
         auto mode = git_tree_entry_filemode(entry);
-        if (expectSymlink) {
-            if (mode != GIT_FILEMODE_LINK)
-                notExpected();
-        } else {
-            if (mode != GIT_FILEMODE_BLOB && mode != GIT_FILEMODE_BLOB_EXECUTABLE)
-                notExpected();
-        }
+        if ((mode == GIT_FILEMODE_LINK) != expectSymlink)
+            notExpected();
 
         Blob blob;
         if (git_blob_lookup(Setter(blob), *state.repo, git_tree_entry_id(entry)))

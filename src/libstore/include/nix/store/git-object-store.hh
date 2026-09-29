@@ -357,7 +357,8 @@ public:
         };
 
         /** All walking workers have joined. Reserve both result vectors before
-         * consuming the pending relation; allocation failure leaves it intact. */
+         * consuming the pending relation; allocation failure leaves it intact.
+         * Each vector is ordered by active identifier bytes, then mode. */
         Projection takeProjection() const;
 
         /** Stage an owned directory body or symlink target. Concurrent duplicate

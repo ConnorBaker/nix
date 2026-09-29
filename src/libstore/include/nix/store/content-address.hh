@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <cassert>
 #include <variant>
 #include "nix/util/hash.hh"
 #include "nix/store/path.hh"
@@ -139,7 +140,19 @@ struct ContentAddressMethod
      * There is no support for flat serialisation of merkle objects; and even if there were,
      * it would be unable to represent executable files.
      */
-    FileSerialisationMethod getFileSerialisationMethod() const;
+    FileSerialisationMethod getFileSerialisationMethod() const
+    {
+        switch (raw) {
+        case ContentAddressMethod::Raw::Flat:
+        case ContentAddressMethod::Raw::Text:
+            return FileSerialisationMethod::Flat;
+        case ContentAddressMethod::Raw::NixArchive:
+        case ContentAddressMethod::Raw::Git:
+            return FileSerialisationMethod::NixArchive;
+        default:
+            assert(false);
+        }
+    }
 };
 
 /*

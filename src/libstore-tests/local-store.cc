@@ -3888,7 +3888,7 @@ TEST_F(LocalStoreObjectsTest, sweepWritesNothingIntoAnOwnedPart)
     EXPECT_TRUE(hasTree(r.root.hash));
 }
 
-/* Completed rows denote the input relation independently of shard occupancy,
+/* Completed rows denote the input relation independently of first-byte values,
    duplicate claims, handoff order, or later reuse of their hold. */
 TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
 {
@@ -3940,7 +3940,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
 
     store->beginIngestion(hold, "/empty");
     complete({});
-    /* Every singleton shard address and both regular-file modes. */
+    /* Every first-byte value as a singleton, under both regular-file modes. */
     for (unsigned byte = 0; byte < 256; ++byte)
         for (bool executable : {false, true}) {
             SCOPED_TRACE(fmt("byte=%d executable=%d", byte, executable));
@@ -3950,7 +3950,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
             complete({row});
         }
 
-    /* All shards occupied together, with both keys in every shard. */
+    /* All first-byte values coexist, each under both regular-file modes. */
     std::vector<Row> firstExpected, secondExpected;
     for (unsigned byte = 0; byte < 256; ++byte)
         for (bool executable : {false, true}) {
@@ -3967,7 +3967,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
     auto second = complete(secondExpected);
 
     /* Reset also abandons an unconsumed projection. Returned rows remain
-       independently owned through destruction and reuse of every shard. */
+       independently owned through clearing and reuse of the pending sets. */
     store->beginIngestion(hold, "/abandoned");
     for (auto & row : firstExpected)
         claim(row, "/abandoned");
@@ -4014,13 +4014,11 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
     auto checkRows = [&](const Relation & expected) {
         auto rows = hold.takeProjection().regular;
         ASSERT_EQ(rows.size(), expected.size());
-        std::set<Key> seen;
+        auto ordered = expected.begin();
         for (auto & row : rows) {
             auto k = key(row.id, row.executable);
-            ASSERT_TRUE(seen.insert(k).second);
-            auto i = expected.find(k);
-            ASSERT_NE(i, expected.end());
-            const auto & first = i->second;
+            ASSERT_EQ(k, ordered->first);
+            const auto & first = (ordered++)->second;
             EXPECT_EQ(row.id.hashSize, first.id.hashSize);
             EXPECT_EQ(row.id.algo, first.id.algo);
             EXPECT_TRUE(std::equal(row.id.hash, row.id.hash + Hash::maxHashSize, first.id.hash));
@@ -4200,57 +4198,145 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
 
 TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
 {
-    for (bool executable : {false, true}) {
-        SCOPED_TRACE(executable);
-        auto bytes = fmt("correct-content-%d", executable);
-        auto corrupt = fmt("corrupt-content-%d", executable);
-        ASSERT_EQ(bytes.size(), corrupt.size());
-        auto nar = treeNar({{"file", bytes, executable ? 'x' : 'f'}});
-        auto donor = config->realStoreDir.get() / fmt("own-corrupt-donor-%d", executable);
-        auto other = config->realStoreDir.get() / fmt("own-corrupt-other-%d", executable);
-        restore(donor, nar);
-        restore(other, nar);
-        unlinkInPlace(other / "file");
-        {
-            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
-            SQLiteStmt update{
-                db, "update Blobs set ino = ?, dev = ? where ingestion in (select id from Ingestions where path = ?);"};
-            update.use()
-                .apply(static_cast<int64_t>(st(other / "file").st_ino))
-                .apply(static_cast<int64_t>(st(other / "file").st_dev))
-                .apply((std::filesystem::path(config->storeDir) / other.filename()).string())
-                .exec();
-        }
-        for (auto & candidate : {donor, other}) {
-            chmod(candidate / "file", 0644);
-            writeFile(candidate / "file", corrupt);
-            chmod(candidate / "file", executable ? 0555 : 0444);
-            setWriteTime(candidate / "file", 1, 1);
-        }
-        auto physicalClass = [&](const std::filesystem::path & file) {
-            auto status = st(file);
-            return std::pair{static_cast<int64_t>(status.st_dev), static_cast<int64_t>(status.st_ino)};
-        };
-        auto donorClass = physicalClass(donor / "file");
-        auto otherClass = physicalClass(other / "file");
-        ASSERT_NE(donorClass, otherClass);
+    enum class Change { None, Content, Mode, Seconds, Nanoseconds, Size };
+    size_t cases = 0;
+    for (bool executable : {false, true})
+        for (auto change :
+             {Change::None, Change::Content, Change::Mode, Change::Seconds, Change::Nanoseconds, Change::Size}) {
+            SCOPED_TRACE(fmt("executable=%d change=%d", executable, static_cast<int>(change)));
+            auto label = fmt("%d-%d", executable, static_cast<int>(change));
+            auto bytes = "correct-content-" + label;
+            auto corrupt = "corrupt-content-" + label;
+            ASSERT_EQ(bytes.size(), corrupt.size());
+            auto id = merkle::blobId(bytes);
+            auto nar = treeNar({{"file", bytes, executable ? 'x' : 'f'}});
+            auto donor = config->realStoreDir.get() / ("own-corrupt-donor-" + label);
+            auto other = config->realStoreDir.get() / ("own-corrupt-other-" + label);
+            restore(donor, nar);
+            restore(other, nar);
+            unlinkInPlace(other / "file");
+            {
+                SQLite db{
+                    store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                SQLiteStmt update{
+                    db,
+                    "update Blobs set ino = ?, dev = ? where ingestion in (select id from Ingestions where path = ?);"};
+                update.use()
+                    .apply(static_cast<int64_t>(st(other / "file").st_ino))
+                    .apply(static_cast<int64_t>(st(other / "file").st_dev))
+                    .apply((std::filesystem::path(config->storeDir) / other.filename()).string())
+                    .exec();
+            }
+            auto physicalClass = [&](const std::filesystem::path & file) {
+                auto status = st(file);
+                return std::pair{static_cast<int64_t>(status.st_dev), static_cast<int64_t>(status.st_ino)};
+            };
+            auto donorClass = physicalClass(donor / "file");
+            auto otherClass = physicalClass(other / "file");
+            ASSERT_NE(donorClass, otherClass);
+            auto candidateRow = store->objects.index->lookup(id, executable, GitObjectStore::Holder::initialCursor);
+            ASSERT_TRUE(candidateRow);
+            ASSERT_TRUE(GitObjectStore::validHolderMetadata(*candidateRow, executable, st(candidateRow->file)));
 
-        ValidPathInfo info{
-            StorePath::random(fmt("own-corrupt-publication-%d", executable)),
-            UnkeyedValidPathInfo{*store, std::nullopt}};
-        auto real = store->toRealPath(info.path);
-        auto hold = store->objects.hold();
-        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
-        StringSource source{nar};
-        auto result = store->restoreThroughObjects(
-            real, [&](FileSystemObjectSink & sink) { parseDump(sink, source); }, false, hooks.get(), hold, NoRepair);
-        info.objectHash = ObjectHash::of(result.root);
-        info.narSize = result.narSize.value();
-        ASSERT_EQ(physicalClass(real / "file"), std::min(donorClass, otherClass));
-        ASSERT_EQ(readFile(real / "file"), corrupt);
-        EXPECT_THROW(store->registerValidPath(info, hold), Error);
-        EXPECT_FALSE(store->isValidPath(info.path));
-    }
+            /* Retain the original same-size content-corruption case: NoRepair
+               can reuse it during restore, but publication must reject it. */
+            if (change == Change::Content)
+                for (auto & candidate : {donor, other}) {
+                    chmod(candidate / "file", 0644);
+                    writeFile(candidate / "file", corrupt);
+                    chmod(candidate / "file", executable ? 0555 : 0444);
+                    setWriteTime(candidate / "file", 1, 1);
+                }
+
+            ValidPathInfo info{
+                StorePath::random("own-corrupt-publication-" + label), UnkeyedValidPathInfo{*store, std::nullopt}};
+            auto real = store->toRealPath(info.path);
+            auto hold = store->objects.hold();
+            auto hooks =
+                makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+            StringSource source{nar};
+            auto result = store->restoreThroughObjects(
+                real,
+                [&](FileSystemObjectSink & sink) { parseDump(sink, source); },
+                false,
+                hooks.get(),
+                hold,
+                NoRepair);
+            info.objectHash = ObjectHash::of(result.root);
+            info.narSize = result.narSize.value();
+            ASSERT_EQ(physicalClass(real / "file"), std::min(donorClass, otherClass));
+            ASSERT_EQ(st(real / "file").st_ino, candidateRow->ino);
+            ASSERT_EQ(st(real / "file").st_dev, candidateRow->dev);
+            ASSERT_EQ(readFile(real / "file"), change == Change::Content ? corrupt : bytes);
+            ASSERT_EQ(hold.pendingHolder(id, executable), std::optional{(real / "file").string()});
+            ASSERT_TRUE(hold.ingestion);
+            ASSERT_FALSE(hold.ingestion->id);
+
+            /* Change physical metadata only after restore has linked the owned
+               target. Both saved donor rows remain unchanged. Two inode classes
+               are necessary to exercise publication's collision reconciliation. */
+            for (auto & candidate : {donor, other}) {
+                auto file = candidate / "file";
+                if (change == Change::Size) {
+                    chmod(file, 0644);
+                    writeFile(file, bytes + "!");
+                    chmod(file, executable ? 0555 : 0444);
+                    setWriteTime(file, 1, 1);
+                } else if (change == Change::Mode)
+                    chmod(file, (executable ? 0555 : 0444) | S_IWUSR);
+                else if (change == Change::Seconds || change == Change::Nanoseconds) {
+                    timespec times[2]{
+                        {0, UTIME_OMIT}, {change == Change::Seconds ? 2 : 1, change == Change::Nanoseconds ? 1 : 0}};
+                    ASSERT_EQ(::utimensat(AT_FDCWD, file.c_str(), times, 0), 0);
+                }
+            }
+            ASSERT_EQ(
+                GitObjectStore::validHolderMetadata(*candidateRow, executable, st(real / "file")),
+                change == Change::None || change == Change::Content);
+            const std::array files{donor / "file", other / "file", real / "file"};
+            const std::array before{st(files[0]), st(files[1]), st(files[2])};
+            auto expectedBytes = change == Change::Content ? corrupt : change == Change::Size ? bytes + "!" : bytes;
+            auto rowsBefore = blobRowCount(*store, executable);
+            if (change == Change::None)
+                EXPECT_NO_THROW(store->registerValidPath(info, hold));
+            else
+                EXPECT_THROW(store->registerValidPath(info, hold), Error);
+            EXPECT_EQ(store->isValidPath(info.path), change == Change::None);
+            EXPECT_EQ(hold.ingestion->id.has_value(), change == Change::None);
+            EXPECT_EQ(blobRowCount(*store, executable), rowsBefore + (change == Change::None ? 1 : 0));
+
+            if (change == Change::None)
+                EXPECT_EQ(gitHash(real), result.root);
+            else {
+                /* Rejection rolls back index publication and does not relink,
+                   canonicalise, or rewrite either owned or registered files. Use
+                   raw lookup: holderOrForget would itself change the stale index. */
+                auto retained = store->objects.index->lookup(id, executable, GitObjectStore::Holder::initialCursor);
+                ASSERT_TRUE(retained);
+                EXPECT_EQ(retained->file, candidateRow->file);
+                EXPECT_EQ(retained->ingestion, candidateRow->ingestion);
+                EXPECT_EQ(retained->ino, candidateRow->ino);
+                EXPECT_EQ(retained->dev, candidateRow->dev);
+                EXPECT_EQ(retained->size, candidateRow->size);
+                for (size_t i = 0; i < files.size(); ++i) {
+                    auto after = st(files[i]);
+                    EXPECT_EQ(readFile(files[i]), expectedBytes);
+                    EXPECT_EQ(after.st_ino, before[i].st_ino);
+                    EXPECT_EQ(after.st_dev, before[i].st_dev);
+                    EXPECT_EQ(after.st_mode, before[i].st_mode);
+                    EXPECT_EQ(after.st_size, before[i].st_size);
+                    EXPECT_EQ(after.st_nlink, before[i].st_nlink);
+                    EXPECT_EQ(after.st_mtime, before[i].st_mtime);
+#  ifdef __APPLE__
+                    EXPECT_EQ(after.st_mtimespec.tv_nsec, before[i].st_mtimespec.tv_nsec);
+#  else
+                    EXPECT_EQ(after.st_mtim.tv_nsec, before[i].st_mtim.tv_nsec);
+#  endif
+                }
+            }
+            ++cases;
+        }
+    EXPECT_EQ(cases, 12u);
 }
 
 TEST_F(LocalStoreObjectsTest, verifierReentryDoesNotWaitForAnOutputLock)
@@ -4470,11 +4556,12 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     auto projection = hold.takeProjection();
     ASSERT_EQ(projection.auxiliary.size(), 2u * (1 + 32 * 255));
     ASSERT_EQ(projection.regular.size(), projection.auxiliary.size());
-    std::set<Key> seen;
+    ASSERT_EQ(projection.auxiliary.size(), expected.size());
+    auto ordered = expected.begin();
     for (auto & value : projection.auxiliary) {
         Key key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode};
-        EXPECT_TRUE(seen.insert(key).second);
-        EXPECT_EQ(value.body, expected.at(key));
+        EXPECT_EQ(key, ordered->first);
+        EXPECT_EQ(value.body, (ordered++)->second);
     }
     auto isolated = privateAttempt.takeProjection();
     ASSERT_EQ(isolated.auxiliary.size(), 1u);
@@ -4486,7 +4573,6 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
         hold.addAuxiliary(value);
     store->beginIngestion(hold, "/reset");
     EXPECT_TRUE(hold.takeProjection().auxiliary.empty());
-    EXPECT_EQ(projection.auxiliary.size(), expected.size());
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliaryKeysAdmitExactlyCanonicalProducerIdentities)
@@ -6267,7 +6353,7 @@ TEST_F(LocalStoreObjectsTest, flatAddIsEnteredAndRegistersItsObjectHash)
     settings.getLocalSettings().narBufferSize = 0;
     check("flat spilled to disk", "flat-spilled");
 
-    /* Text and Flat describe the same regular tree with different CA tags.
+    /* Text, Flat and Git describe the same regular tree with different CA tags.
        Keep the input fully buffered, including above the shared writer's
        1 MiB bound; the original forced-spill case above remains separate. */
     constexpr size_t limit = 1 << 20;
@@ -6291,7 +6377,7 @@ TEST_F(LocalStoreObjectsTest, flatAddIsEnteredAndRegistersItsObjectHash)
         auto blob = merkle::blobId(bytes);
         if (!bytes.empty())
             ASSERT_FALSE(hasBlob(blob, false));
-        auto contentHash = hashString(HashAlgorithm::SHA256, bytes);
+        auto contentHash = method == ContentAddressMethod::Raw::Git ? blob : hashString(HashAlgorithm::SHA256, bytes);
         auto expected =
             store->makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, contentHash, {}));
         StringSink nar;
@@ -6360,17 +6446,82 @@ TEST_F(LocalStoreObjectsTest, flatAddIsEnteredAndRegistersItsObjectHash)
             EXPECT_EQ(st(real).st_nlink, 1u);
     };
     for (size_t size : {size_t{32}, limit, limit + 1})
-        for (auto method : {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat})
+        for (auto method :
+             {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat, ContentAddressMethod::Raw::Git})
             for (auto repair : {NoRepair, Repair})
                 for (auto donor : {Donor::Absent, Donor::Valid, Donor::Corrupt})
                     direct(std::string(size, 'b'), method, repair, donor);
     /* Empty bytes have only one identity and cannot be corrupted at the
        same length. These cells check the direct empty producer without
        making an absent-donor claim after the first empty publication. */
-    for (auto method : {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat})
+    for (auto method :
+         {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat, ContentAddressMethod::Raw::Git})
         for (auto repair : {NoRepair, Repair})
             direct({}, method, repair, Donor::Absent);
-    EXPECT_EQ(serial, 40u);
+    EXPECT_EQ(serial, 60u);
+}
+
+TEST_F(LocalStoreObjectsTest, flatReferenceSelectionAgreesAcrossBufferBoundaries)
+{
+    Finally restoreNarBufferSize{[oldSize = settings.getLocalSettings().narBufferSize]() {
+        settings.getLocalSettings().narBufferSize.assign(oldSize);
+    }};
+    auto used = store->addTextToStore("used-reference", "used", {});
+    auto unused = store->addTextToStore("unused-reference", "unused", {});
+    auto bytes = "selected " + store->printStorePath(used) + "\n";
+    StringSink nar;
+    dumpString(bytes, nar);
+    auto blob = merkle::blobId(bytes);
+    unsigned cells = 0;
+    for (auto raw : {ContentAddressMethod::Raw::Flat, ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Git})
+        for (bool filter : {false, true})
+            for (size_t bound : {size_t{0}, bytes.size(), bytes.size() + 1}) {
+                auto name = fmt("flat-reference-%d", cells++);
+                SCOPED_TRACE(fmt("method=%d filter=%d bound=%d", static_cast<int>(raw), filter, bound));
+                settings.getLocalSettings().narBufferSize = bound;
+                ContentAddressMethod method{raw};
+                /* Flat and Git addresses admit no references. A discarded candidate
+                   still tests its filtered route without inventing an invalid CA. */
+                auto offered = raw != ContentAddressMethod::Raw::Text ? (filter ? StorePathSet{unused} : StorePathSet{})
+                                                                      : StorePathSet{used, unused};
+                auto expectedRefs =
+                    raw != ContentAddressMethod::Raw::Text ? StorePathSet{} : (filter ? StorePathSet{used} : offered);
+                auto hash = raw == ContentAddressMethod::Raw::Git ? blob : hashString(HashAlgorithm::SHA256, bytes);
+                auto expected = store->makeFixedOutputPathFromCA(
+                    name, ContentAddressWithReferences::fromParts(method, hash, {.others = expectedRefs}));
+                for (bool valid : {false, true}) {
+                    SCOPED_TRACE(valid);
+                    EXPECT_EQ(store->isValidPath(expected), valid);
+                    StringSource source{bytes};
+                    auto actual = store->addToStoreFromDump(
+                        source,
+                        name,
+                        FileSerialisationMethod::Flat,
+                        method,
+                        HashAlgorithm::SHA256,
+                        offered,
+                        NoRepair,
+                        filter);
+                    EXPECT_EQ(actual, expected);
+                    auto info = store->queryPathInfo(actual);
+                    ASSERT_TRUE(info->ca);
+                    EXPECT_EQ(info->ca->method, method);
+                    EXPECT_EQ(info->ca->hash, hash);
+                    EXPECT_EQ(info->references, expectedRefs);
+                    EXPECT_EQ(info->objectHash, ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, blob}));
+                    EXPECT_EQ(info->narSize, nar.s.size());
+                    auto real = store->toRealPath(actual);
+                    EXPECT_EQ(readFile(real), bytes);
+                    StringSink actualNar;
+                    dumpPath(real, actualNar);
+                    EXPECT_EQ(actualNar.s, nar.s);
+                    EXPECT_EQ(st(real).st_mode & ~S_IFMT, 0444u);
+                    ASSERT_TRUE(hasBlob(blob, false));
+                    EXPECT_EQ(st(real).st_dev, st(blobFileOf(blob, false)).st_dev);
+                    EXPECT_EQ(st(real).st_ino, st(blobFileOf(blob, false)).st_ino);
+                }
+            }
+    EXPECT_EQ(cells, 18u);
 }
 
 /* The lazy migration of a schema-10 row (01 section 9.11, "The database")
@@ -9122,28 +9273,38 @@ TEST_F(LocalStoreAutoGCTest, spilledAddToStoreFromDumpsOwnCollectionKeepsItsObje
    the restore (the test above). */
 TEST_F(LocalStoreAutoGCTest, inMemoryAddOfAValidPathRunsNoCollection)
 {
-    auto nar = treeWithSymlink();
-    auto add = [&] {
-        StringSource source{nar};
-        return store->addToStoreFromDump(
-            source,
-            "auto-gc-valid",
-            FileSerialisationMethod::NixArchive,
-            ContentAddressMethod::Raw::NixArchive,
-            HashAlgorithm::SHA256,
-            {},
-            NoRepair);
-    };
-    auto p = add();
-    ASSERT_FALSE(pathExists(garbage)) << "the first add's collection ran";
-    ASSERT_TRUE(store->isValidPath(p));
+    Finally restoreNarBufferSize{[oldSize = settings.getLocalSettings().narBufferSize]() {
+        settings.getLocalSettings().narBufferSize.assign(oldSize);
+    }};
+    unsigned cells = 0;
+    uint64_t freeSpace = 1000;
+    auto check = [&](std::string dump, FileSerialisationMethod transport, ContentAddressMethod method, bool filter) {
+        auto name = fmt("auto-gc-valid-%d", cells++);
+        SCOPED_TRACE(name);
+        settings.getLocalSettings().narBufferSize = dump.size() + 1;
+        auto add = [&] {
+            StringSource source{dump};
+            return store->addToStoreFromDump(
+                source, name, transport, method, HashAlgorithm::SHA256, {}, NoRepair, filter);
+        };
+        auto p = add();
+        ASSERT_FALSE(pathExists(garbage)) << "the first add's collection ran";
+        ASSERT_TRUE(store->isValidPath(p));
 
-    /* The trigger armed again: garbage planted, the free space below 97 %
-       of what the last collection left. */
-    writeFile(garbage, "dead");
-    writeFile(fakeFree, "500");
-    EXPECT_EQ(add(), p);
-    EXPECT_TRUE(pathExists(garbage)) << "a collection ran for an add that wrote nothing";
+        /* Re-arm the existing trigger below 97% of the previous collection's
+           observed space; no timing or syscall-count assertion is involved. */
+        writeFile(garbage, "dead");
+        freeSpace /= 2;
+        writeFile(fakeFree, std::to_string(freeSpace));
+        EXPECT_EQ(add(), p);
+        EXPECT_TRUE(pathExists(garbage)) << "a collection ran for an add that wrote nothing";
+    };
+    check(treeWithSymlink(), FileSerialisationMethod::NixArchive, ContentAddressMethod::Raw::NixArchive, false);
+    for (auto method :
+         {ContentAddressMethod::Raw::Flat, ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Git})
+        for (bool filter : {false, true})
+            check("buffered flat " + std::to_string(cells), FileSerialisationMethod::Flat, method, filter);
+    EXPECT_EQ(cells, 7u);
 }
 
 /* The source has no stable name, so every call must observe its bytes

@@ -186,7 +186,7 @@ void ObjectHashSink::deliver(const CanonPath & path, fun<HashedNode()> visit)
         root = visit();
         return;
     }
-    if (open.empty())
+    if (!open)
         throw Error("object hash sink: '%s' arrived with no open directory to hold it", path);
     /* The tree's own name: the NAR restorer may have appended the
        case-hack suffix before this child was delivered (archive.cc,
@@ -194,7 +194,7 @@ void ObjectHashSink::deliver(const CanonPath & path, fun<HashedNode()> visit)
        so the hash and the NAR size are over the name without it. */
     /* The push driver has no listing to type a child by, and never
        needs one: only a visitor that may split its children reads it. */
-    (*open.back())(unhackName(*path.baseName()), false, std::move(visit));
+    (*open)(unhackName(*path.baseName()), false, std::move(visit));
 }
 
 void ObjectHashSink::createDirectory(const CanonPath & path)
@@ -206,8 +206,8 @@ void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCal
 {
     auto visit = [&] {
         auto children = [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
-            open.push_back(&each);
-            Finally close{[&] { open.pop_back(); }};
+            auto previous = std::exchange(open, &each);
+            Finally restore{[&] { open = previous; }};
             /* As the base class's default: the same sink, the same path, so
                the children arrive at `path / name`. */
             callback(*this, path);
