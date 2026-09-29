@@ -177,8 +177,11 @@ public:
     /** Ensure the temporary regular-link and ingestion-lease namespace exists. */
     void createDirectories() const;
 
-    /** The identifier of the blob a regular file's bytes are. */
-    static Hash blobIdOfFile(const std::filesystem::path & path);
+    /** Hash file bytes using their previously observed size.
+     * The caller must ensure that size is still correct or compare the result
+     * with the expected canonical blob identifier. This does not establish
+     * a snapshot of a concurrently mutable file. */
+    static Hash blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize);
 
     static std::string idString(const Hash & id);
 

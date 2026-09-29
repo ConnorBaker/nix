@@ -497,6 +497,69 @@ TEST(AttrsCodec, lazyAttrIsForcedAsAttrsToJSONForcesIt)
     EXPECT_EQ(decodeAttrs(encodeAttrs(attrs)), (Attrs{{"x", uint64_t(99)}}));
 }
 
+/* Every byte, both where a decimal digit belongs and where its delimiter
+   belongs. Lengths use small payloads so their accepted forms are observable. */
+TEST(AttrsCodec, decimalByteAlphabet)
+{
+    for (unsigned byte = 0; byte <= std::numeric_limits<unsigned char>::max(); ++byte) {
+        SCOPED_TRACE(byte);
+        std::string token(1, static_cast<char>(byte));
+        bool digit = byte >= '0' && byte <= '9';
+        for (const std::string & prefix : {std::string{}, std::string("1")}) {
+            // Two payload bytes make an early ':' leave malformed trailing input.
+            auto value = digit ? (prefix.empty() ? 0 : 10) + byte - '0' : 2;
+            auto integer = "i0:" + prefix + token + ";";
+            auto length = "s0:" + prefix + token + ":" + std::string(value, 'x');
+            if (digit) {
+                EXPECT_EQ(decodeAttrs(integer), (Attrs{{"", uint64_t(value)}}));
+                EXPECT_EQ(decodeAttrs(length), (Attrs{{"", std::string(value, 'x')}}));
+            } else {
+                EXPECT_THROW(decodeAttrs(integer), Error);
+                EXPECT_THROW(decodeAttrs(length), Error);
+            }
+        }
+        if (byte == ';')
+            EXPECT_EQ(decodeAttrs("i0:0" + token), (Attrs{{"", uint64_t(0)}}));
+        else
+            EXPECT_THROW(decodeAttrs("i0:0" + token), Error);
+        if (byte == ':')
+            EXPECT_EQ(decodeAttrs("s0:0" + token), (Attrs{{"", std::string{}}}));
+        else
+            EXPECT_THROW(decodeAttrs("s0:0" + token), Error);
+    }
+}
+
+TEST(AttrsCodec, decimalBoundariesAndTruncations)
+{
+    for (auto value : {uint64_t(0), uint64_t(9), uint64_t(10), std::numeric_limits<uint64_t>::max()}) {
+        auto whole = "i0:" + std::to_string(value) + ";";
+        EXPECT_EQ(decodeAttrs(whole), (Attrs{{"", value}}));
+        for (size_t n = 1; n < whole.size(); ++n)
+            EXPECT_THROW(decodeAttrs(std::string_view(whole).substr(0, n)), Error) << n;
+    }
+    for (auto value : {size_t(0), size_t(9), size_t(10), size_t(20)}) {
+        auto whole = "s0:" + std::to_string(value) + ":" + std::string(value, 'x');
+        EXPECT_EQ(decodeAttrs(whole), (Attrs{{"", std::string(value, 'x')}}));
+        for (size_t n = 1; n < whole.size(); ++n)
+            EXPECT_THROW(decodeAttrs(std::string_view(whole).substr(0, n)), Error) << n;
+    }
+    for (const std::string & decimal :
+         {std::string{},
+          std::string("00"),
+          std::string("01"),
+          std::string("+0"),
+          std::string("-0"),
+          std::string("18446744073709551616"),
+          std::string("99999999999999999999"),
+          std::string("100000000000000000000"),
+          std::string(256, '9'),
+          std::string(256, '0')}) {
+        SCOPED_TRACE(decimal);
+        EXPECT_THROW(decodeAttrs("i0:" + decimal + ";"), Error);
+        EXPECT_THROW(decodeAttrs("s0:" + decimal + ":"), Error);
+    }
+}
+
 /* Every proper, non-empty prefix of a one-attribute encoding is refused
    (the empty prefix is the empty map), and so is each malformation. */
 TEST(AttrsCodec, truncatedAndMalformedEncodingsThrow)

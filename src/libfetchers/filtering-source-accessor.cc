@@ -25,7 +25,7 @@ void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<
 {
     auto owner = weak_from_this().lock();
     checkAllowed(path);
-    return next->readFile(prefix / path, sink, sizeCallback);
+    return next->readFile(prefix / path, sink, std::move(sizeCallback));
 }
 
 bool FilteringSourceAccessor::pathExists(const CanonPath & path)

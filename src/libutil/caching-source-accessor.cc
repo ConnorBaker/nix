@@ -70,7 +70,7 @@ public:
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
         auto inner = next;
-        inner->readFile(path, sink, sizeCallback);
+        inner->readFile(path, sink, std::move(sizeCallback));
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override

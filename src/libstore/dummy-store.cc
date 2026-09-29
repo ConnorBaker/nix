@@ -93,7 +93,7 @@ public:
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
         return callWithAccessorForPath(path, [&](SourceAccessor & accessor, const CanonPath & path) {
-            return accessor.readFile(path, sink, sizeCallback);
+            return accessor.readFile(path, sink, std::move(sizeCallback));
         });
     }
 

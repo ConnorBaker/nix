@@ -12,7 +12,8 @@
 #include "nix/util/sync.hh"
 #include "nix/util/util.hh"
 
-#include <set>
+#include <algorithm>
+#include <unordered_set>
 
 #include <atomic>
 #include <cstring>
@@ -35,9 +36,9 @@ void GitObjectStore::createDirectories() const
     createDirs(dir / "tmp");
 }
 
-Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path)
+Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize)
 {
-    merkle::ObjectHasher hasher{"blob", static_cast<uint64_t>(lstat(path).st_size)};
+    merkle::ObjectHasher hasher{"blob", observedSize};
     readFile(path, hasher);
     return hasher.finish();
 }
@@ -49,12 +50,8 @@ std::string GitObjectStore::idString(const Hash & id)
 
 std::filesystem::path GitObjectStore::tempPath(std::string_view kind) const
 {
-    /* The second is in the name because a temporary that is a hard link to
-       a blob (`place`) shares the blob's inode, whose change time every
-       later link of the blob advances: by the inode such a leftover would
-       never be an hour old, and would keep the blob's link count above one
-       for ever.  The counter starts at a random value, as `makeTempPath`'s
-       does, against names an earlier process left. */
+    /* Timestamp names by creation time: hard-linking advances inode ctime,
+       so ctime cannot age these pins. A random counter seed avoids old names. */
     static std::atomic<uint32_t> counter(std::random_device{}());
     return dir / "tmp"
            / fmt("%s-%d-%d-%d", kind, static_cast<long long>(time(nullptr)), getpid(), counter.fetch_add(1));
@@ -97,11 +94,11 @@ struct GitObjectStore::Hold::Pending
        equality uses length and bytes, without an algorithm tag. */
     struct Key
     {
-        const Hash & id;
+        std::string_view id;
         merkle::Mode mode;
 
         Key(const Hash & id, merkle::Mode mode) noexcept
-            : id(id)
+            : id(reinterpret_cast<const char *>(id.hash), id.hashSize)
             , mode(mode)
         {
         }
@@ -115,22 +112,27 @@ struct GitObjectStore::Hold::Pending
             : Key(object.entry.hash, object.entry.mode)
         {
         }
+
+        auto operator<=>(const Key &) const = default;
     };
 
-    struct KeyLess
+    struct KeyHash
     {
         using is_transparent = void;
 
-        bool operator()(Key a, Key b) const noexcept
+        size_t operator()(Key key) const noexcept
         {
-            auto c = std::string_view{reinterpret_cast<const char *>(a.id.hash), a.id.hashSize}.compare(
-                {reinterpret_cast<const char *>(b.id.hash), b.id.hashSize});
-            return c != 0 ? c < 0 : a.mode < b.mode;
+            return std::hash<std::string_view>{}(key.id) ^ static_cast<size_t>(key.mode);
         }
     };
 
-    Sync<std::set<Row, KeyLess>> regular;
-    Sync<std::set<Auxiliary, KeyLess>> auxiliary;
+    struct KeyEqual : std::equal_to<Key>
+    {
+        using is_transparent = void;
+    };
+
+    Sync<std::unordered_set<Row, KeyHash, KeyEqual>> regular;
+    Sync<std::unordered_set<Auxiliary, KeyHash, KeyEqual>> auxiliary;
     std::filesystem::path root;
 };
 
@@ -177,6 +179,8 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     static_assert(std::is_trivially_move_constructible_v<Hash>);
     static_assert(std::is_nothrow_move_constructible_v<Row>);
     static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
+    static_assert(std::is_nothrow_move_assignable_v<Row>);
+    static_assert(std::is_nothrow_move_assignable_v<Auxiliary>);
     auto regular = pending->regular.lock();
     auto auxiliary = pending->auxiliary.lock();
     Projection projection;
@@ -190,6 +194,8 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
     for (const auto & object : *auxiliary)
         projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
     auxiliary->clear();
+    std::sort(projection.regular.begin(), projection.regular.end(), std::less<Pending::Key>{});
+    std::sort(projection.auxiliary.begin(), projection.auxiliary.end(), std::less<Pending::Key>{});
     return projection;
 }
 
@@ -203,11 +209,8 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
-/* The holder's name under the ingestion's root, made on the worker that wrote
-   the file.  With no root set -- a caller that drives the object store
-   directly, as the unit tests do -- the absolute path is kept instead and the
-   registration relativises it; a name under a root never begins with a
-   separator, so the two are told apart. */
+/* Names are relative to the ingestion root, empty for the root itself.
+   Direct object-store callers without a root retain absolute names. */
 static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
 {
     auto & r = root.native();
@@ -381,11 +384,8 @@ GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repa
         if (counters)
             counters->blobsStatted++;
         auto st = maybeLstatOf(row->file);
-        /* Each row is one ingestion's candidate, not the whole set of
-           holders. Validate that candidate, forgetting only the row read.
-           The candidate cursor also advances in a read-only store, whose
-           forget operation deliberately does nothing. */
-        if (st && validHolderMetadata(*row, executable, *st) && (!repair || blobIdOfFile(row->file) == id)) {
+        /* Forget only this candidate. Advance even when read-only cleanup is a no-op. */
+        if (st && validHolderMetadata(*row, executable, *st) && (!repair || blobIdOfFile(row->file, row->size) == id)) {
             return row;
         }
         if (index->forget)
@@ -518,7 +518,8 @@ bool GitObjectStore::link(
                 throw SysError("getting status of %s", PathFmt(where));
             /* The linked inode is the witness. A repaired replacement at
                the donor's pathname must not inherit the old row's hash. */
-            if (!validHolderMetadata(*holder, executable, acquired) || (repair && blobIdOfFile(where) != id)) {
+            if (!validHolderMetadata(*holder, executable, acquired)
+                || (repair && blobIdOfFile(where, holder->size) != id)) {
                 forget();
                 continue;
             }
@@ -564,10 +565,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
 #ifdef _WIN32
     return std::nullopt;
 #else
-    /* The file is written and canonicalised.  Either the store already has
-       a holder for its blob -- then this file is replaced by a link to it,
-       exactly as before -- or it becomes the holder itself, which costs a
-       row and no filesystem call at all. */
+    /* The destination is complete and canonical. Reuse a holder or claim it. */
     auto after = before;
     auto replaceBy = [&](const std::string & file, auto && accept) {
         auto placed = linkOver(*this, file, dirFd, name, where, after, std::forward<decltype(accept)>(accept));
@@ -600,7 +598,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
                 continue;
             if (replaceBy(holder->file, [&](const auto & pin, const std::optional<PosixStat> & acquired) {
                     if (acquired && validHolderMetadata(*holder, executable, *acquired)
-                        && (!repair || blobIdOfFile(pin) == id))
+                        && (!repair || blobIdOfFile(pin, holder->size) == id))
                         return true;
                     if (index->forget)
                         index->forget(id, executable, *holder);
@@ -612,10 +610,8 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
         }
     }
 
-    /* Record this ingestion's own holder on a miss and on registered
-       reuse: the donor may be collected before this path registers.
-       The row is pending until registration. A full directory index
-       cannot be met here, there being no directory to fill (K11). */
+    /* Keep our own witness on both miss and reuse: GC may remove the donor
+       before registration. The row remains private until publication. */
     if (entered && failPlaceWithNoSpace && failPlaceWithNoSpace(where)) {
         printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
         return std::nullopt;
@@ -646,19 +642,12 @@ void GitObjectStore::enterWritten(
     bool looked)
 {
 #ifndef _WIN32
-    /* The file was written because the store had no holder for its blob.
-       It becomes the holder: one `fstatat` for its inode and a pending
-       row, and no `linkat` on a miss. Publication into the pending set is
-       atomic: an earlier lookup miss cannot rule out another worker
-       completing the same blob before this file was written. */
+    /* Claim atomically: another worker may finish this blob after our lookup miss. */
     PosixStat st;
     if (fstatat(dirFd, name.rel_c_str(), &st, AT_SYMLINK_NOFOLLOW) == -1)
         throw SysError("getting status of %1%", PathFmt(where));
-    /* A file streamed past the buffer was written without a look, so the
-       decision is taken here and it is `place`'s: a holder the store
-       already has is linked over this file.  A file written after `link`
-       missed needs no second look (`looked`), which is what keeps the
-       first entry of a fresh tree at one index probe a file. */
+    /* Streamed files have not probed the index. Buffered misses need only
+       the pending-row claim; repeating their registered lookup is unnecessary. */
     if (!looked) {
         place(id, executable, dirFd, name, where, st, repair, hold);
         return;
@@ -728,10 +717,7 @@ GitObjectStore::BlobInodes GitObjectStore::blobInodes() const
 {
     BlobInodes inodes;
 #ifndef _WIN32
-    /* The index, not a walk of `.objects/blobs`: one query over the rows
-       the store wrote, which is both cheaper and more complete than the
-       walk it replaces (design.md section 5). Auxiliary values have no
-       regular-file inode: `known` answers regular files alone. */
+    /* Only regular holders have inode hints; auxiliary values have none. */
     if (index && index->inodes)
         index->inodes(inodes);
 #endif

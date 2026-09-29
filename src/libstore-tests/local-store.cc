@@ -2885,7 +2885,7 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
            interrupted optimisation. A remaining witness must still be sound. */
         if (auto holder = store->objects.holderOrForget(id, executable, NoRepair)) {
             EXPECT_TRUE(GitObjectStore::validHolderMetadata(*holder, executable, st(holder->file)));
-            EXPECT_EQ(GitObjectStore::blobIdOfFile(holder->file), id);
+            EXPECT_EQ(GitObjectStore::blobIdOfFile(holder->file, holder->size), id);
         }
         OptimiseStats retried;
         ASSERT_NO_THROW(store->optimiseStore(retried));

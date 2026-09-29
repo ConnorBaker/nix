@@ -13,15 +13,12 @@ namespace nix::fetchers {
 template<typename Consumer>
 static decltype(auto) withAttr(const Attr & attr, Consumer && consume)
 {
-    auto lazy = std::visit(
+    return std::visit(
         overloaded{
-            [](const LazyAttr & lazy) { return &lazy; },
-            [](const auto &) -> const LazyAttr * { return nullptr; },
+            [&](const LazyAttr & lazy) -> decltype(auto) { return consume(lazy->compute()); },
+            [&](const auto &) -> decltype(auto) { return consume(attr); },
         },
         attr);
-    if (lazy)
-        return consume((*lazy)->compute());
-    return consume(attr);
 }
 
 ResolvedAttr forceAttr(const Attr & attr)
@@ -157,24 +154,12 @@ struct AttrsDecoder
      */
     uint64_t decimal(char terminator)
     {
-        uint64_t value = 0;
-        size_t digits = 0;
-        for (;;) {
-            char c = byte();
-            if (c == terminator)
-                break;
-            if (c < '0' || c > '9')
-                fail("expected a digit");
-            if (digits == 1 && value == 0)
-                fail("a number with a leading zero");
-            uint64_t digit = c - '0';
-            if (value > (std::numeric_limits<uint64_t>::max() - digit) / 10)
-                fail("a number too large");
-            value = value * 10 + digit;
-            digits++;
-        }
-        if (digits == 0)
-            fail("expected a number");
+        auto number = rest.substr(0, rest.starts_with('0') ? 1 : std::numeric_limits<uint64_t>::digits10 + 1);
+        uint64_t value;
+        auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), value);
+        if (ec != std::errc{} || end == rest.data() + rest.size() || *end != terminator)
+            fail("expected a canonical decimal number");
+        rest.remove_prefix(end - rest.data() + 1);
         return value;
     }
 

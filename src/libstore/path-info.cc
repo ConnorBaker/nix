@@ -14,18 +14,9 @@ void ValidPathInfo::anchor() {}
 
 PathInfoJsonFormat parsePathInfoJsonFormat(uint64_t version)
 {
-    switch (version) {
-    case 1:
-        return PathInfoJsonFormat::V1;
-    case 2:
-        return PathInfoJsonFormat::V2;
-    case 3:
-        return PathInfoJsonFormat::V3;
-    case 4:
-        return PathInfoJsonFormat::V4;
-    default:
-        throw Error("unsupported path info JSON format version %d; supported versions are 1, 2, 3 and 4", version);
-    }
+    if (version >= 1 && version <= 4)
+        return static_cast<PathInfoJsonFormat>(version);
+    throw Error("unsupported path info JSON format version %d; supported versions are 1, 2, 3 and 4", version);
 }
 
 UnkeyedValidPathInfo::UnkeyedValidPathInfo(const StoreDirConfig & store, std::optional<ObjectHash> objectHash)

@@ -223,6 +223,38 @@ TEST_F(GitUtilsTest, sink_basic)
     ASSERT_THAT(accessor, testing::HasContents(CanonPath("links/foo"), "hello world"));
 }
 
+/* A bare blob has one root file. Reads and metadata have the same domain. */
+TEST_F(GitUtilsTest, blobRootHasNoChildren)
+{
+    for (auto algorithm : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+        SCOPED_TRACE(printHashAlgo(algorithm));
+        auto path = tmpDir / printHashAlgo(algorithm);
+        GitRepo::Options options{.create = true, .bare = true, .oidType = algorithm};
+        auto repo = GitRepo::openRepo(path, options);
+        auto pool = GitRepoPool::create(path, options);
+        auto blob = writeString(*pool, "root bytes");
+        pool->flush();
+        auto accessor = repo->getAccessor(blob.hash, {}, "blob");
+
+        EXPECT_TRUE(accessor->pathExists(CanonPath::root));
+        EXPECT_EQ(accessor->lstat(CanonPath::root).type, SourceAccessor::tRegular);
+        EXPECT_EQ(accessor->readFile(CanonPath::root), "root bytes");
+        EXPECT_THROW(accessor->readLink(CanonPath::root), Error);
+        EXPECT_THROW(accessor->readDirectory(CanonPath::root), Error);
+        /* Direct children and paths with a nonroot parent exercise both
+           lookup routes; neither can exist below a regular-file root. */
+        for (const auto & path : {CanonPath("child"), CanonPath("child/grandchild")}) {
+            SCOPED_TRACE(path.abs());
+            EXPECT_FALSE(accessor->pathExists(path));
+            EXPECT_FALSE(accessor->maybeLstat(path));
+            EXPECT_THROW(accessor->readFile(path), Error);
+            EXPECT_THROW(accessor->readLink(path), Error);
+            EXPECT_THROW(accessor->readDirectory(path), Error);
+        }
+        EXPECT_EQ(accessor->readFile(CanonPath::root), "root bytes");
+    }
+}
+
 TEST_F(GitUtilsTest, namesFollowTheTreeObjects)
 {
     auto repo = openRepo();

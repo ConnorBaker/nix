@@ -219,7 +219,7 @@ void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCal
 
 void ObjectHashSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
-    auto visit = [&] { return visitor.regular(path, func); };
+    auto visit = [&] { return visitor.regular(path, std::move(func)); };
     deliver(path, std::ref(visit));
 }
 

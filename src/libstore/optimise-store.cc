@@ -51,16 +51,9 @@ static bool linkableOnThisSystem(const std::filesystem::path &)
 }
 #endif
 
-/* Whether the store places the regular file already on disk at `where`
-   -- records a holder or shares an existing one -- or leaves it as written, and why:
-   the exceptions of 01 §9.10 law 3 that can be read off the file.  Decided
-   here alone: the on-disk walk skips such a file, and the
-   verifier expects no holder for it. (The restore route asks
-   `linkableOnThisSystem` before the file exists; its files are never
-   writable, having been canonicalised.)  Law 3's fourth exception -- a
-   file `place` could not enter for `ENOSPC` on a full directory index, or
-   `EMLINK` -- leaves no mark on the file, so it is not decided here: the
-   verifier reports such a file as missing and `--repair` tries again. */
+/* Physical eligibility shared by entry and verification. Writable and
+   platform-forbidden files stay unshared. ENOSPC/EMLINK leave no metadata
+   marker, so verification reports a missing holder and repair retries. */
 enum struct Placement { Placed, LeftWritable, NotLinkable };
 
 static Placement placementOf(const std::filesystem::path & where)
@@ -180,10 +173,7 @@ static void placeRegularFile(
 
 namespace {
 
-/* The object store's side of the hasher for what is not a regular file:
-   each directory's tree and each symlink's target staged as hashed.
-   Regular files are the drivers' business (below): placed after they are
-   on disk, or linked instead of written. */
+/* Stage hashed directory bodies and symlink targets; drivers place regular files. */
 struct ObjectStoreVisitor : HashingVisitor
 {
     GitObjectStore & objects;
@@ -218,11 +208,8 @@ struct ObjectStoreVisitor : HashingVisitor
     }
 };
 
-/* The visitor for a store path already on disk at `root`: a regular file
-   whose inode is a current holder's (`inodes` supplies hints) is not read; every other
-   is hashed and placed, its read-only directory made writable around
-   `place` and a writable file left alone as suspicious; `stats` and `act`,
-   when given, count the files replaced by the store's. */
+/* Enter a materialised tree. Inode hints skip reads only with a current
+   physical witness; all other eligible files are hashed and placed. */
 struct EnterVisitor : ObjectStoreVisitor
 {
     LocalStore & store;
@@ -329,12 +316,8 @@ struct EnterVisitor : ObjectStoreVisitor
     }
 };
 
-/* The verifier's visitor (`LocalStore::verifyObjects`): law 4 of 01 §9.10
-   for one path as it stands on disk, with law 3's exceptions -- every
-   tree on the way and every symlink's target blob must be present, and
-   the blob of every regular file the store places (`placementOf`).  The
-   paths are the on-disk ones, so a case-hacked name is looked at where it
-   is; the entry names are the tree's own, as the hasher's are. */
+/* Check physical hashes and availability of every eligible reached object.
+   Diagnostics use physical spellings, including case-hacked names. */
 struct VerifyVisitor : HashingVisitor
 {
     GitObjectStore & objects;
@@ -349,10 +332,8 @@ struct VerifyVisitor : HashingVisitor
 
     void expect(const merkle::TreeEntry & entry, const std::filesystem::path & path)
     {
-        /* The provider returns owned bytes checked against this typed hash.
-           Older read-only stores may have no auxiliary reader. The physical
-           path is still hashed; only auxiliary availability is then skipped.
-           Report the store node whose metadata is missing, not a cache file. */
+        /* Old read-only stores may lack the auxiliary provider. Still hash their
+           physical trees; report missing metadata by its store-node path. */
         if (objects.index && objects.index->readAuxiliary && !objects.readAuxiliary(entry))
             missing.push_back(path);
     }
@@ -471,23 +452,16 @@ static BufferedRegularFile readBufferedRegular(
     return {std::move(node), std::move(buffer), std::move(writer)};
 }
 
-/* The restore route's visitor (01 §9.10, "Ingestion writes only what the
-   store lacks"; `08` §1.6): a regular file is held up to
-   `restoreBufferLimit` and, with its entry in hand, linked from the store's
-   file -- never written, so `regularFileCreated` does not fire for it --
-   or written and placed; above the limit it is streamed and placed.  The
-   children are created inside `children`, through the sink the
-   `RestoreSink`'s directory callback handed back, so that its
-   `directoryDone` canonicalises the directory when the scope closes. */
+/* Buffer regular files up to restoreBufferLimit, then link or write;
+   larger files stream before placement. Linked files fire no write hook.
+   Directory scopes retain child sinks and canonicalise before staging the body. */
 struct LinkingVisitor : ObjectStoreVisitor
 {
     RepairFlag repair;
     Sink * rootContents;
 
-    /* Only the current sink and optional physical child name are needed.
-       Their owners enclose every accepted visit, including pool joins.
-       C++ scopes restore the previous pair for recursion, helped jobs and
-       reentrant visitors; each thread has its own current pair. */
+    /* Frames borrow from scopes that outlive all joined visits. Thread-local
+       save/restore covers recursion, helped jobs and reentrant visitors. */
     struct Frame
     {
         RestoreSink * sink = nullptr;
@@ -677,10 +651,8 @@ struct LinkingVisitor : ObjectStoreVisitor
 struct ObjectUnavailable
 {};
 
-/* A partial object store viewed as a tree. A directory scope owns its
-   verified table around every child visit; immediate children therefore
-   need no ancestor lookup or second body read. Explicit deeper accessor
-   queries resolve normally without retaining a mutable lookup cache. */
+/* A directory scope owns its verified table through all child visits.
+   Immediate children borrow it; deeper queries resolve from the root. */
 struct ObjectAccessor final : SourceAccessor
 {
     void anchor() override {}
@@ -880,12 +852,8 @@ struct CachedVisitor : LinkingVisitor
     }
 };
 
-/* The accessor copy (01 §9.10; 08 §1.6). A node either makes a
-   verified immutable file or named subtree from existing objects, or
-   descends through LinkingVisitor. The namer is consulted for the root
-   and directories only; raw unnamed files are read and hashed. Directory
-   entries carry tree names, while the child scope borrows its case-hacked
-   name for destination placement. */
+/* Reuse verified immutable files or named root/directory subtrees; other
+   nodes descend through LinkingVisitor. Child scopes retain physical names. */
 struct MaterialisingVisitor : LinkingVisitor
 {
     LocalStore::TreeNamer namer;
@@ -929,10 +897,8 @@ struct MaterialisingVisitor : LinkingVisitor
     std::optional<HashedNode>
     tryKnown(SourceAccessor & accessor, const CanonPath & from, const CanonPath & path, const SourceAccessor::Stat & st)
     {
-        /* A verified immutable blob already has an identity before any
-           bytes are read. Probe the holder first and stream a miss directly
-           into its destination, without buffering and hashing it again.
-           Mutable worktrees supply no such identity; repair ignores it. */
+        /* Use immutable identities to link hits and stream misses without hashing.
+           Mutable worktrees provide none; repair bypasses this shortcut. */
         if (!repair && st.type == SourceAccessor::tRegular)
             if (auto entry = accessor.getKnownEntry(from);
                 entry && entry->hash.algo == merkle::hashAlgo
@@ -1083,13 +1049,8 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
 #else
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = dst;
-    /* The copy's subdirectories go on a small pool (`hashDirectory`): the
-       machine's width, capped to bound filesystem and index contention.
-       Git repository reads remain serialized by their accessor; filesystem
-       scopes permit independent reads.  Not a setting: what the copy makes does not
-       depend on the count (01 §10), so there is nothing for a user to
-       decide.  `copyWorkersForTest` is the tests' seam and is zero
-       everywhere else; one thread is the sequential walk exactly. */
+    /* Worker count affects scheduling only. Accessor, filter and callback
+       permissions gate concurrency; zero selects the default bounded width. */
     size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
     /* Callbacks, filter and source must all permit reordered observations.
        The AllPaths type survives copies of defaultPathFilter. */
@@ -1148,10 +1109,8 @@ StorePath LocalStore::materialise(
     if (!materialisesFromObjects())
         throw Error("this store cannot materialise a path from its object store");
 
-    /* Name the bytes observed by this copy. An unnamed regular root can
-       remain buffered until its destination is known to need writing;
-       every other copy uses the existing locked temporary. Both register
-       the same Git address, root entry and NAR size through one path. */
+    /* Defer buffered regular-root writes until validity is known. Other
+       roots use a locked temporary; both publish the same Git description. */
     const LocalSettings & localSettings = config->getLocalSettings();
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
 
@@ -1266,11 +1225,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
 #ifdef _WIN32
     return {};
 #else
-    /* Only overlapping misses need this walk. Publication reserves the
-       database writer before selecting registered donors; speculative-copy
-       completion supplies stable names already owned by its ingestion.
-       Pin first, then validate the pinned inode and its bytes. Nothing here
-       calls the index, takes a temp root, or acquires the auxiliary-object lock. */
+    /* Publication holds the database writer; speculative completion owns its names.
+       Pin and verify without index calls, temp roots or auxiliary-object locks. */
     struct Winner
     {
         const GitObjectStore::Hold::Row & row;
@@ -1303,7 +1259,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 auto current = lstat(own);
                 if (!GitObjectStore::validHolderMetadata(candidate, row.executable, current))
                     throw Error("ingestion holder %s changed before publication", PathFmt(own));
-                auto observed = GitObjectStore::blobIdOfFile(own);
+                auto observed = GitObjectStore::blobIdOfFile(own, candidate.size);
                 if (observed != row.id)
                     throw Error(
                         "cannot publish ingestion holder %s: expected blob %s, observed %s",
@@ -1343,7 +1299,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             AutoDelete cleanup(pin, false);
             auto pinned = lstat(pin);
             if (!GitObjectStore::validHolderMetadata(candidate, row.executable, pinned)
-                || GitObjectStore::blobIdOfFile(pin) != row.id) {
+                || GitObjectStore::blobIdOfFile(pin, candidate.size) != row.id) {
                 result.rejected.emplace_back(row, candidate);
                 continue;
             }
@@ -1363,10 +1319,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     if (winners.empty())
         return result;
 
-    /* Enumerate physical aliases, not names reconstructed from the Merkle
-       tree. Entered paths can contain noncanonical case-hack suffixes, and
-       (device, inode) already proves which regular files are aliases. The
-       final path is authoritative: hold.root() can name a moved temporary. */
+    /* Walk physical aliases: case-hack spellings need not be canonical.
+       Use the final root; hold.root() may still name a moved temporary. */
     auto walk = [&](auto && self, const std::filesystem::path & where, size_t depth) -> void {
         checkInterrupt();
         auto st = lstat(where);
@@ -1473,12 +1427,8 @@ ObjectHashSink::Result LocalStore::enterIntoObjects(
     OptimiseStats * stats,
     GitObjectStore::BlobInodes * blobInodes)
 {
-    /* The on-disk walk is an ingestion too -- the flat add, the `EXDEV`
-       copy, the after-build walk, `nix-store --optimise`'s re-entry -- and it
-       records the same rows, so it opens the same ingestion: the root is the
-       path it walks, and the caller names it when the path is registered
-       (`endIngestion`).  Each call opens its own, so a hold shared by several
-       outputs does not attribute one output's holders to another's path. */
+    /* Start a fresh projection per path, including reused multioutput holds.
+       The caller supplies its logical name at publication. */
     beginIngestion(hold, path);
     EnterVisitor enter{*this, hold, path, repair, blobInodes, stats, act};
     auto result = objectHashOf(*makeFSSourceAccessor(path), CanonPath::root, defaultPathFilter, enter);
@@ -1508,15 +1458,9 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         if (!row)
             continue; /* path was GC'ed, probably */
         Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
-        /* A row an older Nix wrote (01 §9.11, "The database") is migrated
-           first, by the walk `nix store migrate` makes: the NAR hash it
-           asserts is checked on the tee before its column is written
-           (`walkOldRow`; 01 §10, *a schema-10 row's migration checks the NAR
-           hash the row asserts*), so a path modified since is
-           neither blessed nor entered -- it is reported as the verifier
-           reports it and left to `--verify --check-contents --repair`.  Such
-           a path is read twice here, once to migrate and once to enter; a
-           store this Nix wrote has no such row. */
+        /* Migrate legacy rows before entry, checking their asserted NAR hash.
+           Modified paths remain unentered. Legacy paths need this second walk;
+           current rows already carry the object hash. */
         if (!row->objectHash) {
             ValidPathInfo old(*row);
             std::optional<std::pair<Hash, Hash>> narHashes;
@@ -1542,10 +1486,8 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             }
             stats.rowsMigrated++;
         }
-        /* Every path is walked; an inode hint that still has a matching
-           canonical holder avoids reading that regular file's contents.
-           Its auxiliary values stay owned by the hold until the complete
-           ingestion projection is published below. */
+        /* Current inode witnesses skip regular reads. Publish the complete
+           regular and auxiliary projection after traversal joins. */
         auto hold = objects.hold();
         enterIntoObjects(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
         /* `nix-store --optimise` is what re-establishes an index a

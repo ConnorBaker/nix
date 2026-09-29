@@ -104,8 +104,7 @@ bool LocalStoreConfig::getDefaultRequireSigs()
     return settings.requireSigs;
 }
 
-/* The object store's index keys the blob by its identifier's 32 bytes, not by
-   their hexadecimal encoding: this halves the identifier bytes. */
+/* Decode the index's raw SHA-256 key. */
 static Hash blobIdOf(std::string_view bytes)
 {
     Hash id(GitObjectStore::hashAlgo);
@@ -479,11 +478,8 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
         /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
            got its path, or whose path is no longer valid, names no holder. */
-        /* An ingestion still in flight -- no path yet, its hold directory still
-           under `tmp/` -- is not stale: its rows must survive a collection running
-           beside it as its objects do (`08` K16).  The sweep has already removed
-           the holds of dead ingestions before this runs, so a hold that is still
-           there is a live one.  `?` is the object store's `tmp` directory. */
+        /* Dead-lease cleanup precedes this query. sweepStaleBlobRows checks each
+           returned hold path before removing its projection. */
         state->stmts->QueryStaleIngestions.create(
             state->db,
             "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
@@ -525,9 +521,7 @@ LocalStore::LocalStore(ref<const Config> config)
             )");
     }
 
-    /* The object store's index of
-       blob to holder.  Installed here, after the statements exist; a bare
-       `GitObjectStore` (a test's) has none and misses every lookup. */
+    /* Install the holder provider after its statements exist; bare stores miss. */
     /* The ablation, test-only (`local-store.hh`, `BlobRows`). */
     if (auto v = getEnv("_NIX_TEST_HOLDER_NO_ROWS"); v && *v == "1")
         blobRows = BlobRows::NoRows;
@@ -784,10 +778,8 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
         });
         if (!bad(key, candidate))
             continue;
-        /* The transactional recheck cannot delete a sound replacement on an
-           old snapshot: a conflicting writer makes the upgrade busy and
-           retrySQLite repeats the complete read/hash/delete after rollback.
-           Hashing here has no callbacks; diagnostics follow lock release. */
+        /* Recheck under the transaction: a conflicting writer forces rollback
+           and retry. Hashing invokes no callbacks; diagnose after unlocking. */
         if (repair && !config->readOnly)
             retrySQLite<void>([&] {
                 auto state(_state->lock());
@@ -966,12 +958,9 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     });
 }
 
-/* The index's own sweep (schema.sql): a row whose ingestion never got its
-   path -- a copy that crashed or failed between its writes and its
-   registration -- or whose path is no longer valid, names no holder. Removing
-   the ingestion cascades to both projections under the GC lock. `link`
-   covers the window until this runs: it finds no file at the holder's name
-   and forgets the row. */
+/* After dead-lease cleanup, remove stale ingestions under the GC lock;
+   foreign keys cascade both projections. Holder probes reject stale files
+   until this sweep runs. */
 void LocalStore::sweepStaleBlobRows()
 {
     if (config->readOnly)
@@ -1262,12 +1251,8 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 
-    /* Baseline stores have no object cache; current stores have ingestion-owned
-       candidates and auxiliary values. Install the current tables directly and
-       add the missing regular-row ownership constraint in one transaction.
-       Old cache layouts have the same columns, so their eligible rows survive
-       without replaying intermediate development layouts. Orphan candidates
-       can never be holders and are discarded. ValidPaths is never rebuilt. */
+    /* Install ownership and auxiliary tables in one transaction, retaining
+       non-orphan candidates. ValidPaths is not rebuilt. */
     maybeUpgrade(
         "20260928-ingestion-owned-projections",
         "create table if not exists Ingestions ("
@@ -1389,10 +1374,7 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
             "cannot add path '%s' to the Nix store because it claims to be content-addressed but isn't",
             printStorePath(info.path));
 
-    /* The column holds the object hash and nothing else: an info that
-       carries only a NAR hash (an old peer's, an old cache's) is
-       registered by the ingestion that verified it and computed the
-       object hash from its sink, never directly. */
+    /* Legacy NAR-only descriptions must pass ingestion to obtain an object hash. */
     state.stmts->RegisterValidPath.use()
         .apply(printStorePath(info.path))
         .apply(info.requireObjectHash(*this).render())
@@ -1487,16 +1469,9 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
 {
     auto & path = info.path;
 
-    /* One read of the bytes, two hashes: the object hash from the NAR
-       stream (law 2 of 01 section 9.10: the same value the accessor walk
-       gives) and the NAR hash from a tee of it, under the algorithm the row
-       asserts.  A path the collector took meanwhile is reported as
-       invalid, the caller's contract. */
+    /* Hash the same NAR stream for both identities before updating the row. */
     HashSink narSink{info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256};
-    /* Gone under a valid row -- the directory (`requireStoreObjectAccessor`
-       finds none) or a file of it (`ENOENT` in the walk) -- is the state
-       master's `nix-store --verify` finds and removes; a row that is gone
-       is the collector's doing and the caller's `InvalidPath`. */
+    /* Distinguish missing files under a valid row from concurrent collection. */
     auto rowValid = [&] { return isValidPathUncached(path); };
     std::optional<ObjectHashSink::Result> object;
     try {
@@ -1538,26 +1513,17 @@ std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_pt
     if (info->objectHash)
         return info;
 
-    /* A schema-10 row (01 section 9.11, "The database"): its NAR hash
-       stays as `assertedNarHash`; one walk of the path gives the object
-       hash and the NAR size and checks that NAR hash (`walkOldRow`).  No
-       root is taken here: the collector itself queries infos under its
-       exclusive lock (`keep-derivations`), and a root registered then
-       would keep a dead path alive; every other caller holds a root or a
-       shared lock already. */
+    /* Preserve assertedNarHash until migration checks the bytes. Do not add
+       a temp root here: GC calls this while holding its exclusive lock;
+       other callers already hold a root or shared lock. */
     auto migrated = std::make_shared<ValidPathInfo>(*info);
 
     switch (walkOldRow(*migrated)) {
     case OldRowWalk::Migrated:
         return migrated;
     case OldRowWalk::Modified:
-        /* The row as the database has it (01 section 10, *a schema-10 row's
-           migration checks the NAR hash the row asserts*): the
-           query answers, as master's did; `contentMismatch` and
-           `verifyStore --check-contents` find the modification through the
-           NAR hash and `--repair` restores the path, after which the next
-           walk migrates the row.  Writing the walk's object hash here
-           would bless the modified bytes for every later check. */
+        /* Return the unchanged row so verification can report corruption.
+           Recording the observed hash would bless the modified bytes. */
         debug(
             "path '%s' does not hash to the NAR hash its row asserts; row left unmigrated", printStorePath(info->path));
         return info;
@@ -1610,12 +1576,8 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & s
 
     auto info = std::make_shared<ValidPathInfo>(path, UnkeyedValidPathInfo(*this, std::nullopt));
 
-    /* The column: an object hash rendered `git:sha256:<base16>`, or a
-       schema-10 row's NAR hash rendered `sha256:<base16>`, told apart by
-       prefix *before* the old parser runs -- for the `git` prefix
-       `parseHashAlgo` raises `UsageError`, not the `BadHash` caught
-       below.  The old branch keeps its error for a row that parses as
-       neither. */
+    /* Recognise git:sha256 before the legacy parser, whose algorithm error
+       is not BadHash. Preserve the legacy error for other malformed rows. */
     {
         auto hashColumn = useQueryPathInfo.getStr(1);
         if (auto oh = ObjectHash::parse(hashColumn))
@@ -1957,8 +1919,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            before exposing any of their new candidate rows. */
         for (auto & publication : publications)
             if (updated.contains(publication.info->path))
-                coalesceBlobRows(
-                    *state, publication.info->path, *hold, publication.id, publication.projection.regular);
+                coalesceBlobRows(*state, publication.info->path, *hold, publication.id, publication.projection.regular);
         auto publish = [&](const Publication & publication) {
             auto logical = printStorePath(publication.info->path);
             state->stmts->DeletePathIngestions.use().apply(logical).exec();
@@ -1970,9 +1931,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
 
         auto nextPublication = publications.begin();
         for (auto & [path, info] : infos) {
-            auto * publication = nextPublication != publications.end() && nextPublication->info == &info
-                                     ? &*nextPublication++
-                                     : nullptr;
+            auto * publication =
+                nextPublication != publications.end() && nextPublication->info == &info ? &*nextPublication++ : nullptr;
             if (updated.contains(path)) {
                 updatePathInfo(*state, info);
                 continue;
@@ -2047,19 +2007,12 @@ void LocalStore::addToStore(
     CheckSigsFlag checkSigs,
     const std::function<Hash()> & narHash)
 {
-    /* Something must name the content, or nothing below verifies it: the
-       path's own content address, the sender's object hash, or its NAR
-       hash (an old peer's).  An input-addressed path with neither would be
-       registered as whatever arrived. */
+    /* Require at least one asserted identity before accepting the stream. */
     if (!info.ca && !info.objectHash && !info.assertedNarHash)
         throw Error("path info for '%s' carries no content hash to verify", printStorePath(info.path));
 
-    /* Signatures are checked before the stream is read, except a version-1
-       signature on a description that asserts no NAR hash (01 §10, *a
-       version-1 signature is checked on the stream*): that check needs
-       the stream's NAR hash, so it
-       is made after the restore, on the tee below, and the restored path
-       is removed when it fails.  Nothing is registered before the check. */
+    /* A v1 signature without an asserted NAR hash needs the stream first.
+       Check it after restore and remove the path on failure, before registration. */
     bool checkSigsAfterRestore = false;
     if (checkSigs && pathInfoIsUntrusted(info)) {
         if (!info.assertedNarHash && !info.sigs.empty())
@@ -2089,22 +2042,15 @@ void LocalStore::addToStore(
 
                 deletePath(realPath);
 
-                /* Before the restore: a collection completing between the
-                   restore and the registration would sweep the objects the
-                   restore writes, this path's root not yet in the column
-                   (01 section 9.10, "Collection"; section 10, *the ingestion's
-                   `autoGC()` runs before the restore*). */
+                /* Run autoGC before restoring unregistered content. */
                 autoGC();
 
                 /* This publication owns its projection and any physical lease
                    it needs until registration or failure completes. */
                 auto hold = objects.hold();
 
-                /* A NAR hash the sender asserted is verified on a tee of
-                   the stream and never stored (01 section 9.11); the same
-                   tee gives the hash a deferred version-1 signature check
-                   needs (SHA-256, the algorithm of every version-1
-                   fingerprint made by a Nix that signs). */
+                /* One tee checks the asserted NAR hash and any deferred v1 signature;
+                   v1 fingerprints use SHA-256. */
                 std::optional<HashSink> narHashSink;
                 std::optional<TeeSource> teeSource;
                 Source * restoreSource = &source;
@@ -2113,11 +2059,8 @@ void LocalStore::addToStore(
                     teeSource.emplace(source, *narHashSink);
                     restoreSource = &*teeSource;
                 }
-                /* Verify the content address on the bytes already being
-                   consumed. parseDump accepts only canonical NARs (tag
-                   order, sorted entries, zero padding), so its stream is
-                   also the NAR the restored tree would dump. Flat/text
-                   addresses see only the root regular file's contents. */
+                /* parseDump admits canonical NAR bytes. NAR addresses hash that stream;
+                   Flat/Text addresses hash only the regular root contents. */
                 std::optional<MaskedHashSink> caSink;
                 std::optional<TeeSource> caSource;
                 Sink * rootContents = nullptr;
@@ -2165,15 +2108,8 @@ void LocalStore::addToStore(
                         case FileIngestionMethod::NixArchive:
                             return caSink->finish().hash;
                         case FileIngestionMethod::Git:
-                            /* The sink's root is this identifier.  The SHA-1
-                               form an older Nix made cannot be checked here
-                               and is refused, the restored bytes removed as
-                               the signature check below removes them; the
-                               blobs and trees the restore entered stay in
-                               `.objects` until the next whole-store
-                               collection sweeps them (01 §10, *a version-1
-                               signature is checked on the stream*: the same
-                               cost as the signature refusal's). */
+                            /* Git content addresses require SHA-256. Remove rejected imports
+                               before registration, as for a deferred signature failure. */
                             if (specified.hash.algo != merkle::hashAlgo) {
                                 deletePath(realPath);
                                 throw Error(
@@ -2417,37 +2353,25 @@ StorePath LocalStore::addToStoreFromDump(
     auto canonicalisingRestoreHooks =
         makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
-    /* The ingestion's hold on the objects it writes, made before its first
-       write and released after the registration below, against a
-       collection running meanwhile (`GitObjectStore::Hold`; `08` K16).
-       Made at the restore, on either route, so that an add whose path is
-       valid already makes none. */
+    /* Own pending objects from restoration through registration. Deferred
+       validity hits never need a hold. */
     std::optional<GitObjectStore::Hold> hold;
     auto restore = [&](const std::filesystem::path & path, Source & input) {
+        auto produce = [&](FileSystemObjectSink & sink) {
+            if (dumpMethod == FileSerialisationMethod::NixArchive)
+                parseDump(sink, input);
+            else
+                sink.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
+                    file.preallocateContents(dump.size());
+                    file(dump);
+                });
+        };
         return restoreThroughObjects(
-            path,
-            [&](FileSystemObjectSink & sink) {
-                if (dumpMethod == FileSerialisationMethod::NixArchive)
-                    parseDump(sink, input);
-                else
-                    sink.createRegularFile(CanonPath::root, [&](CreateRegularFileSink & file) {
-                        file.preallocateContents(dump.size());
-                        file(dump);
-                    });
-            },
-            localSettings.fsyncStorePaths,
-            canonicalisingRestoreHooks.get(),
-            *hold,
-            repair);
+            path, std::ref(produce), localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get(), *hold, repair);
     };
 
     if (!inMemoryAndDontNeedRestore) {
-        /* Before the restore, for the reason `addToStore` gives: the spilled
-           restore below writes objects into the store before the path is
-           registered, and whether the path is valid already is known only
-           from the restored tree, so this route pays the free-space check
-           whatever the outcome (01 section 10, *the ingestion's `autoGC()`
-           runs before the restore*). */
+        /* Staging writes before validity is known, so run autoGC first. */
         autoGC();
 
         /* Drain what we pulled so far, and then keep on pulling */
@@ -2584,21 +2508,12 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                 /* Check the content hash (optionally - slow). */
                 printMsg(lvlTalkative, "checking contents of '%s'", printStorePath(i));
 
-                /* The object hash recomputed from the files, the names
-                   unhacked as the serialiser unhacks them, and by the same
-                   walk every object the path reaches that the object store
-                   lacks (law 4 of 01 section 9.10, with law 3's exceptions:
-                   `verifyObjects`). */
+                /* Recompute the physical root and report missing eligible objects. */
                 auto realPath = toRealPath(i);
 
                 if (!info->objectHash) {
-                    /* A schema-10 row the migration left as read: the walk's
-                       NAR hash was not the one the row asserts (`walkOldRow`,
-                       01 section 10, *a schema-10 row's migration checks the
-                       NAR hash the row asserts*).  Master's check, made here
-                       with master's report and remedy: "was modified!", and
-                       under --repair the path is fetched again; the row is
-                       migrated by the next query once the bytes are right. */
+                    /* Migration preserves a mismatching legacy row. Check its asserted
+                       NAR hash and use the existing repair path before attempting migration again. */
                     if (!info->assertedNarHash)
                         throw Error("path '%s' has neither an object hash nor a NAR hash to check", printStorePath(i));
                     HashSink narSink{info->assertedNarHash->algo};
@@ -2646,16 +2561,8 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                         updatePathInfo(*_state->lock(), *info);
                     }
 
-                    /* Law 4 (01 section 9.10): every object the path's hash
-                       reaches is in the object store.  A path that was
-                       never entered (an older Nix wrote it; the shim
-                       migrated its row without entering), or whose objects
-                       a full directory index or an interrupted repair left
-                       missing, is re-entered under --repair by the walk
-                       that enters a built output, and "entered" is said
-                       only once the same check finds nothing missing.  The
-                       hold is the type's demand; no collection runs beside
-                       this verifier, which holds the GC lock shared. */
+                    /* Re-enter missing projections, then verify availability before reporting
+                       repair. The shared GC lock excludes collection during this check. */
                     if (!missing.empty()) {
                         printError(
                             "path '%s' reaches %d objects the object store lacks (first: %s)",

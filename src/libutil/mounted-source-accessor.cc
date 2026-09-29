@@ -44,7 +44,7 @@ public:
             throw NotARegularFile("file '%s' is not a regular file", path.abs());
         if (view.hidden)
             throw FileNotFound("file '%s' does not exist", path.abs());
-        return view.accessor->readFile(view.subpath, sink, sizeCallback);
+        return view.accessor->readFile(view.subpath, sink, std::move(sizeCallback));
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override

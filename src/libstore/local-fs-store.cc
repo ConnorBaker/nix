@@ -131,7 +131,7 @@ public:
     {
         requireStoreObject(path);
         auto inner = accessor;
-        return inner->readFile(path, sink, sizeCallback);
+        return inner->readFile(path, sink, std::move(sizeCallback));
     }
 
     void readDirectoryWithEntries(

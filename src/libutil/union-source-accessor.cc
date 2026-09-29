@@ -112,7 +112,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        requireOwner(path)->readFile(path, sink, sizeCallback);
+        requireOwner(path)->readFile(path, sink, std::move(sizeCallback));
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override

@@ -969,7 +969,7 @@ public:
                     // doing this?
                     auto contents =
                         std::string((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
-                    state->lfsFetch->fetch(contents, path, sink, sizeCallback);
+                    state->lfsFetch->fetch(contents, path, sink, std::move(sizeCallback));
                 } catch (Error & e) {
                     e.addTrace({}, "while smudging git-lfs file '%s'", path);
                     throw;
@@ -986,7 +986,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        return readBlob(path, false, sink, sizeCallback.get_fn());
+        return readBlob(path, false, sink, std::move(sizeCallback).get_fn());
     }
 
     bool pathExists(const CanonPath & path) override
@@ -1246,7 +1246,7 @@ public:
 
     Blob getBlob(State & state, const CanonPath & path, bool expectSymlink)
     {
-        if (!expectSymlink && git_object_type(state.root.get()) == GIT_OBJECT_BLOB)
+        if (path.isRoot() && !expectSymlink && git_object_type(state.root.get()) == GIT_OBJECT_BLOB)
             return dupObject<Blob>((git_blob *) &*state.root);
 
         auto notExpected = [&]() {

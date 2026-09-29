@@ -18,13 +18,13 @@ void copyRecursive(
         std::pair<FileSystemObjectSink &, CanonPath> at(const CanonPath & path)
         {
             auto & [sink, under] = *open;
-            return {*sink, path.isRoot() ? under : under / *path.baseName()};
+            return {*sink, path.isRoot() ? CanonPath(under) : under / *path.baseName()};
         }
 
         std::monostate regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
         {
             auto [sink, p] = at(path);
-            sink.createRegularFile(p, read);
+            sink.createRegularFile(p, std::move(read));
             return {};
         }
 

@@ -42,25 +42,16 @@ Hash::Hash(HashAlgorithm algo, const ExperimentalFeatureSettings & xpSettings)
 
 bool Hash::operator==(const Hash & h2) const noexcept
 {
-    if (hashSize != h2.hashSize)
-        return false;
-    for (unsigned int i = 0; i < hashSize; i++)
-        if (hash[i] != h2.hash[i])
-            return false;
-    return true;
+    return hashSize == h2.hashSize && std::memcmp(hash, h2.hash, hashSize) == 0;
 }
 
 std::strong_ordering Hash::operator<=>(const Hash & h) const noexcept
 {
     if (auto cmp = hashSize <=> h.hashSize; cmp != 0)
         return cmp;
-    for (unsigned int i = 0; i < hashSize; i++) {
-        if (auto cmp = hash[i] <=> h.hash[i]; cmp != 0)
-            return cmp;
-    }
-    if (auto cmp = algo <=> h.algo; cmp != 0)
+    if (auto cmp = std::memcmp(hash, h.hash, hashSize) <=> 0; cmp != 0)
         return cmp;
-    return std::strong_ordering::equivalent;
+    return algo <=> h.algo;
 }
 
 std::string Hash::to_string(HashFormat hashFormat, bool includeAlgo) const
