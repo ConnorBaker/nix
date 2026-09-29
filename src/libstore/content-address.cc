@@ -258,18 +258,11 @@ ContentAddressWithReferences::fromParts(ContentAddressMethod method, const Hash 
     case ContentAddressMethod::Raw::Text:
         if (refs.self)
             throw Error("self-reference not allowed with text hashing");
-        return TextInfo{
-            .hash = hash,
-            .references = std::move(refs.others),
-        };
+        return {std::in_place_type<TextInfo>, hash, std::move(refs.others)};
     case ContentAddressMethod::Raw::Flat:
     case ContentAddressMethod::Raw::NixArchive:
     case ContentAddressMethod::Raw::Git:
-        return FixedOutputInfo{
-            .method = method.getFileIngestionMethod(),
-            .hash = hash,
-            .references = std::move(refs),
-        };
+        return {std::in_place_type<FixedOutputInfo>, method.getFileIngestionMethod(), hash, std::move(refs)};
     default:
         assert(false);
     }
@@ -289,12 +282,7 @@ ContentAddressMethod ContentAddressWithReferences::getMethod() const
 
 Hash ContentAddressWithReferences::getHash() const
 {
-    return std::visit(
-        overloaded{
-            [](const TextInfo & th) { return th.hash; },
-            [](const FixedOutputInfo & fsh) { return fsh.hash; },
-        },
-        raw);
+    return std::visit([](const auto & info) { return info.hash; }, raw);
 }
 
 } // namespace nix

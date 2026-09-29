@@ -113,21 +113,20 @@ void ValidPathInfo::signOverEveryFingerprint(const Store & store, const Signer &
 
 std::optional<ContentAddressWithReferences> ValidPathInfo::contentAddressWithReferences() const
 {
-    if (!ca)
-        return std::nullopt;
-
-    bool isText = ca->method == ContentAddressMethod::Raw::Text;
-    if (isText)
-        assert(references.count(path) == 0);
-    auto refs = references;
-    bool self = !isText && refs.erase(path) != 0;
-    return ContentAddressWithReferences::fromParts(
-        ca->method,
-        ca->hash,
-        {
-            .others = std::move(refs),
-            .self = self,
-        });
+    return ca.transform([&](const ContentAddress & ca) {
+        bool isText = ca.method == ContentAddressMethod::Raw::Text;
+        if (isText)
+            assert(references.count(path) == 0);
+        auto refs = references;
+        bool self = !isText && refs.erase(path) != 0;
+        return ContentAddressWithReferences::fromParts(
+            ca.method,
+            ca.hash,
+            {
+                .others = std::move(refs),
+                .self = self,
+            });
+    });
 }
 
 bool ValidPathInfo::isContentAddressed(const StoreDirConfig & store) const
