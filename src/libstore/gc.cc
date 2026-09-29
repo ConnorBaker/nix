@@ -1070,8 +1070,9 @@ void LocalStore::autoGC(bool sync)
     }
 
 sync:
-    // Wait for the future outside of the state lock.
-    if (sync)
+    // A factory owner joins before delete; other owners must wait here,
+    // before destruction can change the collector's virtual dispatch.
+    if (sync || !std::get_deleter<Deleter>(weak_from_this().lock()))
         future.get();
 #endif
 }

@@ -8722,7 +8722,28 @@ TEST_F(LocalStoreAutoGCTest, overlayDestructionWaitsWhileItsCollectorStillNeedsT
             {"lower-store", lowerReference.render(true)},
             {"upper-layer", (root / "upper").string()},
             {"check-mount", "false"}});
-    auto overlay = std::make_shared<LocalOverlayStore>(ref{overlayConfig});
+    bool destructorEntered = false;
+
+    struct Probe : LocalOverlayStore
+    {
+        bool & entered;
+
+        Probe(ref<const LocalOverlayStoreConfig> config, bool & entered)
+            : Store{*config}
+            , LocalFSStore{*config}
+            , LocalStore{static_cast<ref<const LocalStore::Config>>(config)}
+            , LocalOverlayStore{config}
+            , entered{entered}
+        {
+        }
+
+        ~Probe() override
+        {
+            entered = true;
+        }
+    };
+
+    std::shared_ptr<Probe> overlay{new Probe(ref{overlayConfig}, destructorEntered), LocalStore::Deleter{}};
     LocalStore * raw = overlay.get();
     auto candidate = StorePath::random("overlay-garbage");
     auto where = overlay->toRealPath(candidate);
@@ -8770,12 +8791,14 @@ TEST_F(LocalStoreAutoGCTest, overlayDestructionWaitsWhileItsCollectorStillNeedsT
         void logEI(const ErrorInfo &) noexcept override {}
     } observer;
 
-    bool waited = false, overlayAlive = false;
+    bool waited = false, overlayAlive = false, beforeDestruction = false;
     observer.observe = [&] {
         waited = true;
-        /* This runs on the destructor's thread, with the worker paused.
-           RTTI observes the live subobject without touching old members. */
+        /* This runs on the deleting thread, with the worker paused.
+           Joining in a destructor body is already too late: the most-derived
+           destructor and its virtual-table transition must not have begun. */
         overlayAlive = dynamic_cast<LocalOverlayStore *>(raw) != nullptr;
+        beforeDestruction = !destructorEntered;
         release();
     };
     auto oldLogger = std::exchange(logger, &observer);
@@ -8796,8 +8819,109 @@ TEST_F(LocalStoreAutoGCTest, overlayDestructionWaitsWhileItsCollectorStillNeedsT
         std::rethrow_exception(observer.failure);
     EXPECT_TRUE(waited);
     EXPECT_TRUE(overlayAlive) << "collection must join before the overlay loses its derived lifetime";
+    EXPECT_TRUE(beforeDestruction) << "collection must join before the most-derived destructor begins";
+    EXPECT_TRUE(destructorEntered);
     EXPECT_TRUE(stopped);
     EXPECT_EQ(readFile(where), contents);
+}
+
+TEST_F(LocalStoreAutoGCTest, autoGCReturnRespectsEveryOwnerLifetime)
+{
+    enum class Owner { Unique, Shared, Factory };
+    for (auto owner : {Owner::Unique, Owner::Shared, Owner::Factory})
+        for (bool overlay : {false, true})
+            for (bool sync : {false, true}) {
+                SCOPED_TRACE(fmt("owner=%d overlay=%d sync=%d", static_cast<int>(owner), overlay, sync));
+                auto root = tempStoreDir.path() / fmt("gc-owner-%d-%d-%d", static_cast<int>(owner), overlay, sync);
+                std::unique_ptr<LocalStore> uniqueOwner;
+                std::shared_ptr<LocalStore> sharedOwner;
+                auto own = [&]<typename T>(ref<const typename T::Config> cfg) {
+                    if (owner == Owner::Unique)
+                        uniqueOwner = std::make_unique<T>(cfg);
+                    else if (owner == Owner::Shared)
+                        sharedOwner = std::make_shared<T>(cfg);
+                    else
+                        sharedOwner = cfg->openStore().template dynamic_pointer_cast<LocalStore>();
+                };
+                if (overlay) {
+                    auto lower = config->getReference();
+                    lower.params.insert_or_assign("root", tempStoreDir.path().string());
+                    own.template operator()<LocalOverlayStore>(ref{std::make_shared<LocalOverlayStoreConfig>(
+                        root,
+                        StoreConfig::Params{
+                            {"lower-store", lower.render(true)},
+                            {"upper-layer", (root / "upper").string()},
+                            {"check-mount", "false"}})});
+                } else
+                    own.template operator()<LocalStore>(
+                        ref{std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{})});
+                auto * raw = uniqueOwner ? uniqueOwner.get() : sharedOwner.get();
+                ASSERT_NE(raw, nullptr);
+                auto candidate = StorePath::random("owner-garbage");
+                auto where = raw->toRealPath(candidate);
+                const std::string contents = "unregistered garbage";
+                writeFile(where, contents);
+
+                std::promise<void> pending, resume, returned;
+                auto pendingFuture = pending.get_future();
+                auto resumeFuture = resume.get_future().share();
+                auto returnedFuture = returned.get_future();
+                std::atomic<bool> stopped{false};
+                bool stoppedAtReturn = false, released = false;
+                std::exception_ptr failure;
+                auto release = [&] {
+                    if (!released) {
+                        released = true;
+                        resume.set_value();
+                    }
+                };
+                raw->whileDeletionPending = [&](const StorePath & path) {
+                    if (path != candidate)
+                        throw Error("unexpected garbage in auto-GC ownership test");
+                    pending.set_value();
+                    resumeFuture.wait();
+                    stopped = true;
+                    /* Every cell ends before deletion, sweeping or remounting.
+                       This marker observes protected collector work, not thread
+                       destruction or a maximum duration. */
+                    throw Error("stop collection at the auto-GC ownership boundary");
+                };
+                std::thread caller([&] {
+                    try {
+                        raw->autoGC(sync);
+                        stoppedAtReturn = stopped.load();
+                    } catch (...) {
+                        failure = std::current_exception();
+                    }
+                    returned.set_value();
+                });
+                Finally finish{[&] {
+                    release();
+                    if (caller.joinable())
+                        caller.join();
+                    uniqueOwner.reset();
+                    sharedOwner.reset();
+                }};
+                ASSERT_EQ(pendingFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+                bool asynchronous = owner == Owner::Factory && !sync;
+                if (asynchronous) {
+                    /* Positive evidence of return while the worker is paused;
+                       the timeout only bounds a failed test, not scheduling. */
+                    ASSERT_EQ(returnedFuture.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+                    EXPECT_FALSE(stoppedAtReturn);
+                    EXPECT_FALSE(stopped.load());
+                }
+                release();
+                caller.join();
+                if (failure)
+                    std::rethrow_exception(failure);
+                if (!asynchronous)
+                    EXPECT_TRUE(stoppedAtReturn) << "an unprotected owner or synchronous call must wait";
+                uniqueOwner.reset();
+                sharedOwner.reset();
+                EXPECT_TRUE(stopped.load());
+                EXPECT_EQ(readFile(where), contents);
+            }
 }
 
 TEST_F(LocalStoreAutoGCTest, addToStoresOwnCollectionKeepsItsObjects)

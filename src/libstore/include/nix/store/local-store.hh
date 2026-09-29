@@ -270,6 +270,8 @@ private:
 
     const PublicKeys & getPublicKeys();
 
+    void waitForAutoGC();
+
 public:
 
     /**
@@ -284,6 +286,12 @@ public:
     LocalStore(ref<const Config> params);
 
     ~LocalStore();
+
+    /** Join automatic GC before entering the most-derived destructor. */
+    struct Deleter
+    {
+        void operator()(LocalStore * store) const noexcept;
+    };
 
     /**
      * Implementations of abstract store API methods.
@@ -719,6 +727,8 @@ public:
     /**
      * If free disk space in /nix/store if below minFree, delete
      * garbage until it exceeds maxFree.
+     * Asynchronous return requires shared ownership with Deleter; other
+     * owners wait so no collector can outlive the polymorphic object.
      */
     void autoGC(bool sync = true);
 
@@ -739,9 +749,6 @@ public:
     std::optional<std::string> getVersion() override;
 
 protected:
-
-    /** Join auto-GC before destroying members used by its virtual calls. */
-    void waitForAutoGC();
 
     void verifyPath(
         const StorePath & path,

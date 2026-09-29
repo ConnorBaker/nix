@@ -149,7 +149,7 @@ At every call of one of these kinds, the caller writes the assumption as a comme
 
 **Types as invariants.** Does the token have a user-provided move constructor? Are the members meant to be unreachable `private`, not `protected`? Does the type's constructor do what the type's name promises?
 
-**Destructors and exits.** Does this exit path run destructors — `exec` does not, `_exit` does not? Can the destructor's work fail, and who reports the failure? Is the environment the destructor needs still in place? `LocalOverlayStore` waits for automatic GC before its derived members, including the lower store and remount state, are destroyed. Both its destructor and `LocalStore`'s destructor call `waitForAutoGC`; the base call also protects ordinary local stores and joins only a still-joinable thread.
+**Destructors and exits.** Does this exit path run destructors — `exec` does not, `_exit` does not? Can the destructor's work fail, and who reports the failure? Is the environment the destructor needs still in place? Local-store factories use `LocalStore::Deleter` to join automatic GC before entering any destructor: a destructor body is too late to protect virtual dispatch from its entry-time vptr writes. Other owners wait for collection inside `autoGC`, even when passed `false`; the completion promise follows all virtual store work. The base destructor still joins any remaining worker tail. The owner is identified through the store's own `weak_from_this`, so unrelated aliasing pointers cannot confer asynchronous lifetime.
 
 **Meson.** Is `--suite` combined with names on one line (the intersection runs)? After a dependency change, does `meson configure build | grep pkg_config_path` show the new path?
 

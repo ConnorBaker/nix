@@ -96,7 +96,7 @@ std::filesystem::path LocalBuildStoreConfig::getBuildDir() const
 
 ref<Store> LocalStore::Config::openStore() const
 {
-    return make_ref<LocalStore>(ref{shared_from_this()});
+    return ref{std::shared_ptr<LocalStore>{new LocalStore(ref{shared_from_this()}), LocalStore::Deleter{}}};
 }
 
 bool LocalStoreConfig::getDefaultRequireSigs()
@@ -1032,6 +1032,14 @@ void LocalStore::deleteStorePath(const std::filesystem::path & path, uint64_t & 
             throw;
         }
     }
+}
+
+void LocalStore::Deleter::operator()(LocalStore * store) const noexcept
+{
+    if (!store)
+        return;
+    store->waitForAutoGC();
+    delete store;
 }
 
 void LocalStore::waitForAutoGC()

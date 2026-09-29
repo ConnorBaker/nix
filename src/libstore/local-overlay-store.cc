@@ -24,8 +24,9 @@ std::string LocalOverlayStoreConfig::doc()
 
 ref<Store> LocalOverlayStoreConfig::openStore() const
 {
-    return make_ref<LocalOverlayStore>(
-        ref{std::dynamic_pointer_cast<const LocalOverlayStoreConfig>(shared_from_this())});
+    return ref{std::shared_ptr<LocalOverlayStore>{
+        new LocalOverlayStore(ref{std::dynamic_pointer_cast<const LocalOverlayStoreConfig>(shared_from_this())}),
+        LocalStore::Deleter{}}};
 }
 
 StoreReference LocalOverlayStoreConfig::getReference() const
@@ -78,11 +79,6 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
             throw Error("overlay filesystem %s mounted incorrectly", PathFmt(config->realStoreDir.get()));
         }
     }
-}
-
-LocalOverlayStore::~LocalOverlayStore()
-{
-    waitForAutoGC();
 }
 
 void LocalOverlayStore::registerDrvOutputUnchecked(const Realisation & info)
