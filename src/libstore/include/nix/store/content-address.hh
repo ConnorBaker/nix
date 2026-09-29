@@ -311,7 +311,7 @@ struct ContentAddressWithReferences
      * *partial function* and exceptions will be thrown for invalid
      * combinations.
      */
-    static ContentAddressWithReferences fromParts(ContentAddressMethod method, Hash hash, StoreReferences refs);
+    static ContentAddressWithReferences fromParts(ContentAddressMethod method, const Hash & hash, StoreReferences refs);
 
     ContentAddressMethod getMethod() const;
 

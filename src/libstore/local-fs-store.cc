@@ -112,18 +112,16 @@ public:
                store objects, valid ones if validity is required, and not
                whatever else the directory holds (`.links`, temporary
                directories).  Before this, listing the root threw. */
-            DirEntries res;
             std::optional<StorePathSet> valid;
             if (requireValidPath)
                 /* One query for the whole listing, not one per entry. */
                 valid = store->queryVisibleValidPaths();
-            for (auto & [name, type] : accessor->readDirectory(path)) {
-                auto storePath = maybeGetStoreObjectPath(CanonPath(name));
-                if (!storePath || (valid && !valid->contains(*storePath)))
-                    continue;
-                res.emplace_hint(res.end(), name, type);
-            }
-            return res;
+            auto entries = accessor->readDirectory(path);
+            std::erase_if(entries, [&](const auto & entry) {
+                auto storePath = maybeGetStoreObjectPath(CanonPath(entry.first));
+                return !storePath || (valid && !valid->contains(*storePath));
+            });
+            return entries;
         }
         requireStoreObject(path);
         return accessor->readDirectory(path);

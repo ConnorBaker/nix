@@ -12,9 +12,12 @@ using nlohmann::json;
 
 TEST(PathInfoDeathTest, contentAddressConversionPreservesOwnedData)
 {
+    ExperimentalFeatureSettings mockXpSettings;
+    mockXpSettings.set("experimental-features", "blake3-hashes");
     const StorePath path{"n5wkd9frr45pa74if5gpz9j7mifg27fh-foo"};
     const StorePath other{"g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar"};
     ValidPathInfo info{path, UnkeyedValidPathInfo{"/nix/store", std::nullopt}};
+    info.assertedNarHash = hashString(HashAlgorithm::SHA256, "legacy NAR sentinel");
     info.references = {path, other};
     const auto withoutCa = info;
     EXPECT_FALSE(info.contentAddressWithReferences());
@@ -27,12 +30,16 @@ TEST(PathInfoDeathTest, contentAddressConversionPreservesOwnedData)
              std::pair{Method::NixArchive, FileIngestionMethod::NixArchive},
              std::pair{Method::Git, FileIngestionMethod::Git},
          }) {
-        for (auto algo : {HashAlgorithm::SHA256, HashAlgorithm::SHA1}) {
-            if (algo == HashAlgorithm::SHA1 && method != Method::Git)
-                continue;
+        for (auto algo : {
+                 HashAlgorithm::MD5,
+                 HashAlgorithm::SHA1,
+                 HashAlgorithm::SHA256,
+                 HashAlgorithm::SHA512,
+                 HashAlgorithm::BLAKE3,
+             }) {
             for (bool hasOther : {false, true}) {
                 for (bool hasSelf : {false, true}) {
-                    info.ca = ContentAddress{method, hashString(algo, "content")};
+                    info.ca = ContentAddress{method, hashString(algo, "content", mockXpSettings)};
                     info.references = hasOther ? StorePathSet{other} : StorePathSet{};
                     if (hasSelf)
                         info.references.insert(path);

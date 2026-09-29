@@ -58,6 +58,8 @@ TEST(ContentAddress, sha1GitFormIsReadable)
 
 TEST(ContentAddress, withoutRefsPreservesMethodAndHash)
 {
+    ExperimentalFeatureSettings mockXpSettings;
+    mockXpSettings.set("experimental-features", "blake3-hashes");
     using Method = ContentAddressMethod::Raw;
     for (auto [method, ingestion] : {
              std::pair{Method::Text, FileIngestionMethod::Flat},
@@ -65,10 +67,14 @@ TEST(ContentAddress, withoutRefsPreservesMethodAndHash)
              std::pair{Method::NixArchive, FileIngestionMethod::NixArchive},
              std::pair{Method::Git, FileIngestionMethod::Git},
          }) {
-        for (auto algo : {HashAlgorithm::SHA256, HashAlgorithm::SHA1}) {
-            if (algo == HashAlgorithm::SHA1 && method != Method::Git)
-                continue;
-            ContentAddress ca{method, hashString(algo, "content")};
+        for (auto algo : {
+                 HashAlgorithm::MD5,
+                 HashAlgorithm::SHA1,
+                 HashAlgorithm::SHA256,
+                 HashAlgorithm::SHA512,
+                 HashAlgorithm::BLAKE3,
+             }) {
+            ContentAddress ca{method, hashString(algo, "content", mockXpSettings)};
             SCOPED_TRACE(ca.printMethodAlgo());
             const auto before = ca;
             auto actual = ContentAddressWithReferences::withoutRefs(ca);

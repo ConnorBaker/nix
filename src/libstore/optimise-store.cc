@@ -357,33 +357,23 @@ struct VerifyVisitor : HashingVisitor
             missing.push_back(path);
     }
 
-    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    HashedNode node(
+        SourceAccessor &,
+        const CanonPath &,
+        const CanonPath & path,
+        const SourceAccessor::Stat & st,
+        fun<HashedNode()> descend) override
     {
-        auto node = HashingVisitor::regular(path, std::move(read));
-        if (placementOf(onDisk(root, path)) == Placement::Placed) {
-            /* Law 4 for a regular-file blob: the index knows the identifier
-               with a holder that is still what the row says.  The bytes are
-               under the verifier's own hands -- this very file -- so there
-               is nothing else to check; what the row adds is that the store
-               will not write the blob again (design.md section 2.3). */
-            bool executable = node.entry.mode == merkle::Mode::Executable;
-            if (!objects.holderOrForget(node.entry.hash, executable, NoRepair))
-                missing.push_back(onDisk(root, path));
-        }
-        return node;
-    }
-
-    HashedNode symlink(const CanonPath & path, const std::string & target) override
-    {
-        auto node = HashingVisitor::symlink(path, target);
-        expect(node.entry, onDisk(root, path));
-        return node;
-    }
-
-    HashedNode directory(const CanonPath & path, Children children) override
-    {
-        auto node = HashingVisitor::directory(path, std::move(children));
-        expect(node.entry, onDisk(root, path));
+        auto node = descend();
+        auto where = onDisk(root, path);
+        if (st.type == SourceAccessor::tRegular) {
+            /* The bytes were checked by this walk; regular presence adds
+               a valid holder with the same executable bit. */
+            if (placementOf(where) == Placement::Placed
+                && !objects.holderOrForget(node.entry.hash, node.entry.mode == merkle::Mode::Executable, NoRepair))
+                missing.push_back(std::move(where));
+        } else
+            expect(node.entry, where);
         return node;
     }
 };

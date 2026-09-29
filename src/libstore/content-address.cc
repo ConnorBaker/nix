@@ -252,14 +252,14 @@ ContentAddressWithReferences ContentAddressWithReferences::withoutRefs(const Con
 }
 
 ContentAddressWithReferences
-ContentAddressWithReferences::fromParts(ContentAddressMethod method, Hash hash, StoreReferences refs)
+ContentAddressWithReferences::fromParts(ContentAddressMethod method, const Hash & hash, StoreReferences refs)
 {
     switch (method.raw) {
     case ContentAddressMethod::Raw::Text:
         if (refs.self)
             throw Error("self-reference not allowed with text hashing");
         return TextInfo{
-            .hash = std::move(hash),
+            .hash = hash,
             .references = std::move(refs.others),
         };
     case ContentAddressMethod::Raw::Flat:
@@ -267,7 +267,7 @@ ContentAddressWithReferences::fromParts(ContentAddressMethod method, Hash hash, 
     case ContentAddressMethod::Raw::Git:
         return FixedOutputInfo{
             .method = method.getFileIngestionMethod(),
-            .hash = std::move(hash),
+            .hash = hash,
             .references = std::move(refs),
         };
     default:

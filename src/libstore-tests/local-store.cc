@@ -9857,9 +9857,16 @@ TEST_F(TempLocalStoreTest, overlayAccessorListsLowerVisibleObjectsWithoutClaimin
     std::filesystem::copy_file(store->toRealPath(lowerPath), overlay->toRealPath(lowerPath));
     auto unregistered = StorePath::random("unregistered");
     writeFile(overlay->toRealPath(unregistered), "not registered in either layer");
+    writeFile(overlay->toRealPath(unregistered).parent_path() / ".listing-internal", "not a store object");
     auto entries = view->readDirectory(CanonPath::root);
     ASSERT_EQ(entries.size(), 1u);
     EXPECT_TRUE(entries.contains(lowerPath.to_string()));
+    /* Without the validity restriction, canonical unregistered objects are
+       visible too; internal names are excluded in both views. */
+    auto unchecked = overlay->getFSAccessor(false)->readDirectory(CanonPath::root);
+    ASSERT_EQ(unchecked.size(), 2u);
+    EXPECT_TRUE(unchecked.contains(lowerPath.to_string()));
+    EXPECT_TRUE(unchecked.contains(unregistered.to_string()));
     unsigned calls = 0;
     view->readDirectoryWithEntries(
         CanonPath::root,
