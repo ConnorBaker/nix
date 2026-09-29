@@ -13,12 +13,15 @@ namespace nix::fetchers {
 template<typename Consumer>
 static decltype(auto) withAttr(const Attr & attr, Consumer && consume)
 {
-    return std::visit(
+    auto lazy = std::visit(
         overloaded{
-            [&](const LazyAttr & lazy) -> decltype(auto) { return consume(lazy->compute()); },
-            [&](const auto &) -> decltype(auto) { return consume(attr); },
+            [](const LazyAttr & lazy) { return &lazy; },
+            [](const auto &) -> const LazyAttr * { return nullptr; },
         },
         attr);
+    if (lazy)
+        return consume((*lazy)->compute());
+    return consume(attr);
 }
 
 ResolvedAttr forceAttr(const Attr & attr)
@@ -53,13 +56,13 @@ nlohmann::json attrsToJSON(const Attrs & attrs)
 {
     nlohmann::json json;
     for (auto & attr : attrs)
-        withAttr(attr.second, [&](auto && resolved) {
+        json[attr.first] = withAttr(attr.second, [](auto && resolved) -> nlohmann::json {
             if (auto v = std::get_if<uint64_t>(&resolved))
-                json[attr.first] = *v;
+                return *v;
             else if (auto v = std::get_if<std::string>(&resolved))
-                json[attr.first] = std::move(*v);
+                return std::move(*v);
             else if (auto v = std::get_if<Explicit<bool>>(&resolved))
-                json[attr.first] = v->t;
+                return v->t;
             else
                 unreachable();
         });
@@ -259,9 +262,8 @@ static std::optional<T> maybeGetAttr(const Attrs & attrs, const std::string & na
 }
 
 template<typename T>
-static T getAttr(const Attrs & attrs, const std::string & name)
+static T requireAttr(std::optional<T> value, const std::string & name)
 {
-    auto value = maybeGetAttr<T>(attrs, name);
     if (!value)
         throw Error("input attribute '%s' is missing", name);
     return std::move(*value);
@@ -274,7 +276,7 @@ std::optional<std::string> maybeGetStrAttr(const Attrs & attrs, const std::strin
 
 std::string getStrAttr(const Attrs & attrs, const std::string & name)
 {
-    return getAttr<std::string>(attrs, name);
+    return requireAttr(maybeGetStrAttr(attrs, name), name);
 }
 
 std::optional<uint64_t> maybeGetIntAttr(const Attrs & attrs, const std::string & name)
@@ -284,7 +286,7 @@ std::optional<uint64_t> maybeGetIntAttr(const Attrs & attrs, const std::string &
 
 uint64_t getIntAttr(const Attrs & attrs, const std::string & name)
 {
-    return getAttr<uint64_t>(attrs, name);
+    return requireAttr(maybeGetIntAttr(attrs, name), name);
 }
 
 std::optional<bool> maybeGetBoolAttr(const Attrs & attrs, const std::string & name)
@@ -294,23 +296,23 @@ std::optional<bool> maybeGetBoolAttr(const Attrs & attrs, const std::string & na
 
 bool getBoolAttr(const Attrs & attrs, const std::string & name)
 {
-    return getAttr<Explicit<bool>>(attrs, name).t;
+    return requireAttr(maybeGetBoolAttr(attrs, name), name);
 }
 
 StringMap attrsToQuery(const Attrs & attrs)
 {
     StringMap query;
     for (auto & attr : attrs)
-        withAttr(attr.second, [&](auto && resolved) {
-            if (auto v = std::get_if<uint64_t>(&resolved))
-                query.insert_or_assign(attr.first, fmt("%d", *v));
-            else if (auto v = std::get_if<std::string>(&resolved))
-                query.insert_or_assign(attr.first, std::move(*v));
-            else if (auto v = std::get_if<Explicit<bool>>(&resolved))
-                query.insert_or_assign(attr.first, v->t ? "1" : "0");
-            else
-                unreachable();
-        });
+        query.insert_or_assign(attr.first, withAttr(attr.second, [](auto && resolved) -> std::string {
+                                   if (auto v = std::get_if<uint64_t>(&resolved))
+                                       return fmt("%d", *v);
+                                   else if (auto v = std::get_if<std::string>(&resolved))
+                                       return std::move(*v);
+                                   else if (auto v = std::get_if<Explicit<bool>>(&resolved))
+                                       return v->t ? "1" : "0";
+                                   else
+                                       unreachable();
+                               }));
     return query;
 }
 
