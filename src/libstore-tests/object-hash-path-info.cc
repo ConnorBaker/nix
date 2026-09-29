@@ -12,6 +12,7 @@
 #include <gmock/gmock.h>
 
 #include "nix/store/path-info.hh"
+#include "nix/store/nar-info.hh"
 #include "nix/store/store-dir-config.hh"
 #include "nix/util/object-hash.hh"
 #include "nix/util/signature/local-keys.hh"
@@ -468,6 +469,41 @@ TEST_F(ObjectHashPathInfoJsonV4, constructors_take_optional_objectHash)
     auto e = a;
     e.assertedNarHash = narHash();
     EXPECT_NE(a, e);
+}
+
+/* Constructor arguments are borrowed only while making the owned metadata.
+   The aliased rvalue path must move after the metadata base has been copied. */
+TEST_F(ObjectHashPathInfoJsonV4, constructorsOwnMetadataAndShareOneVirtualBase)
+{
+    auto source = makeFullKeyedV4(*store, true);
+    source.assertedNarHash = narHash();
+    const UnkeyedValidPathInfo expected = source;
+    ASSERT_TRUE(source.deriver);
+    const auto path = *source.deriver;
+
+    ValidPathInfo copied{*source.deriver, source};
+    UnkeyedNarInfo unkeyed{source};
+    NarInfo diamond{copied};
+    ValidPathInfo moved{std::move(*source.deriver), source};
+    static_cast<UnkeyedValidPathInfo &>(source) = UnkeyedValidPathInfo{*store, std::nullopt};
+
+    for (const UnkeyedValidPathInfo * info :
+         {static_cast<const UnkeyedValidPathInfo *>(&copied),
+          static_cast<const UnkeyedValidPathInfo *>(&moved),
+          static_cast<const UnkeyedValidPathInfo *>(&unkeyed),
+          static_cast<const UnkeyedValidPathInfo *>(&diamond)})
+        EXPECT_EQ(*info, expected);
+    EXPECT_EQ(copied.path, path);
+    EXPECT_EQ(moved.path, path);
+    EXPECT_EQ(diamond.path, path);
+    EXPECT_EQ(
+        static_cast<UnkeyedValidPathInfo *>(static_cast<ValidPathInfo *>(&diamond)),
+        static_cast<UnkeyedValidPathInfo *>(static_cast<UnkeyedNarInfo *>(&diamond)));
+
+    static_cast<UnkeyedValidPathInfo &>(copied) = UnkeyedValidPathInfo{*store, std::nullopt};
+    copied.path = StorePath::dummy;
+    EXPECT_EQ(static_cast<const UnkeyedValidPathInfo &>(diamond), expected);
+    EXPECT_EQ(diamond.path, path);
 }
 
 } // namespace nix

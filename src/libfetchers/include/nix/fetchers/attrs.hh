@@ -60,9 +60,10 @@ nlohmann::json attrsToJSON(const Attrs & attrs);
  * the name as `<decimal length>:<bytes>`, then the value — a string as
  * `<decimal length>:<bytes>`, an integer as its decimal digits followed
  * by `;`, a Boolean as `0` or `1`.  Length prefixes make the encoding
- * total over any bytes (a NUL included) and injective; the map order
- * makes it canonical, so equal `Attrs` encode to one string.  A lazy
- * attribute is forced, as `attrsToJSON` forces it.
+ * total over any bytes (a NUL included). For a fixed map of resolved
+ * values, the encoding is canonical and injective. Each lazy attribute
+ * is forced when visited in map order, as by `attrsToJSON`; computation
+ * identity does not promise a stable result.
  */
 std::string encodeAttrs(const Attrs & attrs);
 

@@ -297,14 +297,14 @@ struct ValidPathInfo : virtual UnkeyedValidPathInfo
      */
     Strings shortRefs() const;
 
-    ValidPathInfo(StorePath && path, UnkeyedValidPathInfo info)
+    ValidPathInfo(StorePath && path, const UnkeyedValidPathInfo & info)
         : UnkeyedValidPathInfo(info)
         , path(std::move(path))
     {
     }
 
-    ValidPathInfo(const StorePath & path, UnkeyedValidPathInfo info)
-        : ValidPathInfo(StorePath{path}, std::move(info))
+    ValidPathInfo(const StorePath & path, const UnkeyedValidPathInfo & info)
+        : ValidPathInfo(StorePath{path}, info)
     {
     }
 

@@ -17,8 +17,8 @@ struct UnkeyedNarInfo : virtual UnkeyedValidPathInfo
     std::optional<Hash> fileHash;
     uint64_t fileSize = 0;
 
-    UnkeyedNarInfo(UnkeyedValidPathInfo info)
-        : UnkeyedValidPathInfo(std::move(info))
+    UnkeyedNarInfo(const UnkeyedValidPathInfo & info)
+        : UnkeyedValidPathInfo(info)
     {
     }
 
@@ -47,11 +47,8 @@ public:
 
     NarInfo(ValidPathInfo info)
         : UnkeyedValidPathInfo{static_cast<UnkeyedValidPathInfo &&>(info)}
-        /* Later copies from `*this` are pointless. The argument is only
-           there so the constructors can also call
-           `UnkeyedValidPathInfo`, but this won't happen since the base
-           class is virtual. Only this constructor (assuming it is most
-           derived) will initialize that virtual base class. */
+        /* Only the most-derived constructor initializes the virtual base.
+           Intermediate constructors borrow that already-initialized base. */
         , ValidPathInfo{info.path, static_cast<const UnkeyedValidPathInfo &>(*this)}
         , UnkeyedNarInfo{static_cast<const UnkeyedValidPathInfo &>(*this)}
     {
