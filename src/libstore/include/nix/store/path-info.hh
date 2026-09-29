@@ -164,9 +164,9 @@ struct UnkeyedValidPathInfo
      *              If null, store paths are rendered as base names.
      * @param includeImpureInfo If true, variable elements such as the
      *                          registration time are included.
-     * @param format JSON format version. Version 1 uses string hashes and
-     *               string content addresses. Version 2 uses structured
-     *               hashes and structured content addresses. Version 4
+     * @param format JSON format version. `narHash` always uses an SRI string.
+     *               Version 1 uses string content addresses; version 2 uses
+     *               structured content addresses. Version 4
      *               carries `objectHash` (required) and `narHash` only
      *               when `assertedNarHash` is present.
      * @param narHashFor For formats 1 to 3, which require `narHash`:
