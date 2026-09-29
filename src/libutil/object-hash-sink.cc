@@ -3,7 +3,6 @@
 #include "nix/util/error.hh"
 #include "nix/util/finally.hh"
 
-#include <algorithm>
 #include <boost/container/small_vector.hpp>
 
 namespace nix {
@@ -108,7 +107,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     merkle::Tree tree;
     merkle::nar::Directory size;
     bool sizeExact = true;
-    auto consume = [&](std::string && name, HashedNode && child) {
+    auto consume = [&](std::string && name, const HashedNode & child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
@@ -125,7 +124,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     if (workers == 1 || !children.canDefer) {
         children([&](std::string_view name, bool, fun<HashedNode()> visit) {
             auto child = visit();
-            consume(std::string(name), std::move(child));
+            consume(std::string(name), child);
         });
     } else {
         struct Child
@@ -142,25 +141,23 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             boost::container::small_vector_options_t<
                 boost::container::growth_factor<boost::container::growth_factor_100>>>
             kids;
+        bool canFork = false;
         children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit), std::nullopt});
+            canFork |= subdirectory;
         });
-        bool canFork =
-            kids.size() > 1 && std::any_of(kids.begin(), kids.end(), [](auto & child) { return child.subdirectory; });
+        canFork &= kids.size() > 1;
         if (!pool && canFork)
             pool = std::make_unique<CopyPool>(workers);
-        auto run = [&](size_t i) { kids[i].node = kids[i].visit(); };
-        auto fold = [&](size_t i) {
-            auto & child = kids[i];
-            consume(std::move(child.name), std::move(child.node.value()));
-        };
         if (canFork)
-            pool->ordered(kids.size(), [&](size_t i) { return kids[i].subdirectory; }, run, fold);
+            pool->ordered(
+                kids.size(),
+                [&](size_t i) { return kids[i].subdirectory; },
+                [&](size_t i) { kids[i].node = kids[i].visit(); },
+                [&](size_t i) { consume(std::move(kids[i].name), kids[i].node.value()); });
         else
-            for (size_t i = 0; i < kids.size(); ++i) {
-                run(i);
-                fold(i);
-            }
+            for (auto & child : kids)
+                consume(std::move(child.name), child.visit());
     }
 
     auto body = merkle::serialiseTree(tree);
