@@ -5076,6 +5076,71 @@ TEST_F(LocalStoreObjectsTest, concurrentMissesShareTheFirstCompletedHolder)
             }
 }
 
+TEST_F(LocalStoreObjectsTest, refusedStreamedEntryLeavesNoPendingHolder)
+{
+    auto & objects = store->objects;
+    for (bool executable : {false, true}) {
+        SCOPED_TRACE(executable);
+        auto dir = tempStoreDir.path() / fmt("refused-streamed-%d", executable);
+        createDir(dir);
+        auto fd = openDirectory(dir);
+        auto name = CanonPath::fromFilename("a");
+        auto where = dir / "a";
+        auto bytes = dir.filename().string();
+        auto id = merkle::blobId(bytes);
+        writeFile(where, bytes);
+        chmod(where, executable ? 0555 : 0444);
+        setWriteTime(where, 1, 1);
+        auto before = st(where);
+        bool refused = false;
+        objects.failPlaceWithNoSpace = [&](const std::filesystem::path & path) {
+            if (path != where)
+                return false;
+            refused = true;
+            return true;
+        };
+        Finally unhook{[&] { objects.failPlaceWithNoSpace = {}; }};
+
+        /* The same fresh file is independently refused by place itself. */
+        auto control = objects.hold();
+        control.setRoot(dir);
+        EXPECT_FALSE(objects.place(id, executable, fd.get(), name, where, before, NoRepair, control));
+        EXPECT_TRUE(refused);
+        EXPECT_FALSE(control.pendingHolder(id, executable));
+        EXPECT_TRUE(control.takeProjection().regular.empty());
+
+        auto hold = objects.hold();
+        hold.setRoot(dir);
+        refused = false;
+        objects.enterWritten(id, executable, fd.get(), name, where, NoRepair, hold, /*looked=*/false);
+        EXPECT_TRUE(refused);
+        EXPECT_FALSE(hold.pendingHolder(id, executable));
+        EXPECT_TRUE(hold.takeProjection().regular.empty());
+        auto after = st(where);
+        EXPECT_EQ(after.st_ino, before.st_ino);
+        EXPECT_EQ(after.st_dev, before.st_dev);
+        EXPECT_EQ(after.st_mode, before.st_mode);
+        EXPECT_EQ(after.st_nlink, before.st_nlink);
+        EXPECT_EQ(after.st_mtime, before.st_mtime);
+        EXPECT_EQ(readFile(where), bytes);
+
+        /* Refusal does not poison a later claim of this unchanged file. */
+        objects.failPlaceWithNoSpace = {};
+        objects.enterWritten(id, executable, fd.get(), name, where, NoRepair, hold, /*looked=*/false);
+        auto holder = hold.pendingHolder(id, executable);
+        ASSERT_TRUE(holder);
+        EXPECT_EQ(std::filesystem::path(*holder), where);
+        auto rows = hold.takeProjection().regular;
+        ASSERT_EQ(rows.size(), 1u);
+        EXPECT_EQ(rows.front().id, id);
+        EXPECT_EQ(rows.front().executable, executable);
+        EXPECT_EQ(rows.front().ino, before.st_ino);
+        EXPECT_EQ(rows.front().dev, before.st_dev);
+        EXPECT_EQ(rows.front().size, bytes.size());
+        EXPECT_EQ(readFile(where), bytes);
+    }
+}
+
 /* A holder names the same owned file for every admitted root spelling.
    Filesystem-root cases only read that spelling; all files stay in the fixture. */
 TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)

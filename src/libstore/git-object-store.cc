@@ -735,8 +735,10 @@ void GitObjectStore::enterWritten(
        already has is linked over this file.  A file written after `link`
        missed needs no second look (`looked`), which is what keeps the
        first entry of a fresh tree at one index probe a file. */
-    if (!looked && place(id, executable, dirFd, name, where, st, repair, hold))
+    if (!looked) {
+        place(id, executable, dirFd, name, where, st, repair, hold);
         return;
+    }
     auto other = hold.addRow(
         Hold::Row{
             .id = id,
