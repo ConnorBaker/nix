@@ -63,13 +63,39 @@ while f307 uses libgit2 2.0.0-rc.1 and zlib-ng 2.3.3. SQLite 3.51.2,
 OpenSSL 3.6.3 and GC 8.2.12 file hashes match. These library changes
 confound causal attribution to Nix source alone.
 
-The remaining source of the larger **system-time** delta is not located
-by this user-only profile. The planned FD-resolved strace phase was
-omitted: a tiny `strace true` probe failed with `PTRACE_TRACEME: Operation
-not permitted` under this environment. No permission escalation was
-available. Earlier all-process syscall aggregates belong to older branch
-endpoints and cannot substitute for exact f307 FD/callsite attribution.
-The checked claim is that the exact current binary spends observable user
-CPU naming mutable worktree bytes; the claim that this route causes all
-of the regression, or that libgit2/kernel work does not contribute,
-remains unproved.
+A subsequent exact-binary FD-resolved trace, after ptrace became available,
+locates the additional filesystem domain. With fresh private seeds and
+matching outputs, selected syscall calls rise 380,242→853,883; worktree
+reads rise 4,558,023→195,269,564 bytes. Local-store DB reads instead fall
+52,606,302→417,894 bytes. Every call, including 561,755 branch
+unfinished/resumed pairs, was parsed and independently counted. The
+[trace readout](/home/connorbaker/Benchmarks/nix-performance-fixes/attribution-20260930/warm-git/READOUT.md)
+and [FD census](/home/connorbaker/Benchmarks/nix-performance-fixes/attribution-20260930/warm-git/FD-COUNTS.json)
+retain the complete domain partition and exact capture bindings.
+
+The finite fixture has 52,856 regular files, including 23 empty files.
+Every branch file's pread interval union exactly covers its pinned size:
+189,657,925 unique bytes plus 5,611,639 repeated bytes. This establishes
+full raw-file reading in this capture, beyond the earlier sampled stacks;
+the [coverage check](/home/connorbaker/Benchmarks/nix-performance-fixes/attribution-20260930/warm-git/SOURCE-READ-COVERAGE.json)
+records the exhaustive result. The added worktree `fcntl` calls are
+74,242 directory setup operations. Source and exact mapped glibc assembly
+show `fdopendir` performing `fstat`, `F_GETFL` and `F_SETFD` even after an
+`O_DIRECTORY|O_CLOEXEC` open; the
+[assembly binding](/home/connorbaker/Benchmarks/nix-performance-fixes/attribution-20260930/warm-git/SOURCE-ASM-BINDING.json)
+identifies the inspected library.
+
+The [status API audit](/home/connorbaker/Benchmarks/nix-performance-fixes/attribution-20260930/warm-git/STATUS-API-AUDIT.md)
+binds the inspected status, diff and iterator source to the registered
+libgit2 dependency and enumerates deletion, conflict, replacement, filter,
+index-flag and submodule cases. No supported option was found that avoids
+the complete tracked-parent directory scan while preserving membership
+and dirty metadata. Literal pathspecs still enumerate those directories;
+an index-only pathspec can also omit HEAD-only staged deletions.
+
+These traces locate extra work, not its exact share of CPU seconds.
+Tracing amplifies and serializes filesystem calls; the readout records
+shared-host I/O pressure and the capture limits. Dynamic syscall callsites
+and a predictive partition of the system-time delta remain open. The
+private trace states were retired; this evidence adds no source
+optimization or new benchmark speedup claim.
