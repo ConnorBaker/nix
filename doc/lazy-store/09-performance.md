@@ -1,5 +1,31 @@
 # Evaluation performance and preserved behavior
 
+Measured **76b4cae3281b149f239396efcbe7b01b864bbfbf** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Cold-path and both warm-Git CPU medians remain higher in every pair. The uniform-performance and source-size goals remain open: the implementation is **9,456 physical runtime-source lines above base**, **45 fewer than measured v5**.
+
+The [sealed v7 comparison](/tmp/nix-combined-reductions-v7-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v5 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. The [independent result audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-COMBINED-REDUCTIONS-V7-BENCHMARK-RESULT-AUDIT.json) checks the complete finite comparison domains. Percentages below are medians of paired candidate/control ratios; negative is lower.
+
+| Case | Wall change | CPU change | RSS change | Faster wall pairs |
+|---|---:|---:|---:|---:|
+| cold 32 path | −20.45% | +59.13% | +15.56% | 6/6 |
+| cold 32 git | −20.16% | −2.25% | −0.40% | 6/6 |
+| cold 32 github | −35.18% | −67.81% | −9.60% | 6/6 |
+| warm 8 path | −86.66% | −68.85% | −12.47% | 6/6 |
+| warm 8 git | −4.53% | +65.58% | +1.44% | 6/6 |
+| warm 8 github | −13.64% | −14.29% | +2.17% | 6/6 |
+| warm 32 path | −71.27% | −57.12% | −6.93% | 6/6 |
+| warm 32 git | −5.01% | +33.35% | −0.02% | 5/6 |
+| warm 32 github | −9.66% | −7.59% | +0.91% | 5/6 |
+
+Against actual v5, focused cold-path wall/CPU changes are **−0.56%/−0.29%** (three of six faster wall pairs); warm-8 Git changes **+3.51%/+1.19%** (one of six faster wall pairs). The simplifications therefore establish no uniform incremental evaluation benefit. All warm states seed 32 attributes, including focused Git; earlier focused seed-eight cohorts remain distinct. CPU counters retain their original centisecond precision.
+
+The reduction replaces private state and repeated operations with existing combinators, borrows SQLite BLOB bytes within their statement lifetime, and reuses a final typed hashing-file sink. The rejected variant representation added work on empty-file announcement; the accepted implementation retains optional hasher state. It also preserves intrinsic store fingerprints when no external fingerprint exists. [All debug suites pass](/tmp/nix-combined-reductions-v7-debug-test-types-successor-oct7/complete.receipt.json), and the exact optimized endpoint passes [18 functionals and 12 real-overlay tests](/tmp/nix-combined-reductions-v7-functional-oct7/COMPLETE.json), with zero failures or skips and all test states retired. These gates establish behavior, not evaluation speedups.
+
+[Every observation and pressure sample](/tmp/nix-combined-reductions-v7-benchmark-oct7/READOUT.md) is retained. Timed load1 ranges **1.21–9.26**; CPU/I/O/memory some-PSI avg10 maxima are **6.34%/2.44%/0%**. Shared-host pressure does not explain instruction counts or assign causal fractions. Base uses libgit2 **1.9.7**, while v5/v7 share identical **2.0.0-rc.1** images; the base comparison includes dependency differences. Cold means fresh private application state, not evicted kernel caches; GitHub uses real pinned network acquisition. This v7 timing packet contains no PMU or syscall attribution; matched v4/v5 PMU evidence concerns those earlier endpoints and supplies no v7 execution counters.
+
+Commit **161443ba1** subsequently removes five runtime lines by constructing the owned filtering-scope coordinate once. The natural rebuild and all 179 fetcher tests pass; this change is not in the optimized v7 endpoint. Current source remains **+9,451** against base. The private `std::to_chars` header reduction was rejected by [finite native analysis](/tmp/nix-merkle-hash-native-preparation-oct7/NATIVE-READOUT.md); it adds generated work on nonzero inputs and does not match the actual provider context.
+
+## Earlier October 7 v5 comparison
+
 Measured **43f45b07a3c9ca5484ec495ba7c337c09221cbce** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Three CPU medians remain higher. The source-size and uniform-performance goals remain open: the measured implementation is **9,501 physical runtime-source lines above base**.
 
 The [sealed v5 comparison](/tmp/nix-borrowed-driver-v5-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v4 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. [Independent byte closure](/tmp/nix-permissions-retry-oct7/INDEPENDENT-BORROWED-DRIVER-V5-BENCHMARK-CLOSURE-AUDIT.json) checks all 557 retained leaves. Percentages below are medians of paired candidate/control ratios; negative is lower.
@@ -19,6 +45,16 @@ The [sealed v5 comparison](/tmp/nix-borrowed-driver-v5-benchmark-oct7/COMPLETE.j
 Against actual v4, focused cold-path wall/CPU changes are **+1.51%/+3.70%** (three of six faster wall pairs); warm-8 Git changes **+2.99%/+0.81%** (two of six faster wall pairs). These results establish no causal evaluation benefit from the adapter simplification. All warm states in this cohort seed 32 attributes, including focused warm Git; earlier focused seed-eight cohorts remain distinct. CPU counters retain their original centisecond precision.
 
 [Every observation and pressure sample](/tmp/nix-borrowed-driver-v5-benchmark-oct7/READOUT.md) is retained. Timed load1 ranges **0.41–10.99**; CPU/I/O/memory some-PSI avg10 maxima are **6.60%/17.01%/0%**. Shared-host interference is possible, but these observations do not explain instruction counts or assign causal fractions. Base uses libgit2 **1.9.7**, while v4/v5 share identical **2.0.0-rc.1** images; the base comparison includes dependency differences. Cold means fresh private application state, not evicted kernel caches; GitHub uses real pinned network acquisition. This timing packet contains no PMU or syscall attribution.
+
+
+The separate [matched v4/v5 PMU diagnostic](/tmp/nix-v4-v5-pmu-oct7/COMPLETE.json) retains six balanced pairs per case, with warm Git seeded32. All24 four-event groups have positive unscaled counts and exact enabled==running; all26 complete outputs and seven complete graphs pass. Paired median v5/v4 changes are:
+
+| Case | User instructions | Kernel instructions | User cycles | Kernel cycles |
+|---|---:|---:|---:|---:|
+| cold32 path | +0.010038% | +1.249125% | −0.238175% | +1.758833% |
+| warm8 Git | +0.016933% | −0.059348% | +0.057287% | +0.467019% |
+
+Target-inherited counts include setpriv/Python/taskset/ELF startup; they provide no per-CPU or descendant partition and exclude asynchronous kernel-worker work. These counters do not explain the earlier GNUtime differences. The original postflight rendering failure remains preserved: independent checking found only one anonymous ASLR-normalized loader row, and only the seven planned graph checks continued, without evaluation/counter reruns. Raw pre-normalization loader addresses were not retained. All14 private states are retired; the [readout](/tmp/nix-v4-v5-pmu-oct7/READOUT.md) retains every pair and scope limit.
 
 ## Earlier October 7 v3 comparison
 
@@ -94,7 +130,7 @@ Paired CPU medians regress for **cold GitHub, warm-8 GitHub, warm-32 Git and war
 
 Cold path improves against U in all five wall pairs (**−11.119%** paired median; range **−16.196% to −5.643%**), but CPU improves in four of five (**−5.009%**; range **−16.376% to +6.186%**). These direct results describe the combined change, not any individual edit. Recorded one-minute load ranges are 3.01–5.54 for the base comparison and 3.29–6.43 for U. Five cold pairs, ten warm pairs and the retained spreads limit broader claims; adverse observations are not dismissed as noise. Historical base-relative percentages are not subtracted across different host windows.
 
-## Current source, validation and implementation
+## Earlier source, validation and implementation
 
 After the measured v3 endpoint, two simplifications remove **eleven more runtime lines**, leaving **+9,507** against base. A single optional buffered-file owner replaces the intermediate payload transfer; the fixed synchronous hashing callback supplies its lifetime. [Independent native review](/tmp/nix-store-reduction-domain-audit-oct7/assembly/BUFFER-NATIVE-AUDIT.json) finds 59–68 fewer normal-path caller instructions across the enumerated buffer classes. Full-path hard links use `::link` directly, preserving its platform-specific symlink behavior and generic error mapping. [All four native caller roles](/tmp/nix-copy-pool-domain-oct7/DIRECT-LINK-ACTUAL-NATIVE-FOUR-ROLE-AUDIT.json) remove filesystem-path construction and reduce four calls to one. [All 1,007 store tests pass](/tmp/nix-link-buffer-simplification-oct7/TESTS.json), with no failures or skips and one disabled case. Both are included in the v5 cohort above; their individual timing effects are not isolated.
 

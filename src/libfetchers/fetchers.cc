@@ -286,10 +286,10 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settin
 
         checkLocks(*this, result);
 
-        /* Every assertion is verified here against the tree, named by the
-           memoised dry run `mountInput` repeats for free: a `treeHash` by
-           equality, a `narHash` through the shim.  The name then replaces
-           the `narHash`, so no result carries one (`mountInput` refuses it). */
+        /* Verify assertions against the rendered tree: `treeHash` by equality,
+           `narHash` through the shim. Named views can reuse this observation
+           at `mountInput`; unnamed worktrees must be observed again. Replace
+           `narHash` with the tree name (`mountInput` refuses `narHash`). */
         if (getTreeHash() || getNarHash()) {
             auto treeHash =
                 fetchToStore2(settings, store, SourcePath(accessor), FetchMode::DryRun, result.getName()).second;
