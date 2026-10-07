@@ -66,6 +66,20 @@ void LocalBuildStoreConfig::anchor() {}
 
 void LocalStore::anchor() {}
 
+[[gnu::always_inline]]
+static inline void writeBlobRow(SQLiteStmt & statement, uint64_t ingestion, const GitObjectStore::Hold::Row & row)
+{
+    statement.use()
+        .apply(row.id.hash, row.id.hashSize)
+        .apply(int64_t(row.executable ? 1 : 0))
+        .apply(static_cast<int64_t>(row.ino))
+        .apply(static_cast<int64_t>(row.dev))
+        .apply(static_cast<int64_t>(ingestion))
+        .apply(row.name)
+        .apply(static_cast<int64_t>(row.size))
+        .exec();
+}
+
 void GcStore::anchor() {}
 
 LocalStoreConfig::LocalStoreConfig(const std::filesystem::path & path, const Params & params)
@@ -452,7 +466,7 @@ LocalStore::LocalStore(ref<const Config> config)
             "insert or replace into Blobs (id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);");
         state->stmts->DeleteBlob.create(
             state->db,
-            "delete from Blobs where id = ? and exec = ? and ingestion = ? and ino = ? and dev = ? and size = ? and name = ?;");
+            "delete from Blobs where id = ? and exec = ? and ino = ? and dev = ? and ingestion = ? and name = ? and size = ?;");
         /* Only the first registered candidate is canonical to the optimiser's
            inode shortcut. Other candidates must reach place() to coalesce. */
         state->stmts->QueryBlobInodes.create(
@@ -577,15 +591,10 @@ LocalStore::LocalStore(ref<const Config> config)
                 name /= *i;
             retrySQLite<void>([&]() {
                 auto state(_state->lock());
-                auto use(state->stmts->DeleteBlob.use());
-                use.apply(id.hash, id.hashSize)
-                    .apply(int64_t(executable ? 1 : 0))
-                    .apply(static_cast<int64_t>(holder.ingestion))
-                    .apply(static_cast<int64_t>(holder.ino))
-                    .apply(static_cast<int64_t>(holder.dev))
-                    .apply(static_cast<int64_t>(holder.size))
-                    .apply(name.string())
-                    .exec();
+                writeBlobRow(
+                    state->stmts->DeleteBlob,
+                    holder.ingestion,
+                    {id, executable, holder.ino, holder.dev, holder.size, name.string()});
             });
         };
         blobIndex.inodes = [this](boost::unordered_flat_map<ino_t, Hash> & inodes) {
@@ -617,15 +626,7 @@ void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<con
     if (blobRows == BlobRows::NoRows)
         return;
     for (auto & row : rows)
-        state.stmts->InsertBlob.use()
-            .apply(row.id.hash, row.id.hashSize)
-            .apply(int64_t(row.executable ? 1 : 0))
-            .apply(static_cast<int64_t>(row.ino))
-            .apply(static_cast<int64_t>(row.dev))
-            .apply(static_cast<int64_t>(ingestion))
-            .apply(row.name)
-            .apply(static_cast<int64_t>(row.size))
-            .exec();
+        writeBlobRow(state.stmts->InsertBlob, ingestion, row);
 }
 
 /* SQLite's selected 1,000,000,000-byte row limit and bind_blob's signed
@@ -880,32 +881,17 @@ void LocalStore::coalesceBlobRows(
             sync();
     }
     for (auto & collision : collisions)
-        if (!collision.eligible) {
-            auto & row = collision.row;
-            state.stmts->DeleteBlob.use()
-                .apply(row.id.hash, row.id.hashSize)
-                .apply(int64_t(row.executable ? 1 : 0))
-                .apply(static_cast<int64_t>(ingestion))
-                .apply(static_cast<int64_t>(row.ino))
-                .apply(static_cast<int64_t>(row.dev))
-                .apply(static_cast<int64_t>(row.size))
-                .apply(row.name)
-                .exec();
-        }
+        if (!collision.eligible)
+            writeBlobRow(state.stmts->DeleteBlob, ingestion, collision.row);
     for (auto & [row, holder] : rejected) {
         auto relative = std::filesystem::path(holder.file).lexically_relative(getRealStoreDir());
         std::filesystem::path name;
         for (auto i = ++relative.begin(); i != relative.end(); ++i)
             name /= *i;
-        state.stmts->DeleteBlob.use()
-            .apply(row.id.hash, row.id.hashSize)
-            .apply(int64_t(row.executable ? 1 : 0))
-            .apply(static_cast<int64_t>(holder.ingestion))
-            .apply(static_cast<int64_t>(holder.ino))
-            .apply(static_cast<int64_t>(holder.dev))
-            .apply(static_cast<int64_t>(holder.size))
-            .apply(name.string())
-            .exec();
+        writeBlobRow(
+            state.stmts->DeleteBlob,
+            holder.ingestion,
+            {row.id, row.executable, holder.ino, holder.dev, holder.size, name.string()});
     }
     insertBlobRows(state, ingestion, selected);
 }

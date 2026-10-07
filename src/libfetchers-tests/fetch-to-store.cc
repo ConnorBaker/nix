@@ -287,8 +287,8 @@ TEST(AllowListFilter, admissionAndNamingMatchEveryPrefixSubsetAndGrowth)
                         } else
                             EXPECT_FALSE(result);
                     }
-                    EXPECT_EQ(inner->names, covered ? 1 : 0);
-                    EXPECT_EQ(inner->stats, covered && outcome == Observed::Missing ? 1 : 0);
+                    EXPECT_EQ(inner->names, covered ? 1u : 0u);
+                    EXPECT_EQ(inner->stats, covered && outcome == Observed::Missing ? 1u : 0u);
                     EXPECT_EQ(inner->requested, covered ? std::optional<CanonPath>(path) : std::nullopt);
                 }
             }
@@ -323,7 +323,7 @@ TEST(AllowListFilter, exactPathsDoNotAdmitOrNameTheirRelatives)
         auto result = accessor->getFingerprint(path);
         EXPECT_FALSE(result);
     }
-    EXPECT_EQ(errors, 5);
+    EXPECT_EQ(errors, 5u);
     accessor->allowPrefix(CanonPath("a"));
     accessor->fingerprint = "whole";
     for (auto & path : {CanonPath::root, exact, CanonPath("other")}) {

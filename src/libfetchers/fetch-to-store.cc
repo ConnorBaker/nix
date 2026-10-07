@@ -299,26 +299,20 @@ struct MemoVisitor : HashingVisitor
                 std::lock_guard lock(mutex);
                 writes.emplace_back(std::move(*key), entryRow(result.entry));
                 if (writes.size() >= maxPendingWrites)
-                    flushLocked();
+                    flush();
             }
         }
         return result;
     }
 
-    /* The caller holds mutex. */
-    void flushLocked()
+    /* Writes are excluded by mutex during the walk, or by joining all
+       visits before the final flush. */
+    void flush()
     {
         if (writes.empty())
             return;
         cache->upsert(writes);
         writes.clear();
-    }
-
-    /* Hand the rows named so far to the cache, in one commit. */
-    void flush()
-    {
-        std::lock_guard lock(mutex);
-        flushLocked();
     }
 };
 

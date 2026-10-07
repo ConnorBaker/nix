@@ -40,7 +40,7 @@ TEST_F(FetcherCacheTest, roundTripsAnEmptyNameAndNulBytesThroughTheDatabase)
     auto found = cache->lookup({"test", key});
     ASSERT_TRUE(found);
     EXPECT_EQ(*found, value);
-    EXPECT_EQ(getStrAttr(*found, "hash").size(), 9);
+    EXPECT_EQ(getStrAttr(*found, "hash").size(), 9u);
 
     /* A second write of the same key replaces the row. */
     Attrs value2{{"hash", std::string("other")}};

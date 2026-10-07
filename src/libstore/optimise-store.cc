@@ -751,20 +751,19 @@ struct MaterialisingVisitor : LinkingVisitor
             if (tree.contains("."))
                 throw Error("synthetic root object cannot be used as a directory");
 
-            /* NAR names order siblings and case-hack allocation. Transfer the
-               parsed nodes from Git's slash-suffixed keys without new nodes. */
-            std::map<std::string, merkle::TreeEntry> names;
-            while (!tree.empty()) {
-                auto child = tree.extract(tree.begin());
-                if (child.mapped().mode == merkle::Mode::Directory)
-                    child.key().pop_back();
-                names.insert(std::move(child));
-            }
+            /* NAR order and case-hack allocation omit the directory slash.
+               Shortened keys precede the saved next iterator; leaves stay put. */
+            for (auto i = tree.begin(); i != tree.end();)
+                if (auto child = i++; child->second.mode == merkle::Mode::Directory) {
+                    auto directory = tree.extract(child);
+                    directory.key().pop_back();
+                    tree.insert(std::move(directory));
+                }
             merkle::nar::Directory size;
             auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
                 assert(rel.isRoot());
                 CaseHackNames hack;
-                for (auto & [name, child] : names) {
+                for (auto & [name, child] : tree) {
                     auto diskName = hack.diskName(name);
                     Scope childScope{sub, &diskName};
                     size.add(name, materialise(child, path / name, depth + 1, attemptHold));
@@ -1120,7 +1119,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     winners.reserve(collisions.size());
     BlobCoalescingResult result;
     std::map<std::pair<dev_t, ino_t>, size_t> byInode;
-    std::map<std::pair<dev_t, ino_t>, size_t> byWinnerInode;
     auto temporary = [&] { return hold.directory() / objects.tempPath("coalesce").filename(); };
 
     for (auto & collision : collisions) {
@@ -1187,7 +1185,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             auto [_, inserted] = byInode.emplace(std::pair{row.dev, row.ino}, winners.size());
             if (!inserted)
                 throw Error("one ingestion records different blobs for the same inode in %s", PathFmt(root));
-            byWinnerInode.emplace(std::pair{candidate.dev, candidate.ino}, winners.size());
             winners.push_back(Winner{collision, candidate, std::move(cleanup), std::nullopt});
             break;
         }
@@ -1198,6 +1195,9 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     }
     if (winners.empty())
         return result;
+    /* Add winning classes after losing classes: the latter always take priority. */
+    for (size_t i = 0; i < winners.size(); ++i)
+        byInode.emplace(std::pair{winners[i].holder.dev, winners[i].holder.ino}, i);
 
     /* Walk physical aliases: case-hack spellings need not be canonical.
        Use the final root; hold.root() may still name a moved temporary. */
@@ -1221,20 +1221,16 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
         auto i = byInode.find({st.st_dev, st.st_ino});
         if (!linkableOnThisSystem(where))
             return;
-        if (i == byInode.end()) {
-            /* A prior partially completed attempt may already have linked
-               an alias even when the old representative still lost. */
-            auto existing = byWinnerInode.find({st.st_dev, st.st_ino});
-            if (existing != byWinnerInode.end()) {
-                auto & winner = winners[existing->second];
-                if (!winner.representative
-                    && GitObjectStore::validHolderMetadata(winner.holder, winner.collision.row.executable, st))
-                    winner.representative = where;
-            }
+        if (i == byInode.end())
             return;
-        }
         auto & winner = winners[i->second];
         auto & row = winner.collision.row;
+        /* Losing classes take priority; other hits are already-winning aliases. */
+        if (row.dev != st.st_dev || row.ino != st.st_ino) {
+            if (!winner.representative && GitObjectStore::validHolderMetadata(winner.holder, row.executable, st))
+                winner.representative = where;
+            return;
+        }
         auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, where.string()};
         if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
             return;
