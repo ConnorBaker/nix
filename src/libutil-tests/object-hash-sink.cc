@@ -18,6 +18,8 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <type_traits>
+#include <vector>
 
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/merkle-hash.hh"
@@ -202,7 +204,7 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
         HashedNode directory(const CanonPath & path, Children children) override
         {
             EXPECT_FALSE(children.canDefer);
-            return HashingVisitor::directory(path, [&](auto each) {
+            return HashingVisitor::directory(path, {[&](auto each) {
                 struct Context
                 {
                     decltype(each) & consume;
@@ -218,7 +220,7 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
                     ++context->completed;
                     context->consume(name, isDirectory, [&] { return child; });
                 });
-            });
+            }});
         }
     } visitor;
 
@@ -259,7 +261,7 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                 const HashedNode last{
                     tail, acceptedSize ? std::optional(merkle::nar::regular(4, false)) : std::nullopt};
                 std::vector<std::string> visits;
-                auto actual = visitor.directory(CanonPath::root, [&](auto each) {
+                auto actual = visitor.directory(CanonPath::root, {[&](auto each) {
                     each("keep", false, [&] {
                         visits.push_back("first");
                         return first;
@@ -279,7 +281,7 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                         visits.push_back("last");
                         return last;
                     });
-                });
+                }});
                 EXPECT_EQ(visits, (std::vector<std::string>{"first", "rejected", "last"}));
                 EXPECT_EQ(actual.entry, (merkle::TreeEntry{merkle::Mode::Directory, expectedId}));
                 EXPECT_EQ(actual.narSize.has_value(), acceptedSize);
@@ -1062,6 +1064,132 @@ TEST(ObjectHashSink, short_delivery_against_announced_size_throws)
                 crf("ab");
             }),
         Error);
+}
+
+/* One delivered regular node has the same meaning independently of the size
+   announcement, chunk boundaries, or executable-marker position. */
+namespace {
+
+enum class SizePhase { Absent, Early, AfterEmpty, Mid, End };
+struct RegularEvent
+{
+    bool announce;
+    std::string_view bytes = {};
+    uint64_t size = 0;
+};
+
+std::vector<RegularEvent> regularEvents(std::string_view bytes, SizePhase phase, bool zeros, uint64_t size)
+{
+    std::vector<RegularEvent> events;
+    auto announce = [&] { events.push_back({true, {}, size}); };
+    auto chunk = [&](std::string_view data) { events.push_back({false, data}); };
+    if (phase == SizePhase::Early)
+        announce();
+    if (zeros || phase == SizePhase::AfterEmpty)
+        chunk({});
+    if (phase == SizePhase::AfterEmpty)
+        announce();
+    chunk(bytes.substr(0, bytes.size() / 2));
+    if (zeros)
+        chunk({});
+    if (phase == SizePhase::Mid)
+        announce();
+    chunk(bytes.substr(bytes.size() / 2));
+    if (zeros)
+        chunk({});
+    if (phase == SizePhase::End)
+        announce();
+    return events;
+}
+
+HashedNode deliverRegular(
+    bool direct, const std::vector<RegularEvent> & events, size_t executableAt, size_t duplicateAt)
+{
+    const CanonPath path{"/file"};
+    auto read = [&](CreateRegularFileSink & sink) {
+        for (size_t position = 0; position <= events.size(); ++position) {
+            if (position == executableAt)
+                sink.isExecutable();
+            if (position == duplicateAt) {
+                auto first = std::find_if(events.begin(), events.end(), [](auto & event) { return event.announce; });
+                EXPECT_THROW(sink.preallocateContents(first->size + 1), Error);
+            }
+            if (position < events.size()) {
+                auto & event = events[position];
+                if (event.announce)
+                    sink.preallocateContents(event.size);
+                else
+                    sink(event.bytes);
+            }
+        }
+    };
+    if (direct) {
+        HashingRegularFileSink sink{path};
+        read(sink);
+        return sink.finish();
+    }
+    return HashingVisitor{}.regular(path, std::ref(read));
+}
+
+static_assert(std::is_constructible_v<HashingRegularFileSink, const CanonPath &>);
+static_assert(!std::is_constructible_v<HashingRegularFileSink, CanonPath &&>);
+
+} // namespace
+
+TEST(HashingRegularFileSink, delivery_protocol_matches_reference_and_nar)
+{
+    for (size_t length : {0, 1, 15, 16, 64}) {
+        std::string bytes(length, '\0');
+        for (size_t i = 0; i < length; ++i)
+            bytes[i] = char(i);
+        for (auto phase : {SizePhase::Absent, SizePhase::Early, SizePhase::AfterEmpty, SizePhase::Mid, SizePhase::End})
+            for (bool zeros : {false, true}) {
+                auto events = regularEvents(bytes, phase, zeros, length);
+                /* Every event boundary plus the absent executable marker. */
+                for (size_t executableAt = 0; executableAt <= events.size() + 1; ++executableAt)
+                    for (size_t duplicateAt = 0; duplicateAt <= events.size() + 1; ++duplicateAt) {
+                        /* A duplicate can only follow the first announcement. */
+                        if (duplicateAt <= events.size()
+                            && std::none_of(events.begin(), events.begin() + duplicateAt,
+                                [](auto & event) { return event.announce; }))
+                            continue;
+                        auto source = make_ref<MemorySourceAccessor>();
+                        source->root = File{File::Regular{
+                            .executable = executableAt <= events.size(), .contents = bytes}};
+                        auto expected = referenceObjectEntry(*source, CanonPath::root);
+                        auto narSize = narOf(*source).size();
+                        for (bool direct : {false, true}) {
+                            SCOPED_TRACE(::testing::Message() << length << ':' << int(phase) << ':' << zeros
+                                << ':' << executableAt << ':' << duplicateAt << ':' << direct);
+                            auto node = deliverRegular(direct, events, executableAt, duplicateAt);
+                            EXPECT_EQ(node.entry, expected);
+                            ASSERT_TRUE(node.narSize);
+                            EXPECT_EQ(merkle::nar::root(*node.narSize), narSize);
+                        }
+                    }
+            }
+    }
+}
+
+TEST(HashingRegularFileSink, short_and_long_delivery_are_rejected_at_every_announcement_phase)
+{
+    for (size_t length : {0, 1, 15, 16, 64})
+        for (auto phase : {SizePhase::Early, SizePhase::AfterEmpty, SizePhase::Mid, SizePhase::End})
+            for (bool zeros : {false, true})
+                for (int delta : {-1, 1}) {
+                    if (!length && delta < 0)
+                        continue;
+                    std::string bytes(length, '\0');
+                    for (size_t i = 0; i < length; ++i)
+                        bytes[i] = char(i);
+                    auto events = regularEvents(bytes, phase, zeros, length + delta);
+                    for (size_t executableAt = 0; executableAt <= events.size() + 1; ++executableAt)
+                        for (bool direct : {false, true}) {
+                            SCOPED_TRACE(::testing::Message() << length << ':' << int(phase) << ':' << zeros
+                                << ':' << delta << ':' << executableAt << ':' << direct);
+                            EXPECT_THROW(deliverRegular(direct, events, executableAt, events.size() + 1), Error);
+                        }
+                }
 }
 
 /* `RestoreSink`'s two-phase regular file (`beginRegularFile`, then

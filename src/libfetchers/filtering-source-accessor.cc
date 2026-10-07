@@ -60,8 +60,7 @@ SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPat
     return entries;
 }
 
-void FilteringSourceAccessor::readDirectoryScoped(
-    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
+void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDirectoryCallback callback)
 {
     /* The scoped view borrows this policy throughout the callback. Stack
        scopes are already kept alive by their enclosing directory call. */
@@ -127,9 +126,7 @@ void FilteringSourceAccessor::readDirectoryScoped(
                 return owner->getFingerprint(original / p);
             }
 
-            void readDirectoryWithEntries(
-                const CanonPath & p,
-                std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+            void readDirectoryWithEntries(const CanonPath & p, ReadDirectoryCallback callback) override
             {
                 readDirectoryScoped(p, std::move(callback));
             }
@@ -172,9 +169,7 @@ struct AllowListSourceAccessorImpl final : AllowListSourceAccessor
         return inner->allowsConcurrentTraversal();
     }
 
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
         readDirectoryScoped(path, std::move(callback));
     }
@@ -267,9 +262,7 @@ public:
 
 struct FixedSetFilteringSourceAccessor : FilteringSourceAccessor
 {
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
         readDirectoryScoped(path, std::move(callback));
     }

@@ -8,6 +8,7 @@
 #include "nix/util/tree-traversal.hh"
 #include "nix/util/thread-pool.hh"
 
+#include <functional>
 #include <optional>
 #include <string>
 #include <utility>
@@ -26,6 +27,67 @@ struct HashedNode
 {
     merkle::TreeEntry entry;
     std::optional<uint64_t> narSize;
+};
+
+/** Hash a regular node as size-prefixed bytes arrive, retaining bytes until
+ * their size is announced. Borrows path; finish once after delivery. */
+struct HashingRegularFileSink final : CreateRegularFileSink
+{
+private:
+    const CanonPath & path;
+    bool executable = false;
+    std::optional<merkle::ObjectHasher> hasher;
+    uint64_t announced = 0;
+    uint64_t received = 0;
+    std::string buffer;
+
+public:
+    ~HashingRegularFileSink() override;
+
+    explicit HashingRegularFileSink(std::reference_wrapper<const CanonPath> path)
+        : path(path)
+    {
+    }
+
+    void isExecutable() override
+    {
+        executable = true;
+    }
+
+    void preallocateContents(uint64_t size) override
+    {
+        if (hasher)
+            throw Error("object hash: the size of file '%s' was announced twice", path);
+        announced = size;
+        hasher.emplace("blob", size);
+        if (!buffer.empty()) {
+            (*hasher)(buffer);
+            buffer.clear();
+        }
+    }
+
+    void operator()(std::string_view data) override
+    {
+        received += data.size();
+        if (hasher)
+            (*hasher)(data);
+        else
+            buffer.append(data);
+    }
+
+    HashedNode finish()
+    {
+        auto size = hasher ? announced : buffer.size();
+        if (hasher && received != announced)
+            throw Error("object hash: file '%s' announced %d bytes but delivered %d", path, announced, received);
+        return {
+            .entry = {
+                .mode = executable ? merkle::Mode::Executable : merkle::Mode::Regular,
+                .hash = hasher ? hasher->finish() : merkle::blobId(buffer),
+            },
+            .narSize = merkle::nar::regular(size, executable),
+        };
+    }
 };
 
 /**

@@ -3653,7 +3653,7 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                 auto use = query.use();
                 while (use.next())
                     rows.emplace_back(
-                        use.getBlobStr(0),
+                        use.getBlobView(0),
                         use.getInt(1),
                         use.getInt(2),
                         use.getInt(3),
@@ -4722,7 +4722,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
             while (use.next()) {
                 EXPECT_EQ(use.getInt(0), static_cast<int64_t>(ordinal));
                 EXPECT_EQ(use.getStr(1), "blob");
-                auto bytes = use.getBlobStr(2);
+                auto bytes = use.getBlobView(2);
                 EXPECT_EQ(bytes, body.substr(offset, std::min(chunkSize, size - offset)));
                 offset += bytes.size();
                 ++ordinal;
@@ -4837,7 +4837,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                 use.apply(static_cast<int64_t>(first));
                 std::string joined;
                 while (use.next())
-                    joined += use.getBlobStr(0);
+                    joined += use.getBlobView(0);
                 EXPECT_EQ(joined, body)
                     << "this malformed encoding is rejected independently of its correct framed hash";
             }

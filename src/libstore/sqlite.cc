@@ -244,11 +244,11 @@ bool SQLiteStmt::Use::next()
     return r == SQLITE_ROW;
 }
 
-std::string SQLiteStmt::Use::getBlobStr(int col)
+std::string_view SQLiteStmt::Use::getBlobView(int col)
 {
     auto p = (const char *) sqlite3_column_blob(stmt, col);
     auto n = sqlite3_column_bytes(stmt, col);
-    return p ? std::string(p, n) : std::string();
+    return p ? std::string_view(p, n) : std::string_view();
 }
 
 std::string SQLiteStmt::Use::getStr(int col)

@@ -51,8 +51,7 @@ struct FilteringSourceAccessor : SourceAccessor
 
     /** Scope a view that only filters access and forwards the bytes.
      * Subclasses that change reads must retain their own traversal. */
-    void readDirectoryScoped(
-        const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback);
+    void readDirectoryScoped(const CanonPath & path, ReadDirectoryCallback callback);
 
     std::string readLink(const CanonPath & path) override;
 

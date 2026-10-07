@@ -381,14 +381,14 @@ static BufferedRegularFile readBufferedRegular(
     struct BufferThenStreamFile : CreateRegularFileSink
     {
         const fun<std::unique_ptr<RegularFileWriter>()> & open;
-        CreateRegularFileSink & hashing;
+        HashingRegularFileSink & hashing;
         Sink * contents;
         bool executable = false;
         std::string buffer;
         std::unique_ptr<RegularFileWriter> writer;
 
         BufferThenStreamFile(
-            const fun<std::unique_ptr<RegularFileWriter>()> & open, CreateRegularFileSink & hashing, Sink * contents)
+            const fun<std::unique_ptr<RegularFileWriter>()> & open, HashingRegularFileSink & hashing, Sink * contents)
             : open(open)
             , hashing(hashing)
             , contents(contents)
@@ -440,13 +440,10 @@ static BufferedRegularFile readBufferedRegular(
         }
     };
 
-    std::optional<BufferThenStreamFile> file;
-    auto readAndBuffer = [&](CreateRegularFileSink & hashing) {
-        file.emplace(open, hashing, contents);
-        read(*file);
-    };
-    auto node = HashingVisitor{}.regular(path, std::ref(readAndBuffer));
-    return {std::move(node), std::move(file->buffer), std::move(file->writer)};
+    HashingRegularFileSink hashing{path};
+    BufferThenStreamFile file{open, hashing, contents};
+    read(file);
+    return {hashing.finish(), std::move(file.buffer), std::move(file.writer)};
 }
 
 /* Buffer regular files up to restoreBufferLimit, then link or write;

@@ -59,15 +59,7 @@ struct NodeVisitor
         /* Lifetime permission, distinct from permission for concurrent
            observations. Push producers borrow each visit only until Each
            returns; pull producers lend it through the directory scope. */
-        bool canDefer;
-
-        template<typename F>
-            requires(!std::is_same_v<std::remove_cvref_t<F>, Children>)
-        Children(F && each, bool canDefer = false)
-            : each(std::forward<F>(each))
-            , canDefer(canDefer)
-        {
-        }
+        bool canDefer = false;
 
         void operator()(Each callback) const
         {

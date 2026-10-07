@@ -435,12 +435,10 @@ LocalStore::LocalStore(ref<const Config> config)
     state->stmts->QueryValidPaths.create(state->db, "select path from ValidPaths");
     /* Cache tables are optional in an older read-only store. Its valid
        paths and their hashes remain readable without migrating a cache. */
-    auto hasTable = [&](std::string_view name) {
-        SQLiteStmt query(state->db, "select 1 from sqlite_master where type = 'table' and name = ?;");
-        return query.use().apply(name).next();
-    };
-    state->stmts->hasBlobIndex = hasTable("Blobs") && hasTable("Ingestions");
-    state->stmts->hasAuxiliary = hasTable("AuxValues");
+    SQLiteStmt tables(state->db, "select 1 from sqlite_master where type = 'table' and name = ?;");
+    bool hasBlobs = tables.use().apply("Blobs").next();
+    state->stmts->hasBlobIndex = hasBlobs && tables.use().apply("Ingestions").next();
+    state->stmts->hasAuxiliary = tables.use().apply("AuxValues").next();
     if (state->stmts->hasAuxiliary) {
         state->stmts->ReadAuxiliary.create(
             state->db,
@@ -602,7 +600,7 @@ LocalStore::LocalStore(ref<const Config> config)
                 auto state(_state->lock());
                 auto use(state->stmts->QueryBlobInodes.use());
                 while (use.next())
-                    inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobStr(1)));
+                    inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobView(1)));
             });
         };
     }
@@ -651,12 +649,8 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
         bool first = !result;
         if (first)
             result.emplace(use.getInt(0), std::string());
-        if (!result->body)
-            continue;
-        if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER || sqlite3_column_type(stmt, 2) != SQLITE_BLOB) {
-            result->body.reset();
-            continue;
-        }
+        if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER || sqlite3_column_type(stmt, 2) != SQLITE_BLOB)
+            return AuxiliaryCandidate{result->ingestion, std::nullopt};
         auto * data = sqlite3_column_blob(stmt, 2);
         if (!data && sqlite3_errcode(stmt.db) == SQLITE_NOMEM)
             SQLiteError::throw_(stmt.db, "reading auxiliary body chunk");
@@ -664,10 +658,8 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
         if (!std::cmp_equal(use.getInt(1), result->body->size() / auxiliaryChunkSize) || size > auxiliaryChunkSize
             || result->body->size() % auxiliaryChunkSize != 0 || (!first && result->body->empty())
             || (size == 0 && !first)
-            || size > result->body->max_size() - result->body->size()) {
-            result->body.reset();
-            continue;
-        }
+            || size > result->body->max_size() - result->body->size())
+            return AuxiliaryCandidate{result->ingestion, std::nullopt};
         if (size)
             result->body->append(static_cast<const char *>(data), size);
     }
@@ -755,7 +747,7 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
             return keys;
         auto use(state->stmts->QueryAuxiliaryKeys.use());
         while (use.next())
-            keys.push_back({use.getInt(0), use.getBlobStr(1), use.getInt(2)});
+            keys.push_back({use.getInt(0), std::string(use.getBlobView(1)), use.getInt(2)});
         return keys;
     });
     auto inspect = [&](State & state, const Key & key) {
@@ -814,7 +806,7 @@ void LocalStore::coalesceBlobRows(
         auto use(state.stmts->QueryBlobCollisions.use());
         use.apply(static_cast<int64_t>(ingestion));
         while (use.next()) {
-            auto id = blobIdOf(use.getBlobStr(0));
+            auto id = blobIdOf(use.getBlobView(0));
             bool executable = use.getInt(1) != 0;
             if (collisions.empty() || collisions.back().row.id != id || collisions.back().row.executable != executable)
                 collisions.push_back({

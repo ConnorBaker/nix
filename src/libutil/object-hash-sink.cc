@@ -19,74 +19,13 @@ size_t HashingVisitor::workerCountFor(SourceAccessor & accessor, PathFilter & fi
     return workers;
 }
 
+HashingRegularFileSink::~HashingRegularFileSink() = default;
+
 HashedNode HashingVisitor::regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read)
 {
-    /* Receives one file in the order both drivers deliver it: the
-       executable flag, then the size, then the bytes.  The size opens the
-       blob's header, so the identifier is complete when the bytes are and
-       nothing is buffered. */
-    struct FileHasher : CreateRegularFileSink
-    {
-        const CanonPath & path;
-        bool executable = false;
-        std::optional<merkle::ObjectHasher> hasher;
-        uint64_t announced = 0;
-        uint64_t received = 0;
-
-        /* A fallback for a driver that never announces the size: the
-           bytes are kept and hashed whole at the end.  Neither driver
-           takes this path. */
-        std::string buffer;
-
-        explicit FileHasher(const CanonPath & path)
-            : path(path)
-        {
-        }
-
-        void isExecutable() override
-        {
-            executable = true;
-        }
-
-        void preallocateContents(uint64_t size) override
-        {
-            if (hasher)
-                throw Error("object hash: the size of file '%s' was announced twice", path);
-            announced = size;
-            hasher.emplace("blob", size);
-            if (!buffer.empty()) {
-                (*hasher)(buffer);
-                buffer.clear();
-            }
-        }
-
-        void operator()(std::string_view data) override
-        {
-            received += data.size();
-            if (hasher)
-                (*hasher)(data);
-            else
-                buffer.append(data);
-        }
-
-        /* The blob's identifier and the file's size. */
-        std::pair<Hash, uint64_t> finish()
-        {
-            if (!hasher)
-                return {merkle::blobId(buffer), buffer.size()};
-            if (received != announced)
-                throw Error("object hash: file '%s' announced %d bytes but delivered %d", path, announced, received);
-            return {hasher->finish(), announced};
-        }
-    };
-
-    FileHasher f{path};
-    read(f);
-    auto [id, size] = f.finish();
-    return {
-        .entry = {.mode = f.executable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = id},
-        .narSize = merkle::nar::regular(size, f.executable),
-    };
+    HashingRegularFileSink file{path};
+    read(file);
+    return file.finish();
 }
 
 HashedNode HashingVisitor::symlink(const CanonPath &, const std::string & target)
@@ -212,7 +151,7 @@ void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCal
                the children arrive at `path / name`. */
             callback(*this, path);
         };
-        return visitor.directory(path, std::ref(children));
+        return visitor.directory(path, {std::ref(children)});
     };
     deliver(path, std::ref(visit));
 }

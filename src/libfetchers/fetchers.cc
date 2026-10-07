@@ -350,7 +350,8 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
                 auto accessor = store.requireStoreObjectAccessor(storePath);
 
-                accessor->fingerprint = getFingerprint(store);
+                if (auto fingerprint = getFingerprint(store))
+                    accessor->fingerprint = std::move(fingerprint);
 
                 // Store a cache entry for the substituted tree so later fetches
                 // can reuse the existing object instead of copying the unpacked

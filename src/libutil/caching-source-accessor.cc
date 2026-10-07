@@ -94,9 +94,7 @@ public:
         return cached(&Caches::readLink, path, [&] { return next->readLink(path); });
     }
 
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
         auto inner = next;
         inner->readDirectoryWithEntries(path, std::move(callback));

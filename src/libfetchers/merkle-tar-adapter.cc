@@ -46,11 +46,6 @@ struct File
     std::optional<Hash> * hash;
 
     bool executable;
-
-    merkle::Mode mode() const
-    {
-        return executable ? merkle::Mode::Executable : merkle::Mode::Regular;
-    }
 };
 
 /**
@@ -63,11 +58,6 @@ struct File
 struct Symlink
 {
     Hash hash;
-
-    merkle::Mode mode() const
-    {
-        return merkle::Mode::Symlink;
-    }
 };
 
 /**
@@ -83,11 +73,6 @@ using Child = std::variant<Directory, File, Symlink>;
 struct Directory
 {
     std::map<std::string, Child, std::less<>> children;
-
-    merkle::Mode mode() const
-    {
-        return merkle::Mode::Directory;
-    }
 };
 
 /**
@@ -315,25 +300,27 @@ struct TarAdapterImpl : merkle::TarAdapter
 
         /* Write the directories, children before parents. */
         auto entry = [&store = store](this const auto & write, const Child & child) -> merkle::TreeEntry {
-            return {
-                .mode = std::visit([](const auto & sub) { return sub.mode(); }, child),
-                .hash = std::visit(
-                    overloaded{
-                        [&](const Directory & dir) {
-                            auto dirSink = store.makeDirectorySink();
-                            for (auto & [name, sub] : dir.children)
-                                dirSink->insertChild(name, write(sub));
-                            return std::move(*dirSink).finalize();
-                        },
-                        [&](const File & file) {
-                            /* Filled in by the writers we waited for just above. */
-                            assert(file.hash->has_value());
-                            return **file.hash;
-                        },
-                        [&](const Symlink & link) { return link.hash; },
+            return std::visit(
+                overloaded{
+                    [&](const Directory & dir) -> merkle::TreeEntry {
+                        auto dirSink = store.makeDirectorySink();
+                        for (auto & [name, sub] : dir.children)
+                            dirSink->insertChild(name, write(sub));
+                        return {.mode = merkle::Mode::Directory, .hash = std::move(*dirSink).finalize()};
                     },
-                    child),
-            };
+                    [&](const File & file) -> merkle::TreeEntry {
+                        /* Filled in by the writers we waited for just above. */
+                        assert(file.hash->has_value());
+                        return {
+                            .mode = file.executable ? merkle::Mode::Executable : merkle::Mode::Regular,
+                            .hash = **file.hash,
+                        };
+                    },
+                    [&](const Symlink & link) -> merkle::TreeEntry {
+                        return {.mode = merkle::Mode::Symlink, .hash = link.hash};
+                    },
+                },
+                child);
         }(*projected);
 
         store.flush();

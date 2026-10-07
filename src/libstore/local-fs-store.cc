@@ -134,9 +134,7 @@ public:
         return inner->readFile(path, sink, std::move(sizeCallback));
     }
 
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
         if (path.isRoot()) {
             return SourceAccessor::readDirectoryWithEntries(path, std::move(callback));

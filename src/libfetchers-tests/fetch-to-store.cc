@@ -1203,6 +1203,7 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
 
 TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsTheSource)
 {
+    EnableExperimentalFeature enableFlakes("flakes");
     for (auto kind :
          {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory}) {
         SCOPED_TRACE(static_cast<RawMode>(kind));
@@ -1233,6 +1234,22 @@ TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsThe
         auto stored = store->requireStoreObjectAccessor(copied.first);
         EXPECT_TRUE(stored->getFingerprint(CanonPath::root));
         EXPECT_EQ(objectHashOf(*stored, CanonPath::root).root, entry);
+
+        /* The final input has no name for its source, but substitution
+           returns the already named store object and verifies both locks. */
+        auto input = fetchers::Input::fromAttrs({
+            {"type", "git"},
+            {"url", (tempStoreDir.path() / "absent-git-input").string()},
+            {"name", "known"},
+            {"__final", Explicit{true}},
+            {"treeHash", named.second.to_string(HashFormat::SRI, true)},
+            {"narHash", tree->hashPath(CanonPath::root).to_string(HashFormat::SRI, true)},
+        });
+        EXPECT_FALSE(input.getFingerprint(*store));
+        auto [substituted, locked] = input.getAccessor(settings, *store);
+        EXPECT_EQ(substituted->getFingerprint(CanonPath::root), stored->getFingerprint(CanonPath::root));
+        EXPECT_EQ(locked.getTreeHash(), named.second);
+        EXPECT_FALSE(locked.getNarHash());
         tree->reads = 0;
         fetchers::Settings fresh;
         EXPECT_EQ(fetchToStore2(fresh, *store, SourcePath(tree), FetchMode::Copy, "known"), named);
@@ -1640,9 +1657,7 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
             MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             ++active;
             ++opened;
@@ -1688,9 +1703,7 @@ TEST(ScopedFilter, nestedScopesPreservePolicyCoordinatesSnapshotsAndInnerOperati
             return std::nullopt;
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }
@@ -1951,9 +1964,7 @@ TEST(ScopedFilter, consumingListingPreservesUpstreamAdmissionSnapshots)
         {
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             auto entries = readDirectory(path);
             auto before = entries;
@@ -1986,9 +1997,7 @@ TEST(ScopedFilter, consumingListingPreservesUpstreamAdmissionSnapshots)
             return true;
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             readDirectoryScoped(
                 path, [&](SourceAccessor & scoped, const CanonPath & relative, DirectoryListing && listing) {
@@ -2067,9 +2076,7 @@ TEST(ScopedFilter, concurrencyPermissionRequiresBothThePolicyAndPhysicalAccessor
             return permission;
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }

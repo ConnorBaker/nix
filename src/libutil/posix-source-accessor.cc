@@ -343,9 +343,7 @@ public:
 
     DirEntries readDirectory(const CanonPath & path) override;
 
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override;
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override;
 
     std::string readLink(const CanonPath & path) override;
 
@@ -609,8 +607,7 @@ try {
     throw SymlinkNotAllowed(e.path, "path '%s' is a symlink", showPath(e.path));
 }
 
-void PosixDirectorySourceAccessor::readDirectoryWithEntries(
-    const CanonPath & path, std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback)
+void PosixDirectorySourceAccessor::readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback)
 {
     auto keepAlive = weak_from_this().lock();
     try {

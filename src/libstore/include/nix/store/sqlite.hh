@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <string>
+#include <string_view>
 
 #include "nix/util/error.hh"
 
@@ -144,8 +145,8 @@ struct SQLiteStmt
         bool next();
 
         std::string getStr(int col);
-        /** The column's bytes, for a `blob` column (`getStr` would convert it). */
-        std::string getBlobStr(int col);
+        /** BLOB view; invalidated by step/next, reset (Use exit), finalize, or conversion of that column. */
+        std::string_view getBlobView(int col);
         int64_t getInt(int col);
         bool isNull(int col);
     };

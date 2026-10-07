@@ -1793,9 +1793,7 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
             return inner->allowsConcurrentTraversal();
         }
 
-        void readDirectoryWithEntries(
-            const CanonPath & path,
-            std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
         {
             readDirectoryScoped(path, std::move(callback));
         }

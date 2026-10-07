@@ -704,9 +704,7 @@ struct CachingOwnershipProbe : SourceAccessor
         return {{"entry", tRegular}};
     }
 
-    void readDirectoryWithEntries(
-        const CanonPath & path,
-        std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)> callback) override
+    void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
         DirEntries entries{{"entry", tRegular}};
         callback(*this, path, DirectoryListing(std::move(entries)));
