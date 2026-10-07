@@ -1017,14 +1017,16 @@ TEST(ObjectHashSink, filter_matches_dumpPath)
    half-supported. */
 TEST(ObjectHashSink, flat_createDirectory_form_is_refused)
 {
-    ObjectHashSink sink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink sink{objectVisitor};
     EXPECT_THROW(sink.createDirectory(CanonPath::root), Error);
 }
 
 /* An empty sink has no root to report. */
 TEST(ObjectHashSink, finish_without_root_throws)
 {
-    ObjectHashSink sink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink sink{objectVisitor};
     EXPECT_THROW(sink.finish(), Error);
 }
 
@@ -1036,7 +1038,8 @@ TEST(ObjectHashSink, regular_file_without_announced_size)
     StringSink nar;
     dumpString("abc", nar);
 
-    ObjectHashSink sink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink sink{objectVisitor};
     sink.createRegularFile(CanonPath::root, [](CreateRegularFileSink & crf) {
         crf("a");
         crf("bc");
@@ -1049,7 +1052,8 @@ TEST(ObjectHashSink, regular_file_without_announced_size)
 /* A size announced and then not met is refused rather than hashed wrong. */
 TEST(ObjectHashSink, short_delivery_against_announced_size_throws)
 {
-    ObjectHashSink sink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink sink{objectVisitor};
     EXPECT_THROW(
         sink.createRegularFile(
             CanonPath::root,

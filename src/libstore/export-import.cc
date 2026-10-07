@@ -80,7 +80,8 @@ StorePaths importPaths(Store & store, Source & source, CheckSigsFlag checkSigs)
            the way: the object hash of what is imported, and its size. */
         StringSink saved;
         TeeSource tee{source, saved};
-        ObjectHashSink hasher;
+        HashingVisitor objectVisitor;
+        ObjectHashSink hasher{objectVisitor};
         parseDump(hasher, tee);
         auto object = hasher.finish();
 

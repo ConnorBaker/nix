@@ -115,7 +115,8 @@ TEST(NarListing, parserScopesPreserveNodesAndPayloadOffsetsAcrossSinks)
                 auto copied = make_ref<MemorySourceAccessor>();
                 MemorySink memory{*copied};
                 NullFileSystemObjectSink skip;
-                ObjectHashSink hash;
+                HashingVisitor objectVisitor;
+                ObjectHashSink hash{objectVisitor};
                 TeeFileSystemObjectSink scoped{memory, skip};
                 FileSystemObjectSink * sinks[]{nullptr, &skip, &memory, &hash, &scoped};
                 StringSource input{framed};
@@ -181,7 +182,8 @@ TEST_F(NarListingTest, parserErrorsKeepTheirSourcePositionWithEitherListingOverl
         for (size_t route = 0; route < 3; ++route) {
             StringSource source{bytes};
             NullFileSystemObjectSink skip;
-            ObjectHashSink hash;
+            HashingVisitor objectVisitor;
+            ObjectHashSink hash{objectVisitor};
             try {
                 if (route == 0)
                     parseDump(skip, source);
@@ -236,7 +238,7 @@ TEST(NarAccessor, directoryEntryTypesFollowListingKinds)
         auto accessor = lazy ? makeLazyNarAccessor(std::move(listing), [&](uint64_t, uint64_t, Sink &) { ++reads; })
                              : makeNarAccessor(std::move(listing));
         auto rootEntries = accessor->readDirectory(CanonPath::root);
-        ASSERT_EQ(rootEntries.size(), 1);
+        ASSERT_EQ(rootEntries.size(), size_t{1});
         EXPECT_EQ(rootEntries.at("nested"), SourceAccessor::tDirectory);
         auto path = CanonPath("/nested");
         auto entries = accessor->readDirectory(path);
@@ -258,7 +260,7 @@ TEST(NarAccessor, directoryEntryTypesFollowListingKinds)
         EXPECT_THROW(accessor->readDirectory(path / "absent"), Error);
         EXPECT_THROW(accessor->readDirectory(path / "regular-000"), Error);
         EXPECT_THROW(accessor->readDirectory(path / "dangling-link"), Error);
-        EXPECT_EQ(reads, 0);
+        EXPECT_EQ(reads, size_t{0});
     }
 }
 

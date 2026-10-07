@@ -392,7 +392,8 @@ ValidPathInfo Store::addToStoreSlow(
     /* The object hash is computed for every method; the flat method's
        content hash needs the file's bytes as well, through `fileSink`, so
        there the parse is delivered to both. */
-    ObjectHashSink objectSink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink objectSink{objectVisitor};
     TeeFileSystemObjectSink flatTee{fileSink, objectSink};
     auto & parseSink = method.getFileIngestionMethod() == FileIngestionMethod::Flat
                            ? (FileSystemObjectSink &) flatTee

@@ -167,7 +167,8 @@ BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair, fun<ValidPat
     HashSink fileHashSink{HashAlgorithm::SHA256};
     std::shared_ptr<NarAccessor> narAccessor;
     HashSink narHashSink{HashAlgorithm::SHA256};
-    ObjectHashSink objectSink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink objectSink{objectVisitor};
     {
         FdSink fileSink(fdTemp.get());
         TeeSink teeSinkCompressed{fileSink, fileHashSink};

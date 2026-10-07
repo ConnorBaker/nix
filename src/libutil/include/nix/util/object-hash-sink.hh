@@ -74,8 +74,8 @@ protected:
  * The push driver of a `NodeVisitor<HashedNode>`: the sink protocol
  * (`parseDump`) adapted to the visitor (`08` §1.6).  Children are
  * recorded under the tree's own name (`unhackName`); `node` is never
- * consulted, since a NAR's bytes cannot be skipped.  Without a visitor
- * of its own it hashes with a `HashingVisitor`.
+ * consulted, since a NAR's bytes cannot be skipped. The caller owns the
+ * visitor; this stationary adapter borrows it through callbacks and finish.
  */
 struct ObjectHashSink : FileSystemObjectSink
 {
@@ -96,15 +96,9 @@ struct ObjectHashSink : FileSystemObjectSink
         static Result of(const HashedNode & root);
     };
 
-    HashingVisitor hasher;
-
     NodeVisitor<HashedNode> & visitor;
 
-    ObjectHashSink()
-        : visitor(hasher)
-    {
-    }
-
+    ObjectHashSink(const ObjectHashSink &) = delete;
     explicit ObjectHashSink(NodeVisitor<HashedNode> & visitor)
         : visitor(visitor)
     {

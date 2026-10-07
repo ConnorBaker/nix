@@ -305,7 +305,8 @@ void TeeFileSystemObjectSink::createSymlink(const CanonPath & path, const std::s
 
 ObjectHashSink::Result objectHashOfNar(Source & source)
 {
-    ObjectHashSink sink;
+    HashingVisitor objectVisitor;
+    ObjectHashSink sink{objectVisitor};
     parseDump(sink, source);
     return sink.finish();
 }
