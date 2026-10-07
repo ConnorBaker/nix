@@ -49,7 +49,7 @@ std::string SourceAccessor::Stat::typeString()
 }
 
 SourceAccessor::SourceAccessor()
-    : number(++nextNumber)
+    : number(nextNumber.fetch_add(1, std::memory_order_relaxed) + 1)
     , displayPrefix{"«unknown»"}
 {
 }
