@@ -83,25 +83,21 @@ public:
         DirEntries result;
         if (!view.hidden)
             result = view.accessor->readDirectory(view.subpath);
-        /* Resolve child shapes before asking for mounted root types. A
-           deeper binding already proves its first component is a directory,
-           even if a direct mount at that component cannot be inspected. */
-        for (auto & [mountPoint, mounted] : view.below) {
-            auto rel = mountPoint.removePrefix(path);
-            std::string name(*rel.begin());
-            if (rel.parent()->isRoot())
-                result.erase(name);
-            else
+        /* CanonPath order makes all grafts through one child contiguous. */
+        for (auto i = view.below.begin(); i != view.below.end();) {
+            auto relative = i->first.removePrefix(path);
+            std::string name(*relative.begin());
+            auto child = path / name;
+            auto next = std::find_if_not(i + 1, view.below.end(), [&](const auto & binding) {
+                return binding.first.isWithin(child);
+            });
+            if (i->first != child || next != i + 1)
                 result.insert_or_assign(name, tDirectory);
-        }
-        for (auto & [mountPoint, mounted] : view.below) {
-            auto rel = mountPoint.removePrefix(path);
-            if (rel.parent()->isRoot()) {
-                std::string name(*rel.begin());
-                if (!result.contains(name))
-                    if (auto st = mounted->maybeLstat(CanonPath::root))
-                        result.emplace(name, st->type);
-            }
+            else if (auto st = i->second->maybeLstat(CanonPath::root))
+                result.insert_or_assign(name, st->type);
+            else
+                result.erase(name);
+            i = next;
         }
         return result;
     }
@@ -167,18 +163,17 @@ public:
            The owning snapshot is complete before invoking any child. */
         auto prefix = mountPoint;
         auto component = result.subpath.begin();
-        while (std::any_of(nested.begin(), nested.end(), [&](auto & binding) {
-            return binding.first != prefix && binding.first.isWithin(prefix);
-        })) {
-            auto st = result.accessor->maybeLstat(prefix.removePrefix(mountPoint));
-            if (!st || st->type != tDirectory) {
-                result.hidden = true;
-                break;
+        for (const auto & binding : nested)
+            while (binding.first != prefix && binding.first.isWithin(prefix)) {
+                auto st = result.accessor->maybeLstat(prefix.removePrefix(mountPoint));
+                if (!st || st->type != tDirectory) {
+                    result.hidden = true;
+                    return result;
+                }
+                if (prefix == path)
+                    return result;
+                prefix.push(*component++);
             }
-            if (prefix == path)
-                break;
-            prefix.push(*component++);
-        }
         return result;
     }
 

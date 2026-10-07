@@ -12,8 +12,8 @@
 #include "nix/util/sync.hh"
 #include "nix/util/util.hh"
 
-#include <algorithm>
-#include <unordered_set>
+#include <utility>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <atomic>
 #include <cstring>
@@ -92,28 +92,19 @@ struct GitObjectStore::Hold::Pending
 {
     /* Borrow the value's existing identity. Like the old binary key, Hash
        equality uses length and bytes, without an algorithm tag. */
-    struct Key
+    struct Key : std::pair<merkle::Mode, const Hash &>
     {
-        std::string_view id;
-        merkle::Mode mode;
-
-        Key(const Hash & id, merkle::Mode mode) noexcept
-            : id(reinterpret_cast<const char *>(id.hash), id.hashSize)
-            , mode(mode)
-        {
-        }
+        using std::pair<merkle::Mode, const Hash &>::pair;
 
         Key(const Row & row) noexcept
-            : Key(row.id, row.executable ? merkle::Mode::Executable : merkle::Mode::Regular)
+            : Key(row.executable ? merkle::Mode::Executable : merkle::Mode::Regular, row.id)
         {
         }
 
         Key(const Auxiliary & object) noexcept
-            : Key(object.entry.hash, object.entry.mode)
+            : Key(object.entry.mode, object.entry.hash)
         {
         }
-
-        bool operator==(const Key &) const = default;
     };
 
     struct KeyHash
@@ -122,7 +113,7 @@ struct GitObjectStore::Hold::Pending
 
         size_t operator()(Key key) const noexcept
         {
-            return std::hash<std::string_view>{}(key.id) ^ static_cast<size_t>(key.mode);
+            return std::hash<Hash>{}(key.second) ^ static_cast<size_t>(key.first);
         }
     };
 
@@ -131,8 +122,8 @@ struct GitObjectStore::Hold::Pending
         using is_transparent = void;
     };
 
-    Sync<std::unordered_set<Row, KeyHash, KeyEqual>> regular;
-    Sync<std::unordered_set<Auxiliary, KeyHash, KeyEqual>> auxiliary;
+    Sync<boost::unordered_flat_set<Row, KeyHash, KeyEqual>> regular;
+    Sync<boost::unordered_flat_set<Auxiliary, KeyHash, KeyEqual>> auxiliary;
     std::filesystem::path root;
 };
 
@@ -198,7 +189,7 @@ GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
 {
     auto regular = pending->regular.lock();
-    auto i = regular->find(Pending::Key{id, executable ? merkle::Mode::Executable : merkle::Mode::Regular});
+    auto i = regular->find(Pending::Key{executable ? merkle::Mode::Executable : merkle::Mode::Regular, id});
     if (i == regular->end())
         return std::nullopt;
     auto & name = i->name;
@@ -438,6 +429,33 @@ static std::optional<GitObjectStore::Placed> linkOver(
         cleanup.cancel();
     return GitObjectStore::Placed{placed.st_ino, false};
 }
+
+static GitObjectStore::Hold::Row rowOf(
+    const Hash & id,
+    bool executable,
+    const PosixStat & st,
+    const std::filesystem::path & where,
+    const GitObjectStore::Hold & hold)
+{
+    return {id, executable, st.st_ino, st.st_dev, static_cast<uint64_t>(st.st_size), nameUnderRoot(where, hold.root())};
+}
+
+static std::optional<GitObjectStore::Placed> placePending(
+    GitObjectStore & objects,
+    const std::string & file,
+    Descriptor dirFd,
+    const CanonPath & name,
+    const std::filesystem::path & where,
+    const PosixStat & before)
+{
+    auto st = maybeLstatOf(file);
+    if (!st)
+        return std::nullopt;
+    if (st->st_ino == before.st_ino && st->st_dev == before.st_dev)
+        return GitObjectStore::Placed{before.st_ino, false};
+    return linkOver(objects, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
+}
+
 #endif
 
 bool GitObjectStore::link(
@@ -530,15 +548,7 @@ bool GitObjectStore::link(
        registration. Keep its own witness, using the status already read.
        A concurrent worker may have claimed a different holder meanwhile. */
     if (!mine)
-        if (auto other = hold.addRow(
-                Hold::Row{
-                    .id = id,
-                    .executable = executable,
-                    .ino = st->st_ino,
-                    .dev = st->st_dev,
-                    .size = static_cast<uint64_t>(st->st_size),
-                    .name = nameUnderRoot(where, hold.root()),
-                }))
+        if (auto other = hold.addRow(rowOf(id, executable, *st, where, hold)))
             if (auto placed =
                     linkOver(*this, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; }))
                 st->st_ino = placed->ino;
@@ -574,12 +584,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
        within one path), then the index's holder. */
     bool entered = true;
     if (auto mine = hold.pendingHolder(id, executable)) {
-        if (auto st = maybeLstatOf(*mine)) {
-            if (st->st_ino == before.st_ino && st->st_dev == before.st_dev)
-                return Placed{before.st_ino, false};
-            return replaceBy(*mine, [](auto &, const auto &) { return true; });
-        }
-        return std::nullopt;
+        return placePending(*this, *mine, dirFd, name, where, before);
     } else if (index && index->lookup) {
         auto cursor = Holder::initialCursor;
         while (auto holder = index->lookup(id, executable, cursor)) {
@@ -612,15 +617,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
         printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
         return std::nullopt;
     }
-    auto other = hold.addRow(
-        Hold::Row{
-            .id = id,
-            .executable = executable,
-            .ino = after.st_ino,
-            .dev = after.st_dev,
-            .size = static_cast<uint64_t>(after.st_size),
-            .name = nameUnderRoot(where, hold.root()),
-        });
+    auto other = hold.addRow(rowOf(id, executable, after, where, hold));
     if (other)
         return replaceBy(*other, [](auto &, const auto &) { return true; });
     return Placed{after.st_ino, entered};
@@ -648,17 +645,9 @@ void GitObjectStore::enterWritten(
         place(id, executable, dirFd, name, where, st, repair, hold);
         return;
     }
-    auto other = hold.addRow(
-        Hold::Row{
-            .id = id,
-            .executable = executable,
-            .ino = st.st_ino,
-            .dev = st.st_dev,
-            .size = static_cast<uint64_t>(st.st_size),
-            .name = nameUnderRoot(where, hold.root()),
-        });
+    auto other = hold.addRow(rowOf(id, executable, st, where, hold));
     if (other)
-        place(id, executable, dirFd, name, where, st, repair, hold);
+        placePending(*this, *other, dirFd, name, where, st);
 #endif
 }
 

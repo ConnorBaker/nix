@@ -2,8 +2,9 @@
 #include "nix/util/archive.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/error.hh"
+#include "nix/util/finally.hh"
 
-#include <stack>
+#include <utility>
 
 namespace nix {
 
@@ -44,7 +45,7 @@ static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
         std::optional<NarListing> root;
         Source & source;
 
-        std::stack<NarListing *> parents;
+        NarListing::Directory * parent = nullptr;
 
         uint64_t pos = 0;
 
@@ -55,32 +56,22 @@ static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
 
         NarListing & createMember(const CanonPath & path, NarListing member)
         {
-            size_t level = 0;
-            for (auto _ : path) {
-                (void) _;
-                ++level;
-            }
-
-            while (parents.size() > level)
-                parents.pop();
-
-            if (parents.empty()) {
-                root = std::move(member);
-                parents.push(&*root);
-                return *root;
-            } else {
-                auto * parentDir = std::get_if<NarListing::Directory>(&parents.top()->raw);
-                if (!parentDir)
-                    throw Error("NAR file missing parent directory of path '%s'", path);
-                auto result = parentDir->entries.emplace(*path.baseName(), std::move(member));
-                parents.push(&result.first->second);
-                return result.first->second;
-            }
+            if (!parent)
+                return root.emplace(std::move(member));
+            return parent->entries.emplace(*path.baseName(), std::move(member)).first->second;
         }
 
         void createDirectory(const CanonPath & path) override
         {
             createMember(path, NarListing::Directory{});
+        }
+
+        void createDirectory(const CanonPath & path, DirectoryCreatedCallback callback) override
+        {
+            auto & directory = std::get<NarListing::Directory>(createMember(path, NarListing::Directory{}).raw);
+            auto previous = std::exchange(parent, &directory);
+            Finally restore{[&] { parent = previous; }};
+            callback(*this, path);
         }
 
         void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func) override

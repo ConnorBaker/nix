@@ -5382,6 +5382,66 @@ TEST_F(LocalStoreObjectsTest, concurrentMissesShareTheFirstCompletedHolder)
             }
 }
 
+TEST_F(LocalStoreObjectsTest, completedPendingWitnessKeepsItsIdentityAcrossPlacement)
+{
+    enum class State { Distinct, Shared, Missing };
+    unsigned cases = 0;
+    auto & objects = store->objects;
+    for (auto state : {State::Distinct, State::Shared, State::Missing})
+        for (bool executable : {false, true})
+            for (bool looked : {false, true}) {
+                SCOPED_TRACE(fmt("state=%d executable=%d looked=%d", static_cast<unsigned>(state), executable, looked));
+                auto dir = tempStoreDir.path() / fmt("pending-placement-%d", cases++);
+                createDir(dir);
+                auto fd = openDirectory(dir);
+                auto first = dir / "first";
+                auto target = dir / "target";
+                auto bytes = dir.filename().string();
+                auto id = merkle::blobId(bytes);
+                auto mode = executable ? 0555 : 0444;
+                writeFile(first, bytes);
+                chmod(first, mode);
+                setWriteTime(first, 1, 1);
+                auto witness = st(first);
+                auto hold = objects.hold();
+                hold.setRoot(dir);
+                ASSERT_FALSE(hold.addRow({id, executable, witness.st_ino, witness.st_dev, bytes.size(), "first"}));
+
+                if (state == State::Shared)
+                    std::filesystem::create_hard_link(first, target);
+                else {
+                    writeFile(target, bytes);
+                    chmod(target, mode);
+                    setWriteTime(target, 1, 1);
+                }
+                auto before = st(target);
+                if (state == State::Missing)
+                    std::filesystem::remove(first);
+
+                objects.enterWritten(
+                    id, executable, fd.get(), CanonPath::fromFilename("target"), target, NoRepair, hold, looked);
+                auto after = st(target);
+                EXPECT_EQ(after.st_ino, state == State::Missing ? before.st_ino : witness.st_ino);
+                EXPECT_EQ(after.st_dev, before.st_dev);
+                EXPECT_EQ(after.st_mode, before.st_mode);
+                EXPECT_EQ(after.st_size, before.st_size);
+                EXPECT_EQ(after.st_mtime, before.st_mtime);
+                EXPECT_EQ(readFile(target), bytes);
+                EXPECT_EQ(hold.pendingHolder(id, executable), std::optional{first.string()});
+                auto projection = hold.takeProjection();
+                ASSERT_EQ(projection.regular.size(), 1u);
+                EXPECT_TRUE(projection.auxiliary.empty());
+                const auto & row = projection.regular.front();
+                EXPECT_EQ(row.id, id);
+                EXPECT_EQ(row.executable, executable);
+                EXPECT_EQ(row.ino, witness.st_ino);
+                EXPECT_EQ(row.dev, witness.st_dev);
+                EXPECT_EQ(row.size, bytes.size());
+                EXPECT_EQ(row.name, "first");
+            }
+    EXPECT_EQ(cases, 12u);
+}
+
 TEST_F(LocalStoreObjectsTest, refusedStreamedEntryLeavesNoPendingHolder)
 {
     auto & objects = store->objects;

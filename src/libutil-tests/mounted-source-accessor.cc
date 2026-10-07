@@ -3,6 +3,8 @@
 #include "nix/util/tests/gmock-matchers.hh"
 #include "nix/util/tests/source-accessor-gen.hh"
 
+#include <algorithm>
+#include <bit>
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
@@ -384,6 +386,48 @@ TEST(MountedSourceAccessor, ancestorShapeDoesNotForceFallbackContents)
             }
 }
 
+TEST(MountedSourceAccessor, graftsInspectExactlyTheirSharedQueryPrefixes)
+{
+    using Observation = GraftDemandProbe::Observation;
+    const std::vector<CanonPath> grafts{
+        CanonPath("a"), CanonPath("z/a"), CanonPath("z/deep/other"), CanonPath("z/deep/more/x")};
+    const std::vector<CanonPath> observations{
+        CanonPath::root, CanonPath("z"), CanonPath("z/deep"), CanonPath("z/deep/more"), CanonPath("z/deep/more/file")};
+    for (unsigned subset = 0; subset < 16; ++subset)
+        for (bool rootMount : {false, true})
+            for (size_t at = 0; at < observations.size(); ++at)
+                for (auto observation :
+                     {Observation::Missing, Observation::Regular, Observation::Directory, Observation::Error}) {
+                    SCOPED_TRACE(
+                        ::testing::Message() << "subset=" << subset << " rootMount=" << rootMount << " at=" << at
+                                             << " observation=" << int(observation));
+                    auto fallback = make_ref<GraftDemandProbe>();
+                    fallback->root = memoryTree({{"z/deep/more/file", "contents"}})->root;
+                    fallback->observedAt = observations[at];
+                    fallback->observation = observation;
+                    auto accessor = makeMountedSourceAccessor({{CanonPath::root, fallback}});
+                    auto mountPoint = rootMount ? CanonPath::root : CanonPath("selected");
+                    if (!rootMount)
+                        accessor->mount(mountPoint, fallback);
+                    for (size_t i = 0; i < grafts.size(); ++i)
+                        if (subset & (1u << i))
+                            accessor->mount(mountPoint / grafts[i], memoryTree({}));
+                    /* The deepest shared prefix determines the required observations,
+                       independently of which shallower grafts are present. The query
+                       itself is never such a prefix. */
+                    unsigned required = std::bit_width(subset);
+                    bool inspected = at < required;
+                    auto read = [&] { return accessor->readFile(mountPoint / observations.back()); };
+                    if (inspected && observation == Observation::Error)
+                        EXPECT_THROW(read(), GraftObservationError);
+                    else if (inspected && observation != Observation::Directory)
+                        EXPECT_THROW(read(), FileNotFound);
+                    else
+                        EXPECT_EQ(read(), "contents");
+                    EXPECT_EQ(fallback->calls, inspected && observation != Observation::Directory ? at + 1 : required);
+                }
+}
+
 TEST(MountedSourceAccessor, deeperBindingsDetermineListedChildShape)
 {
     using Observation = GraftDemandProbe::Observation;
@@ -556,6 +600,83 @@ void checkMountedInvalidation(unsigned releaseAt, bool release, bool throwing, b
 }
 
 } // namespace
+
+TEST(MountedSourceAccessor, listingsKeepOrderedCallbacksAndTheCapturedGrafts)
+{
+    for (bool root : {false, true})
+        for (bool reverse : {false, true})
+            for (bool release : {false, true})
+                for (unsigned throwAt = 0; throwAt <= 4; ++throwAt) {
+                    SCOPED_TRACE(
+                        ::testing::Message() << "root=" << root << " reverse=" << reverse << " release=" << release
+                                             << " throwAt=" << throwAt);
+                    const CanonPath query(root ? "/" : "/parent");
+                    std::shared_ptr<MountedSourceAccessor> owner;
+                    std::weak_ptr<MountedSourceAccessor> weakOwner;
+                    std::vector<std::string> calls;
+                    bool firstCall = true;
+                    owner =
+                        makeMountedSourceAccessor(
+                            {{CanonPath::root,
+                              root ? memoryTree({{"a", "old"}, {"aa", "stale"}, {"untouched", "old"}})
+                                   : memoryTree(
+                                         {{"parent/a", "old"}, {"parent/aa", "stale"}, {"parent/untouched", "old"}})}})
+                            .get_ptr();
+                    weakOwner = owner;
+                    auto * accessor = owner.get();
+                    std::vector<std::string> names{
+                        "a", "a/child", "a/deeper/leaf", "a!", "a./child", "a./other", "aa", "b", "c"};
+                    if (reverse)
+                        std::reverse(names.begin(), names.end());
+                    for (const auto & name : names) {
+                        auto child = make_ref<MountedOwnershipProbe>();
+                        child->present = name != "aa";
+                        child->callback = [&, name] {
+                            calls.push_back(name);
+                            /* Deeper grafts determine their parent's shape without observing these roots. */
+                            if (name != "a!" && name != "aa" && name != "b" && name != "c")
+                                throw MountedCallbackException{};
+                            if (firstCall && name == "a!") {
+                                accessor->mount(query / CanonPath("aa/new"), memoryTree({}));
+                                auto original = accessor->getMount(query / "b");
+                                accessor->mount(query / "b", make_ref<MemorySourceAccessor>());
+                                EXPECT_EQ(accessor->getMount(query / "b"), original);
+                                if (release)
+                                    owner.reset();
+                                EXPECT_FALSE(weakOwner.expired());
+                            }
+                            if (firstCall && calls.size() == throwAt)
+                                throw MountedCallbackException{};
+                        };
+                        accessor->mount(query / CanonPath(name), child);
+                    }
+                    SourceAccessor::DirEntries expected{
+                        {"a", SourceAccessor::tDirectory},
+                        {"a!", SourceAccessor::tDirectory},
+                        {"a.", SourceAccessor::tDirectory},
+                        {"b", SourceAccessor::tDirectory},
+                        {"c", SourceAccessor::tDirectory},
+                        {"untouched", SourceAccessor::tRegular},
+                    };
+                    if (throwAt)
+                        EXPECT_THROW(accessor->readDirectory(query), MountedCallbackException);
+                    else
+                        EXPECT_EQ(accessor->readDirectory(query), expected);
+                    std::vector<std::string> ordered{"a!", "aa", "b", "c"};
+                    if (throwAt)
+                        ordered.resize(throwAt);
+                    EXPECT_EQ(calls, ordered);
+                    EXPECT_EQ(weakOwner.expired(), release);
+                    if (!release) {
+                        /* Even a failed listing used its captured mounts. Only the next call sees aa promoted. */
+                        firstCall = false;
+                        calls.clear();
+                        expected.emplace("aa", SourceAccessor::tDirectory);
+                        EXPECT_EQ(accessor->readDirectory(query), expected);
+                        EXPECT_EQ(calls, (std::vector<std::string>{"a!", "b", "c"}));
+                    }
+                }
+}
 
 TEST(MountedSourceAccessor, statCallbacksRetainTheFallbackOwner)
 {

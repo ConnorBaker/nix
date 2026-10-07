@@ -253,9 +253,13 @@ struct std::hash<nix::Hash>
 {
     std::size_t operator()(const nix::Hash & hash) const noexcept
     {
-        assert(hash.hashSize > sizeof(size_t));
-        std::size_t result;
-        std::memcpy(&result, hash.hash, sizeof(result));
+        if (hash.hashSize >= sizeof(std::size_t)) {
+            std::size_t result;
+            std::memcpy(&result, hash.hash, sizeof(result));
+            return result;
+        }
+        std::size_t result = 0;
+        std::memcpy(&result, hash.hash, hash.hashSize);
         return result;
     }
 };

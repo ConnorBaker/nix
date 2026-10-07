@@ -1,9 +1,12 @@
 #include <string_view>
 
+#include "nix/util/archive.hh"
 #include "nix/util/nar-accessor.hh"
+#include "nix/util/object-hash-sink.hh"
 #include "nix/util/error.hh"
 
 #include "nix/util/tests/json-characterization.hh"
+#include "nix/util/tests/setting-scopes.hh"
 
 namespace nix {
 
@@ -81,6 +84,122 @@ INSTANTIATE_TEST_SUITE_P(
             "shallow",
             listNarShallow(*memory_source_accessor::exampleComplex(), CanonPath::root),
         }));
+
+TEST(NarListing, parserScopesPreserveNodesAndPayloadOffsetsAcrossSinks)
+{
+    using File = MemorySourceAccessor::File;
+    size_t cases = 0;
+    for (bool caseHack : {false, true}) {
+        WithCaseHack setting{caseHack};
+        for (auto mode :
+             {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory}) {
+            auto tree = make_ref<MemorySourceAccessor>();
+            if (mode == merkle::Mode::Directory) {
+                for (size_t size = 0; size <= 8; ++size)
+                    tree->addFile(CanonPath("/nested/data-" + std::to_string(size)), std::string(size, 'a' + size));
+                tree->open(CanonPath("/nested/empty"), File{File::Directory{}});
+                tree->open(CanonPath("/nested/exec"), File{File::Regular{true, "executable"}});
+                tree->open(CanonPath("/nested/link"), File{File::Symlink{"../Foo"}});
+                tree->addFile(CanonPath("/Foo"), "first");
+                tree->addFile(CanonPath("/foo"), "second");
+                tree->addFile(CanonPath("/tail"), "after nested directory");
+            } else if (mode == merkle::Mode::Symlink)
+                tree->open(CanonPath::root, File{File::Symlink{"absent"}});
+            else
+                tree->open(CanonPath::root, File{File::Regular{mode == merkle::Mode::Executable, "root payload"}});
+            StringSink encoded;
+            tree->dumpPath(CanonPath::root, encoded);
+            auto framed = encoded.s + "trailing bytes";
+            for (size_t sinkKind = 0; sinkKind < 5; ++sinkKind) {
+                SCOPED_TRACE(fmt("caseHack=%d mode=%o sink=%d", caseHack, static_cast<RawMode>(mode), sinkKind));
+                auto copied = make_ref<MemorySourceAccessor>();
+                MemorySink memory{*copied};
+                NullFileSystemObjectSink skip;
+                ObjectHashSink hash;
+                TeeFileSystemObjectSink scoped{memory, skip};
+                FileSystemObjectSink * sinks[]{nullptr, &skip, &memory, &hash, &scoped};
+                StringSource input{framed};
+                auto listing = sinks[sinkKind] ? parseNarListing(input, *sinks[sinkKind]) : parseNarListing(input);
+                EXPECT_EQ(input.pos, encoded.s.size());
+                auto check = [&](this const auto & self, const File & expected, const NarListing & actual) -> void {
+                    ASSERT_EQ(actual.raw.index(), expected.raw.index());
+                    if (auto regular = std::get_if<File::Regular>(&expected.raw)) {
+                        auto & entry = std::get<NarListing::Regular>(actual.raw);
+                        EXPECT_EQ(entry.executable, regular->executable);
+                        ASSERT_TRUE(entry.contents.fileSize);
+                        ASSERT_TRUE(entry.contents.narOffset);
+                        EXPECT_EQ(*entry.contents.fileSize, regular->contents.size());
+                        ASSERT_LE(*entry.contents.narOffset, encoded.s.size());
+                        ASSERT_LE(*entry.contents.fileSize, encoded.s.size() - *entry.contents.narOffset);
+                        EXPECT_EQ(
+                            encoded.s.substr(*entry.contents.narOffset, *entry.contents.fileSize), regular->contents);
+                    } else if (auto directory = std::get_if<File::Directory>(&expected.raw)) {
+                        auto & entries = std::get<NarListing::Directory>(actual.raw).entries;
+                        ASSERT_EQ(entries.size(), directory->entries.size());
+                        for (auto & [name, child] : directory->entries) {
+                            auto physical = caseHack && name == "foo" ? name + std::string(caseHackSuffix) + "1" : name;
+                            ASSERT_TRUE(entries.contains(physical));
+                            self(child, entries.at(physical));
+                        }
+                    } else
+                        EXPECT_EQ(
+                            std::get<NarListing::Symlink>(actual.raw).target,
+                            std::get<File::Symlink>(expected.raw).target);
+                };
+                check(*tree->root, listing);
+                if (sinkKind == 2 || sinkKind == 4) {
+                    StringSink output;
+                    copied->dumpPath(CanonPath::root, output);
+                    EXPECT_EQ(output.s, encoded.s);
+                } else if (sinkKind == 3) {
+                    EXPECT_EQ(hash.finish().narSize, encoded.s.size());
+                }
+                ++cases;
+            }
+        }
+    }
+    EXPECT_EQ(cases, 40u);
+}
+
+TEST_F(NarListingTest, parserErrorsKeepTheirSourcePositionWithEitherListingOverload)
+{
+    for (auto name :
+         {"invalid-tag-instead-of-contents",
+          "nul-character",
+          "dot",
+          "dotdot",
+          "slash",
+          "empty",
+          "executable-after-contents",
+          "name-after-node",
+          "regular-one-byte-non-zero-padding",
+          "regular-truncated-padding",
+          "regular-truncated-large-contents"}) {
+        SCOPED_TRACE(name);
+        auto bytes = readFile(getUnitTestData() / "nars" / (std::string(name) + ".nar"));
+        std::pair<std::string, size_t> expected;
+        for (size_t route = 0; route < 3; ++route) {
+            StringSource source{bytes};
+            NullFileSystemObjectSink skip;
+            ObjectHashSink hash;
+            try {
+                if (route == 0)
+                    parseDump(skip, source);
+                else if (route == 1)
+                    (void) parseNarListing(source);
+                else
+                    (void) parseNarListing(source, hash);
+                FAIL() << "invalid NAR was accepted";
+            } catch (Error & error) {
+                auto observed = std::pair{error.msg(), source.pos};
+                if (route == 0)
+                    expected = observed;
+                else
+                    EXPECT_EQ(observed, expected);
+            }
+        }
+    }
+}
 
 TEST(NarAccessor, directoryEntryTypesFollowListingKinds)
 {
