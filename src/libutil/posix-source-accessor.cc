@@ -532,11 +532,7 @@ AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & pat
     } else {
         auto [parentFd, parentFdOwning] = openParentAndUpsert(path, /*ignoreMissing=*/false);
 
-        try {
-            dirFdOwning = unix::openFileFinalComponentNoSymlinks(parentFd, path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-        } catch (SymlinkNotAllowed &) {
-            throw SymlinkNotAllowed(path, "path '%s' is a symlink", showPath(path));
-        }
+        dirFdOwning = unix::openFileFinalComponentNoSymlinks(parentFd, path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
 
         if (!dirFdOwning) {
             if (errno == ENOTDIR)
