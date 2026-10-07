@@ -68,15 +68,6 @@ static std::optional<time_t> tempTime(std::string_view name)
     return std::nullopt;
 }
 
-/* A hard link `to` for the file `from`, by full paths; the error, empty
-   on success, compares to `std::errc` on every platform. */
-static std::error_code hardLink(const std::filesystem::path & from, const std::filesystem::path & to)
-{
-    std::error_code ec;
-    std::filesystem::create_hard_link(from, to, ec);
-    return ec;
-}
-
 static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
 {
     if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
@@ -397,7 +388,8 @@ static std::optional<GitObjectStore::Placed> linkOver(
 {
     auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
     auto tempLink = objects.tempPath("link");
-    if (auto ec = hardLink(file, tempLink)) {
+    if (::link(file.c_str(), tempLink.c_str()) == -1) {
+        auto ec = std::error_code(errno, std::generic_category());
         if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
             printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
             return std::nullopt;

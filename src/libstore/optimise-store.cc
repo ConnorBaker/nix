@@ -440,16 +440,13 @@ static BufferedRegularFile readBufferedRegular(
         }
     };
 
-    std::string buffer;
-    std::unique_ptr<RegularFileWriter> writer;
+    std::optional<BufferThenStreamFile> file;
     auto readAndBuffer = [&](CreateRegularFileSink & hashing) {
-        BufferThenStreamFile file{open, hashing, contents};
-        read(file);
-        buffer = std::move(file.buffer);
-        writer = std::move(file.writer);
+        file.emplace(open, hashing, contents);
+        read(*file);
     };
     auto node = HashingVisitor{}.regular(path, std::ref(readAndBuffer));
-    return {std::move(node), std::move(buffer), std::move(writer)};
+    return {std::move(node), std::move(file->buffer), std::move(file->writer)};
 }
 
 /* Buffer regular files up to restoreBufferLimit, then link or write;
