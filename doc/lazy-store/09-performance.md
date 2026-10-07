@@ -1,5 +1,27 @@
 # Evaluation performance and preserved behavior
 
+Measured **89bdfbbccb9cfd74ec6b67d5c8ece03504a6cdc7** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Cold-path and both warm-Git CPU medians remain higher; warm-32 Git loses two wall pairs. The source-size and uniform-performance goals remain open: this measured source is **9,518 physical runtime-source lines above base**.
+
+The [sealed v3 comparison](/tmp/nix-derived-state-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case, plus twelve direct pairs against the actual v2 endpoint. All **140 complete outputs and 28 complete store graphs** pass, and all **56 private states** are retired. Percentages below are paired medians; negative is lower.
+
+| Case | Wall change | CPU change | RSS change | Faster wall pairs |
+|---|---:|---:|---:|---:|
+| cold 32 path | −21.10% | +58.81% | +14.03% | 6/6 |
+| cold 32 git | −19.99% | −3.20% | −0.83% | 6/6 |
+| cold 32 github | −40.89% | −67.69% | −5.14% | 6/6 |
+| warm 8 path | −86.52% | −68.49% | −12.90% | 6/6 |
+| warm 8 git | −11.50% | +58.88% | −0.43% | 6/6 |
+| warm 8 github | −11.68% | −12.25% | −1.10% | 6/6 |
+| warm 32 path | −72.41% | −58.03% | −6.70% | 6/6 |
+| warm 32 git | −4.35% | +35.00% | −0.07% | 4/6 |
+| warm 32 github | −9.11% | −9.47% | −3.06% | 6/6 |
+
+Against actual v2, focused cold-path wall/CPU changes are **−0.89%/−0.45%**; warm-8 Git **−2.10%/−0.39%**. These small CPU differences approach centisecond rounding and establish no causal work reduction. Main warm states seed 32 attributes; focused warm Git seeds eight. [Every observation, adverse metric and pressure sample](/tmp/nix-derived-state-benchmark-oct7/READOUT.md) remains retained. The quieter host differs from the v2 window; no historical unpaired ratio is used.
+
+[Fresh v2 profiles](/tmp/nix-semantic-simplification-profiling-oct7/READOUT.md) establish extra retired instructions: cold path **+11.80% user/+21.32% kernel**, warm Git **+0.86% user/+55.84% kernel**. Raw-tree naming, filesystem and SQLite/journal routes are observed; inclusive samples are neither call counts nor causal seconds. All 16 profiling states are retired and the [entire sealed packet passes independent byte verification](/tmp/nix-copy-pool-domain-oct7/INDEPENDENT-FRESH-PROFILE-FULL-BYTE-SEAL.json). Thirty-five sampled module frames retain unverified compiled-image identity. The subsequent v3 changes were not in these captures.
+
+## Earlier October 7 v2 comparison
+
 Measured **8f3ca63bf41225f63d7f423df653cf0959b6846c** improves seven of nine paired wall medians against immutable branch base **8aad447**. Warm Git remains slower for 8/32 attributes: wall **+5.82%/+1.79%**, CPU **+45.32%/+28.88%**. Cold-path CPU also rises **29.74%**. The uniform-performance goal remains unmet. This committed implementation is still **9,525 physical runtime-source lines above base**.
 
 The [sealed October 7 comparison](/tmp/nix-semantic-simplification-benchmark-oct7/READOUT.md) retains six balanced adjacent pairs for each of nine cases, plus twelve direct pairs against the actual preceding accessor endpoint. All **140 outputs and 28 complete store graphs** pass; all **56 private states** are retired. The [independent closure audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-SEMANTIC-BENCHMARK-CLOSURE-AUDIT.json) checks all retained evidence files. Cold 32-attribute path/Git/GitHub wall medians change **−10.75%/−14.64%/−44.09%**; warm 8/32 path changes **−80.55%/−65.24%**, and GitHub **−13.35%/−5.38%**. Against the preceding endpoint, cold path changes **−1.63% wall/+1.96% CPU**, while warm Git changes **+0.53% wall** with CPU essentially tied. Shared-host pressure and every outlier remain recorded; these edits establish no warm Git improvement.
@@ -52,7 +74,7 @@ Cold path improves against U in all five wall pairs (**−11.119%** paired media
 
 ## Current source, validation and implementation
 
-The next two store simplifications remove **seven runtime lines**, leaving net **+9,518** against 8aad: coalescing preserves the existing hash/mode and updates only physical fields after computing the new name; auxiliary parsing derives ordinal and continuation validity from its owned byte prefix. [Optimized assembly](/tmp/nix-tracked-directory-domain-oct7/derived-state-assembly/RECEIPT.json) confirms coalesced root publication drops 47→21 caller instructions, and valid first/continued chunks drop 77→74 / 57→56 with equal calls. Malformed-candidate draining adds two instructions per later row. [All 1,007 store tests pass](/tmp/nix-derived-state-simplification-oct7/REGRESSION-STORE-TESTS-PORTABLE.json), including twenty malformed-encoding cases that now cover correct-hash duplicate chunks in constraintless immutable read-only snapshots. Six expectation type fixes preserve their values and operators. The [optimized endpoint](/tmp/nix-derived-state-simplification-oct7/BINDING.json) changes only the store library from the measured endpoint above; evaluation timing remains pending.
+The measured v3 store simplifications remove **seven runtime lines**, leaving net **+9,518** against 8aad: coalescing preserves the existing hash/mode and updates only physical fields after computing the new name; auxiliary parsing derives ordinal and continuation validity from its owned byte prefix. [Optimized assembly](/tmp/nix-tracked-directory-domain-oct7/derived-state-assembly/RECEIPT.json) confirms coalesced root publication drops 47→21 caller instructions, and valid first/continued chunks drop 77→74 / 57→56 with equal calls. Malformed-candidate draining adds two instructions per later row. [All 1,007 store tests pass](/tmp/nix-derived-state-simplification-oct7/REGRESSION-STORE-TESTS-PORTABLE.json), including twenty malformed-encoding cases that now cover correct-hash duplicate chunks in constraintless immutable read-only snapshots. Six expectation type fixes preserve their values and operators. The [optimized endpoint](/tmp/nix-derived-state-simplification-oct7/BINDING.json) changes only the store library from the measured endpoint above; its evaluation results are recorded above, without attributing their differences to individual edits.
 
 The next October 7 simplification removes twenty-four production lines: the final memo flush runs after joined traversal without taking the worker mutex; directory materialisation rekeys only directory nodes in its existing tree; coalescing uses one left-biased inode map; four SQL paths share the existing blob-row representation. The [independent domain audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-STORE-REKEY-COALESCE-TEST-CONSTANT-AUDIT.json) preserves losing-class priority even when inode roles overlap. The [assembly review](/tmp/nix-store-simplification-oct7/assembly-audit-v2/READOUT.md) rejected an outlined SQL binder that added per-row frames; the final inline binder restores the original 33-instruction, nine-call hot loop. Rekeying adds iterator advancement and the union map changes hit comparisons, so source reduction does not establish universal instruction savings. Runtime source remains net **+9,525 lines** against 8aad under the unchanged classifier.
 
