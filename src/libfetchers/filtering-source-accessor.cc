@@ -81,7 +81,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                 SourceAccessor & inner,
                 const CanonPath & relative,
                 FilteringSourceAccessor & owner,
-                const CanonPath & original,
+                CanonPath original,
                 const DirEntries & admitted)
                 /* Borrowed only during readDirectoryWithEntries's scope.
                    No accessor or visitor may retain it after callback. */
@@ -92,18 +92,9 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                           relative),
                       [this](const CanonPath & p) { return this->owner->makeNotAllowedError(this->original / p); })
                 , owner(&owner)
-                , original(original)
+                , original(std::move(original))
                 , admitted(admitted)
             {
-                /* Nested scopes change coordinates, not the admission
-                   policy. Compose those coordinates once instead of
-                   rebuilding the path through every enclosing scope
-                   for each descendant. The physical accessor remains
-                   the innermost borrowed directory above. */
-                if (auto parent = dynamic_cast<Scoped *>(&owner)) {
-                    this->original = parent->original / original;
-                    this->owner = parent->owner;
-                }
             }
 
             bool isAllowed(const CanonPath & p) override
@@ -130,7 +121,11 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
             {
                 readDirectoryScoped(p, std::move(callback));
             }
-        } scoped{inner, relative, *this, path, admitted};
+        };
+        /* Compose the policy coordinate before constructing its owned value. */
+        auto * parent = dynamic_cast<Scoped *>(this);
+        Scoped scoped{
+            inner, relative, parent ? *parent->owner : *this, parent ? parent->original / path : path, admitted};
         callback(scoped, CanonPath::root, DirectoryListing(std::cref(admitted)));
     };
     next->readDirectoryWithEntries(prefix / path, std::ref(handler));
