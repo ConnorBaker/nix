@@ -583,12 +583,12 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_with_outputs)
     ASSERT_EQ(ret, NIX_OK);
 
     // The closure should contain the derivation and its outputs
-    ASSERT_GE(closure_paths.size(), 2);
+    ASSERT_GE(closure_paths.size(), 2u);
 
     // Verify the output path is in the closure
     std::string outPathName;
     nix_store_path_name(outPath, OBSERVE_STRING(outPathName));
-    ASSERT_EQ(closure_paths.count(outPathName), 1);
+    ASSERT_EQ(closure_paths.count(outPathName), 1u);
 }
 
 TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_without_outputs)
@@ -623,7 +623,7 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_without_outputs
     // Verify the output path is NOT in the closure
     std::string outPathName;
     nix_store_path_name(outPath, OBSERVE_STRING(outPathName));
-    ASSERT_EQ(closure_paths.count(outPathName), 0) << "Output path should not be in closure when includeOutputs=false";
+    ASSERT_EQ(closure_paths.count(outPathName), 0u) << "Output path should not be in closure when includeOutputs=false";
 }
 
 TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_flip_direction)
@@ -660,7 +660,7 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_flip_direction)
     // Verify the output path is NOT in the closure when direction is flipped
     std::string outPathName;
     nix_store_path_name(outPath, OBSERVE_STRING(outPathName));
-    ASSERT_EQ(closure_paths.count(outPathName), 0) << "Output path should not be in closure when flip_direction=true";
+    ASSERT_EQ(closure_paths.count(outPathName), 0u) << "Output path should not be in closure when flip_direction=true";
 }
 
 TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_include_derivers)
@@ -699,7 +699,7 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_get_fs_closure_include_deriver
     // output happens to exist, the deriver could be anything.
     std::string drvPathName;
     nix_store_path_name(drvPath, OBSERVE_STRING(drvPathName));
-    ASSERT_EQ(closure_paths.count(drvPathName), 1) << "Derivation should be in closure when include_derivers=true";
+    ASSERT_EQ(closure_paths.count(drvPathName), 1u) << "Derivation should be in closure when include_derivers=true";
 }
 
 TEST_F(NixApiStoreTestWithRealisedPath, nix_store_realise_output_ordering)
@@ -797,7 +797,7 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_realise_output_ordering)
         ctx, store, drvPath, static_cast<void *>(&cb), decltype(cb)::call_void<const char *, const StorePath *>);
     assert_ctx_ok();
     ASSERT_EQ(ret, NIX_OK);
-    ASSERT_EQ(outputs.size(), 10);
+    ASSERT_EQ(outputs.size(), 10u);
 
     // Verify outputs are returned in alphabetical order by output name
     std::vector<std::string> expected_order = {
@@ -831,7 +831,7 @@ TEST_F(NixApiStoreTestWithRealisedPath, nix_store_realise_output_ordering)
     ASSERT_EQ(ret, NIX_OK);
 
     // Should contain at least the derivation and 10 outputs
-    ASSERT_GE(closure_paths.size(), 11);
+    ASSERT_GE(closure_paths.size(), 11u);
 
     // Verify all outputs are present in the closure
     for (const auto & [outname, outPath] : outputs) {

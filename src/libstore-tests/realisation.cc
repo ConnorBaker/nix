@@ -198,7 +198,7 @@ TEST_P(RealisationSigningTest, verify_rejects_wrong_key)
     LocalSigner signer(SecretKey{testSecretKey});
     r.sign(realisation.id, signer);
 
-    ASSERT_EQ(r.checkSignatures(realisation.id, publicKeys), 0);
+    ASSERT_EQ(r.checkSignatures(realisation.id, publicKeys), 0u);
 }
 
 TEST_P(RealisationSigningTest, verify_rejects_tampered_outpath)
@@ -216,7 +216,7 @@ TEST_P(RealisationSigningTest, verify_rejects_tampered_outpath)
     // Tamper with the output path after signing.
     r.outPath = StorePath{"g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar"};
 
-    ASSERT_EQ(r.checkSignatures(realisation.id, publicKeys), 0);
+    ASSERT_EQ(r.checkSignatures(realisation.id, publicKeys), 0u);
 }
 
 TEST_P(RealisationSigningTest, signatures_stripped_from_fingerprint)

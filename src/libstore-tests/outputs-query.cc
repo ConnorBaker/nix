@@ -116,7 +116,7 @@ TEST_F(OutputsQueryTest, fibonacciChainQueryCount)
     }
 
     // With full memoization (ResolveCache + RealisationCache), each derivation should be queried exactly once.
-    EXPECT_EQ(totalCalls, N + 1) << "queryRealisation called " << totalCalls << " times; expected exactly " << (N + 1);
+    EXPECT_EQ(totalCalls, static_cast<int>(N + 1)) << "queryRealisation called " << totalCalls << " times; expected exactly " << (N + 1);
 }
 
 } // namespace nix

@@ -300,10 +300,10 @@ void TryResolveTest::exportRefGraphSubpathTest(
         .output = "out",
     };
 
-    ASSERT_EQ(options.exportReferencesGraph.size(), 1);
+    ASSERT_EQ(options.exportReferencesGraph.size(), 1u);
     auto it = options.exportReferencesGraph.find("refs");
     ASSERT_NE(it, options.exportReferencesGraph.end());
-    ASSERT_EQ(it->second.size(), 1);
+    ASSERT_EQ(it->second.size(), 1u);
     EXPECT_EQ(*it->second.begin(), expectedPath);
 
     // Also test that resolution works

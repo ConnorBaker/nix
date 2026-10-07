@@ -252,14 +252,14 @@ TEST(references, scanForReferencesDeep)
         });
 
         // Verify we found the expected references
-        EXPECT_EQ(foundRefs.size(), 4); // file1, file2, file4, link1
+        EXPECT_EQ(foundRefs.size(), 4u); // file1, file2, file4, link1
 
         // Check file1.txt found path1
         {
             CanonPath f1Path("/file1.txt");
             auto it = foundRefs.find(f1Path);
             ASSERT_TRUE(it != foundRefs.end());
-            EXPECT_EQ(it->second.size(), 1);
+            EXPECT_EQ(it->second.size(), 1u);
             EXPECT_TRUE(it->second.count(path1));
         }
 
@@ -268,7 +268,7 @@ TEST(references, scanForReferencesDeep)
             CanonPath f2Path("/file2.txt");
             auto it = foundRefs.find(f2Path);
             ASSERT_TRUE(it != foundRefs.end());
-            EXPECT_EQ(it->second.size(), 2);
+            EXPECT_EQ(it->second.size(), 2u);
             EXPECT_TRUE(it->second.count(path2));
             EXPECT_TRUE(it->second.count(path3));
         }
@@ -284,7 +284,7 @@ TEST(references, scanForReferencesDeep)
             CanonPath f4Path("/subdir/file4.txt");
             auto it = foundRefs.find(f4Path);
             ASSERT_TRUE(it != foundRefs.end());
-            EXPECT_EQ(it->second.size(), 1);
+            EXPECT_EQ(it->second.size(), 1u);
             EXPECT_TRUE(it->second.count(path1));
         }
 
@@ -293,7 +293,7 @@ TEST(references, scanForReferencesDeep)
             CanonPath linkPath("/link1");
             auto it = foundRefs.find(linkPath);
             ASSERT_TRUE(it != foundRefs.end());
-            EXPECT_EQ(it->second.size(), 1);
+            EXPECT_EQ(it->second.size(), 1u);
             EXPECT_TRUE(it->second.count(path2));
         }
     }
@@ -302,7 +302,7 @@ TEST(references, scanForReferencesDeep)
     {
         auto results = scanForReferencesDeep(*accessor, CanonPath::root, refs);
 
-        EXPECT_EQ(results.size(), 4); // file1, file2, file4, link1
+        EXPECT_EQ(results.size(), 4u); // file1, file2, file4, link1
 
         // Verify all expected files are in the results
         EXPECT_TRUE(results.count(CanonPath("/file1.txt")));
