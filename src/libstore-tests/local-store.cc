@@ -205,7 +205,7 @@ protected:
         } else if (S_ISREG(st.st_mode)) {
             ASSERT_TRUE(modeTypeMaskedOut == 0555 || modeTypeMaskedOut == 0444);
         } else if (S_ISDIR(st.st_mode)) {
-            ASSERT_EQ(modeTypeMaskedOut, 0555);
+            ASSERT_EQ(modeTypeMaskedOut, 0555u);
             for (const auto & p : DirectoryIterator{path})
                 assertCanonicalPermissions(p.path());
         } else {
@@ -776,7 +776,7 @@ TEST_F(LocalStoreObjectsTest, pathMetadataCanonicalisationNormalizesCompleteTime
             EXPECT_EQ(after.st_mtim.tv_nsec, 0);
 #  endif
             if (kind != 3) {
-                EXPECT_EQ(after.st_mode & ~S_IFMT, kind == 0 ? 0444 : 0555);
+                EXPECT_EQ(after.st_mode & ~S_IFMT, kind == 0 ? 0444u : 0555u);
             } else {
                 EXPECT_EQ(readLink(path), "absent-target");
             }
@@ -4739,7 +4739,10 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
 
 TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
 {
-    enum class Fault { MissingFirst, Gap, TrailingEmpty, ShortNonfinal, Oversized, Text, WrongHash, Truncated };
+    enum class Fault {
+        MissingFirst, Gap, TrailingEmpty, ShortNonfinal, Oversized, Text, WrongHash, Truncated,
+        DuplicateEmpty, DuplicateFull
+    };
     constexpr size_t chunkSize = 1 << 20;
     const std::array faults{
         Fault::MissingFirst,
@@ -4749,12 +4752,19 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
         Fault::Oversized,
         Fault::Text,
         Fault::WrongHash,
-        Fault::Truncated};
+        Fault::Truncated,
+        Fault::DuplicateEmpty,
+        Fault::DuplicateFull};
+    auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
+    Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
+    experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::ReadOnlyLocalStore);
     size_t cases = 0;
     for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
         for (auto fault : faults) {
             SCOPED_TRACE(fmt("mode=%o fault=%d", (RawMode) mode, int(fault)));
-            auto body = fmt("candidate-%d-", cases) + std::string(2 * chunkSize, 'x');
+            auto body = fault == Fault::DuplicateEmpty ? std::string()
+                        : fault == Fault::DuplicateFull ? std::string(2 * chunkSize, static_cast<char>('a' + cases))
+                                                        : fmt("candidate-%d-", cases) + std::string(2 * chunkSize, 'x');
             auto id = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
             merkle::TreeEntry entry{mode, id};
             auto first = publishAuxiliary(config->realStoreDir.get() / fmt("bad-chunks-%d", cases), {{entry, body}});
@@ -4810,6 +4820,16 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
             case Fault::Truncated:
                 mutate("delete from AuxValues where ingestion = ? and chunk = 2;");
                 break;
+            case Fault::DuplicateEmpty:
+            case Fault::DuplicateFull:
+                /* A read-only provider admits existing tables without producer constraints.
+                   Duplicate ordinals must fail even when their joined bytes hash correctly. */
+                db.exec("create table UnconstrainedAux as select * from AuxValues; drop table AuxValues; "
+                        "alter table UnconstrainedAux rename to AuxValues;");
+                mutate(fault == Fault::DuplicateEmpty
+                           ? "insert into AuxValues select * from AuxValues where ingestion = ?;"
+                           : "update AuxValues set chunk = 0 where ingestion = ? and chunk = 1;");
+                break;
             }
             if (fault != Fault::WrongHash && fault != Fault::Truncated) {
                 SQLiteStmt pieces{db, "select body from AuxValues where ingestion = ? order by chunk;"};
@@ -4821,14 +4841,32 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                 EXPECT_EQ(joined, body)
                     << "this malformed encoding is rejected independently of its correct framed hash";
             }
+            auto reader = store;
+            auto readOnlyReader = [&] {
+                db.exec("pragma wal_checkpoint(truncate);");
+                return std::make_shared<LocalStore>(
+                    make_ref<LocalStoreConfig>(tempStoreDir.path(), StoreConfig::Params{{"read-only", "true"}}));
+            };
+            if (fault == Fault::DuplicateEmpty || fault == Fault::DuplicateFull) {
+                reader = readOnlyReader();
+                SQLite snapshot{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::Immutable}};
+                SQLiteStmt query{snapshot, "select count(*) from AuxValues where ingestion = ?;"};
+                auto use = query.use();
+                use.apply(static_cast<int64_t>(first));
+                ASSERT_TRUE(use.next());
+                EXPECT_EQ(use.getInt(0), 2);
+            }
             auto before = auxiliaryRowCount();
-            EXPECT_FALSE(store->objects.readAuxiliary(entry));
+            EXPECT_FALSE(reader->objects.readAuxiliary(entry));
             EXPECT_EQ(auxiliaryRowCount(), before) << "ordinary lookup does not mutate a corrupt incarnation";
+            reader = store; // An immutable read-only connection must close before another publication.
             publishAuxiliary(config->realStoreDir.get() / fmt("sound-chunks-%d", cases), {{entry, body}});
-            EXPECT_EQ(store->objects.readAuxiliary(entry), body) << "a corrupt older donor cannot hide a sound donor";
+            if (fault == Fault::DuplicateEmpty || fault == Fault::DuplicateFull)
+                reader = readOnlyReader();
+            EXPECT_EQ(reader->objects.readAuxiliary(entry), body) << "a corrupt older donor cannot hide a sound donor";
             ++cases;
         }
-    EXPECT_EQ(cases, 16u);
+    EXPECT_EQ(cases, 20u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliaryLookupEnumeratesTheFullSignedIngestionCursor)
@@ -6559,7 +6597,7 @@ TEST_F(LocalStoreObjectsTest, flatAddIsEnteredAndRegistersItsObjectHash)
         EXPECT_EQ(info->narSize, nar.s.size());
         auto real = store->toRealPath(path);
         EXPECT_EQ(st(real).st_mode & ~S_IFMT, 0444u);
-        EXPECT_EQ(st(real).st_size, bytes.size());
+        EXPECT_EQ(st(real).st_size, static_cast<off_t>(bytes.size()));
         /* With one physical donor class, NoRepair can trust its canonical
            metadata. Multiple-class publication corruption is covered by
            publicationRejectsProvenCorruptionOfItsOwnHolder. */
@@ -8562,9 +8600,9 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
                                 auto named = st(path);
                                 EXPECT_EQ(metadata.st_dev, named.st_dev);
                                 EXPECT_EQ(metadata.st_ino, named.st_ino);
-                                EXPECT_EQ(metadata.st_size, bytes.size());
+                                EXPECT_EQ(metadata.st_size, static_cast<off_t>(bytes.size()));
                                 EXPECT_EQ(executable, expectedExecutable);
-                                EXPECT_EQ(metadata.st_mode & ~S_IFMT, expectedExecutable ? 0555 : 0444);
+                                EXPECT_EQ(metadata.st_mode & ~S_IFMT, expectedExecutable ? 0555u : 0444u);
                                 EXPECT_EQ(metadata.st_uid, geteuid());
                                 EXPECT_EQ(metadata.st_mtime, 1);
 #  ifdef __APPLE__
@@ -9578,7 +9616,7 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                             }
                             EXPECT_EQ(readFile(store->toRealPath(actual)), bytes);
                             auto metadata = st(store->toRealPath(actual));
-                            EXPECT_EQ(metadata.st_mode & ~S_IFMT, executable ? 0555 : 0444);
+                            EXPECT_EQ(metadata.st_mode & ~S_IFMT, executable ? 0555u : 0444u);
                             EXPECT_EQ(metadata.st_uid, geteuid());
                             EXPECT_EQ(metadata.st_mtime, 1);
 #  ifdef __APPLE__

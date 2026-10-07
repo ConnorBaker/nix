@@ -647,10 +647,9 @@ struct AuxiliaryCandidate
 static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, SQLiteStmt::Use & use)
 {
     std::optional<AuxiliaryCandidate> result;
-    uint64_t ordinal = 0;
-    size_t previousSize = auxiliaryChunkSize;
     while (use.next()) {
-        if (!result)
+        bool first = !result;
+        if (first)
             result.emplace(use.getInt(0), std::string());
         if (!result->body)
             continue;
@@ -662,17 +661,15 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
         if (!data && sqlite3_errcode(stmt.db) == SQLITE_NOMEM)
             SQLiteError::throw_(stmt.db, "reading auxiliary body chunk");
         auto size = static_cast<size_t>(sqlite3_column_bytes(stmt, 2));
-        if (ordinal > static_cast<uint64_t>(std::numeric_limits<int64_t>::max())
-            || use.getInt(1) != static_cast<int64_t>(ordinal) || size > auxiliaryChunkSize
-            || previousSize != auxiliaryChunkSize || (size == 0 && ordinal != 0)
+        if (!std::cmp_equal(use.getInt(1), result->body->size() / auxiliaryChunkSize) || size > auxiliaryChunkSize
+            || result->body->size() % auxiliaryChunkSize != 0 || (!first && result->body->empty())
+            || (size == 0 && !first)
             || size > result->body->max_size() - result->body->size()) {
             result->body.reset();
             continue;
         }
         if (size)
             result->body->append(static_cast<const char *>(data), size);
-        previousSize = size;
-        ++ordinal;
     }
     return result;
 }
