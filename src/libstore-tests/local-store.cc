@@ -205,7 +205,7 @@ protected:
         } else if (S_ISREG(st.st_mode)) {
             ASSERT_TRUE(modeTypeMaskedOut == 0555 || modeTypeMaskedOut == 0444);
         } else if (S_ISDIR(st.st_mode)) {
-            ASSERT_EQ(modeTypeMaskedOut, 0555u);
+            ASSERT_EQ(modeTypeMaskedOut, static_cast<decltype(modeTypeMaskedOut)>(0555));
             for (const auto & p : DirectoryIterator{path})
                 assertCanonicalPermissions(p.path());
         } else {
@@ -776,7 +776,7 @@ TEST_F(LocalStoreObjectsTest, pathMetadataCanonicalisationNormalizesCompleteTime
             EXPECT_EQ(after.st_mtim.tv_nsec, 0);
 #  endif
             if (kind != 3) {
-                EXPECT_EQ(after.st_mode & ~S_IFMT, kind == 0 ? 0444u : 0555u);
+                EXPECT_EQ(after.st_mode & ~S_IFMT, static_cast<decltype(after.st_mode & ~S_IFMT)>(kind == 0 ? 0444 : 0555));
             } else {
                 EXPECT_EQ(readLink(path), "absent-target");
             }
@@ -8602,7 +8602,9 @@ TEST_F(LocalStoreObjectsTest, reentrantCopiesRestoreTheirDestinationAfterReturnA
                                 EXPECT_EQ(metadata.st_ino, named.st_ino);
                                 EXPECT_EQ(metadata.st_size, static_cast<off_t>(bytes.size()));
                                 EXPECT_EQ(executable, expectedExecutable);
-                                EXPECT_EQ(metadata.st_mode & ~S_IFMT, expectedExecutable ? 0555u : 0444u);
+                                EXPECT_EQ(
+                                    metadata.st_mode & ~S_IFMT,
+                                    static_cast<decltype(metadata.st_mode & ~S_IFMT)>(expectedExecutable ? 0555 : 0444));
                                 EXPECT_EQ(metadata.st_uid, geteuid());
                                 EXPECT_EQ(metadata.st_mtime, 1);
 #  ifdef __APPLE__
@@ -9616,7 +9618,9 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                             }
                             EXPECT_EQ(readFile(store->toRealPath(actual)), bytes);
                             auto metadata = st(store->toRealPath(actual));
-                            EXPECT_EQ(metadata.st_mode & ~S_IFMT, executable ? 0555u : 0444u);
+                            EXPECT_EQ(
+                                metadata.st_mode & ~S_IFMT,
+                                static_cast<decltype(metadata.st_mode & ~S_IFMT)>(executable ? 0555 : 0444));
                             EXPECT_EQ(metadata.st_uid, geteuid());
                             EXPECT_EQ(metadata.st_mtime, 1);
 #  ifdef __APPLE__
