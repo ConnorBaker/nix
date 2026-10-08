@@ -187,20 +187,6 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
-/* Names are relative to the ingestion root, empty for the root itself.
-   Empty or nonmatching roots retain the caller's absolute name. */
-static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
-{
-    std::string_view r = root.native();
-    auto & w = where.native();
-    while (r.ends_with('/'))
-        r.remove_suffix(1);
-    if (root.empty() || !w.starts_with(r) || (w.size() != r.size() && w[r.size()] != '/'))
-        return w;
-    auto name = w.find_first_not_of('/', r.size());
-    return name == w.npos ? std::string() : w.substr(name);
-}
-
 GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
 {
     /* GC may remove the empty directory before its lock is acquired.
@@ -423,6 +409,20 @@ static std::optional<GitObjectStore::Placed> linkOver(
     if (placed.st_ino != before.st_ino || placed.st_dev != before.st_dev)
         cleanup.cancel();
     return GitObjectStore::Placed{placed.st_ino, false};
+}
+
+/* Names are relative to the ingestion root, empty for the root itself.
+   Empty or nonmatching roots retain the caller's absolute name. */
+static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
+{
+    std::string_view r = root.native();
+    auto & w = where.native();
+    while (r.ends_with('/'))
+        r.remove_suffix(1);
+    if (root.empty() || !w.starts_with(r) || (w.size() != r.size() && w[r.size()] != '/'))
+        return w;
+    auto name = w.find_first_not_of('/', r.size());
+    return name == w.npos ? std::string() : w.substr(name);
 }
 
 static GitObjectStore::Hold::Row rowOf(
