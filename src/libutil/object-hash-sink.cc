@@ -10,16 +10,6 @@ namespace nix {
 
 std::atomic<size_t> HashingVisitor::workersForTest{0};
 
-size_t HashingVisitor::workerCountFor(SourceAccessor & accessor, PathFilter & filter)
-{
-    if (!filter.get_fn().target<AllPaths>() || !accessor.allowsConcurrentTraversal())
-        return 1;
-    auto workers = workersForTest.load(std::memory_order_relaxed);
-    if (!workers)
-        workers = CopyPool::defaultWorkers();
-    return workers;
-}
-
 HashingRegularFileSink::~HashingRegularFileSink() = default;
 
 HashedNode HashingVisitor::regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read)

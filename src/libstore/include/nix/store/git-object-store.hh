@@ -11,6 +11,7 @@
 #include "nix/util/repair-flag.hh"
 #include "nix/util/fun.hh"
 
+#include <boost/container/flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include <filesystem>
@@ -373,16 +374,10 @@ public:
             std::optional<uint64_t> id;
         };
 
-        /** Completed outputs retain their database identity across the next beginIngestion. */
-        struct CompletedIngestion
-        {
-            std::string path;
-            uint64_t id;
-        };
-
         /* Accessed only before or after the path's walking workers run. */
         mutable std::optional<Ingestion> ingestion;
-        mutable std::vector<CompletedIngestion> completedIngestions;
+        /** Completed outputs retain their database identity across the next beginIngestion. */
+        mutable boost::container::flat_map<std::string, uint64_t> completedIngestions;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;

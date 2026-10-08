@@ -115,7 +115,15 @@ public:
      * machine width, and tests enumerate 1..8. Permissions still gate concurrency. */
     static std::atomic<size_t> workersForTest;
 
-    static size_t workerCountFor(SourceAccessor & accessor, PathFilter & filter);
+    static size_t workerCountFor(SourceAccessor & accessor, PathFilter & filter)
+    {
+        if (!filter.get_fn().target<AllPaths>() || !accessor.allowsConcurrentTraversal())
+            return 1;
+        auto workers = workersForTest.load(std::memory_order_relaxed);
+        if (!workers)
+            workers = CopyPool::defaultWorkers();
+        return workers;
+    }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override;
 

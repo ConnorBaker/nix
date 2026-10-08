@@ -2607,7 +2607,7 @@ TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
     SQLiteStmt named{db, "select path from Ingestions where id = ?"};
     {
         auto row = named.use();
-        row.apply(static_cast<int64_t>(pending.completedIngestions.front().id));
+        row.apply(static_cast<int64_t>(pending.completedIngestions.begin()->second));
         ASSERT_TRUE(row.next());
         ASSERT_FALSE(row.isNull(0));
         EXPECT_EQ(row.getStr(0), store->printStorePath(second.path));
@@ -2649,7 +2649,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
             stageLegacyUnregisteredRows(hold);
         else if (origin == Origin::Completed)
             store->endIngestion(hold, path);
-        auto original = origin == Origin::Completed ? std::optional(hold.completedIngestions.front().id)
+        auto original = origin == Origin::Completed ? std::optional(hold.completedIngestions.begin()->second)
                                                    : hold.ingestion->id;
 
         SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
@@ -2724,7 +2724,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
         ASSERT_EQ(retry.publications, 2u);
         ASSERT_EQ(retry.interleaved, SQLITE_OK);
         ASSERT_GT(retry.rejected, 0);
-        auto committed = origin == Origin::Completed ? hold.completedIngestions.front().id : *hold.ingestion->id;
+        auto committed = origin == Origin::Completed ? hold.completedIngestions.begin()->second : *hold.ingestion->id;
         if (original) {
             EXPECT_EQ(retry.rejected, static_cast<int64_t>(*original));
             EXPECT_EQ(committed, *original);
@@ -2843,7 +2843,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             store->registerValidPath(infos[0], holds[0]);
             store->endIngestion(holds[1], infos[1].path);
             ASSERT_FALSE(holds[1].ingestion);
-            auto own = holds[1].completedIngestions.front().id;
+            auto own = holds[1].completedIngestions.begin()->second;
             auto donor = *holds[0].ingestion->id;
             std::map<int64_t, std::string> names{
                 {int64_t(own), store->printStorePath(infos[1].path)},
@@ -2854,7 +2854,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
                    relation even after retry reinserts the selected own row. */
                 store->endIngestion(holds[2], infos[2].path);
                 store->registerValidPath(infos[2]);
-                names.emplace(holds[2].completedIngestions.front().id, store->printStorePath(infos[2].path));
+                names.emplace(holds[2].completedIngestions.begin()->second, store->printStorePath(infos[2].path));
                 ASSERT_NE(st(files[0]).st_ino, st(files[2]).st_ino);
                 ASSERT_NE(st(files[1]).st_ino, st(files[2]).st_ino);
             }
@@ -2862,7 +2862,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             SQLite other{
                 store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
             auto domain = fmt(
-                "ingestion in (%d, %d, %d)", own, donor, key.triple ? holds[2].completedIngestions.front().id : donor);
+                "ingestion in (%d, %d, %d)", own, donor, key.triple ? holds[2].completedIngestions.begin()->second : donor);
             other.exec("create temp table original as select * from Blobs where " + domain);
             auto mutation = "begin; delete from Blobs where " + domain + "; insert into Blobs select " + key.id + ", "
                             + key.mode + ", ino, dev, ingestion, name, size from original"
@@ -2990,7 +2990,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
                 EXPECT_EQ(readFile(files[i]), bytes);
             }
             EXPECT_EQ(store->isValidPath(infos[1].path), !key.error);
-            EXPECT_EQ(holds[1].completedIngestions.front().id, own);
+            EXPECT_EQ(holds[1].completedIngestions.begin()->second, own);
             EXPECT_TRUE(pathExists(lease));
             EXPECT_TRUE(store->isValidPath(infos[0].path));
             SQLiteStmt rows{
@@ -3664,7 +3664,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     auto abandoned = store->objects.hold();
                     auto old = restoreInfo(path, treeNar({{"old", tag + "-old", 'f'}}), abandoned);
                     store->endIngestion(abandoned, path);
-                    oldIngestion = abandoned.completedIngestions.back().id;
+                    oldIngestion = abandoned.completedIngestions.begin()->second;
                     if (wasValid)
                         store->registerValidPath(old, abandoned);
                 }
@@ -3859,15 +3859,15 @@ TEST_F(LocalStoreObjectsTest, completedOutputsRetainIdentityWithoutRecoveringItF
     };
     auto old = store->objects.hold();
     complete(old, path, "first");
-    auto first = old.completedIngestions.front().id;
+    auto first = old.completedIngestions.begin()->second;
     complete(old, path, "replacement");
     ASSERT_EQ(old.completedIngestions.size(), 1u);
-    EXPECT_NE(old.completedIngestions.front().id, first);
+    EXPECT_NE(old.completedIngestions.begin()->second, first);
     EXPECT_FALSE(old.ingestion);
 
     auto current = store->objects.hold();
     auto info = complete(current, path, "current");
-    auto currentId = current.completedIngestions.front().id;
+    auto currentId = current.completedIngestions.begin()->second;
     auto other = complete(current, sibling, "sibling");
     ASSERT_EQ(current.completedIngestions.size(), 2u);
     /* Registration through a superseded hold must not remove the replacement. */
@@ -3899,7 +3899,7 @@ TEST_F(LocalStoreObjectsTest, ingestionDeletionOwnsBothProjectionsAndRollsBackTo
         hold,
         NoRepair);
     store->endIngestion(hold, path);
-    auto id = static_cast<int64_t>(hold.completedIngestions.front().id);
+    auto id = static_cast<int64_t>(hold.completedIngestions.begin()->second);
     SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
     auto counts = [&] {
         SQLiteStmt query{

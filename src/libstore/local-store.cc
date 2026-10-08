@@ -910,13 +910,8 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     auto & rows = projection.regular;
     auto logical = printStorePath(path);
     auto & completed = hold.completedIngestions;
-    auto previous =
-        std::find_if(completed.begin(), completed.end(), [&](const auto & value) { return value.path == logical; });
-    auto slot = static_cast<size_t>(previous - completed.begin());
-    /* Allocate the completion before committing. Its ownership handoff below cannot throw. */
-    GitObjectStore::Hold::CompletedIngestion completion{logical, 0};
-    if (slot == completed.size())
-        completed.reserve(completed.size() + 1);
+    /* Reserve before committing; the concrete string/id insertion cannot throw afterwards. */
+    completed.reserve(completed.size() + !completed.contains(logical));
     auto holdName = hold.directory().filename().string();
     retrySQLite<void>([&]() {
         auto state(_state->lock());
@@ -937,11 +932,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         state->stmts->DeletePathIngestions.use().apply(logical).exec();
         state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
         txn.commit();
-        completion.id = *id;
-        if (slot == completed.size())
-            completed.push_back(std::move(completion));
-        else
-            completed[slot] = std::move(completion);
+        completed.insert_or_assign(std::move(logical), *id);
         hold.ingestion.reset();
     });
 }
@@ -1817,11 +1808,9 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         } else {
             for (auto & [path, info] : infos) {
                 auto logical = printStorePath(path);
-                for (auto & completed : hold->completedIngestions)
-                    if (completed.path == logical) {
-                        publications.push_back({&info, completed.id, {}});
-                        break;
-                    }
+                if (auto completed = hold->completedIngestions.find(logical);
+                    completed != hold->completedIngestions.end())
+                    publications.push_back({&info, completed->second, {}});
             }
         }
     }

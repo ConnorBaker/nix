@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <tuple>
 
-#include <boost/unordered/concurrent_flat_map.hpp>
+#include "nix/util/sync.hh"
 #include <nlohmann/json.hpp>
 
 namespace nix {
@@ -23,17 +23,15 @@ private:
     void anchor() override {};
 
 public:
-    boost::concurrent_flat_map<CanonPath, ref<SourceAccessor>> mounts;
+    Sync<std::map<CanonPath, ref<SourceAccessor>>> mounts;
 
     MountedSourceAccessorImpl(std::map<CanonPath, ref<SourceAccessor>> _mounts)
+        : mounts(std::move(_mounts))
     {
         displayPrefix.clear();
 
         // Currently we require a root filesystem. This could be relaxed.
-        assert(_mounts.contains(CanonPath::root));
-
-        for (auto & [path, accessor] : _mounts)
-            mount(path, accessor);
+        assert(mounts.readLock()->contains(CanonPath::root));
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
@@ -125,8 +123,8 @@ public:
         // Find the nearest parent of `path` that is a mount point.
         auto prefix = path;
         while (true) {
-            if (auto mount = getConcurrent(mounts, prefix))
-                return {std::move(*mount), path.removePrefix(prefix), std::move(prefix)};
+            if (auto mount = getMount(prefix))
+                return {ref(std::move(mount)), path.removePrefix(prefix), std::move(prefix)};
 
             assert(!prefix.isRoot());
             prefix.pop();
@@ -183,11 +181,9 @@ public:
     std::vector<std::pair<CanonPath, ref<SourceAccessor>>> mountsBelow(const CanonPath & path)
     {
         std::vector<std::pair<CanonPath, ref<SourceAccessor>>> res;
-        mounts.visit_all([&](auto & kv) {
-            if (kv.first != path && kv.first.isWithin(path))
-                res.emplace_back(kv.first, kv.second);
-        });
-        std::sort(res.begin(), res.end(), [](auto & a, auto & b) { return a.first < b.first; });
+        auto state = mounts.readLock();
+        for (auto i = state->upper_bound(path); i != state->end() && i->first.isWithin(path); ++i)
+            res.emplace_back(*i);
         return res;
     }
 
@@ -196,7 +192,8 @@ public:
         /* This call invalidates the observed mounts. A reentrant mount is
            for the next call; no child callback runs under the map's lock. */
         std::vector<ref<SourceAccessor>> children;
-        mounts.visit_all([&](auto & kv) { children.push_back(kv.second); });
+        for (auto state = mounts.readLock(); const auto & [path, child] : *state)
+            children.push_back(child);
         for (auto & child : children)
             child->invalidateCache();
     }
@@ -214,15 +211,14 @@ public:
     {
         /* Insert only: a fact already handed out about this tree must stay
            true, so a mount is never replaced. */
-        mounts.emplace(std::move(mountPoint), std::move(accessor));
+        mounts.lock()->try_emplace(std::move(mountPoint), std::move(accessor));
     }
 
     std::shared_ptr<SourceAccessor> getMount(const CanonPath & mountPoint) override
     {
-        if (auto res = getConcurrent(mounts, mountPoint))
-            return *res;
-        else
-            return nullptr;
+        auto state = mounts.readLock();
+        auto i = state->find(mountPoint);
+        return i != state->end() ? i->second.get_ptr() : nullptr;
     }
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
