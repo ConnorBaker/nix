@@ -347,17 +347,13 @@ StorePaths Store::topoSortPathsBy(const StorePathSet & paths, fun<StorePathSet(c
 {
     auto result = topoSort(paths, [&](const StorePath & path) -> StorePathSet { return getReferences(path); });
 
-    return std::visit(
-        overloaded{
-            [&](const Cycle<StorePath> & cycle) -> StorePaths {
-                throw BuildError(
-                    BuildResult::Failure::OutputRejected,
-                    "cycle detected in the references of '%s' from '%s'",
-                    printStorePath(cycle.path),
-                    printStorePath(cycle.parent));
-            },
-            [](const auto & sorted) { return sorted; }},
-        result);
+    if (auto cycle = std::get_if<Cycle<StorePath>>(&result))
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "cycle detected in the references of '%s' from '%s'",
+            printStorePath(cycle->path),
+            printStorePath(cycle->parent));
+    return std::get<StorePaths>(std::move(result));
 }
 
 OutputPathMap resolveDerivedPath(Store & store, const DerivedPath::Built & bfd, Store * evalStore_)

@@ -246,7 +246,7 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
 
     StringSet emptySet;
 
-    auto topoSortResult = topoSort(outputsToSort, [&](const std::string & name) -> const StringSet & {
+    auto getReferences = [&](const std::string & name) -> const StringSet & {
         auto * orifu = get(outputReferencesIfUnregistered, name);
         if (!orifu)
             throw BuildError(
@@ -263,25 +263,21 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 [&](const PerhapsNeedToRegister & refs) -> const StringSet & { return refs.otherOutputs; },
             },
             *orifu);
-    });
-
-    auto sortedOutputNames = std::visit(
-        overloaded{
-            [&](Cycle<std::string> & cycle) -> std::vector<std::string> {
-                // TODO with more -vvvv also show the temporary paths for manual inspection.
-                throw BuildError(
-                    BuildResult::Failure::OutputRejected,
-                    "cycle detected in build of '%s' in the references of output '%s' from output '%s'",
-                    store->printStorePath(drvPath),
-                    cycle.path,
-                    cycle.parent);
-            },
-            [](auto & sorted) { return sorted; }},
-        topoSortResult);
+    };
+    std::vector<std::string> sortedOutputNames;
+    if (auto cycle = visitDependencies(
+            outputsToSort, getReferences, [&](const std::string & name) { sortedOutputNames.push_back(name); }))
+        // TODO with more -vvvv also show the temporary paths for manual inspection.
+        throw BuildError(
+            BuildResult::Failure::OutputRejected,
+            "cycle detected in build of '%s' in the references of output '%s' from output '%s'",
+            store->printStorePath(drvPath),
+            cycle->path,
+            cycle->parent);
 
     OutputPathMap finalOutputs;
 
-    for (auto & outputName : sortedOutputNames | std::views::reverse) {
+    for (auto & outputName : sortedOutputNames) {
         auto output = get(drv.outputs, outputName);
         auto scratchPath = get(scratchOutputs, outputName);
         assert(output && scratchPath);

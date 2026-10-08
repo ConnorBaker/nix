@@ -35,17 +35,13 @@ private:
     /* VTable anchor to avoid weak linkage of the vtable - it breaks
        dynamic_cast across shared libraries on Darwin. */
     virtual void anchor();
-    fetchers::LazyAttr lazy;
 
 public:
+    fetchers::LazyAttr lazy;
+
     LazyFetcherAttr(fetchers::LazyAttr lazy)
         : lazy(std::move(lazy))
     {
-    }
-
-    fetchers::ResolvedAttr force()
-    {
-        return lazy->compute();
     }
 
 protected:
@@ -87,15 +83,12 @@ static void resolvedAttrToValue(EvalState & state, Value & v, const fetchers::Re
  */
 static void prim_forceLazyFetcherAttr(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    Value & arg = *args[0];
-
-    state.forceValue(arg, noPos);
     // We only construct this primop with LazyFetcherAttr preapplied.
-    assert(arg.type() == nExternal);
+    assert(args[0]->type() == nExternal);
     auto * ext = dynamic_cast<LazyFetcherAttr *>(args[0]->external());
     assert(ext);
 
-    resolvedAttrToValue(state, v, ext->force());
+    resolvedAttrToValue(state, v, ext->lazy->compute());
 }
 
 /**

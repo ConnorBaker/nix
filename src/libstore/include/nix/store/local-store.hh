@@ -881,12 +881,9 @@ public:
     OldRowWalk walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes = nullptr);
 
     /**
-     * The one write of an older row's object hash: the row re-read under
-     * the lock, and written only if it still holds no object hash (another
-     * process may have migrated, signed or deleted it meanwhile).  Nothing
-     * on a read-only store.  Called by `migratedPathInfo` with the walk's
-     * result and by `optimiseStore` with the entering walk's, which is the
-     * same walk.
+     * Record a validated legacy walk after a fresh transactional reread.
+     * Write only while the row still lacks its object hash, preserving
+     * concurrent migration, signing or deletion. Read-only stores are not written.
      *
      * @return Whether the row was written.
      */

@@ -807,12 +807,12 @@ void LocalStore::coalesceBlobRows(
             auto mode = use.getInt(1);
             if (mode != 0 && mode != 1)
                 throw Error("blob index row holds an invalid executable flag %d", mode);
-            auto id = blobIdOf(use.getBlobView(0));
+            auto id = use.getBlobView(0);
             bool executable = mode != 0;
-            if (collisions.empty() || collisions.back().row.id != id || collisions.back().row.executable != executable)
+            if (collisions.empty() || blobRowKey(collisions.back().row) != std::pair{id, executable})
                 collisions.push_back({
                     .row =
-                        {id,
+                        {blobIdOf(id),
                          executable,
                          static_cast<ino_t>(use.getInt(2)),
                          static_cast<dev_t>(use.getInt(3)),
@@ -1402,7 +1402,7 @@ void LocalStore::queryPathInfoUncached(
 
 std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoUnmigrated(const StorePath & path)
 {
-    return retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+    return retrySQLite<std::shared_ptr<ValidPathInfo>>(
         [&]() { return queryPathInfoInternal(*_state->lock(), path); });
 }
 
@@ -1862,11 +1862,10 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            error if a cycle is detected and roll back the
            transaction.  Cycles can only occur when a derivation
            has multiple outputs. */
-        auto topoSortResult = topoSort(std::move(paths), [&](const StorePath & path) -> const StorePathSet & {
-            return infos.at(path).references;
-        });
-
-        if (auto cycle = std::get_if<Cycle<StorePath>>(&topoSortResult))
+        if (auto cycle = visitDependencies(
+                paths,
+                [&](const StorePath & path) -> const StorePathSet & { return infos.at(path).references; },
+                [](const StorePath &) {}))
             throw BuildError(
                 BuildResult::Failure::OutputRejected,
                 "cycle detected in the references of '%s' from '%s'",

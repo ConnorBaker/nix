@@ -79,7 +79,8 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                 SourceAccessor & inner,
                 const CanonPath & relative,
                 FilteringSourceAccessor & owner,
-                CanonPath original,
+                const CanonPath & path,
+                const Scoped * parent,
                 DirectoryListing && listing)
                 /* Borrowed only during readDirectoryWithEntries's scope.
                    No accessor or visitor may retain it after callback. */
@@ -89,8 +90,8 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                               std::shared_ptr<SourceAccessor>(std::shared_ptr<SourceAccessor>{}, &inner)),
                           relative),
                       [this](const CanonPath & p) { return this->owner->makeNotAllowedError(this->original / p); })
-                , owner(&owner)
-                , original(std::move(original))
+                , owner(parent ? parent->owner : &owner)
+                , original(parent ? parent->original / path : path)
                 , admitted(std::move(listing).filter([&](const auto & entry) {
                     return this->owner->isAllowed(this->original / entry.first);
                 }))
@@ -124,8 +125,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
         };
         /* Non-root scopes flatten coordinates; root rereads retain the prior admission. */
         auto * parent = path.isRoot() ? nullptr : dynamic_cast<Scoped *>(this);
-        Scoped scoped{
-            inner, relative, parent ? *parent->owner : *this, parent ? parent->original / path : path, std::move(listing)};
+        Scoped scoped{inner, relative, *this, path, parent, std::move(listing)};
         callback(scoped, CanonPath::root, DirectoryListing(std::cref(scoped.admitted)));
     });
 }

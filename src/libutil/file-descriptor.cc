@@ -213,8 +213,6 @@ void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink, bool t
     static constexpr size_t copyBufferSize = 64 * 1024;
 
     if (tryCoW && nbytes > copyBufferSize) {
-        /* dynamic_cast here is slightly annoying, but it's much cheaper than
-           doing I/O so it doesn't really matter. */
         FdSink * fdSink = dynamic_cast<FdSink *>(&sink);
         /* Destination is a regular file which hasn't been written to and we've
            been hinted that we should try block cloning. Try it and in case we
@@ -226,19 +224,18 @@ void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink, bool t
         }
     }
 
-    auto left = nbytes;
-    std::array<std::byte, copyBufferSize> buf;
-
-    while (left) {
-        auto limit = std::min<size_t>(left, buf.size());
-        auto n = readOffset(fd, offset, std::span(buf.data(), limit));
-        if (n == 0)
-            throw EndOfFile("unexpected end-of-file reading from %1%", PathFmt(descriptorToPath(fd)));
-        assert(n <= left);
-        sink(std::string_view(reinterpret_cast<const char *>(buf.data()), n));
-        offset += n;
-        left -= n;
-    }
+    return [] [[gnu::noinline]] (Descriptor fd, off_t offset, size_t left, Sink & sink) static {
+        std::array<std::byte, copyBufferSize> buf;
+        while (left) {
+            auto n = readOffset(fd, offset, std::span(buf.data(), std::min<size_t>(left, buf.size())));
+            if (n == 0)
+                throw EndOfFile("unexpected end-of-file reading from %1%", PathFmt(descriptorToPath(fd)));
+            assert(n <= left);
+            sink(std::string_view(reinterpret_cast<const char *>(buf.data()), n));
+            offset += n;
+            left -= n;
+        }
+    }(fd, offset, nbytes, sink);
 }
 
 //////////////////////////////////////////////////////////////////////

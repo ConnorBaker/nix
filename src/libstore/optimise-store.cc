@@ -1301,7 +1301,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         PathLocks outputLock;
         if (!locksHeld.count(printStorePath(i)))
             outputLock.lockPaths({pathRoot});
-        auto row = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+        auto row = retrySQLite<std::shared_ptr<ValidPathInfo>>(
             [&]() { return queryPathInfoInternal(*_state->lock(), i); });
         if (!row)
             continue; /* path was GC'ed, probably */
@@ -1310,10 +1310,9 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
            Modified paths remain unentered. Legacy paths need this second walk;
            current rows already carry the object hash. */
         if (!row->objectHash) {
-            ValidPathInfo old(*row);
             std::optional<std::pair<Hash, Hash>> narHashes;
             try {
-                switch (walkOldRow(old, &narHashes)) {
+                switch (walkOldRow(*row, &narHashes)) {
                 case OldRowWalk::Migrated:
                     break;
                 case OldRowWalk::Modified:

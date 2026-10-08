@@ -100,8 +100,8 @@ void CanonPath::extend(const CanonPath & x)
 
 CanonPath CanonPath::operator/(const CanonPath & x) const
 {
-    if (x.isRoot())
-        return *this;
+    if (x.isRoot() || (path == "/" && x.path.front() == '/'))
+        return x.isRoot() ? *this : x;
     return CanonPath(unchecked_t(), concatStrings(path, isRoot() ? x.rel() : std::string_view(x.path)));
 }
 

@@ -115,18 +115,16 @@ StorePaths HttpBinaryCacheStore::topoSortPaths(const StorePathSet & paths)
             co_return res;
         });
 
-    auto result = topoSort(paths, [&](const StorePath & path) { return pathInfos.at(path)->references; });
+    auto result = topoSort(paths, [&](const StorePath & path) -> const StorePathSet & {
+        return pathInfos.at(path)->references;
+    });
 
-    return std::visit(
-        overloaded{
-            [&](const Cycle<StorePath> & cycle) -> StorePaths {
-                throw Error(
-                    "cycle detected in the references of '%s' from '%s'",
-                    printStorePath(cycle.path),
-                    printStorePath(cycle.parent));
-            },
-            [](const auto & sorted) { return sorted; }},
-        result);
+    if (auto cycle = std::get_if<Cycle<StorePath>>(&result))
+        throw Error(
+            "cycle detected in the references of '%s' from '%s'",
+            printStorePath(cycle->path),
+            printStorePath(cycle->parent));
+    return std::get<StorePaths>(std::move(result));
 }
 
 std::optional<CompressionAlgo> HttpBinaryCacheStore::getCompressionMethod(const std::string & path)
