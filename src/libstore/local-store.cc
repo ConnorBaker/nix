@@ -1395,7 +1395,8 @@ void LocalStore::queryPathInfoUncached(
     const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept
 {
     try {
-        auto info = queryPathInfoUnmigrated(path);
+        auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+            [&]() { return queryPathInfoInternal(*_state->lock(), path); });
 
         /* Outside the lock: a schema-10 row's migration may walk the path. */
         if (info)
@@ -1416,7 +1417,8 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoUnmigrated(const S
 
 void LocalStore::migratePathInfo(const StorePath & path)
 {
-    auto info = queryPathInfoUnmigrated(path);
+    auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+        [&]() { return queryPathInfoInternal(*_state->lock(), path); });
 
     if (!info)
         throw InvalidPath("path '%s' is not valid", printStorePath(path));

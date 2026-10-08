@@ -1314,7 +1314,8 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         PathLocks outputLock;
         if (!locksHeld.count(printStorePath(i)))
             outputLock.lockPaths({pathRoot});
-        auto row = queryPathInfoUnmigrated(i);
+        auto row = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+            [&]() { return queryPathInfoInternal(*_state->lock(), i); });
         if (!row)
             continue; /* path was GC'ed, probably */
         Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
