@@ -24,6 +24,28 @@ The reduction replaces private state and repeated operations with existing combi
 
 Commit **161443ba1** subsequently removes five runtime lines by constructing the owned filtering-scope coordinate once. The natural rebuild and all 179 fetcher tests pass; this change is not in the optimized v7 endpoint. Current source remains **+9,451** against base. The private `std::to_chars` header reduction was rejected by [finite native analysis](/tmp/nix-merkle-hash-native-preparation-oct7/NATIVE-READOUT.md); it adds generated work on nonzero inputs and does not match the actual provider context.
 
+## Matched v7 warm-Git execution counts
+
+The [sealed entry-count capture](/tmp/nix-base-current-callcounts-control-write-successor-oct7/READOUT.md) compares the same v7 endpoint with branch base, evaluating eight attributes after seeding thirty-two. All **182 emitted entry points and 18 native counter cells**, including zeros, are retained. Four complete outputs and one complete store graph pass independent review; all three successful/failed-attempt states are retired, and every owned probe was removed.
+
+| Emitted entry or native event | Base | v7 |
+|---|---:|---:|
+| POSIX regular-file reads | 346 | 53,439 |
+| Hashing visitor regular files | absent | 52,856 |
+| Hashing visitor directories | absent | 37,120 |
+| Source accessor constructor | 358 | 74,253 |
+| Canonical-path composition, two overloads | 25,998 | 603,040 |
+| SHA-256 initialization/finalization, each | 9,726 | 100,184 |
+| SHA-256 update | 9,726 | 191,552 |
+| All syscall entries | 389,485 | 865,708 |
+| `getdents64` | 75,831 | 150,087 |
+| `openat` | 37,693 | 129,170 |
+| `fcntl` | 4,968 | 78,470 |
+
+The v7 memo visitor enters exactly **89,979** times, matching every node in the complete pinned fixture census. This locates an additional raw filesystem walk: it hashes 52,856 regular files and opens 37,120 directory scopes. The installed glibc's `fdopendir` implementation performs one `fstat` and two `fcntl` calls per successful conversion, despite the caller already opening a readable directory with `O_CLOEXEC`. Its public API has no trusted-descriptor constructor that omits those checks while retaining the opened directory through child callbacks.
+
+Declared malloc/aligned/realloc entry counts decrease; these observations do not support a blanket claim of more allocations. The three monitored Git status APIs enter once each in both endpoints, which says nothing about their internal cost. Counters inherit through target threads/processes and include launcher work; rounded `100.00%` reporting is retained. Aliases are deduplicated by image/offset, forwarding thunks remain separate, and inlined calls are outside the emitted-entry domain. Counts establish executed work, not elapsed-time attribution or causal CPU fractions. The [independent audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-ENTRY-COUNT-THREE-PACKET-CLOSURE-AUDIT.json) checks the complete retained result domain.
+
 ## Earlier October 7 v5 comparison
 
 Measured **43f45b07a3c9ca5484ec495ba7c337c09221cbce** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Three CPU medians remain higher. The source-size and uniform-performance goals remain open: the measured implementation is **9,501 physical runtime-source lines above base**.
