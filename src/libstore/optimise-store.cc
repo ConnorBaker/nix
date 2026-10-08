@@ -378,19 +378,18 @@ static BufferedRegularFile readBufferedRegular(
     fun<std::unique_ptr<RegularFileWriter>()> open,
     Sink * contents = nullptr)
 {
-    struct BufferThenStreamFile : CreateRegularFileSink
+    struct BufferThenStreamFile : HashingRegularFileSink
     {
         const fun<std::unique_ptr<RegularFileWriter>()> & open;
-        HashingRegularFileSink & hashing;
         Sink * contents;
         bool executable = false;
         std::string buffer;
         std::unique_ptr<RegularFileWriter> writer;
 
         BufferThenStreamFile(
-            const fun<std::unique_ptr<RegularFileWriter>()> & open, HashingRegularFileSink & hashing, Sink * contents)
-            : open(open)
-            , hashing(hashing)
+            const CanonPath & path, const fun<std::unique_ptr<RegularFileWriter>()> & open, Sink * contents)
+            : HashingRegularFileSink(path)
+            , open(open)
             , contents(contents)
         {
         }
@@ -398,14 +397,14 @@ static BufferedRegularFile readBufferedRegular(
         void isExecutable() override
         {
             executable = true;
-            hashing.isExecutable();
+            HashingRegularFileSink::isExecutable();
             if (writer)
                 writer->isExecutable();
         }
 
         void preallocateContents(uint64_t size) override
         {
-            hashing.preallocateContents(size);
+            HashingRegularFileSink::preallocateContents(size);
             if (size > restoreBufferLimit)
                 stream();
             if (writer)
@@ -428,7 +427,7 @@ static BufferedRegularFile readBufferedRegular(
 
         void operator()(std::string_view data) override
         {
-            hashing(data);
+            HashingRegularFileSink::operator()(data);
             if (contents)
                 (*contents)(data);
             if (!writer && buffer.size() + data.size() > restoreBufferLimit)
@@ -440,10 +439,9 @@ static BufferedRegularFile readBufferedRegular(
         }
     };
 
-    HashingRegularFileSink hashing{path};
-    BufferThenStreamFile file{open, hashing, contents};
+    BufferThenStreamFile file{path, open, contents};
     read(file);
-    return {hashing.finish(), std::move(file.buffer), std::move(file.writer)};
+    return {file.finish(), std::move(file.buffer), std::move(file.writer)};
 }
 
 /* Buffer regular files up to restoreBufferLimit, then link or write;

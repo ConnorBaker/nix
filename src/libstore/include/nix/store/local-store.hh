@@ -971,7 +971,7 @@ public:
         GitObjectStore::BlobInodes * blobInodes = nullptr);
 
     // Internal versions that are not wrapped in retry_sqlite.
-    bool isValidPath_(State & state, const StorePath & path);
+    bool isValidPath_(State & state, std::string_view logical);
     void queryReferrers(State & state, const StorePath & path, StorePathSet & referrers);
 
     void addBuildLog(const StorePath & drvPath, std::string_view log) override;

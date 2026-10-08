@@ -271,11 +271,9 @@ std::string CaseHackNames::diskName(std::string_view name0)
     std::string name(name0);
     if (!archiveSettings.useCaseHack)
         return name;
-    auto i = names.find(name);
-    if (i == names.end()) {
-        names[name] = 0;
+    auto [i, inserted] = names.try_emplace(name, 0);
+    if (inserted)
         return name;
-    }
     debug("case collision between '%1%' and '%2%'", i->first, name);
     name += caseHackSuffix;
     name += std::to_string(++i->second);

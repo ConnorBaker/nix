@@ -148,8 +148,6 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryRealisedOutput;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
-    bool hasBlobIndex = false;
-    bool hasAuxiliary = false;
     SQLiteStmt ReadAuxiliary;
     SQLiteStmt ReadAuxiliaryExact;
     SQLiteStmt QueryAuxiliaryKeys;
@@ -436,9 +434,9 @@ LocalStore::LocalStore(ref<const Config> config)
        paths and their hashes remain readable without migrating a cache. */
     SQLiteStmt tables(state->db, "select 1 from sqlite_master where type = 'table' and name = ?;");
     bool hasBlobs = tables.use().apply("Blobs").next();
-    state->stmts->hasBlobIndex = hasBlobs && tables.use().apply("Ingestions").next();
-    state->stmts->hasAuxiliary = tables.use().apply("AuxValues").next();
-    if (state->stmts->hasAuxiliary) {
+    bool hasBlobIndex = hasBlobs && tables.use().apply("Ingestions").next();
+    bool hasAuxiliary = tables.use().apply("AuxValues").next();
+    if (hasAuxiliary) {
         state->stmts->ReadAuxiliary.create(
             state->db,
             "select a.ingestion, a.chunk, a.body from AuxValues a"
@@ -456,7 +454,7 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->DeleteAuxiliary.create(
             state->db, "delete from AuxValues where kind = ? and id = ? and ingestion = ?;");
     }
-    if (state->stmts->hasBlobIndex) {
+    if (hasBlobIndex) {
         state->stmts->LookupBlob.create(state->db, lookupBlobSql);
         state->stmts->InsertBlob.create(
             state->db,
@@ -537,7 +535,7 @@ LocalStore::LocalStore(ref<const Config> config)
     /* The ablation, test-only (`local-store.hh`, `BlobRows`). */
     if (auto v = getEnv("_NIX_TEST_HOLDER_NO_ROWS"); v && *v == "1")
         blobRows = BlobRows::NoRows;
-    if (state->stmts->hasBlobIndex) {
+    if (state->stmts->LookupBlob) {
         blobIndex.lookup = [this](const Hash & id, bool executable, GitObjectStore::Holder::Cursor cursor)
             -> std::optional<GitObjectStore::Holder> {
             return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
@@ -603,7 +601,7 @@ LocalStore::LocalStore(ref<const Config> config)
             });
         };
     }
-    if (state->stmts->hasAuxiliary)
+    if (state->stmts->ReadAuxiliary)
         blobIndex.readAuxiliary = [this](const merkle::TreeEntry & entry) { return readAuxiliary(entry); };
     objects.index = &blobIndex;
 }
@@ -738,7 +736,7 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
     auto keys = retrySQLite<std::vector<Key>>([&] {
         auto state(_state->lock());
         std::vector<Key> keys;
-        if (!state->stmts->hasAuxiliary)
+        if (!state->stmts->QueryAuxiliaryKeys)
             return keys;
         auto use(state->stmts->QueryAuxiliaryKeys.use());
         while (use.next())
@@ -926,7 +924,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         insertAuxiliaryRows(*state, *id, projection.auxiliary);
         /* This naming is itself publication for a path already valid.
            Builder outputs are reconciled when their validity is committed. */
-        if (isValidPath_(*state, path))
+        if (isValidPath_(*state, logical))
             coalesceBlobRows(*state, path, hold, *id, rows);
 
         state->stmts->DeletePathIngestions.use().apply(logical).exec();
@@ -1621,16 +1619,16 @@ uint64_t LocalStore::queryValidPathId(State & state, const StorePath & path)
     return use.getInt(0);
 }
 
-bool LocalStore::isValidPath_(State & state, const StorePath & path)
+bool LocalStore::isValidPath_(State & state, std::string_view logical)
 {
-    return state.stmts->QueryValidPathId.use().apply(printStorePath(path)).next();
+    return state.stmts->QueryValidPathId.use().apply(logical).next();
 }
 
 bool LocalStore::isValidPathUncached(const StorePath & path)
 {
     return retrySQLite<bool>([&]() {
         auto state(_state->lock());
-        bool valid = isValidPath_(*state, path);
+        bool valid = isValidPath_(*state, printStorePath(path));
         if (valid && pathInfoCache) {
             /* Publish under the same database lock as invalidation, so a
                completed invalidation cannot be followed by an older hit.
@@ -2420,7 +2418,7 @@ void LocalStore::invalidatePathChecked(const StorePath & path)
 
         SQLiteTxn txn(state->db);
 
-        if (isValidPath_(*state, path)) {
+        if (isValidPath_(*state, printStorePath(path))) {
             StorePathSet referrers;
             queryReferrers(*state, path, referrers);
             referrers.erase(path); /* ignore self-references */

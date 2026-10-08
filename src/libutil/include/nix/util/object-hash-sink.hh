@@ -31,7 +31,7 @@ struct HashedNode
 
 /** Hash a regular node as size-prefixed bytes arrive, retaining bytes until
  * their size is announced. Borrows path; finish once after delivery. */
-struct HashingRegularFileSink final : CreateRegularFileSink
+struct HashingRegularFileSink : CreateRegularFileSink
 {
 private:
     const CanonPath & path;

@@ -1,6 +1,7 @@
 #include "nix/util/mounted-source-accessor.hh"
 
 #include <algorithm>
+#include <iterator>
 #include <tuple>
 
 #include "nix/util/sync.hh"
@@ -121,13 +122,11 @@ public:
     std::tuple<ref<SourceAccessor>, CanonPath, CanonPath> resolve(const CanonPath & path)
     {
         // Find the nearest parent of `path` that is a mount point.
-        auto prefix = path;
-        while (true) {
-            if (auto mount = getMount(prefix))
-                return {ref(std::move(mount)), path.removePrefix(prefix), std::move(prefix)};
-
+        auto state = mounts.readLock();
+        for (auto prefix = path;; prefix.pop()) {
+            if (auto mount = state->find(prefix); mount != state->end())
+                return {mount->second, path.removePrefix(prefix), std::move(prefix)};
             assert(!prefix.isRoot());
-            prefix.pop();
         }
     }
 
@@ -142,49 +141,35 @@ public:
     ResolvedTree resolveTree(const CanonPath & path, bool needDirectoryContents = false)
     {
         auto [accessor, subpath, mountPoint] = resolve(path);
-        auto nested = mountsBelow(mountPoint);
         ResolvedTree result{std::move(accessor), std::move(subpath), {}};
-        if (nested.empty())
-            return result;
-        for (auto & binding : nested)
-            if (binding.first != path && binding.first.isWithin(path))
-                result.below.push_back(binding);
-
-        /* A descendant binding proves the directory's shape without forcing
-           the fallback. Only listing and naming need its surviving contents. */
-        if (!result.below.empty() && !needDirectoryContents)
-            return result;
-
-        /* Grafting through a non-directory discards its old subtree. Inspect
-           only prefixes required by an explicit descendant; once our path
-           diverges, the remaining original subtree can be delegated whole.
-           The owning snapshot is complete before invoking any child. */
-        auto prefix = mountPoint;
+        auto last = CanonPath::root;
+        {
+            auto state = mounts.readLock();
+            auto next = state->upper_bound(path);
+            auto before = std::prev(next); // The required root mount is at or before every query.
+            if (before->first == mountPoint && (next == state->end() || !next->first.isWithin(mountPoint)))
+                return result;
+            for (auto i = next; i != state->end() && i->first.isWithin(path); ++i)
+                result.below.emplace_back(*i);
+            /* Shape needs no fallback observation; listing and naming need its contents. */
+            if (!result.below.empty() && !needDirectoryContents)
+                return result;
+            /* Strict descendants of each query prefix form an ordered interval.
+               If nonempty, it contains one of the query's two neighbours. */
+            last = path;
+            while ((next == state->end() || !next->first.isWithin(last))
+                   && (before->first == last || !before->first.isWithin(last)))
+                last.pop();
+        }
+        last = last.removePrefix(mountPoint);
         auto component = result.subpath.begin();
-        for (const auto & binding : nested)
-            while (binding.first != prefix && binding.first.isWithin(prefix)) {
-                auto st = result.accessor->maybeLstat(prefix.removePrefix(mountPoint));
-                if (!st || st->type != tDirectory) {
-                    result.hidden = true;
-                    return result;
-                }
-                if (prefix == path)
-                    return result;
-                prefix.push(*component++);
-            }
+        for (auto prefix = CanonPath::root;; prefix.push(*component++)) {
+            auto st = result.accessor->maybeLstat(prefix);
+            result.hidden = !st || st->type != tDirectory;
+            if (result.hidden || prefix == last)
+                break;
+        }
         return result;
-    }
-
-    /**
-     * The mounts whose mount point lies strictly below `path`, in path order.
-     */
-    std::vector<std::pair<CanonPath, ref<SourceAccessor>>> mountsBelow(const CanonPath & path)
-    {
-        std::vector<std::pair<CanonPath, ref<SourceAccessor>>> res;
-        auto state = mounts.readLock();
-        for (auto i = state->upper_bound(path); i != state->end() && i->first.isWithin(path); ++i)
-            res.emplace_back(*i);
-        return res;
     }
 
     void invalidateCache() override
