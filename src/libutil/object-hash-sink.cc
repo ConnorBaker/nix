@@ -3,6 +3,7 @@
 #include "nix/util/error.hh"
 #include "nix/util/finally.hh"
 
+#include <algorithm>
 #include <boost/container/small_vector.hpp>
 
 namespace nix {
@@ -79,12 +80,10 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             boost::container::small_vector_options_t<
                 boost::container::growth_factor<boost::container::growth_factor_100>>>
             kids;
-        bool hasSubdirectories = false;
         children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit)});
-            hasSubdirectories |= subdirectory;
         });
-        if (kids.size() > 1 && hasSubdirectories) {
+        if (kids.size() > 1 && std::ranges::any_of(kids.data(), kids.data() + kids.size(), &Child::subdirectory)) {
             if (!pool)
                 pool = std::make_unique<CopyPool>(workers);
             std::vector<std::optional<HashedNode>> nodes(kids.size());
