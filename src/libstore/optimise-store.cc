@@ -1108,8 +1108,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
 
     for (auto & collision : collisions) {
         auto & row = collision.row;
-        bool selected = false;
-        bool refused = false;
+        bool useOwn = true;
         for (auto & candidate : collision.candidates) {
             if (candidate.size != row.size) {
                 result.rejected.emplace_back(row, candidate);
@@ -1129,7 +1128,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                         PathFmt(own),
                         GitObjectStore::idString(row.id),
                         GitObjectStore::idString(observed));
-                selected = true;
+                useOwn = false;
                 collision.eligible = true;
                 break;
             }
@@ -1150,7 +1149,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                     continue;
                 }
                 if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-                    refused = true;
+                    useOwn = false;
                     continue;
                 }
                 throw Error(
@@ -1166,7 +1165,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 result.rejected.emplace_back(row, candidate);
                 continue;
             }
-            selected = true;
+            useOwn = false;
             auto [_, inserted] = byInode.emplace(std::pair{row.dev, row.ino}, winners.size());
             if (!inserted)
                 throw Error("one ingestion records different blobs for the same inode in %s", PathFmt(root));
@@ -1175,7 +1174,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
         }
         /* No usable donor means this file can become the holder. A file
            refused sharing is an exception, not a new canonical donor. */
-        if (!selected && !refused)
+        if (useOwn)
             collision.eligible = true;
     }
     if (winners.empty())

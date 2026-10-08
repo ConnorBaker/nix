@@ -1828,10 +1828,10 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
 
         SQLiteTxn txn(state->db);
         StorePathSet paths;
-        StorePathSet updated;
         /* Within this transaction, the finite path/reference domain has
            stable row ids. Retain each lookup through reference insertion. */
         std::map<StorePath, uint64_t> pathIds;
+        std::set<std::reference_wrapper<const StorePath>, std::less<StorePath>> updated;
         for (auto publication = publications.begin(); publication != publications.end();) {
             /* Retry active IDs from the unchanged hold; completed IDs are stable. */
             auto id = ingestion ? ingestion->id : std::optional(publication->id);
@@ -1860,8 +1860,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 auto use(state->stmts->QueryValidPathId.use());
                 use.apply(printStorePath(i.path));
                 if (use.next()) {
-                    updated.insert(i.path);
-                    pathIds.emplace(i.path, static_cast<uint64_t>(use.getInt(0)));
+                    updated.insert(pathIds.emplace(i.path, static_cast<uint64_t>(use.getInt(0))).first->first);
                 }
             }
             paths.insert(i.path);

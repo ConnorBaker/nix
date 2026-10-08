@@ -2,7 +2,7 @@
 ///@file
 
 #include "nix/util/error.hh"
-#include "nix/util/fun.hh"
+#include <functional>
 #include <variant>
 #include <concepts>
 
@@ -25,8 +25,7 @@ TopoSortResult<T> topoSort(std::set<T, Compare> items, const F & getChildren)
     std::vector<T> sorted;
     decltype(items) visited, parents;
 
-    fun<std::optional<Cycle<T>>(const T & path, const T * parent)> dfsVisit =
-        [&](const T & path, const T * parent) -> std::optional<Cycle<T>> {
+    auto dfsVisit = [&](this const auto & self, const T & path, const T * parent) -> std::optional<Cycle<T>> {
         if (parents.count(path)) {
             return Cycle{path, *parent};
         }
@@ -41,7 +40,7 @@ TopoSortResult<T> topoSort(std::set<T, Compare> items, const F & getChildren)
         for (auto & i : references)
             /* Don't traverse into items that don't exist in our starting set. */
             if (i != path && items.count(i)) {
-                auto result = dfsVisit(i, &path);
+                auto result = self(i, &path);
                 if (result.has_value()) {
                     return result;
                 }
