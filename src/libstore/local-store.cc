@@ -791,6 +791,13 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
     return errors;
 }
 
+/* The SQL key is the active digest bytes and mode, not the Hash algorithm tag. */
+static auto blobRowKey(const GitObjectStore::Hold::Row & row) noexcept
+{
+    const auto & id = row.id;
+    return std::pair{std::string_view{reinterpret_cast<const char *>(id.hash), id.hashSize}, row.executable};
+}
+
 void LocalStore::coalesceBlobRows(
     State & state,
     const StorePath & path,
@@ -803,11 +810,17 @@ void LocalStore::coalesceBlobRows(
        between this query and pinning its file. No collision means no walk. */
     std::vector<BlobCoalescing> collisions;
     {
-        auto use(state.stmts->QueryBlobCollisions.use());
+        auto & statement = state.stmts->QueryBlobCollisions;
+        auto use(statement.use());
         use.apply(static_cast<int64_t>(ingestion));
         while (use.next()) {
+            if (sqlite3_column_type(statement, 0) != SQLITE_BLOB || sqlite3_column_type(statement, 1) != SQLITE_INTEGER)
+                throw Error("blob index row has an invalid key storage class");
+            auto mode = use.getInt(1);
+            if (mode != 0 && mode != 1)
+                throw Error("blob index row holds an invalid executable flag %d", mode);
             auto id = blobIdOf(use.getBlobView(0));
-            bool executable = use.getInt(1) != 0;
+            bool executable = mode != 0;
             if (collisions.empty() || collisions.back().row.id != id || collisions.back().row.executable != executable)
                 collisions.push_back({
                     .row =
@@ -839,16 +852,9 @@ void LocalStore::coalesceBlobRows(
     /* SQL rollback cannot undo hard links. Retain the selected physical
        representatives in the caller's existing pending rows before SQL.
        A key declined for a link limit/full directory is not a new donor. */
-    auto keyLess = [](const auto & a, const auto & b) {
-        auto c = memcmp(a.id.hash, b.id.hash, a.id.hashSize);
-        return c != 0 ? c < 0 : a.executable < b.executable;
-    };
     std::erase_if(rows, [&](const auto & row) {
-        auto collision =
-            std::lower_bound(collisions.begin(), collisions.end(), row, [&](const auto & c, const auto & r) {
-                return keyLess(c.row, r);
-            });
-        return collision != collisions.end() && !keyLess(row, collision->row);
+        return std::ranges::binary_search(
+            collisions, blobRowKey(row), {}, [](const auto & collision) { return blobRowKey(collision.row); });
     });
     auto unchanged = rows.size();
     rows.reserve(unchanged + std::ranges::count_if(collisions, &BlobCoalescing::eligible));
@@ -895,9 +901,7 @@ static void sortProjectionForPublication(GitObjectStore::Hold::Projection & proj
         return std::string_view{reinterpret_cast<const char *>(id.hash), id.hashSize};
     };
     if (writeBlobs)
-        std::ranges::sort(projection.regular, {}, [&](const auto & row) noexcept {
-            return std::pair{bytes(row.id), row.executable};
-        });
+        std::ranges::sort(projection.regular, {}, blobRowKey);
     std::ranges::sort(projection.auxiliary, {}, [&](const auto & value) noexcept {
         return std::pair{value.entry.mode, bytes(value.entry.hash)};
     });

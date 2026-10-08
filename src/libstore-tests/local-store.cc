@@ -2647,6 +2647,272 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
     }
 }
 
+/* The SQL key must be admitted before any physical coalescing, including
+   when a prior SQL rollback left selected representatives in memory. */
+TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
+{
+    struct Key
+    {
+        std::string id = "id", mode = "exec";
+        const char *idType = "blob", *modeType = "integer", *error = nullptr;
+        bool executable = false, triple = false;
+        int width = -1;
+    };
+
+    std::vector<Key> keys;
+    for (bool executable : {false, true})
+        for (int width = 0; width <= 64; ++width)
+            keys.push_back(
+                {width == 32 ? "id" : fmt("zeroblob(%d)", width),
+                 "exec",
+                 "blob",
+                 "integer",
+                 width == 32 ? nullptr : "-byte identifier",
+                 executable,
+                 false,
+                 width});
+    for (auto [sql, type] :
+         {std::pair{"42", "integer"}, {"42.5", "real"}, {"printf('%032d', 0)", "text"}, {"NULL", "null"}})
+        keys.push_back(
+            {sql, "exec", type, "integer", type == std::string_view("null") ? nullptr : "invalid key storage class"});
+    for (auto [sql, type, mode, error] :
+         {std::tuple{"-9223372036854775808", "integer", false, "invalid executable flag"},
+          {"-1", "integer", false, "invalid executable flag"},
+          {"0", "integer", false, nullptr},
+          {"1", "integer", true, nullptr},
+          {"2", "integer", false, "invalid executable flag"},
+          {"9223372036854775807", "integer", false, "invalid executable flag"},
+          {"0.5", "real", false, "invalid key storage class"},
+          {"'not-a-mode'", "text", false, "invalid key storage class"},
+          {"x'00'", "blob", false, "invalid key storage class"},
+          {"NULL", "null", false, nullptr},
+          {"'0'", "integer", false, nullptr},
+          {"'1'", "integer", true, nullptr},
+          {"0.0", "integer", false, nullptr},
+          {"1.0", "integer", true, nullptr},
+          {"'0.0'", "integer", false, nullptr},
+          {"'1e0'", "integer", true, nullptr},
+          {"'-1'", "integer", false, "invalid executable flag"},
+          {"'2'", "integer", false, "invalid executable flag"},
+          {"'9223372036854775807'", "integer", false, "invalid executable flag"},
+          {"9223372036854775808", "real", false, "invalid key storage class"}})
+        keys.push_back({"id", sql, "blob", type, error, mode});
+    keys.push_back({"id", "m.value", "blob", "integer", "invalid executable flag", false, true});
+
+    unsigned cases = 0;
+    for (bool retry : {false, true})
+        for (const auto & key : keys) {
+            SCOPED_TRACE(fmt("retry=%d id=%s mode=%s case=%d", retry, key.id, key.mode, cases));
+            auto bytes = fmt("key-admission-%d", cases++);
+            std::array holds{store->objects.hold(), store->objects.hold(), store->objects.hold()};
+            std::vector<ValidPathInfo> infos;
+            std::array<std::filesystem::path, 3> files;
+            unsigned fileCount = key.triple ? 3 : 2;
+            for (unsigned i = 0; i < fileCount; ++i) {
+                infos.emplace_back(
+                    StorePath::random(bytes + fmt("-%d", i)), UnkeyedValidPathInfo{*store, std::nullopt});
+                auto root = store->toRealPath(infos.back().path);
+                files[i] = root / "file";
+                StringSource source{treeNar({{"file", bytes, key.executable ? 'x' : 'f'}})};
+                auto hooks =
+                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+                auto result = store->restoreThroughObjects(
+                    root,
+                    [&](FileSystemObjectSink & sink) { parseDump(sink, source); },
+                    false,
+                    hooks.get(),
+                    holds[i],
+                    NoRepair);
+                infos.back().objectHash = ObjectHash::of(result.root);
+                infos.back().narSize = result.narSize.value();
+            }
+            ASSERT_NE(st(files[0]).st_ino, st(files[1]).st_ino);
+            store->registerValidPath(infos[0], holds[0]);
+            store->endIngestion(holds[1], infos[1].path);
+            ASSERT_FALSE(holds[1].ingestion);
+            auto own = holds[1].completedIngestions.front().id;
+            auto donor = *holds[0].ingestion->id;
+            std::map<int64_t, std::string> names{
+                {int64_t(own), store->printStorePath(infos[1].path)},
+                {int64_t(donor), store->printStorePath(infos[0].path)}};
+            if (key.triple) {
+                /* Metadata-only registration preserves an already persisted
+                   projection: a second published inode keeps exec=0 in the
+                   relation even after retry reinserts the selected own row. */
+                store->endIngestion(holds[2], infos[2].path);
+                store->registerValidPath(infos[2]);
+                names.emplace(holds[2].completedIngestions.front().id, store->printStorePath(infos[2].path));
+                ASSERT_NE(st(files[0]).st_ino, st(files[2]).st_ino);
+                ASSERT_NE(st(files[1]).st_ino, st(files[2]).st_ino);
+            }
+            auto lease = holds[1].directory();
+            SQLite other{
+                store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+            auto domain = fmt(
+                "ingestion in (%d, %d, %d)", own, donor, key.triple ? holds[2].completedIngestions.front().id : donor);
+            other.exec("create temp table original as select * from Blobs where " + domain);
+            auto mutation = "begin; delete from Blobs where " + domain + "; insert into Blobs select " + key.id + ", "
+                            + key.mode + ", ino, dev, ingestion, name, size from original"
+                            + (key.triple ? ", (select -1 value union all select 0 union all select 1) m" : "")
+                            + "; commit;";
+            unsigned pins = 0;
+            store->objects.failPlaceWithNoSpace = [&](const auto &) {
+                ++pins;
+                return false;
+            };
+
+            struct Attempt
+            {
+                sqlite3 * db;
+                const char * sql;
+                std::array<const char *, 3> files;
+                unsigned fileCount;
+                unsigned * pins;
+                bool retry;
+                unsigned begins = 0, publications = 0, pinsBefore = 0;
+                int mutation = SQLITE_ERROR, rollback = SQLITE_OK;
+                std::array<int, 3> statResults{};
+                std::array<struct stat, 3> before{};
+
+                void inject() noexcept
+                {
+                    pinsBefore = *pins;
+                    for (unsigned i = 0; i < fileCount; ++i)
+                        statResults[i] = ::lstat(files[i], &before[i]);
+                    mutation = sqlite3_exec(db, sql, nullptr, nullptr, nullptr);
+                    if (mutation != SQLITE_OK)
+                        rollback = sqlite3_exec(db, "rollback;", nullptr, nullptr, nullptr);
+                }
+            } attempt{
+                other,
+                mutation.c_str(),
+                {files[0].c_str(), files[1].c_str(), files[2].c_str()},
+                fileCount,
+                &pins,
+                retry};
+
+            Finally clear{[&] {
+                store->objects.failPlaceWithNoSpace = {};
+                auto state = lockStoreState();
+                sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+                sqlite3_exec(state->db, "drop trigger if exists key_retry;", nullptr, nullptr, nullptr);
+                sqlite3_create_function_v2(
+                    state->db, "key_retry", 0, SQLITE_UTF8, nullptr, nullptr, nullptr, nullptr, nullptr);
+            }};
+            {
+                auto state = lockStoreState();
+                ASSERT_EQ(
+                    sqlite3_create_function_v2(
+                        state->db,
+                        "key_retry",
+                        0,
+                        SQLITE_UTF8,
+                        &attempt,
+                        [](sqlite3_context * context, int, sqlite3_value **) {
+                            auto & a = *static_cast<Attempt *>(sqlite3_user_data(context));
+                            if (++a.publications == 1 && a.retry)
+                                sqlite3_result_error_code(context, SQLITE_BUSY);
+                            else
+                                sqlite3_result_null(context);
+                        },
+                        nullptr,
+                        nullptr,
+                        nullptr),
+                    SQLITE_OK);
+                state->db.exec(
+                    "create temp trigger key_retry after insert on ValidPaths begin select key_retry(); end;");
+                ASSERT_EQ(
+                    sqlite3_trace_v2(
+                        state->db,
+                        SQLITE_TRACE_STMT,
+                        [](unsigned, void * context, void * statement, void *) -> int {
+                            auto & a = *static_cast<Attempt *>(context);
+                            auto sql = sqlite3_sql(static_cast<sqlite3_stmt *>(statement));
+                            if (sql && std::string_view(sql) == "begin;" && ++a.begins == 2)
+                                a.inject();
+                            return 0;
+                        },
+                        &attempt),
+                    SQLITE_OK);
+            }
+            if (!retry)
+                attempt.inject();
+            std::string error;
+            try {
+                store->registerValidPath(infos[1], holds[1]);
+            } catch (Error & e) {
+                error = e.what();
+            }
+            // Stop observing transactions before the queries and recovery below.
+            {
+                auto state = lockStoreState();
+                sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+                state->db.exec("drop trigger key_retry;");
+            }
+            bool null = key.idType == std::string_view("null") || key.modeType == std::string_view("null");
+            ASSERT_EQ(attempt.mutation, null ? SQLITE_CONSTRAINT : SQLITE_OK);
+            ASSERT_EQ(attempt.rollback, SQLITE_OK);
+            ASSERT_EQ(attempt.begins, retry ? 2u : 1u);
+            EXPECT_EQ(attempt.publications, unsigned(retry) + unsigned(!key.error));
+            if (key.error) {
+                EXPECT_THAT(error, ::testing::HasSubstr(key.error));
+                EXPECT_EQ(pins, attempt.pinsBefore);
+            } else
+                EXPECT_TRUE(error.empty()) << error;
+            if (retry) {
+                EXPECT_GT(attempt.pinsBefore, 0u);
+                EXPECT_TRUE(
+                    attempt.before[1].st_ino == attempt.before[0].st_ino
+                    || (key.triple && attempt.before[1].st_ino == attempt.before[2].st_ino))
+                    << "the first attempt must have physically coalesced before SQL rollback";
+            }
+            for (unsigned i = 0; i < fileCount; ++i) {
+                ASSERT_EQ(attempt.statResults[i], 0);
+                auto after = st(files[i]);
+                if (key.error) {
+                    EXPECT_EQ(after.st_ino, attempt.before[i].st_ino);
+                    EXPECT_EQ(after.st_dev, attempt.before[i].st_dev);
+                }
+                EXPECT_EQ(after.st_mode, attempt.before[i].st_mode);
+                EXPECT_EQ(readFile(files[i]), bytes);
+            }
+            EXPECT_EQ(store->isValidPath(infos[1].path), !key.error);
+            EXPECT_EQ(holds[1].completedIngestions.front().id, own);
+            EXPECT_TRUE(pathExists(lease));
+            EXPECT_TRUE(store->isValidPath(infos[0].path));
+            SQLiteStmt rows{
+                other,
+                "select typeof(b.id), typeof(exec), length(b.id), exec, i.path, ingestion"
+                " from Blobs b join Ingestions i on i.id = b.ingestion where "
+                    + domain + " order by ingestion, exec"};
+            unsigned count = 0;
+            {
+                auto row = rows.use();
+                while (row.next()) {
+                    EXPECT_EQ(row.getStr(0), null ? "blob" : key.idType);
+                    EXPECT_EQ(row.getStr(1), null ? "integer" : key.modeType);
+                    if (key.width >= 0)
+                        EXPECT_EQ(row.getInt(2), key.width);
+                    if (key.triple)
+                        EXPECT_EQ(row.getInt(3), int64_t(count % 3) - 1);
+                    EXPECT_EQ(row.getStr(4), names.at(row.getInt(5)));
+                    ++count;
+                }
+            }
+            EXPECT_EQ(count, key.triple ? 9u : 2u);
+            if (key.error) {
+                other.exec(
+                    "begin; delete from Blobs where " + domain + "; insert into Blobs select * from original; commit;");
+                ASSERT_NO_THROW(store->registerValidPath(infos[1], holds[1]));
+            }
+            EXPECT_TRUE(
+                st(files[1]).st_ino == st(files[0]).st_ino
+                || (key.triple && st(files[1]).st_ino == st(files[2]).st_ino));
+            EXPECT_TRUE(store->isValidPath(infos[1].path));
+        }
+    EXPECT_EQ(cases, 310u);
+}
+
 TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolders)
 {
     /* All six orders respecting legacy insertion before completion. Each
