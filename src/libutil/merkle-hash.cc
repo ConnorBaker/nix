@@ -177,9 +177,9 @@ uint64_t symlink(uint64_t targetLen)
     return tag("(") + tag("type") + tag("symlink") + tag("target") + stringSize(targetLen) + tag(")");
 }
 
-void Directory::add(std::string_view name, uint64_t nodeSize)
+void Directory::add(uint64_t nameSize, uint64_t nodeSize) noexcept
 {
-    entries += tag("entry") + tag("(") + tag("name") + stringSize(name.size()) + tag("node") + nodeSize + tag(")");
+    entries += tag("entry") + tag("(") + tag("name") + stringSize(nameSize) + tag("node") + nodeSize + tag(")");
 }
 
 uint64_t Directory::finish() const

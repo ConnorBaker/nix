@@ -366,7 +366,7 @@ public:
     EvalMemory & operator=(const EvalMemory &) = delete;
     EvalMemory & operator=(EvalMemory &&) = delete;
 
-    inline void * allocBytes(size_t n);
+    static inline void * allocBytes(size_t n);
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 

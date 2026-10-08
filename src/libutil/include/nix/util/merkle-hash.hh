@@ -140,7 +140,7 @@ struct Directory
      */
     uint64_t entries = 0;
 
-    void add(std::string_view name, uint64_t nodeSize);
+    void add(uint64_t nameSize, uint64_t nodeSize) noexcept;
 
     uint64_t finish() const;
 };

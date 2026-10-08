@@ -597,25 +597,8 @@ std::string readString(Source & source, size_t max)
     auto len = readNum<size_t>(source);
     if (len > max)
         throw SerialisationError("string is too long");
-    /* Grow with the data actually received rather than trusting `len` for
-       the allocation, so a bogus length prefix costs the peer as many bytes
-       as it costs us. */
-    std::string res;
-    while (res.size() < len) {
-        size_t filled = res.size();
-        size_t want = std::min(len, std::max<size_t>(2 * filled, 64 * 1024));
-        std::exception_ptr ex;
-        res.resize_and_overwrite(want, [&](char * buf, size_t) -> size_t {
-            try {
-                return filled + source.read(buf + filled, want - filled);
-            } catch (...) {
-                ex = std::current_exception();
-                return filled;
-            }
-        });
-        if (ex)
-            std::rethrow_exception(ex);
-    }
+    // Grow with the received bytes rather than trusting the length prefix.
+    auto res = readPrefix(len, [&](char * buf, size_t size) { return source.read(buf, size); });
     readPadding(len, source);
     return res;
 }

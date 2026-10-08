@@ -35,8 +35,7 @@ HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath & path, Children children)
 {
     merkle::Tree tree;
-    merkle::nar::Directory size;
-    bool sizeExact = true;
+    std::optional<merkle::nar::Directory> size{std::in_place};
     auto consume = [&](std::string && name, const HashedNode & child) {
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
@@ -44,12 +43,12 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
                 path / name,
                 printHashAlgo(child.entry.hash.algo),
                 printHashAlgo(merkle::hashAlgo));
-        auto nextSize = size;
-        if (child.narSize)
-            nextSize.add(name, *child.narSize);
+        auto nameSize = name.size();
         merkle::insertEntry(tree, std::move(name), child.entry);
-        size = nextSize;
-        sizeExact &= child.narSize.has_value();
+        if (!child.narSize)
+            size.reset();
+        if (size)
+            size->add(nameSize, *child.narSize);
     };
     if (workers == 1 || !children.canDefer) {
         children.each([&](std::string_view name, bool, fun<HashedNode()> visit) {
@@ -92,7 +91,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
     return {
         HashedNode{
             .entry = {.mode = merkle::Mode::Directory, .hash = merkle::treeId(body)},
-            .narSize = sizeExact ? std::optional(size.finish()) : std::nullopt,
+            .narSize = size.transform([](const auto & directory) { return directory.finish(); }),
         },
         std::move(body),
     };

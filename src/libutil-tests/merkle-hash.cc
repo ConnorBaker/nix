@@ -74,7 +74,7 @@ static uint64_t narNodeSize(SourceAccessor & acc, const CanonPath & p)
     case SourceAccessor::tDirectory: {
         merkle::nar::Directory d;
         for (auto & [name, actual] : unhackedEntries(acc, p))
-            d.add(name, narNodeSize(acc, p / actual));
+            d.add(name.size(), narNodeSize(acc, p / actual));
         return d.finish();
     }
     case SourceAccessor::tChar:

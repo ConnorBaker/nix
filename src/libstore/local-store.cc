@@ -2259,38 +2259,14 @@ StorePath LocalStore::addToStoreFromDump(
        destination store path is already valid, we just delete the
        temporary path. Otherwise, we move it to the destination store
        path. */
-    bool inMemory = false;
-
-    /* Because std::string has resize_and_overwrite. */
-    std::string dump;
-
-    /* Fill out buffer, and decide whether we are working strictly in
-       memory based on whether we break out because the buffer is full
-       or the original source is empty */
-    while (dump.size() < localSettings.narBufferSize) {
-        const auto oldSize = dump.size();
-        constexpr size_t chunkSize = 65536;
-        auto want = std::min(chunkSize, localSettings.narBufferSize - oldSize);
-        std::exception_ptr ex;
-        dump.resize_and_overwrite(
-            oldSize + want,
-            [&inMemory, &source, &ex, sz = oldSize](char * buf, std::size_t bufSize) -> std::string::size_type {
-                try {
-                    auto got = source.read(buf + sz, bufSize - sz);
-                    return sz + got;
-                } catch (EndOfFile &) {
-                    inMemory = true;
-                    return sz;
-                } catch (...) {
-                    ex = std::current_exception();
-                    return sz;
-                }
-            });
-        if (ex)
-            std::rethrow_exception(ex);
-        if (inMemory)
-            break;
-    }
+    auto limit = localSettings.narBufferSize.get();
+    auto dump = readPrefix(limit, [&](char * buf, size_t size) -> std::optional<size_t> {
+        try {
+            return source.read(buf, size);
+        } catch (EndOfFile &) {
+            return std::nullopt;
+        }
+    });
 
     std::unique_ptr<AutoDelete> delTempDir;
     std::filesystem::path tempPath;
@@ -2303,7 +2279,7 @@ StorePath LocalStore::addToStoreFromDump(
     /* A complete Flat buffer directly supplies Flat/Text or Git addresses;
        scanned NARs and mismatched NAR methods still need parsing first. */
     bool inMemoryAndDontNeedRestore =
-        inMemory
+        dump.size() < limit
         && (dumpMethod == FileSerialisationMethod::Flat ? ingestionMethod != FileIngestionMethod::NixArchive
                                                         : methodsMatch && !filterReferences);
     auto canonicalisingRestoreHooks =

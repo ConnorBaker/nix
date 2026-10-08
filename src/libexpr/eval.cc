@@ -86,20 +86,18 @@ static const char * makeImmutableString(std::string_view s)
     return t;
 }
 
-StringData & StringData::alloc(EvalMemory & mem, size_t size)
+StringData & StringData::alloc(size_t size)
 {
-    void * t = mem.allocBytes(sizeof(StringData) + size + 1);
-    if (!t)
-        throw std::bad_alloc();
+    void * t = EvalMemory::allocBytes(sizeof(StringData) + size + 1);
     auto res = new (t) StringData(size);
     return *res;
 }
 
-const StringData & StringData::make(EvalMemory & mem, std::string_view s)
+const StringData & StringData::make(std::string_view s)
 {
     if (s.empty())
         return ""_sds;
-    auto & res = alloc(mem, s.size());
+    auto & res = alloc(s.size());
     std::memcpy(&res.data_, s.data(), s.size());
     res.data_[s.size()] = '\0';
     return res;
@@ -904,9 +902,9 @@ DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
         evalState.runDebugRepl(nullptr, trace.env, trace.expr);
 }
 
-void Value::mkString(std::string_view s, EvalMemory & mem)
+void Value::mkString(std::string_view s, EvalMemory &)
 {
-    mkStringNoCopy(StringData::make(mem, s));
+    mkStringNoCopy(StringData::make(s));
 }
 
 Value::StringWithContext::Context *
@@ -917,13 +915,13 @@ Value::StringWithContext::Context::fromBuilder(const NixStringContext & context,
 
     auto ctx = new (mem.allocBytes(sizeof(Context) + context.size() * sizeof(value_type))) Context(context.size());
     std::ranges::transform(
-        context, ctx->elems, [&](const NixStringContextElem & elt) { return &StringData::make(mem, elt.to_string()); });
+        context, ctx->elems, [](const NixStringContextElem & elt) { return &StringData::make(elt.to_string()); });
     return ctx;
 }
 
 void Value::mkString(std::string_view s, const NixStringContext & context, EvalMemory & mem)
 {
-    mkStringNoCopy(StringData::make(mem, s), Value::StringWithContext::Context::fromBuilder(context, mem));
+    mkStringNoCopy(StringData::make(s), Value::StringWithContext::Context::fromBuilder(context, mem));
 }
 
 void Value::mkStringMove(const StringData & s, const NixStringContext & context, EvalMemory & mem)
@@ -931,9 +929,9 @@ void Value::mkStringMove(const StringData & s, const NixStringContext & context,
     mkStringNoCopy(s, Value::StringWithContext::Context::fromBuilder(context, mem));
 }
 
-void Value::mkPath(const SourcePath & path, EvalMemory & mem)
+void Value::mkPath(const SourcePath & path, EvalMemory &)
 {
-    mkPath(&*path.accessor, StringData::make(mem, path.path.abs()));
+    mkPath(&*path.accessor, StringData::make(path.path.abs()));
 }
 
 [[gnu::always_inline]] inline Value * EvalState::lookupVar(Env * env, const ExprVar & var, bool noEval)
@@ -2244,7 +2242,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         }
         v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
     } else {
-        auto & resultStr = StringData::alloc(state.mem, sSize);
+        auto & resultStr = StringData::alloc(sSize);
         auto * tmp = resultStr.data();
         for (const auto & part : strings) {
             std::memcpy(tmp, part->data(), part->size());

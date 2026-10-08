@@ -208,7 +208,7 @@ TEST_F(TextStoreTest, derivationReferencesAreStoredBeforePublication)
     NixStringContext context;
     auto drvPath = state.coerceToStorePath(noPos, v, context, "while testing");
     auto drv = state.store->readDerivation(drvPath);
-    ASSERT_EQ(drv.inputs.size(), 1);
+    ASSERT_EQ(drv.inputs.size(), 1u);
     auto script = drv.inputs.begin()->getBaseStorePath();
     EXPECT_TRUE(state.store->isValidPath(script));
     EXPECT_EQ(readStoreFile(script), "echo");

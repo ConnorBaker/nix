@@ -2223,7 +2223,7 @@ static void prim_readFile(EvalState & state, CallSite callSite, Value * const * 
             .atPos(noPos)
             .debugThrow();
     StorePathSet refs;
-    if (state.store->isInStore(path.path.abs())) {
+    if (s.size() >= StorePath::HashLen && state.store->isInStore(path.path.abs())) {
         try {
             refs = state.store->queryPathInfo(state.store->toStorePath(path.path.abs()).first)->references;
         } catch (Error &) { // FIXME: should be InvalidPathError

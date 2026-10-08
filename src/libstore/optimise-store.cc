@@ -754,7 +754,7 @@ struct MaterialisingVisitor : LinkingVisitor
                 for (auto & [name, child] : tree) {
                     auto diskName = hack.diskName(name);
                     Scope childScope{sub, &diskName};
-                    size.add(name, materialise(child, path / name, depth + 1, attemptHold));
+                    size.add(name.size(), materialise(child, path / name, depth + 1, attemptHold));
                 }
             };
             target.sink.createSubdirectory(target.name, std::ref(populate));

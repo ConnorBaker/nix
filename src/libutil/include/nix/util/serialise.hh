@@ -1,7 +1,11 @@
 #pragma once
 ///@file
 
+#include <algorithm>
+#include <exception>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <type_traits>
 
 #include "nix/util/fun.hh"
@@ -143,6 +147,37 @@ public:
 
     virtual void skip(size_t len);
 };
+
+/** Read up to len bytes; producer reports at most the requested count, nullopt ends.
+ * Calls are synchronous; engaged zero retries; producer must not retain the lent buffer. */
+template<class Read>
+std::string readPrefix(uint64_t len, Read && read)
+{
+    std::string result;
+    while (len) {
+        auto filled = result.size();
+        auto want = static_cast<size_t>(std::min<uint64_t>(len, filled < 32768 ? 65536 - filled : filled));
+        if (want > result.max_size() - filled)
+            throw std::length_error("source prefix exceeds maximum string size");
+        std::optional<size_t> got{0};
+        std::exception_ptr ex;
+        result.resize_and_overwrite(filled + want, [&](char * buf, size_t) -> size_t {
+            try {
+                got = read(buf + filled, want);
+                return filled + got.value_or(0);
+            } catch (...) {
+                ex = std::current_exception();
+                return filled;
+            }
+        });
+        if (ex)
+            std::rethrow_exception(ex);
+        if (!got)
+            break;
+        len -= *got;
+    }
+    return result;
+}
 
 /**
  * A buffered abstract source. Warning: a BufferedSource should not be

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <utility>
@@ -200,6 +201,102 @@ TEST(readNum, negativeValuesSerialiseWellDefined)
     /* The result doesn't depend on the source type - only the destination matters. */
     EXPECT_EQ(readNum<uint64_t>(*makeNumSource(int32_t(-1))), std::numeric_limits<uint64_t>::max());
     EXPECT_EQ(readNum<uint64_t>(*makeNumSource(int16_t(-1))), std::numeric_limits<uint64_t>::max());
+}
+
+TEST(readPrefix, finiteProducerProtocol)
+{
+    enum class End { Normal, Eof, Failure };
+    struct Failure { int tag; };
+    for (size_t limit : {0u, 1u, 7u})
+        for (size_t available : {limit ? limit - 1 : 0, limit, limit + 1})
+            for (size_t chunk : {1u, 7u})
+                for (auto end : {End::Normal, End::Eof, End::Failure}) {
+                    SCOPED_TRACE((::testing::Message() << limit << ':' << available << ':' << chunk << ':' << int(end)));
+                    size_t consumed = 0, reads = 0;
+                    auto read = [&](char * data, size_t requested) -> std::optional<size_t> {
+                        if (reads++ == 0)
+                            return 0; // An engaged zero delivery is not completion.
+                        if (consumed == available) {
+                            if (end == End::Normal)
+                                return std::nullopt;
+                            if (end == End::Eof)
+                                throw EndOfFile("prefix boundary");
+                            throw Failure{42};
+                        }
+                        auto n = std::min({requested, chunk, available - consumed});
+                        std::fill_n(data, n, 'x');
+                        consumed += n;
+                        return n;
+                    };
+                    std::string result = "unchanged";
+                    bool complete = available >= limit || end == End::Normal;
+                    if (complete)
+                        EXPECT_NO_THROW(result = readPrefix(limit, read));
+                    else
+                        try {
+                            result = readPrefix(limit, read);
+                            FAIL() << "missing producer failure";
+                        } catch (EndOfFile & error) {
+                            EXPECT_EQ(end, End::Eof);
+                            EXPECT_EQ(error.message(), "prefix boundary");
+                        } catch (Failure & error) {
+                            EXPECT_EQ(end, End::Failure);
+                            EXPECT_EQ(error.tag, 42);
+                        }
+                    EXPECT_EQ(consumed, std::min(available, limit));
+                    EXPECT_EQ(result, complete ? std::string(consumed, 'x') : "unchanged");
+                    if (!limit)
+                        EXPECT_EQ(reads, 0u);
+                }
+}
+
+TEST(readPrefix, binaryGrowthBoundaries)
+{
+    for (size_t limit : {65535u, 65536u, 65537u, 131071u, 131072u, 131073u}) {
+        std::string bytes(limit + 1, '\0');
+        for (size_t i = 0; i < bytes.size(); ++i)
+            bytes[i] = static_cast<char>(i % 256);
+        for (size_t available : {limit - 1, limit, limit + 1})
+            for (size_t chunk : {size_t{32768}, std::numeric_limits<size_t>::max()})
+                for (bool firstByte : {false, true}) {
+                    SCOPED_TRACE((::testing::Message() << limit << ':' << available << ':' << chunk << ':' << firstByte));
+                    size_t consumed = 0;
+                    auto read = [&](char * data, size_t requested) -> std::optional<size_t> {
+                        if (consumed == available)
+                            return std::nullopt;
+                        auto delivery = firstByte && !consumed ? size_t{1} : chunk;
+                        auto n = bytes.copy(data, std::min({requested, delivery, available - consumed}), consumed);
+                        consumed += n;
+                        return n;
+                    };
+                    EXPECT_EQ(readPrefix(limit, read), bytes.substr(0, std::min(available, limit)));
+                    EXPECT_EQ(consumed, std::min(available, limit));
+                }
+        StringSink encoded;
+        encoded << std::string_view(bytes);
+        StringSource framed{encoded.s};
+        EXPECT_EQ(readString(framed), bytes);
+    }
+}
+
+TEST(readString, rejectsLimitsTruncationAndBadPadding)
+{
+    StringSink encoded;
+    encoded << "abc";
+    for (size_t max : {2u, 3u}) {
+        StringSource source{encoded.s};
+        if (max < 3)
+            EXPECT_THROW(readString(source, max), SerialisationError);
+        else
+            EXPECT_EQ(readString(source, max), "abc");
+    }
+    for (size_t end : {8u, 10u, 11u, 15u}) {
+        StringSource truncated{encoded.s.substr(0, end)};
+        EXPECT_THROW(readString(truncated), EndOfFile);
+    }
+    encoded.s.back() = 1;
+    StringSource badPadding{encoded.s};
+    EXPECT_THROW(readString(badPadding), SerialisationError);
 }
 
 TEST(readString, roundTrip)
