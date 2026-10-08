@@ -549,10 +549,6 @@ struct GitInputScheme : InputScheme
            the URL (which is never a `file` URL). */
         std::variant<std::filesystem::path, ParsedURL> location;
 
-        /* The shared membership/status snapshot for a worktree input;
-           absent for a commit input. It does not snapshot file contents. */
-        std::shared_ptr<const GitRepo::WorkdirInfo> workdirInfo;
-
         std::string locationToArg() const
         {
             return std::visit(
@@ -695,11 +691,6 @@ struct GitInputScheme : InputScheme
             repoInfo.location = url;
         }
 
-        // If this is a local directory and no ref or revision is
-        // given, then allow the use of an unclean working tree.
-        if (auto repoPath = repoInfo.getPath(); !input.getRef() && !input.getRev() && repoPath)
-            repoInfo.workdirInfo = GitRepo::getCachedWorkdirInfo(*repoPath);
-
         return repoInfo;
     }
 
@@ -804,8 +795,6 @@ struct GitInputScheme : InputScheme
     std::pair<ref<SourceAccessor>, Input>
     getAccessorFromCommit(const Settings & settings, Store & store, RepoInfo & repoInfo, Input && input) const
     {
-        assert(!repoInfo.workdirInfo);
-
         auto origRev = input.getRev();
 
         auto originalRef = input.getRef();
@@ -991,8 +980,7 @@ struct GitInputScheme : InputScheme
     {
         auto repoPath = repoInfo.getPath().value();
 
-        auto workdirInfo = repoInfo.workdirInfo;
-        assert(workdirInfo);
+        auto workdirInfo = GitRepo::getCachedWorkdirInfo(repoPath);
         /* Only a view with submodules needs a modified membership set.
            The cache keeps the original immutable status snapshot. */
         if (!workdirInfo->submodules.empty()) {

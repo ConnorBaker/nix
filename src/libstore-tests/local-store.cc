@@ -7547,6 +7547,72 @@ TEST_F(LocalStoreObjectsTest, deleteSpecificReadsOnlyTheDeletedPathsTrees)
     EXPECT_EQ(counters.blobsStatted, 0u) << "collection does not inspect holder candidates";
 }
 
+/* Targeted collection keeps unrelated cleanup work for a whole-store
+   collection, including --skip-alive's DeleteDead action. Check physical
+   legacy files and an independently owned stale SQL value, not scan counters. */
+TEST_F(LocalStoreObjectsTest, onlyWholeStoreDeletionCleansUnrelatedRepresentations)
+{
+    setenv("_NIX_TEST_NO_LSOF", "1", 1);
+    Finally unset{[] { unsetenv("_NIX_TEST_NO_LSOF"); }};
+    enum class Selection { Whole, Empty, Specific };
+    size_t cases = 0;
+    for (auto selection : {Selection::Whole, Selection::Empty, Selection::Specific})
+        for (auto action : {GCAction::gcReturnLive, GCAction::gcReturnDead, GCAction::gcDeleteDead, GCAction::gcDeleteSpecific})
+            for (uint64_t limit : {uint64_t(0), uint64_t(1), std::numeric_limits<uint64_t>::max()})
+                for (bool deleteReferrers : {false, true}) {
+                    SCOPED_TRACE(fmt("selection=%d action=%d limit=%d referrers=%d", int(selection), int(action), limit, deleteReferrers));
+                    auto path = store->addToStoreSlow(
+                        fmt("selected-%d", cases), {treeAccessor({{"a", fmt("selected body %d", cases), 'f'}})},
+                        ContentAddressMethod::Raw::Git, HashAlgorithm::SHA256).path;
+                    store.reset(); // Release the selected path's producer root.
+                    store = std::make_shared<LocalStore>(ref{config});
+
+                    auto owner = config->realStoreDir.get() / fmt("stale-owner-%d", cases);
+                    auto body = fmt("unrelated auxiliary %d", cases);
+                    merkle::TreeEntry entry{merkle::Mode::Symlink, merkle::blobId(body)};
+                    publishAuxiliary(owner, {{entry, body}});
+                    forgetFixturePath(owner);
+                    ASSERT_EQ(store->objects.readAuxiliary(entry), body);
+                    auto legacy = store->objects.dir / "trees" / "flat";
+                    auto links = config->realStoreDir.get() / ".links" / "flat";
+                    createDirs(legacy.parent_path());
+                    createDirs(links.parent_path());
+                    writeFile(legacy, body);
+                    writeFile(links, body);
+
+                    GCOptions options{.action = action};
+                    options.maxFreed = limit;
+                    if (selection != Selection::Whole)
+                        options.pathsToDelete = GCOptions::SpecificPaths{
+                            .paths = selection == Selection::Empty ? StorePathSet{} : StorePathSet{path},
+                            .deleteReferrers = deleteReferrers};
+                    GCResults results;
+                    if (selection == Selection::Whole && action == GCAction::gcDeleteSpecific && limit != 0)
+                        EXPECT_THROW(store->collectGarbage(options, results), Error);
+                    else
+                        EXPECT_NO_THROW(store->collectGarbage(options, results));
+
+                    bool clean = selection == Selection::Whole && action == GCAction::gcDeleteDead;
+                    EXPECT_EQ(pathExists(legacy), !clean);
+                    EXPECT_EQ(pathExists(links), !clean);
+                    EXPECT_EQ(store->objects.readAuxiliary(entry).has_value(), !clean);
+                    if (!clean) {
+                        if (pathExists(legacy))
+                            EXPECT_EQ(readFile(legacy), body);
+                        if (pathExists(links))
+                            EXPECT_EQ(readFile(links), body);
+                        EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                    }
+                    if (selection == Selection::Specific
+                        && (action == GCAction::gcDeleteDead || action == GCAction::gcDeleteSpecific))
+                        EXPECT_FALSE(store->isValidPath(path));
+                    else if (!clean || limit == 0)
+                        EXPECT_TRUE(store->isValidPath(path));
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 72u);
+}
+
 /* The collector's allow-list in the store directory (`gc.cc`, the `readdir`
    loop that skips `.`, `..`, `.links` and the object store's directory):
    everything else that is not a live valid path goes, a name that does not

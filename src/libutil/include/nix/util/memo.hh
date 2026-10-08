@@ -23,14 +23,9 @@ fun<T()> memo(fun<T()> f)
         fun<T()> compute;
         std::once_flag flag;
         std::optional<T> cached;
-
-        explicit State(fun<T()> compute)
-            : compute(std::move(compute))
-        {
-        }
     };
 
-    auto state = std::shared_ptr<State>(new State(std::move(f)));
+    auto state = std::make_shared<State>(std::move(f));
     return [state]() -> T {
         std::call_once(state->flag, [&]() { state->cached.emplace(state->compute()); });
         return *state->cached;
