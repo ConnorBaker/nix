@@ -13,7 +13,7 @@ const CanonPath CanonPath::root = CanonPath("/");
 
 static std::string absPathPure(std::string_view path)
 {
-    return canonPathInner<UnixPathTrait>(path, [](auto &, auto &) {});
+    return canonPathInner<UnixPathTrait>(path.empty() ? std::string_view("/") : path, [](auto &, auto &) {});
 }
 
 static void ensureNoNullBytes(std::string_view s)
@@ -34,13 +34,13 @@ CanonPath CanonPath::fromFilename(std::string_view segment)
 }
 
 CanonPath::CanonPath(std::string_view raw)
-    : path(absPathPure(concatStrings("/", raw)))
+    : path(absPathPure(raw))
 {
     ensureNoNullBytes(raw);
 }
 
 CanonPath::CanonPath(const char * raw)
-    : path(absPathPure(concatStrings("/", raw)))
+    : path(absPathPure(raw))
 {
 }
 
