@@ -61,7 +61,7 @@ std::string Hash::to_string(HashFormat hashFormat, bool includeAlgo) const
         s += printHashAlgo(algo);
         s += hashFormat == HashFormat::SRI ? '-' : ':';
     }
-    const auto bytes = std::as_bytes(std::span<const uint8_t>{&hash[0], hashSize});
+    const auto bytes = std::as_bytes(std::span{this->bytes()});
     /* Encoded into `s` itself: a hash is rendered per node of every walk that
        names or enters a tree, and the string the encoder would return is one
        allocation and one copy each time (`05` section 6). */

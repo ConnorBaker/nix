@@ -126,6 +126,12 @@ public:
      */
     std::strong_ordering operator<=>(const Hash & h2) const noexcept;
 
+    /** Borrowed active prefix, without the tag. Requires hashSize <= maxHashSize. */
+    [[nodiscard]] std::string_view bytes() const noexcept
+    {
+        return {reinterpret_cast<const char *>(hash), hashSize};
+    }
+
     /**
      * Return a string representation of the hash, in base-16, base-32
      * or base-64. By default, this is prefixed by the hash algo

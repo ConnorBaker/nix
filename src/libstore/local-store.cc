@@ -697,10 +697,7 @@ std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & e
             return std::nullopt;
         /* Hash outside the database scope. An old corrupt incarnation must
            not hide a later sound copy; NULL, not zero, is the first cursor. */
-        if (auxiliaryBodyMatches(
-                static_cast<int64_t>(entry.mode),
-                {reinterpret_cast<const char *>(entry.hash.hash), entry.hash.hashSize},
-                candidate->body))
+        if (auxiliaryBodyMatches(static_cast<int64_t>(entry.mode), entry.hash.bytes(), candidate->body))
             return std::move(candidate->body);
         cursor = candidate->ingestion;
     }
@@ -794,8 +791,7 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
 /* The SQL key is the active digest bytes and mode, not the Hash algorithm tag. */
 static auto blobRowKey(const GitObjectStore::Hold::Row & row) noexcept
 {
-    const auto & id = row.id;
-    return std::pair{std::string_view{reinterpret_cast<const char *>(id.hash), id.hashSize}, row.executable};
+    return std::pair{row.id.bytes(), row.executable};
 }
 
 void LocalStore::coalesceBlobRows(
@@ -897,13 +893,10 @@ static void sortProjectionForPublication(GitObjectStore::Hold::Projection & proj
 {
     static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Hold::Row>);
     static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Auxiliary>);
-    auto bytes = [](const Hash & id) noexcept {
-        return std::string_view{reinterpret_cast<const char *>(id.hash), id.hashSize};
-    };
     if (writeBlobs)
         std::ranges::sort(projection.regular, {}, blobRowKey);
     std::ranges::sort(projection.auxiliary, {}, [&](const auto & value) noexcept {
-        return std::pair{value.entry.mode, bytes(value.entry.hash)};
+        return std::pair{value.entry.mode, value.entry.hash.bytes()};
     });
 }
 
@@ -2015,182 +2008,179 @@ void LocalStore::addToStore(
                 "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
     }
 
-    {
-        addTempRoot(info.path);
+    withLockedOutput(info.path, repair, locksHeld, [&](const auto & realPath, bool needsWrite) {
+        /* A raced validity hit supplies no stream for a deferred signature. */
+        if (!needsWrite) {
+            if (checkSigsAfterRestore)
+                throw Error(
+                    "cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
+            return;
+        }
 
-        if (repair || !isValidPath(info.path)) {
+        /* Run autoGC before restoring unregistered content. */
+        autoGC();
 
-            PathLocks outputLock;
+        /* This publication owns its projection and any physical lease
+           it needs until registration or failure completes. */
+        auto hold = objects.hold();
 
-            auto realPath = toRealPath(info.path);
+        /* One tee checks the asserted NAR hash and any deferred v1 signature;
+           v1 fingerprints use SHA-256. */
+        std::optional<HashSink> narHashSink;
+        std::optional<TeeSource> teeSource;
+        Source * restoreSource = &source;
+        if (info.assertedNarHash || checkSigsAfterRestore) {
+            narHashSink.emplace(info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256);
+            teeSource.emplace(source, *narHashSink);
+            restoreSource = &*teeSource;
+        }
+        /* parseDump admits canonical NAR bytes. NAR addresses hash that stream;
+           Flat/Text addresses hash only the regular root contents. */
+        std::optional<MaskedHashSink> caSink;
+        std::optional<TeeSource> caSource;
+        Sink * rootContents = nullptr;
+        if (info.ca && info.ca->method.getFileIngestionMethod() != FileIngestionMethod::Git) {
+            caSink.emplace(info.ca->hash.algo, std::string(info.path.hashPart()));
+            if (info.ca->method.getFileIngestionMethod() == FileIngestionMethod::NixArchive) {
+                caSource.emplace(*restoreSource, *caSink);
+                restoreSource = &*caSource;
+            } else
+                rootContents = &*caSink;
+        }
+        auto canonicalisingRestoreHooks =
+            makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
 
-            /* Lock the output path.  But don't lock if we're being called
-               from a build hook (whose parent process already acquired a
-               lock on this path). */
-            if (!locksHeld.count(printStorePath(info.path)))
-                outputLock.lockPaths({realPath});
+        auto restored = restoreThroughObjects(
+            realPath,
+            [&](FileSystemObjectSink & sink) { parseDump(sink, *restoreSource); },
+            config->getLocalSettings().fsyncStorePaths,
+            canonicalisingRestoreHooks.get(),
+            hold,
+            repair,
+            rootContents);
 
-            /* The path may have been created by another process in the meantime, so check again. */
-            if (repair || !isValidPathUncached(info.path)) {
+        /* The info to register: `info` with the object hash and NAR
+           size the sink computed, and without the sender's NAR-hash
+           assertion, which is checked against the tee below. */
+        ValidPathInfo toRegister{info};
+        toRegister.objectHash = ObjectHash::of(restored.root);
+        toRegister.narSize = restored.narSize.value();
+        toRegister.assertedNarHash = std::nullopt;
 
-                deletePath(realPath);
-
-                /* Run autoGC before restoring unregistered content. */
-                autoGC();
-
-                /* This publication owns its projection and any physical lease
-                   it needs until registration or failure completes. */
-                auto hold = objects.hold();
-
-                /* One tee checks the asserted NAR hash and any deferred v1 signature;
-                   v1 fingerprints use SHA-256. */
-                std::optional<HashSink> narHashSink;
-                std::optional<TeeSource> teeSource;
-                Source * restoreSource = &source;
-                if (info.assertedNarHash || checkSigsAfterRestore) {
-                    narHashSink.emplace(info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256);
-                    teeSource.emplace(source, *narHashSink);
-                    restoreSource = &*teeSource;
-                }
-                /* parseDump admits canonical NAR bytes. NAR addresses hash that stream;
-                   Flat/Text addresses hash only the regular root contents. */
-                std::optional<MaskedHashSink> caSink;
-                std::optional<TeeSource> caSource;
-                Sink * rootContents = nullptr;
-                if (info.ca && info.ca->method.getFileIngestionMethod() != FileIngestionMethod::Git) {
-                    caSink.emplace(info.ca->hash.algo, std::string(info.path.hashPart()));
-                    if (info.ca->method.getFileIngestionMethod() == FileIngestionMethod::NixArchive) {
-                        caSource.emplace(*restoreSource, *caSink);
-                        restoreSource = &*caSource;
-                    } else
-                        rootContents = &*caSink;
-                }
-                auto canonicalisingRestoreHooks =
-                    makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(config->getLocalSettings().ignoredAcls));
-
-                auto restored = restoreThroughObjects(
-                    realPath,
-                    [&](FileSystemObjectSink & sink) { parseDump(sink, *restoreSource); },
-                    config->getLocalSettings().fsyncStorePaths,
-                    canonicalisingRestoreHooks.get(),
-                    hold,
-                    repair,
-                    rootContents);
-
-                /* The info to register: `info` with the object hash and NAR
-                   size the sink computed, and without the sender's NAR-hash
-                   assertion, which is checked against the tee below. */
-                ValidPathInfo toRegister{info};
-                toRegister.objectHash = ObjectHash::of(restored.root);
-                toRegister.narSize = restored.narSize.value();
-                toRegister.assertedNarHash = std::nullopt;
-
-                /* The content address first, then the sender's object hash,
-                   NAR hash and size (01 section 9.10, "The content address
-                   is checked first"). */
-                if (info.ca) {
-                    auto & specified = *info.ca;
-                    auto actualHash = [&]() -> Hash {
-                        switch (specified.method.getFileIngestionMethod()) {
-                        case FileIngestionMethod::Flat:
-                            if (restored.root.mode != merkle::Mode::Regular
-                                && restored.root.mode != merkle::Mode::Executable)
-                                throw Error(
-                                    "flat content address requires a regular file at '%s'", printStorePath(info.path));
-                            [[fallthrough]];
-                        case FileIngestionMethod::NixArchive:
-                            return caSink->finish().hash;
-                        case FileIngestionMethod::Git:
-                            /* Git content addresses require SHA-256. Remove rejected imports
-                               before registration, as for a deferred signature failure. */
-                            if (specified.hash.algo != merkle::hashAlgo) {
-                                deletePath(realPath);
-                                throw Error(
-                                    "cannot import path '%s': its content address '%s' is under %s, and the git "
-                                    "content-address method admits SHA-256 only; re-add the source with this Nix "
-                                    "('nix store add --mode git'), or carry the path with 'nix-store --export | "
-                                    "nix-store --import', which asserts no content address (the path's files were "
-                                    "removed; the objects its restore entered go at the next 'nix-store --gc')",
-                                    printStorePath(info.path),
-                                    specified.render(),
-                                    printHashAlgo(specified.hash.algo));
-                            }
-                            return merkle::objectHash(restored.root);
-                        }
-                        unreachable();
-                    }();
-                    if (specified.hash != actualHash) {
+        /* The content address first, then the sender's object hash,
+           NAR hash and size (01 section 9.10, "The content address
+           is checked first"). */
+        if (info.ca) {
+            auto & specified = *info.ca;
+            auto actualHash = [&]() -> Hash {
+                switch (specified.method.getFileIngestionMethod()) {
+                case FileIngestionMethod::Flat:
+                    if (restored.root.mode != merkle::Mode::Regular
+                        && restored.root.mode != merkle::Mode::Executable)
                         throw Error(
-                            "ca hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                            printStorePath(info.path),
-                            specified.hash.to_string(HashFormat::Nix32, true),
-                            actualHash.to_string(HashFormat::Nix32, true));
-                    }
-                }
-
-                if (info.objectHash && *info.objectHash != *toRegister.objectHash)
-                    throw Error(
-                        "object hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                        printStorePath(info.path),
-                        info.objectHash->render(),
-                        toRegister.objectHash->render());
-
-                std::optional<Hash> streamNarHash;
-                if (narHashSink)
-                    streamNarHash = narHashSink->finish().hash;
-
-                if (info.assertedNarHash && *streamNarHash != *info.assertedNarHash)
-                    throw Error(
-                        "hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                        printStorePath(info.path),
-                        info.assertedNarHash->to_string(HashFormat::SRI, true),
-                        streamNarHash->to_string(HashFormat::SRI, true));
-
-                /* The sink's size is the NAR's length (`merkle::nar`, pinned
-                   against `dumpPath`), so no tee is needed for this check. */
-                if (info.narSize != 0 && restored.narSize.value() != info.narSize)
-                    throw Error(
-                        "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
-                        printStorePath(info.path),
-                        info.narSize,
-                        restored.narSize.value());
-
-                /* The deferred signature check: the description with the
-                   stream's NAR hash and size in place of the assertion it
-                   lacked, under the same rule as before the stream. */
-                if (checkSigsAfterRestore) {
-                    ValidPathInfo described{info};
-                    described.assertedNarHash = streamNarHash;
-                    described.narSize = restored.narSize.value();
-                    if (pathInfoIsUntrusted(described)) {
+                            "flat content address requires a regular file at '%s'", printStorePath(info.path));
+                    [[fallthrough]];
+                case FileIngestionMethod::NixArchive:
+                    return caSink->finish().hash;
+                case FileIngestionMethod::Git:
+                    /* Git content addresses require SHA-256. Remove rejected imports
+                       before registration, as for a deferred signature failure. */
+                    if (specified.hash.algo != merkle::hashAlgo) {
                         deletePath(realPath);
                         throw Error(
-                            "cannot add path '%s' because it lacks a signature by a trusted key",
-                            printStorePath(info.path));
+                            "cannot import path '%s': its content address '%s' is under %s, and the git "
+                            "content-address method admits SHA-256 only; re-add the source with this Nix "
+                            "('nix store add --mode git'), or carry the path with 'nix-store --export | "
+                            "nix-store --import', which asserts no content address (the path's files were "
+                            "removed; the objects its restore entered go at the next 'nix-store --gc')",
+                            printStorePath(info.path),
+                            specified.render(),
+                            printHashAlgo(specified.hash.algo));
                     }
+                    return merkle::objectHash(restored.root);
                 }
-
-                if (config->getLocalSettings().fsyncStorePaths) {
-                    recursiveSync(realPath);
-                    syncParent(realPath);
-                }
-
-                registerValidPath(toRegister, hold);
-            } else {
-                /* Nothing restored, so a deferred signature check has no
-                   stream to check against: refused, as every untrusted
-                   description was before the deferral. */
-                if (checkSigsAfterRestore)
-                    throw Error(
-                        "cannot add path '%s' because it lacks a signature by a trusted key",
-                        printStorePath(info.path));
-                // We may have a negative cache entry for this path, so get rid of it.
-                invalidatePathInfoCacheFor(info.path);
+                unreachable();
+            }();
+            if (specified.hash != actualHash) {
+                throw Error(
+                    "ca hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                    printStorePath(info.path),
+                    specified.hash.to_string(HashFormat::Nix32, true),
+                    actualHash.to_string(HashFormat::Nix32, true));
             }
-
-            outputLock.setDeletion(true);
         }
-    }
+
+        if (info.objectHash && *info.objectHash != *toRegister.objectHash)
+            throw Error(
+                "object hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                printStorePath(info.path),
+                info.objectHash->render(),
+                toRegister.objectHash->render());
+
+        std::optional<Hash> streamNarHash;
+        if (narHashSink)
+            streamNarHash = narHashSink->finish().hash;
+
+        if (info.assertedNarHash && *streamNarHash != *info.assertedNarHash)
+            throw Error(
+                "hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                printStorePath(info.path),
+                info.assertedNarHash->to_string(HashFormat::SRI, true),
+                streamNarHash->to_string(HashFormat::SRI, true));
+
+        /* The sink's size is the NAR's length (`merkle::nar`, pinned
+           against `dumpPath`), so no tee is needed for this check. */
+        if (info.narSize != 0 && restored.narSize.value() != info.narSize)
+            throw Error(
+                "size mismatch importing path '%s';\n  specified: %s\n  got:       %s",
+                printStorePath(info.path),
+                info.narSize,
+                restored.narSize.value());
+
+        /* The deferred signature check: the description with the
+           stream's NAR hash and size in place of the assertion it
+           lacked, under the same rule as before the stream. */
+        if (checkSigsAfterRestore) {
+            ValidPathInfo described{info};
+            described.assertedNarHash = streamNarHash;
+            described.narSize = restored.narSize.value();
+            if (pathInfoIsUntrusted(described)) {
+                deletePath(realPath);
+                throw Error(
+                    "cannot add path '%s' because it lacks a signature by a trusted key",
+                    printStorePath(info.path));
+            }
+        }
+
+        if (config->getLocalSettings().fsyncStorePaths) {
+            recursiveSync(realPath);
+            syncParent(realPath);
+        }
+
+        registerValidPath(toRegister, hold);
+    });
+}
+
+void LocalStore::withLockedOutput(
+    const StorePath & path,
+    RepairFlag repair,
+    const PathSet & heldLocks,
+    function_ref<void(const std::filesystem::path &, bool)> action)
+{
+    addTempRoot(path);
+    if (!repair && isValidPath(path))
+        return;
+    PathLocks outputLock;
+    auto realPath = toRealPath(path);
+    if (heldLocks.empty() || !heldLocks.contains(printStorePath(path)))
+        outputLock.lockPaths({realPath});
+    bool needsWrite = repair || !isValidPathUncached(path);
+    if (needsWrite)
+        deletePath(realPath);
+    action(realPath, bool(needsWrite));
+    if (!needsWrite)
+        invalidatePathInfoCacheFor(path);
+    outputLock.setDeletion(true);
 }
 
 StorePath LocalStore::addToStorePrepared(
@@ -2200,25 +2190,18 @@ StorePath LocalStore::addToStorePrepared(
     fun<std::pair<ObjectHashSink::Result, const GitObjectStore::Hold &>(const std::filesystem::path &)> populate)
 {
     auto dstPath = makeFixedOutputPathFromCA(name, desc);
-    addTempRoot(dstPath);
-    if (repair || !isValidPath(dstPath)) {
-        auto realPath = toRealPath(dstPath);
-        PathLocks outputLock({realPath});
-        // Another writer may have published while we acquired the lock.
-        if (repair || !isValidPathUncached(dstPath)) {
-            deletePath(realPath);
-            auto [result, hold] = populate(realPath);
-            if (config->getLocalSettings().fsyncStorePaths) {
-                recursiveSync(realPath);
-                syncParent(realPath);
-            }
-            auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
-            info.narSize = result.narSize.value();
-            registerValidPath(info, hold);
-        } else
-            invalidatePathInfoCacheFor(dstPath);
-        outputLock.setDeletion(true);
-    }
+    withLockedOutput(dstPath, repair, {}, [&](const auto & realPath, bool needsWrite) {
+        if (!needsWrite)
+            return;
+        auto [result, hold] = populate(realPath);
+        if (config->getLocalSettings().fsyncStorePaths) {
+            recursiveSync(realPath);
+            syncParent(realPath);
+        }
+        auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
+        info.narSize = result.narSize.value();
+        registerValidPath(info, hold);
+    });
     return dstPath;
 }
 

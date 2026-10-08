@@ -1115,7 +1115,7 @@ public:
             s += "git-object-v2:";
             s += kind;
             s += ':';
-            base16::encodeTo(s, std::as_bytes(std::span<const uint8_t>{&hash.hash[0], hash.hashSize}));
+            base16::encodeTo(s, std::as_bytes(std::span{hash.bytes()}));
             return s;
         };
 

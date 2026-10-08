@@ -351,6 +351,14 @@ public:
         const std::function<Hash()> & narHash = {}) override;
 
 private:
+    /** On an initial miss, run action under the owned or already-held output lock.
+     * needsWrite is false only for a raced validity hit; the callback may refuse it. */
+    void withLockedOutput(
+        const StorePath & path,
+        RepairFlag repair,
+        const PathSet & heldLocks,
+        function_ref<void(const std::filesystem::path &, bool)> action);
+
     /** Publish a content-addressed path. Populate is called only under its
      * output lock when writing is necessary and must return an exact NAR size;
      * its hold is borrowed through registration from the caller's scope. */

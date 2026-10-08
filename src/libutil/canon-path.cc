@@ -45,7 +45,8 @@ CanonPath::CanonPath(const char * raw)
 }
 
 CanonPath::CanonPath(std::string_view raw, const CanonPath & root)
-    : path(absPathPure(raw.size() > 0 && raw[0] == '/' ? raw : concatStrings(root.abs(), "/", raw)))
+    : path(canonPathInner<UnixPathTrait>(
+          raw.size() > 0 && raw[0] == '/' ? raw : concatStrings(root.abs(), "/", raw), [](auto &, auto &) {}))
 {
     ensureNoNullBytes(raw);
 }

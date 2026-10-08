@@ -96,7 +96,7 @@ std::string serialiseTree(const Tree & tree)
         }
         body += name;
         body += '\0';
-        body.append(reinterpret_cast<const char *>(entry.hash.hash), entry.hash.hashSize);
+        body.append(entry.hash.bytes());
     }
 
     return body;
@@ -138,7 +138,7 @@ std::optional<std::string> syntheticRootTree(const TreeEntry & root)
         /* The one-entry tree {"." -> root}: six octal mode bytes, a space,
            the name ".", and NUL, followed by the active hash bytes. */
         std::string body(root.mode == Mode::Executable ? "100755 .\0" : "120000 .\0", 9);
-        body.append(reinterpret_cast<const char *>(root.hash.hash), root.hash.hashSize);
+        body.append(root.hash.bytes());
         return body;
     }
     }
