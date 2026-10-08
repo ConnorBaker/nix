@@ -2,11 +2,14 @@
 ///@file
 
 #include <functional>
+#include <boost/compat/function_ref.hpp>
 #include <stdexcept>
 #include <type_traits>
 #include <utility>
 
 namespace nix {
+
+using boost::compat::function_ref;
 
 /**
  * A non-nullable wrapper around `std::function`.

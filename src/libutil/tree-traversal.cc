@@ -42,7 +42,7 @@ void copyRecursive(
                 const Target target{&dirSink, rel};
                 auto previous = std::exchange(open, &target);
                 Finally restore{[&] { open = previous; }};
-                children([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
+                children.each([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
             });
             return {};
         }

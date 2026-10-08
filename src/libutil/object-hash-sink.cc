@@ -62,7 +62,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
         sizeExact &= child.narSize.has_value();
     };
     if (workers == 1 || !children.canDefer) {
-        children([&](std::string_view name, bool, fun<HashedNode()> visit) {
+        children.each([&](std::string_view name, bool, fun<HashedNode()> visit) {
             auto child = visit();
             consume(std::string(name), child);
         });
@@ -80,7 +80,7 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             boost::container::small_vector_options_t<
                 boost::container::growth_factor<boost::container::growth_factor_100>>>
             kids;
-        children([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
+        children.each([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit)});
         });
         if (kids.size() > 1 && std::ranges::any_of(kids.data(), kids.data() + kids.size(), &Child::subdirectory)) {
@@ -143,14 +143,14 @@ void ObjectHashSink::createDirectory(const CanonPath & path)
 void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
 {
     auto visit = [&] {
-        auto children = [&](fun<void(std::string_view, bool, fun<HashedNode()>)> each) {
+        auto children = [&](NodeVisitor<HashedNode>::Children::Each each) {
             auto previous = std::exchange(open, &each);
             Finally restore{[&] { open = previous; }};
             /* As the base class's default: the same sink, the same path, so
                the children arrive at `path / name`. */
             callback(*this, path);
         };
-        return visitor.directory(path, {std::ref(children)});
+        return visitor.directory(path, {children});
     };
     deliver(path, std::ref(visit));
 }

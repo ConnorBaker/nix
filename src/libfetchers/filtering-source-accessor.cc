@@ -66,7 +66,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
        scopes are already kept alive by their enclosing directory call. */
     auto owner = weak_from_this().lock();
     checkAllowed(path);
-    auto handler = [&](SourceAccessor & inner, const CanonPath & relative, DirectoryListing && listing) {
+    next->readDirectoryWithEntries(prefix / path, [&](auto & inner, const auto & relative, auto && listing) {
         auto admitted = std::move(listing).filter([&](const auto & entry) { return isAllowed(path / entry.first); });
 
         struct Scoped final : FilteringSourceAccessor
@@ -127,8 +127,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
         Scoped scoped{
             inner, relative, parent ? *parent->owner : *this, parent ? parent->original / path : path, admitted};
         callback(scoped, CanonPath::root, DirectoryListing(std::cref(admitted)));
-    };
-    next->readDirectoryWithEntries(prefix / path, std::ref(handler));
+    });
 }
 
 std::string FilteringSourceAccessor::readLink(const CanonPath & path)

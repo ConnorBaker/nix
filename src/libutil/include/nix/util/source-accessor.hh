@@ -212,13 +212,14 @@ public:
      */
     virtual DirEntries readDirectory(const CanonPath & path) = 0;
 
-    using ReadDirectoryCallback = std::function<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)>;
+    using ReadDirectoryCallback = function_ref<void(SourceAccessor &, const CanonPath &, DirectoryListing &&)>;
 
     /**
      * List and scope the same directory for a recursive walk, without
      * following symlinks. The callback receives the listing and the accessor
-     * and relative path for reading its children. All uses, including joined
-     * parallel visits, must finish before the callback returns.
+     * and relative path for reading its children. The callback must be valid and
+     * outlive this call; it is borrowed and never retained. All uses, including
+     * joined parallel visits, must finish before the callback returns.
      */
     virtual void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback)
     {

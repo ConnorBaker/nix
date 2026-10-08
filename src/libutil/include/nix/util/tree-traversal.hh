@@ -52,19 +52,16 @@ struct NodeVisitor
      * directory returns. The push driver requires immediate consumption:
      * its child's bytes and callback captures exist only during `each`.
      */
+    /* The emitter must be valid and outlive directory(); each consumer must
+       be valid and outlive the emitter's call. Neither callable is retained. */
     struct Children
     {
-        using Each = fun<void(std::string_view name, bool isDirectory, fun<Result()> visit)>;
-        fun<void(Each)> each;
+        using Each = function_ref<void(std::string_view name, bool isDirectory, fun<Result()> visit)>;
+        function_ref<void(Each)> each;
         /* Lifetime permission, distinct from permission for concurrent
            observations. Push producers borrow each visit only until Each
            returns; pull producers lend it through the directory scope. */
         bool canDefer = false;
-
-        void operator()(Each callback) const
-        {
-            each(std::move(callback));
-        }
     };
 
     virtual ~NodeVisitor() = default;
@@ -73,6 +70,7 @@ struct NodeVisitor
      * Around one node, after its stat and before its contents are read.
      * `accessor` and `from` are the same scoped source used for that stat;
      * `path` is the visitor's logical coordinate. They outlive `descend`.
+     * Its callable target must be valid and outlive node().
      * Return an already known summary or call `descend` exactly once and
      * return its result. The continuation is synchronous and must not be
      * retained. Its scope can carry a memo key without shared visitor state.
@@ -83,7 +81,7 @@ struct NodeVisitor
         const CanonPath & from,
         const CanonPath & path,
         const SourceAccessor::Stat & st,
-        fun<Result()> descend)
+        function_ref<Result()> descend)
     {
         return descend();
     }
@@ -98,7 +96,7 @@ struct NodeVisitor
     virtual Result symlink(const CanonPath & path, const std::string & target) = 0;
 
     /**
-     * A directory: call `children` exactly once, and `visit` once per
+     * A directory: call `children.each` exactly once, and `visit` once per
      * entry it hands over.  A scope the children need (a `RestoreSink`'s
      * directory callback) is opened around that call.
      */
@@ -136,7 +134,7 @@ Result traverse(
 
         auto st = acc.lstat(from);
 
-        auto descend = [&]() -> Result {
+        return v.node(acc, from, to, st, [&]() -> Result {
             switch (st.type) {
             case SourceAccessor::tRegular: {
                 auto read = [&](CreateRegularFileSink & crf) {
@@ -164,43 +162,41 @@ Result traverse(
                        the scope must outlive every visit, and the only bound that
                        does is the directory node itself. */
                     std::optional<Result> result;
-                    auto directory = [&](SourceAccessor & subdirAccessor,
-                                         const CanonPath & subdirFrom,
-                                         SourceAccessor::DirectoryListing && listing) {
-                        const auto & entries = listing.entries();
-                        /* Without a suffix the listing already has the tree's
-                           unique names in its order, under either case-hack
-                           setting. Otherwise validate and reorder every name
-                           before exposing any directory or child callbacks. */
-                        std::optional<StringMap> unhacked;
-                        if (std::any_of(entries.begin(), entries.end(), [](const auto & entry) {
-                                return entry.first.find(caseHackSuffix) != std::string::npos;
-                            }))
-                            unhacked = unhackedEntries(entries, acc, from);
-                        auto visitChild = [&](const std::string & actual) {
-                            return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
-                        };
-                        auto children = [&](fun<void(std::string_view, bool, fun<Result()>)> each) {
-                            auto child =
-                                [&](std::string_view name, const std::string & actual, SourceAccessor::DirEntry type) {
+                    acc.readDirectoryWithEntries(
+                        from, [&](auto & subdirAccessor, const auto & subdirFrom, auto && listing) {
+                            const auto & entries = listing.entries();
+                            /* Without a suffix the listing already has the tree's
+                               unique names in its order, under either case-hack
+                               setting. Otherwise validate and reorder every name
+                               before exposing any directory or child callbacks. */
+                            std::optional<StringMap> unhacked;
+                            if (std::any_of(entries.begin(), entries.end(), [](const auto & entry) {
+                                    return entry.first.find(caseHackSuffix) != std::string::npos;
+                                }))
+                                unhacked = unhackedEntries(entries, acc, from);
+                            auto visitChild = [&](const std::string & actual) {
+                                return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1);
+                            };
+                            auto children = [&](typename NodeVisitor<Result>::Children::Each each) {
+                                auto child = [&](std::string_view name, const std::string & actual, auto type) {
                                     if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
                                         /* The context and name both live for this
                                            directory scope; each deferred visit only
                                            borrows those two existing objects. */
-                                        each(name, type == SourceAccessor::tDirectory, [&visitChild, &actual] {
-                                            return visitChild(actual);
-                                        });
+                                        each(
+                                            std::string_view(name),
+                                            type == SourceAccessor::tDirectory,
+                                            [&visitChild, &actual] { return visitChild(actual); });
                                 };
-                            if (unhacked)
-                                for (auto & [name, actual] : *unhacked)
-                                    child(name, actual, entries.at(actual));
-                            else
-                                for (auto & [name, type] : entries)
-                                    child(name, name, type);
-                        };
-                        result = v.directory(to, {std::ref(children), true});
-                    };
-                    acc.readDirectoryWithEntries(from, std::ref(directory));
+                                if (unhacked)
+                                    for (auto & [name, actual] : *unhacked)
+                                        child(name, actual, entries.at(actual));
+                                else
+                                    for (auto & [name, type] : entries)
+                                        child(name, name, type);
+                            };
+                            result = v.directory(to, {children, true});
+                        });
                     assert(result);
                     return std::move(*result);
                 };
@@ -219,8 +215,7 @@ Result traverse(
             default:
                 throw Error("file '%1%' has an unsupported type of %2%", from, st.typeString());
             }
-        };
-        return v.node(acc, from, to, st, std::ref(descend));
+        });
     }(accessor, path, logicalRoot, std::ranges::distance(logicalRoot));
 }
 

@@ -93,7 +93,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
             const CanonPath &,
             const CanonPath & path,
             const SourceAccessor::Stat & st,
-            fun<std::monostate()> descend) override
+            function_ref<std::monostate()> descend) override
         {
             paths.insert(path);
             if (st.type == SourceAccessor::tDirectory)
@@ -113,7 +113,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
 
         std::monostate directory(const CanonPath &, Children children) override
         {
-            children([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
+            children.each([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
             return {};
         }
     };
@@ -184,7 +184,7 @@ struct NarWriter : NodeVisitor<std::monostate>
     std::monostate directory(const CanonPath &, Children children) override
     {
         sink << "(" << "type" << "directory";
-        children([&](std::string_view name, bool, fun<std::monostate()> visit) {
+        children.each([&](std::string_view name, bool, fun<std::monostate()> visit) {
             sink << "entry" << "(" << "name" << name << "node";
             visit();
             sink << ")";

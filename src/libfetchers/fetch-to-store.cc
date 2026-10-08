@@ -276,7 +276,7 @@ struct MemoVisitor : HashingVisitor
         const CanonPath &,
         const CanonPath & to,
         const SourceAccessor::Stat & st,
-        fun<HashedNode()> descend) override
+        function_ref<HashedNode()> descend) override
     {
         std::optional<fetchers::Cache::Key> key;
         /* Symlinks are named only when recorded; filtered directories

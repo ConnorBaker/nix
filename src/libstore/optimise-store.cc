@@ -242,7 +242,7 @@ struct EnterVisitor : ObjectStoreVisitor
         const CanonPath &,
         const CanonPath & path,
         const SourceAccessor::Stat & st,
-        fun<HashedNode()> descend) override
+        function_ref<HashedNode()> descend) override
     {
         if (auto result = tryKnown(path, st))
             return std::move(*result);
@@ -343,7 +343,7 @@ struct VerifyVisitor : HashingVisitor
         const CanonPath &,
         const CanonPath & path,
         const SourceAccessor::Stat & st,
-        fun<HashedNode()> descend) override
+        function_ref<HashedNode()> descend) override
     {
         auto node = descend();
         auto where = onDisk(root, path);
@@ -654,17 +654,17 @@ struct MaterialisingVisitor : LinkingVisitor
         // Allocate physical names in listing order, before concurrent visits.
         auto withDiskNames = [&](Children::Each each) {
             CaseHackNames hack;
-            children([&](std::string_view name, bool directory, fun<HashedNode()> visit) {
+            children.each([&](std::string_view name, bool directory, fun<HashedNode()> visit) {
                 each(
-                    name,
-                    directory,
+                    std::string_view(name),
+                    bool(directory),
                     [disk = hack.diskName(name), sink = currentFrame().sink, visit = std::move(visit)] {
                         Scope scope{*sink, &disk};
                         return visit();
                     });
             });
         };
-        return LinkingVisitor::directory(path, {std::ref(withDiskNames), children.canDefer});
+        return LinkingVisitor::directory(path, {withDiskNames, children.canDefer});
     }
 
     HashedNode node(
@@ -672,7 +672,7 @@ struct MaterialisingVisitor : LinkingVisitor
         const CanonPath & from,
         const CanonPath & path,
         const SourceAccessor::Stat & st,
-        fun<HashedNode()> descend) override
+        function_ref<HashedNode()> descend) override
     {
         if (auto result = tryKnown(accessor, from, path, st))
             return std::move(*result);

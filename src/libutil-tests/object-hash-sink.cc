@@ -211,14 +211,14 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
                     size_t & completed;
                     size_t ordinal = 0;
                 } context{each, completed};
-                children([context = &context, ordinal = size_t{0}](
+                children.each([context = &context, ordinal = size_t{0}](
                              std::string_view name, bool isDirectory, fun<HashedNode()> visit) mutable {
                     auto child = visit();
                     /* Both captures must remain valid after nested directory
                        callbacks, and the owned ordinal must persist. */
                     EXPECT_EQ(++ordinal, ++context->ordinal);
                     ++context->completed;
-                    context->consume(name, isDirectory, [&] { return child; });
+                    context->consume(std::string_view(name), bool(isDirectory), [&] { return child; });
                 });
             }});
         }
@@ -390,6 +390,84 @@ TEST(TreeTraversal, directoryNamesMatchIndependentlyFramedNarBytes)
     EXPECT_EQ(cases, 192u);
 }
 
+TEST(TreeTraversal, borrowedChildrenKeepsMoveOnlyEmitterStateThroughTheDirectoryScope)
+{
+    using Children = NodeVisitor<HashedNode>::Children;
+    static_assert(std::is_aggregate_v<Children>);
+    static_assert(std::is_trivially_copyable_v<Children>);
+    static_assert(!std::is_default_constructible_v<Children>);
+    static_assert(!std::is_constructible_v<SourceAccessor::ReadDirectoryCallback, std::nullptr_t>);
+
+    StringSink magic;
+    magic << narVersionMagic1;
+    for (size_t workers : {1u, 2u})
+        for (size_t count : {0u, 1u, 4u}) {
+            SCOPED_TRACE(fmt("workers=%d count=%d", workers, count));
+            auto source = make_ref<MemorySourceAccessor>();
+            source->open(CanonPath::root, File{File::Directory{}});
+            std::vector<std::pair<std::string, HashedNode>> entries;
+            for (size_t i = 0; i < count; ++i) {
+                auto name = std::string("child") + std::to_string(i);
+                auto path = CanonPath::root / name;
+                source->addFile(path / "file", std::string(i + 1, char('a' + i)));
+                entries.emplace_back(name, HashedNode{
+                                               .entry = referenceObjectEntry(*source, path),
+                                               .narSize = narOf(*source, path).size() - magic.s.size(),
+                                           });
+            }
+            auto expected = expectedRoot(source);
+            auto expectedSize = narOf(*source).size();
+            std::atomic<bool> emitted{false};
+            std::atomic<size_t> visited{0};
+            size_t calls = 0;
+            auto emitter = [state = std::make_unique<size_t>(0), wide = std::array<char, 256>{}, &entries,
+                            &emitted, &visited, &calls, workers](Children::Each each) mutable {
+                emitted = false;
+                wide.front() = 'z';
+                calls = ++*state;
+                for (auto & [name, node] : entries)
+                    each(std::string_view(name), true, [&, node] {
+                        EXPECT_EQ(emitted.load(), workers > 1);
+                        EXPECT_EQ(wide.front(), 'z');
+                        ++visited;
+                        return node;
+                    });
+                emitted = true;
+            };
+            Children children{emitter, true};
+            auto copied = children;
+            HashingVisitor visitor{workers};
+            for (auto selected : {copied, children}) {
+                auto result = visitor.directory(CanonPath::root, selected);
+                EXPECT_EQ(result.entry, expected);
+                ASSERT_TRUE(result.narSize);
+                EXPECT_EQ(magic.s.size() + *result.narSize, expectedSize);
+            }
+            EXPECT_EQ(calls, 2u);
+            EXPECT_EQ(visited.load(), 2 * count);
+        }
+}
+
+TEST(TreeTraversal, borrowedDirectoryCallbackSharesMoveOnlyStateAndPropagatesFailure)
+{
+    auto source = make_ref<MemorySourceAccessor>();
+    source->open(CanonPath::root, File{File::Directory{}});
+    size_t calls = 0;
+    bool fail = true;
+    auto callback = [state = std::make_unique<size_t>(0), &calls, &fail](
+                        SourceAccessor &, const CanonPath &, SourceAccessor::DirectoryListing && listing) {
+        EXPECT_TRUE(listing.entries().empty());
+        calls = ++*state;
+        if (fail)
+            throw std::runtime_error("borrowed directory callback");
+    };
+    SourceAccessor::ReadDirectoryCallback borrowed = callback;
+    EXPECT_THROW(source->readDirectoryWithEntries(CanonPath::root, borrowed), std::runtime_error);
+    fail = false;
+    EXPECT_NO_THROW(source->readDirectoryWithEntries(CanonPath::root, borrowed));
+    EXPECT_EQ(calls, 2u);
+}
+
 TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
 {
     struct Source : MemorySourceAccessor
@@ -424,7 +502,7 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
         {
             EXPECT_TRUE(children.canDefer);
             std::vector<std::pair<std::string, fun<std::string()>>> pending;
-            children([&](std::string_view name, bool isDirectory, fun<std::string()> visit) {
+            children.each([&](std::string_view name, bool isDirectory, fun<std::string()> visit) {
                 EXPECT_EQ(isDirectory, directories);
                 pending.emplace_back(name, std::move(visit));
             });
@@ -1574,7 +1652,7 @@ TEST(ObjectHashSink, known_answers_without_reading)
             const CanonPath &,
             const CanonPath & p,
             const SourceAccessor::Stat & st,
-            fun<HashedNode()> descend) override
+            function_ref<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tDirectory)
                 return descend();
@@ -1655,7 +1733,7 @@ TEST(ObjectHashSink, known_answers_without_reading)
             const CanonPath &,
             const CanonPath & p,
             const SourceAccessor::Stat & st,
-            fun<HashedNode()> descend) override
+            function_ref<HashedNode()> descend) override
         {
             if (st.type != SourceAccessor::tRegular)
                 return descend();
