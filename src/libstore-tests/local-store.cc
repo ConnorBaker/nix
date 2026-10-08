@@ -5844,9 +5844,21 @@ TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
                 {dir.string() + "/", dir.string() + "/a", "a"},
                 {dir.string() + "//", dir.string() + "//a", "a"},
                 {where.root_path(), where, where.relative_path().string()},
+                // Remaining classes: no root slash with extras, more file slashes, and fewer file slashes.
+                {dir, dir.string() + "//a", "a"},
+                {dir.string() + "/", dir.string() + "//a", "a"},
+                {dir.string() + "//", where, "a"},
+                // Metadata-only outside roots retain absolute names, not rooted ingestion coordinates.
+                {tempStoreDir.path() / "holder", where, where.string()},
+                {dir / "z", where, where.string()},
             };
             for (const auto & spelling : spellings) {
-                SCOPED_TRACE(fmt("root=%s executable=%d route=%d", spelling.root.string(), executable, route));
+                SCOPED_TRACE(fmt(
+                    "root=%s file=%s executable=%d route=%d",
+                    spelling.root.string(),
+                    spelling.file.string(),
+                    executable,
+                    route));
                 auto hold = objects.hold();
                 hold.setRoot(spelling.root);
                 if (route == 2)
@@ -5871,7 +5883,7 @@ TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
                 ++cases;
             }
         }
-    EXPECT_EQ(cases, 36u);
+    EXPECT_EQ(cases, 66u);
 }
 
 TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollectedBeforeRegistration)

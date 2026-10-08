@@ -343,9 +343,9 @@ public:
         /**
          * The directory this ingestion writes under, set before the walk:
          * a locked temporary in the store for a route that moves its path
-         * into place, the real path for one that writes there.  `addRow`
-         * makes each row's name relative to it. Clears the preceding path's
-         * pending projection; no walking worker may still use it.
+         * into place, the real path for one that writes there. Names stay relative
+         * to that root; native root/file boundary separator runs may differ.
+         * Clears the preceding pending projection; no walking worker may still use it.
          */
         void setRoot(std::filesystem::path root) const;
 

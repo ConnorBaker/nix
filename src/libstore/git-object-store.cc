@@ -188,14 +188,17 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
 }
 
 /* Names are relative to the ingestion root, empty for the root itself.
-   Direct object-store callers without a root retain absolute names. */
+   Empty or nonmatching roots retain the caller's absolute name. */
 static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
 {
-    auto & r = root.native();
+    std::string_view r = root.native();
     auto & w = where.native();
-    if (r.empty() || w.size() < r.size() || w.compare(0, r.size(), r) != 0)
+    while (r.ends_with('/'))
+        r.remove_suffix(1);
+    if (root.empty() || !w.starts_with(r) || (w.size() != r.size() && w[r.size()] != '/'))
         return w;
-    return w.size() == r.size() ? std::string() : w.substr(r.size() + (r.back() != '/'));
+    auto name = w.find_first_not_of('/', r.size());
+    return name == w.npos ? std::string() : w.substr(name);
 }
 
 GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
