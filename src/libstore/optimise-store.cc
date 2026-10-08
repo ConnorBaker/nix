@@ -76,7 +76,7 @@ static Placement placementOf(const std::filesystem::path & where)
    is not left writable. */
 struct WritableDirectory
 {
-    std::filesystem::path path;
+    const std::filesystem::path * path = nullptr;
     AutoCloseFD fd;
 
     WritableDirectory(const std::filesystem::path & path, bool toggle)
@@ -91,7 +91,7 @@ struct WritableDirectory
 #else
             chmod(path, lstat(path).st_mode | S_IWUSR);
 #endif
-            this->path = path;
+            this->path = path.empty() ? nullptr : &path;
         }
     }
 
@@ -99,8 +99,8 @@ struct WritableDirectory
     {
         try {
             /* Read-only again, and its timestamp back to 0. */
-            if (!path.empty())
-                canonicaliseTimestampAndPermissions(path.string());
+            if (path)
+                canonicaliseTimestampAndPermissions(*path);
         } catch (...) {
             ignoreExceptionInDestructor();
         }
@@ -128,26 +128,27 @@ static PosixStat statIn(Descriptor dirFd, const CanonPath & name, const std::fil
 #endif
 }
 
-/* `GitObjectStore::place` for the written, canonicalised regular file `name` in the writable directory `dirFd`
-   (at `where`); the walk's `inodes`, `stats` and `act`, when given, record the inode, a file entered as the store's
-   and a file replaced by it. */
+/* Place the written, canonicalised regular file in its temporarily writable parent;
+   the walk's optional observers record its resulting inode and sharing work. */
 static void placeRegularFile(
-    GitObjectStore & objects,
+    LocalStore & store,
     const std::filesystem::path & where,
     const merkle::TreeEntry & entry,
-    Descriptor dirFd,
-    const CanonPath & name,
     RepairFlag repair,
     const GitObjectStore::Hold & hold,
     GitObjectStore::BlobInodes * inodes = nullptr,
     OptimiseStats * stats = nullptr,
     Activity * act = nullptr)
 {
+    auto parent = where.parent_path();
+    WritableDirectory dir(parent, parent != store.config->realStoreDir.get());
+    auto name = CanonPath::fromFilename(where.filename().string());
     bool executable = entry.mode == merkle::Mode::Executable;
 
+    auto dirFd = dir.fd.get();
     auto before = statIn(dirFd, name, where);
 
-    auto after = objects.place(entry.hash, executable, dirFd, name, where, before, repair, hold);
+    auto after = store.objects.place(entry.hash, executable, dirFd, name, where, before, repair, hold);
     if (!after)
         return;
     if (inodes)
@@ -281,10 +282,7 @@ struct EnterVisitor : ObjectStoreVisitor
             })) {
             auto earlier = maybeLstat(std::filesystem::path(*first));
             if (!earlier || earlier->st_ino != file.st_ino || earlier->st_dev != file.st_dev) {
-                auto parent = where.parent_path();
-                WritableDirectory dir(parent, parent != store.config->realStoreDir.get());
-                auto name = CanonPath::fromFilename(where.filename().string());
-                placeRegularFile(objects, where, node.entry, dir.fd.get(), name, repair, hold, inodes, stats, act);
+                placeRegularFile(store, where, node.entry, repair, hold, inodes, stats, act);
             }
         }
         return node;
@@ -306,12 +304,7 @@ struct EnterVisitor : ObjectStoreVisitor
             break;
         }
 
-        /* The containing directory writable, unless it is the store itself. */
-        auto parent = where.parent_path();
-        WritableDirectory dir(parent, parent != store.config->realStoreDir.get());
-        auto name = CanonPath::fromFilename(where.filename().string());
-
-        placeRegularFile(objects, where, node.entry, dir.fd.get(), name, repair, hold, inodes, stats, act);
+        placeRegularFile(store, where, node.entry, repair, hold, inodes, stats, act);
         return node;
     }
 };

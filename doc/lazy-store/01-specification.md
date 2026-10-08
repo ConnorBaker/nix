@@ -200,7 +200,7 @@ The per-operator laws collapse to one property and a few identities, and the tes
 
 ### 8.7 Complete accessor identity inventory
 
-The production inheritance inventory contains 25 `SourceAccessor` subclasses, including abstract bases and the callback-scoped filter. Test doubles are excluded. The base’s optional whole-view fingerprint and root entry are producer assertions: assigning either requires the represented view to remain the complete tree they name. The table distinguishes forwarding an existing proof from creating one. Compound operations retain their shared owner through callbacks and any continuation that still uses that owner; genuinely borrowed accessors must outlive the operation. A retained policy wrapper already owns its selected child, so forwarding does not require another child owner unless the wrapper itself may expire first.
+The production inheritance inventory contains 24 `SourceAccessor` subclasses, including abstract bases and the callback-scoped filter. Test doubles are excluded. The base’s optional whole-view fingerprint and root entry are producer assertions: assigning either requires the represented view to remain the complete tree they name. The table distinguishes forwarding an existing proof from creating one. Compound operations retain their shared owner through callbacks and any continuation that still uses that owner; genuinely borrowed accessors must outlive the operation. A retained policy wrapper already owns its selected child, so forwarding does not require another child owner unless the wrapper itself may expire first.
 
 | Accessor classes | Fingerprint / known-entry rule | Required boundary |
 | --- | --- | --- |
