@@ -266,7 +266,12 @@ public:
     AutoCloseFD & operator=(const AutoCloseFD & fd) = delete;
     // NOLINTNEXTLINE(performance-noexcept-move-constructor) - technically can throw because of close()
     AutoCloseFD & operator=(AutoCloseFD && fd);
-    Descriptor get() const noexcept;
+
+    Descriptor get() const noexcept
+    {
+        return fd;
+    }
+
     explicit operator bool() const noexcept;
     Descriptor release() noexcept;
     /** Relinquish ownership and attempt to close once, throwing on failure.

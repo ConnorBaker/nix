@@ -18,7 +18,6 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
-#include <random>
 #include <type_traits>
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -29,11 +28,6 @@ namespace nix {
 GitObjectStore::GitObjectStore(std::filesystem::path dir)
     : dir(std::move(dir))
 {
-}
-
-void GitObjectStore::createDirectories() const
-{
-    createDirs(dir / "tmp");
 }
 
 Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize)
@@ -48,16 +42,15 @@ std::string GitObjectStore::idString(const Hash & id)
     return id.to_string(HashFormat::Base16, false);
 }
 
-std::filesystem::path GitObjectStore::tempPath(std::string_view kind) const
+std::filesystem::path GitObjectStore::Hold::tempPath(std::string_view kind) const
 {
-    /* Timestamp names by creation time: hard-linking advances inode ctime,
-       so ctime cannot age these pins. A random counter seed avoids old names. */
-    static std::atomic<uint32_t> counter(std::random_device{}());
-    return dir / "tmp"
+    /* Preserve the historical unique name format; the lease owns its lifetime. */
+    static std::atomic<uint32_t> counter(0);
+    return directory()
            / fmt("%s-%d-%d-%d", kind, static_cast<long long>(time(nullptr)), getpid(), counter.fetch_add(1));
 }
 
-/* The second a temporary file's name carries (`tempPath`), if it does. */
+/* The creation second carried by a retired flat temporary name, if present. */
 static std::optional<time_t> tempTime(std::string_view name)
 {
     auto parts = tokenizeString<std::vector<std::string>>(name, "-");
@@ -367,7 +360,7 @@ GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repa
    a link whose registered-holder probe raced this ingestion's first claim. */
 template<typename Accept>
 static std::optional<GitObjectStore::Placed> linkOver(
-    GitObjectStore & objects,
+    const GitObjectStore::Hold & hold,
     const std::string & file,
     Descriptor dirFd,
     const CanonPath & name,
@@ -376,7 +369,7 @@ static std::optional<GitObjectStore::Placed> linkOver(
     Accept && accept)
 {
     auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
-    auto tempLink = objects.tempPath("link");
+    auto tempLink = hold.tempPath("link");
     if (::link(file.c_str(), tempLink.c_str()) == -1) {
         auto ec = std::error_code(errno, std::generic_category());
         if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
@@ -436,7 +429,7 @@ static GitObjectStore::Hold::Row rowOf(
 }
 
 static std::optional<GitObjectStore::Placed> placePending(
-    GitObjectStore & objects,
+    const GitObjectStore::Hold & hold,
     const std::string & file,
     Descriptor dirFd,
     const CanonPath & name,
@@ -448,7 +441,7 @@ static std::optional<GitObjectStore::Placed> placePending(
         return std::nullopt;
     if (st->st_ino == before.st_ino && st->st_dev == before.st_dev)
         return GitObjectStore::Placed{before.st_ino, false};
-    return linkOver(objects, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
+    return linkOver(hold, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
 }
 
 #endif
@@ -543,7 +536,7 @@ std::optional<uint64_t> GitObjectStore::link(
        A concurrent worker may have claimed a different holder meanwhile. */
     if (!mine)
         if (auto other = hold.addRow(rowOf(id, executable, *st, where, hold)))
-            linkOver(*this, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
+            linkOver(hold, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
     return static_cast<uint64_t>(st->st_size);
 #endif
 }
@@ -564,7 +557,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
     /* The destination is complete and canonical. Reuse a holder or claim it. */
     auto after = before;
     auto replaceBy = [&](const std::string & file, auto && accept) {
-        auto placed = linkOver(*this, file, dirFd, name, where, after, std::forward<decltype(accept)>(accept));
+        auto placed = linkOver(hold, file, dirFd, name, where, after, std::forward<decltype(accept)>(accept));
         if (placed)
             after.st_ino = placed->ino;
         return placed;
@@ -574,7 +567,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
        within one path), then the index's holder. */
     bool entered = true;
     if (auto mine = hold.pendingHolder(id, executable)) {
-        return placePending(*this, *mine, dirFd, name, where, before);
+        return placePending(hold, *mine, dirFd, name, where, before);
     } else if (index && index->lookup) {
         auto cursor = Holder::initialCursor;
         while (auto holder = index->lookup(id, executable, cursor)) {
@@ -637,7 +630,7 @@ void GitObjectStore::enterWritten(
     }
     auto other = hold.addRow(rowOf(id, executable, st, where, hold));
     if (other)
-        placePending(*this, *other, dirFd, name, where, st);
+        placePending(hold, *other, dirFd, name, where, st);
 #endif
 }
 

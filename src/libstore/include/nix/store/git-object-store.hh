@@ -175,9 +175,6 @@ public:
      */
     std::function<bool(const std::filesystem::path &)> failHoldRemoval;
 
-    /** Ensure the temporary regular-link and ingestion-lease namespace exists. */
-    void createDirectories() const;
-
     /** Hash file bytes using their previously observed size.
      * The caller must ensure that size is still correct or compare the result
      * with the expected canonical blob identifier. This does not establish
@@ -197,13 +194,6 @@ public:
 
     /** Physical facts required before sharing a recorded regular-file holder. */
     static bool validHolderMetadata(const Holder & holder, bool executable, const PosixStat & st);
-
-    /**
-     * A fresh name under `tmp/` for a temporary of the given kind
-     * (`link`, `coalesce`), carrying the second it was made, which is the
-     * age the sweep goes by: a temporary link's inode is a blob's.
-     */
-    std::filesystem::path tempPath(std::string_view kind) const;
 
     /**
      * Link the store's valid file for the blob under its mode as `name`
@@ -369,10 +359,7 @@ public:
         void addAuxiliary(Auxiliary object) const;
 
         /** Active per-path state. The ID can name a previously staged projection. */
-        struct Ingestion
-        {
-            std::optional<uint64_t> id;
-        };
+        using Ingestion = std::optional<uint64_t>;
 
         /* Accessed only before or after the path's walking workers run. */
         mutable std::optional<Ingestion> ingestion;
@@ -381,6 +368,9 @@ public:
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
+
+        /** A temporary regular link owned by this hold's locked lease. */
+        std::filesystem::path tempPath(std::string_view kind) const;
 
         /** Consume a completed row only when its key is new; otherwise leave
          * it intact and return the first holder. Claims remain stable until

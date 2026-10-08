@@ -225,12 +225,8 @@ private:
      */
     VerificationResult verifyAllValidPaths(RepairFlag repair) override;
 
-    /**
-     * The merged directory includes lower-store data. Object materialisation,
-     * cross-layer regular sharing, legacy `.links` removal and object verification
-     * therefore remain disabled here; none may copy up or modify lower data.
-     * The upper database owns its auxiliary values and candidate rows.
-     */
+    /** The merged view cannot provide complete metadata availability or named
+     * materialisation. Physical hashes and upper SQL/file ownership remain (08 K13). */
     bool ownsObjectStore() const override
     {
         return false;

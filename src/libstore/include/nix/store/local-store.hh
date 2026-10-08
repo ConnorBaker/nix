@@ -255,10 +255,7 @@ public:
 
     const std::filesystem::path dbDir;
 
-    /**
-     * The store's object store (01 §9.10): the local store's
-     * representation, unconditionally; every path added is entered.
-     */
+    /** This database's object provider and private ingestion projections (01 §9.10). */
     GitObjectStore objects;
     const std::filesystem::path reservedPath;
     const std::filesystem::path schemaPath;
@@ -537,14 +534,7 @@ public:
         RepairFlag repair = NoRepair,
         Sink * rootContents = nullptr);
 
-    /**
-     * Whether a copy from an accessor may be made from the store's own
-     * objects (01 §9.10, the second route): a store that owns its object
-     * store (`ownsObjectStore`), on a system where the object store
-     * links -- not Windows, where it shares nothing and the `*at` calls
-     * the materialisation rests on have no counterpart.  The one
-     * predicate the route is taken under; `Store::addToStore` asks it.
-     */
+    /** Whether named object materialisation is available: an unlayered store on POSIX (08 K13). */
     bool materialisesFromObjects() const;
 
     /**
@@ -629,36 +619,18 @@ protected:
     virtual VerificationResult verifyAllValidPaths(RepairFlag repair);
 
     /**
-     * Whether the object store under `realStoreDir` -- `.objects`, and an
-     * older Nix's `.links` -- is this store's alone.  When it is not (the
-     * overlay store: its store directory is a merged mount, so `.objects`
-     * and `.links` there show the lower store's too, which is read-only
-     * and shared), the collector sweeps no object and removes no `.links`,
-     * and `--verify --check-contents` checks no path's objects and hashes
-     * no object file, since an unlink or a repair through the merged path
-     * would white out or copy up the lower store's files (01 §10, *the
-     * local overlay store's object store is not its own*).  The sweep is
-     * not gated on this: the overlay store sweeps the objects it owns,
-     * its upper layer's (`sweepObjects`).
+     * Whether the physical view is unlayered. Gates named materialisation,
+     * metadata-availability verification and legacy `.links` removal.
+     * Overlays still hash registered physical paths, own upper SQL values,
+     * and clean only their upper namespace (08 K13).
      */
     virtual bool ownsObjectStore() const
     {
         return true;
     }
 
-    /**
-     * The collector's sweep on a whole-store collection (01 §9.10,
-     * "Collection"; 01 §10, *The object store is swept on whole-store
-     * collections only*): legacy cache files, and then the ingestion's stale
-     * rows.  **Not virtual**, and that is the point.  The rows are the
-     * store's *own database's* whatever its object store is -- the
-     * overlay store's index is the upper store's, holding no row for a
-     * lower path -- so a store that sweeps its objects differently must
-     * not thereby stop sweeping its rows.  A subclass overrides
-     * `sweepObjectStore` alone; this method is what guarantees the row
-     * sweep runs beside it
-     * (`aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRows`).
-     */
+    /** Whole-store cleanup: overridable owned-file cleanup, then unconditional
+     * stale-projection cleanup in this database (01 §9.10, 08 K13). */
     void sweepObjects();
 
     /**
@@ -668,15 +640,8 @@ protected:
      */
     virtual void sweepObjectStore();
 
-    /**
-     * Remove every holder and auxiliary row whose ingestion names no valid path (an
-     * ingestion that never registered, or a path since collected).  Under
-     * the GC lock, with the sweep; it is what replaces the cascade a
-     * foreign key into `ValidPaths` would have given (`schema.sql`).
-     *
-     * Public so that the rule can be driven on its own by the tests that
-     * pin it (`theSweepJudgesARowByItsIngestionsPath`).
-     */
+    /** Under the GC lock, remove stale ingestions after dead-lease cleanup;
+     * foreign keys cascade both projections. Surviving leases retain rows (08 K16). */
 public:
     void sweepStaleBlobRows();
 

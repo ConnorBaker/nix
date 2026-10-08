@@ -187,14 +187,10 @@ LocalStore::LocalStore(ref<const Config> config)
 
     /* Create missing state directories if they don't already exist. */
     createDirs(config->realStoreDir.get());
-    if (config->readOnly) {
+    if (config->readOnly)
         experimentalFeatureSettings.require(Xp::ReadOnlyLocalStore);
-    } else {
+    else
         makeStoreWritable();
-        /* The object store is the store's representation: every path added
-           is entered, so its directories exist from the start. */
-        objects.createDirectories();
-    }
     auto profilesDir = config->stateDir.get() / "profiles";
     createDirs(profilesDir);
     createDirs(tempRootsDir);
@@ -914,7 +910,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
-        auto id = ingestion->id;
+        auto id = *ingestion;
         if (!id) {
             state->stmts->NewIngestion.use().apply("", false).apply(holdName).exec();
             id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
@@ -1834,7 +1830,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         std::set<std::reference_wrapper<const StorePath>, std::less<StorePath>> updated;
         for (auto publication = publications.begin(); publication != publications.end();) {
             /* Retry active IDs from the unchanged hold; completed IDs are stable. */
-            auto id = ingestion ? ingestion->id : std::optional(publication->id);
+            auto id = ingestion ? *ingestion : std::optional(publication->id);
             if (!id) {
                 // This projection and its validity become visible together.
                 state->stmts->NewIngestion.use().apply("", false).apply("", false).exec();
@@ -1923,7 +1919,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         }
         txn.commit();
         if (ingestion && !publications.empty())
-            ingestion->id = publications.front().id;
+            *ingestion = publications.front().id;
         /* A description becomes cacheable only with the committed path
            and references. A rejected reference or cycle rolls the SQL
            back; publishing earlier would leave a false validity hit. */
@@ -2496,11 +2492,12 @@ bool LocalStore::verifyStore(bool checkContents, RepairFlag repair)
                     continue;
                 }
 
-                auto [current, missing] = verifyObjects(realPath);
+                auto [current, missing] = ownObjects ? verifyObjects(realPath) : [&] {
+                    HashingVisitor hasher;
+                    return std::pair{objectHashOf(*makeFSSourceAccessor(realPath), CanonPath::root, defaultPathFilter, hasher),
+                                     std::vector<std::filesystem::path>{}};
+                }();
                 auto currentHash = ObjectHash::of(current.root);
-                if (!ownObjects)
-                    /* Law 4 is not this store's to check or repair. */
-                    missing.clear();
 
                 if (*info->objectHash != currentHash) {
                     printError(

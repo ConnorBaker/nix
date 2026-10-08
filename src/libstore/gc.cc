@@ -494,10 +494,9 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
         });
 
         while (true) {
-            std::vector<struct pollfd> fds;
-            fds.push_back({.fd = shutdownPipe.readSide.get(), .events = POLLIN});
-            fds.push_back({.fd = fdServer.get(), .events = POLLIN});
-            auto count = poll(fds.data(), fds.size(), -1);
+            struct pollfd fds[] = {{.fd = shutdownPipe.readSide.get(), .events = POLLIN},
+                                  {.fd = fdServer.get(), .events = POLLIN}};
+            auto count = poll(fds, std::ranges::size(fds), -1);
             assert(count != -1);
 
             if (fds[0].revents)
@@ -647,6 +646,12 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     boost::unordered_flat_map<StorePath, StorePathSet, std::hash<StorePath>> referrersCache;
 
+    auto clearPending = [&] {
+        auto shared(_shared.lock());
+        shared->pending.reset();
+        wakeup.notify_all();
+    };
+
     /* Helper function that visits all paths reachable from `start`
        via the referrers edges and optionally derivers and derivation
        output edges. If none of those paths are roots, then all
@@ -657,11 +662,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
         /* Wake up any GC client waiting for deletion of the paths in
            'visited' to finish. */
-        Finally releasePending([&]() {
-            auto shared(_shared.lock());
-            shared->pending.reset();
-            wakeup.notify_all();
-        });
+        Finally releasePending(clearPending);
 
         auto enqueue = [&](const StorePath & path) {
             if (visited.insert(path).second)
@@ -731,8 +732,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 if (i == referrersCache.end()) {
                     StorePathSet referrers;
                     queryGCReferrers(*path, referrers);
-                    referrersCache.emplace(*path, std::move(referrers));
-                    i = referrersCache.find(*path);
+                    i = referrersCache.emplace(*path, std::move(referrers)).first;
                 }
                 for (auto & p : i->second)
                     enqueue(p);
@@ -796,11 +796,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                     }
                     shared->pending = hashPart;
                 }
-                Finally resetPending([&]() {
-                    auto shared(_shared.lock());
-                    shared->pending.reset();
-                    wakeup.notify_all();
-                });
+                Finally resetPending(clearPending);
                 /* The window itself, for a test to act in: `pending` names
                    this path and `_shared` is not held, so the socket
                    handler can take another path's root (05 section 7). */

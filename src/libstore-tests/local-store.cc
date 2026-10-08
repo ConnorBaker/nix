@@ -452,7 +452,7 @@ protected:
     void stageLegacyUnregisteredRows(const GitObjectStore::Hold & hold)
     {
         ASSERT_TRUE(hold.ingestion);
-        ASSERT_FALSE(hold.ingestion->id);
+        ASSERT_FALSE(*hold.ingestion);
         auto projection = hold.takeProjection();
         auto state = store->_state->lock();
         SQLiteTxn txn(state->db);
@@ -462,7 +462,7 @@ protected:
         store->insertBlobRows(*state, id, projection.regular);
         store->insertAuxiliaryRows(*state, id, projection.auxiliary);
         txn.commit();
-        hold.ingestion->id = id;
+        *hold.ingestion = id;
     }
 
     /* Fixture roots such as <store>/t1 are not StorePaths. Give them validity
@@ -474,7 +474,7 @@ protected:
             return;
         auto projection = hold.takeProjection();
         auto logical = (std::filesystem::path(store->config->storeDir) / root.filename()).string();
-        auto ingestion = hold.ingestion->id;
+        auto ingestion = *hold.ingestion;
         retrySQLite<void>([&] {
             auto state = store->_state->lock();
             SQLiteTxn txn(state->db);
@@ -502,7 +502,7 @@ protected:
             previous.use().apply(logical).exec();
             name.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
             txn.commit();
-            hold.ingestion->id = id;
+            *hold.ingestion = id;
         });
     }
 
@@ -689,7 +689,7 @@ protected:
         for (auto & value : values)
             hold.addAuxiliary(std::move(value));
         recordBlobsAtPath(hold, path);
-        return *hold.ingestion->id;
+        return **hold.ingestion;
     }
 
     void forgetFixturePath(const std::filesystem::path & path)
@@ -706,6 +706,8 @@ protected:
     {
         if (sub == "tmp") {
             size_t n = 0;
+            if (!pathExists(store->objects.dir / "tmp"))
+                return n;
             for ([[maybe_unused]] auto & e : DirectoryIterator{store->objects.dir / "tmp"})
                 ++n;
             return n;
@@ -2120,6 +2122,7 @@ TEST_F(LocalStoreObjectsTest, staleTemporaryLinkGoesWithTheBlobItPinned)
     restore(path, treeNar({{"file", "pinned", 'f'}}));
     auto blob = blobFileOf(merkle::blobId("pinned"), false);
     auto now = time(nullptr);
+    createDirs(objects.dir / "tmp");
     auto stale = objects.dir / "tmp" / fmt("link-%d-%d-0", now - 7200, getpid());
     auto fresh = objects.dir / "tmp" / fmt("link-%d-%d-1", now, getpid());
     std::filesystem::create_hard_link(blob, stale);
@@ -2312,15 +2315,9 @@ TEST_F(LocalStoreObjectsTest, aCrashBeforeRegistrationLeavesNoRowThatMisleadsLin
 
 namespace {
 
-/* A store that sweeps its object *files* its own way, as
-   `LocalOverlayStore` does -- its `.objects` is the merged mount and it
-   owns the upper layer alone, so it enumerates and unlinks there rather
-   than through the mount.  Its index, though, is its own database's and is
-   narrowed by no layer: it holds no row for a lower path, and every row it
-   does hold is judged by the same rule.  `sweepObjects` is therefore not
-   virtual and `sweepObjectStore` is; this stands in for the overlay, whose
-   own suite needs an overlayfs mount the build sandbox forbids (`05`
-   section 7). */
+/* Stand in for an overlay's owned-file cleanup. SQL stale cleanup still
+   applies to this database, including registered lower-path descriptions.
+   Real overlay authority needs the mounted functional suite (08 K13). */
 struct OwnObjectSweepStore : LocalStore
 {
     explicit OwnObjectSweepStore(ref<const LocalStore::Config> config)
@@ -2331,6 +2328,12 @@ struct OwnObjectSweepStore : LocalStore
     }
 
     unsigned ownSweeps = 0;
+    bool completeObjectView = true;
+
+    bool ownsObjectStore() const override
+    {
+        return completeObjectView;
+    }
 
     void sweepObjectStore() override
     {
@@ -2341,6 +2344,77 @@ struct OwnObjectSweepStore : LocalStore
 };
 
 } // namespace
+
+/* Availability belongs to the provider domain; physical hashes belong to
+   every registered path. A failing or absent provider must not affect a view
+   whose availability is incomplete, while physical corruption still does. */
+TEST_F(LocalStoreObjectsTest, incompleteObjectViewsVerifyPhysicalHashesWithoutProviderEffects)
+{
+    using File = MemorySourceAccessor::File;
+    size_t cases = 0;
+    for (bool owned : {false, true})
+        for (unsigned kind = 0; kind != 4; ++kind)
+            for (bool corrupt : {false, true})
+                for (bool throws : {false, true})
+                    for (bool checkContents : {false, true}) {
+                        SCOPED_TRACE(fmt(
+                            "owned=%d kind=%d corrupt=%d throws=%d contents=%d",
+                            owned,
+                            kind,
+                            corrupt,
+                            throws,
+                            checkContents));
+                        store.reset();
+                        config = std::make_shared<LocalStoreConfig>(
+                            tempStoreDir.path() / fmt("verify-domain-%d", cases++), StoreConfig::Params{});
+                        auto subject = std::make_shared<OwnObjectSweepStore>(ref{config});
+                        subject->completeObjectView = owned;
+                        store = subject;
+                        auto source = treeAccessor({{"file", "physical bytes", 'f'}});
+                        if (kind < 2)
+                            source->root = File::Regular{.executable = kind == 1, .contents = "physical bytes"};
+                        else if (kind == 2)
+                            source->root = File::Symlink{.target = "physical target"};
+                        auto path = store->addToStoreSlow(
+                            "verify-domain", {source}, ContentAddressMethod::Raw::Git, HashAlgorithm::SHA256).path;
+                        if (corrupt) {
+                            auto file = store->toRealPath(path);
+                            if (kind == 2) {
+                                unlink(file);
+                                createSymlink("different target", file);
+                            } else {
+                                if (kind == 3)
+                                    file /= "file";
+                                chmod(file, 0644);
+                                writeFile(file, "different bytes");
+                                chmod(file, kind == 1 ? 0555 : 0444);
+                                setWriteTime(file, 1, 1);
+                            }
+                        }
+                        size_t calls = 0;
+                        GitObjectStore::Index provider{
+                            .lookup = [&](const Hash &, bool, GitObjectStore::Holder::Cursor)
+                                -> std::optional<GitObjectStore::Holder> {
+                                ++calls;
+                                if (throws)
+                                    throw Error("the provider was called");
+                                return std::nullopt;
+                            },
+                            .readAuxiliary = [&](const merkle::TreeEntry &) -> std::optional<std::string> {
+                                ++calls;
+                                if (throws)
+                                    throw Error("the provider was called");
+                                return std::nullopt;
+                            },
+                        };
+                        auto original = store->objects.index;
+                        store->objects.index = &provider;
+                        Finally restoreProvider{[&] { store->objects.index = original; }};
+                        EXPECT_EQ(store->verifyStore(checkContents, NoRepair), checkContents && (corrupt || owned));
+                        EXPECT_EQ(calls == 0, !checkContents || !owned);
+                    }
+    EXPECT_EQ(cases, 64u);
+}
 
 /* A collection on such a store still removes the index's stale rows.
    Before: `LocalOverlayStore::sweepObjects` overrode the only caller of
@@ -2650,7 +2724,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
         else if (origin == Origin::Completed)
             store->endIngestion(hold, path);
         auto original = origin == Origin::Completed ? std::optional(hold.completedIngestions.begin()->second)
-                                                   : hold.ingestion->id;
+                                                   : *hold.ingestion;
 
         SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
         struct Retry
@@ -2724,7 +2798,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
         ASSERT_EQ(retry.publications, 2u);
         ASSERT_EQ(retry.interleaved, SQLITE_OK);
         ASSERT_GT(retry.rejected, 0);
-        auto committed = origin == Origin::Completed ? hold.completedIngestions.begin()->second : *hold.ingestion->id;
+        auto committed = origin == Origin::Completed ? hold.completedIngestions.begin()->second : **hold.ingestion;
         if (original) {
             EXPECT_EQ(retry.rejected, static_cast<int64_t>(*original));
             EXPECT_EQ(committed, *original);
@@ -2844,7 +2918,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             store->endIngestion(holds[1], infos[1].path);
             ASSERT_FALSE(holds[1].ingestion);
             auto own = holds[1].completedIngestions.begin()->second;
-            auto donor = *holds[0].ingestion->id;
+            auto donor = **holds[0].ingestion;
             std::map<int64_t, std::string> names{
                 {int64_t(own), store->printStorePath(infos[1].path)},
                 {int64_t(donor), store->printStorePath(infos[0].path)}};
@@ -3209,7 +3283,7 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
                             update.use()
                                 .apply(static_cast<int64_t>(st(files[i]).st_ino))
                                 .apply(static_cast<int64_t>(st(files[i]).st_dev))
-                                .apply(static_cast<int64_t>(*holds[i].ingestion->id))
+                                .apply(static_cast<int64_t>(**holds[i].ingestion))
                                 .exec();
                     }
                     auto canonical =
@@ -3301,7 +3375,7 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
                 update.use()
                     .apply(static_cast<int64_t>(status.st_ino))
                     .apply(static_cast<int64_t>(status.st_dev))
-                    .apply(static_cast<int64_t>(*holds[i].ingestion->id))
+                    .apply(static_cast<int64_t>(**holds[i].ingestion))
                     .apply(id.hash, id.hashSize)
                     .exec();
             }
@@ -3410,7 +3484,7 @@ TEST_F(LocalStoreObjectsTest, optimiseKeepsTheCanonicalInodeWhenItsFirstHolderIs
                 update.use()
                     .apply(static_cast<int64_t>(st(files[i]).st_ino))
                     .apply(static_cast<int64_t>(st(files[i]).st_dev))
-                    .apply(static_cast<int64_t>(*holds[i].ingestion->id))
+                    .apply(static_cast<int64_t>(**holds[i].ingestion))
                     .exec();
         }
         auto originalIndex = store->objects.index;
@@ -3615,7 +3689,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     SQLiteStmt count;
                     count.create(db, "select count(*) from Blobs where ingestion = ?;");
                     auto use(count.use());
-                    use.apply(static_cast<int64_t>(*holds[0].ingestion->id));
+                    use.apply(static_cast<int64_t>(**holds[0].ingestion));
                     ASSERT_TRUE(use.next());
                     EXPECT_EQ(use.getInt(0), refusal == 2 ? 1 : 0);
                 }
@@ -4731,7 +4805,7 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             ASSERT_EQ(readFile(real / "file"), change == Change::Content ? corrupt : bytes);
             ASSERT_EQ(hold.pendingHolder(id, executable), std::optional{(real / "file").string()});
             ASSERT_TRUE(hold.ingestion);
-            ASSERT_FALSE(hold.ingestion->id);
+            ASSERT_FALSE(*hold.ingestion);
 
             /* Change physical metadata only after restore has linked the owned
                target. Both saved donor rows remain unchanged. Two inode classes
@@ -4763,7 +4837,7 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             else
                 EXPECT_THROW(store->registerValidPath(info, hold), Error);
             EXPECT_EQ(store->isValidPath(info.path), change == Change::None);
-            EXPECT_EQ(hold.ingestion->id.has_value(), change == Change::None);
+            EXPECT_EQ(hold.ingestion->has_value(), change == Change::None);
             EXPECT_EQ(blobRowCount(*store, executable), rowsBefore + (change == Change::None ? 1 : 0));
 
             if (change == Change::None)
@@ -4870,6 +4944,39 @@ TEST_F(LocalStoreObjectsTest, holdsNeverReuseAnExistingName)
     EXPECT_EQ(readLink(dangling), objects.dir / "absent");
 }
 
+TEST_F(LocalStoreObjectsTest, unusedPhysicalObjectNamespaceDoesNotPreventOpening)
+{
+    unsigned serial = 0;
+    /* An existing non-directory in either private parent must be irrelevant
+       until an operation actually needs a physical ingestion lease. */
+    for (bool atTmp : {false, true})
+        for (bool symlink : {false, true}) {
+            SCOPED_TRACE(fmt("tmp=%d symlink=%d", atTmp, symlink));
+            store.reset();
+            auto root = tempStoreDir.path() / fmt("unused-objects-%d", serial++);
+            config = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{});
+            store = std::make_shared<LocalStore>(ref{config});
+            auto objects = store->objects.dir;
+            ASSERT_FALSE(pathExists(objects));
+            store.reset();
+            auto blocker = atTmp ? objects / "tmp" : objects;
+            createDirs(blocker.parent_path());
+            auto outside = root / "outside";
+            writeFile(outside, "untouched");
+            if (symlink)
+                createSymlink(outside, blocker);
+            else
+                writeFile(blocker, "untouched");
+            store = std::make_shared<LocalStore>(ref{config});
+            EXPECT_FALSE(store->objects.readAuxiliary({merkle::Mode::Directory, merkle::treeId("")}));
+            auto hold = store->objects.hold();
+            EXPECT_THROW(hold.directory(), SystemError);
+            EXPECT_EQ(readFile(blocker), "untouched");
+            EXPECT_EQ(readFile(outside), "untouched");
+        }
+    EXPECT_EQ(serial, 4u);
+}
+
 TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
 {
     size_t cases = 0;
@@ -4879,7 +4986,6 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
             do {
                 SCOPED_TRACE(fmt("mode=%o moved=%d order=%d%d%d", (RawMode) mode, moved, order[0], order[1], order[2]));
                 GitObjectStore objects{tempStoreDir.path() / fmt("lease-lifetime-%d", cases)};
-                objects.createDirectories();
                 std::array<std::optional<GitObjectStore::Hold>, 3> views;
                 views[0].emplace(objects.hold());
                 views[1].emplace(views[0]->ownRows());
@@ -5101,7 +5207,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
             SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
             SQLiteStmt query{db, "select chunk, typeof(body), body from AuxValues where ingestion = ? order by chunk;"};
             auto use = query.use();
-            use.apply(static_cast<int64_t>(*hold.ingestion->id));
+            use.apply(static_cast<int64_t>(**hold.ingestion));
             size_t ordinal = 0, offset = 0;
             while (use.next()) {
                 EXPECT_EQ(use.getInt(0), static_cast<int64_t>(ordinal));
@@ -5454,7 +5560,6 @@ TEST_F(LocalStoreObjectsTest, legacyAuxiliaryCleanupIsBoundedAndDoesNotFollowSym
         for (bool sharded : {false, true}) {
             SCOPED_TRACE(fmt("kind=%s sharded=%d", kind, sharded));
             GitObjectStore objects{tempStoreDir.path() / fmt("legacy-bounds-%d", cases)};
-            objects.createDirectories();
             auto outside = tempStoreDir.path() / fmt("legacy-outside-%d", cases);
             createDirs(outside);
             writeFile(outside / "keep", "untouched");
@@ -6197,6 +6302,8 @@ TEST_F(LocalStoreObjectsTest, registeredBlobReuseValidatesTheAcquiredInode)
                                                 EXPECT_EQ(observed.ino, firstRow.ino);
                                                 EXPECT_EQ(observed.dev, firstRow.dev);
                                                 ++forgotten;
+                                                EXPECT_EQ(objects.sweep().holds, place ? 1u : 0u)
+                                                    << "collection retains the lease during donor rejection";
                                             },
                                     };
                                     objects.index = &index;
@@ -6225,8 +6332,8 @@ TEST_F(LocalStoreObjectsTest, registeredBlobReuseValidatesTheAcquiredInode)
                                         EXPECT_EQ(readFile(target), accepted && !sameBytes ? "evil" : "good");
                                     else
                                         EXPECT_FALSE(pathExists(target));
-                                    EXPECT_EQ(count("tmp"), 0u)
-                                        << "destination links need no lease and leak no temporary link";
+                                    EXPECT_EQ(count("tmp"), place ? 1u : 0u)
+                                        << "replacement pins belong to the live lease; direct links need none";
                                     objects.index = originalIndex;
                                 }
     EXPECT_EQ(serial, 176u);
@@ -7645,6 +7752,7 @@ TEST_F(LocalStoreObjectsTest, deletesEverythingNotAllowListedInTheStoreDir)
     writeFile(realStoreDir / "foo", "stray");
     createDirs(realStoreDir / "bar");
     writeFile(realStoreDir / "bar" / "baz", "stray too");
+    createDirs(store->objects.dir);
     ASSERT_TRUE(pathExists(store->objects.dir));
 
     store.reset();
@@ -10062,6 +10170,7 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                                     expected);
                                 source->reads = 0;
                             }
+                            bool donor = hasBlob(expectedRoot.hash, executable);
                             size_t holds = 0;
                             store->objects.atHoldMade = [&] { ++holds; };
                             Finally resetHook{[&] { store->objects.atHoldMade = nullptr; }};
@@ -10069,7 +10178,8 @@ TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeed
                                 store->materialise(name, SourcePath(source), defaultPathFilter, repair, noNode());
                             EXPECT_EQ(actual, expected);
                             EXPECT_EQ(source->reads, 1u);
-                            EXPECT_EQ(holds, 0u) << "no overlapping donor miss needs a physical lease";
+                            EXPECT_EQ(holds, size > limit && donor && (!valid || repair) ? 1u : 0u)
+                                << "only replacement temporaries need a physical lease";
                             EXPECT_EQ(count("tmp"), 0u);
                             {
                                 auto use = owner.use();
@@ -10690,7 +10800,7 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 EXPECT_EQ(rows.size(), 1u);
                 if (rows.size() == 1)
                     EXPECT_EQ(rows.front().id, id);
-                EXPECT_FALSE(hold.ingestion->id.has_value());
+                EXPECT_FALSE(hold.ingestion->has_value());
                 EXPECT_TRUE(hold.completedIngestions.empty());
             }
         }

@@ -1097,7 +1097,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
     winners.reserve(collisions.size());
     BlobCoalescingResult result;
     std::map<std::pair<dev_t, ino_t>, size_t> byInode;
-    auto temporary = [&] { return hold.directory() / objects.tempPath("coalesce").filename(); };
+    auto temporary = [&] { return hold.tempPath("coalesce"); };
 
     for (auto & collision : collisions) {
         auto & row = collision.row;
