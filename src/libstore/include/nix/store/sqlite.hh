@@ -106,8 +106,10 @@ struct SQLiteStmt
         return stmt;
     }
 
+    enum class Bindings { Copy, Borrow };
+
     /**
-     * Helper for binding / executing statements.
+     * Borrow requires unchanged text/blob storage through Use exit, which resets then clears all bindings.
      */
     class Use
     {
@@ -115,7 +117,9 @@ struct SQLiteStmt
     private:
         SQLiteStmt & stmt;
         unsigned int curArg = 1;
-        Use(SQLiteStmt & stmt);
+        bool borrowed;
+        Use(SQLiteStmt & stmt, Bindings bindings);
+        Use & checkBind(int result);
 
     public:
 
@@ -151,9 +155,9 @@ struct SQLiteStmt
         bool isNull(int col);
     };
 
-    Use use()
+    Use use(Bindings bindings = Bindings::Copy)
     {
-        return Use(*this);
+        return Use(*this, bindings);
     }
 };
 

@@ -171,8 +171,9 @@ SQLiteStmt::~SQLiteStmt()
     }
 }
 
-SQLiteStmt::Use::Use(SQLiteStmt & stmt)
+SQLiteStmt::Use::Use(SQLiteStmt & stmt, Bindings bindings)
     : stmt(stmt)
+    , borrowed(bindings == Bindings::Borrow)
 {
     assert(stmt.stmt);
     /* A newly prepared statement is ready; every previous Use resets it
@@ -184,43 +185,38 @@ SQLiteStmt::Use::~Use()
     /* Release any active reader and leave the statement ready for reuse.
        reset returns the preceding step's error, which was handled there. */
     sqlite3_reset(stmt);
+    if (borrowed)
+        sqlite3_clear_bindings(stmt);
+}
+
+SQLiteStmt::Use & SQLiteStmt::Use::checkBind(int result)
+{
+    if (result != SQLITE_OK)
+        SQLiteError::throw_(stmt.db, "binding argument");
+    return *this;
 }
 
 SQLiteStmt::Use & SQLiteStmt::Use::apply(std::string_view value, bool notNull)
 {
-    if (notNull) {
-        if (sqlite3_bind_text(stmt, curArg++, value.data(), value.size(), SQLITE_TRANSIENT) != SQLITE_OK)
-            SQLiteError::throw_(stmt.db, "binding argument");
-    } else
-        bind();
-    return *this;
+    return notNull ? checkBind(sqlite3_bind_text(
+                         stmt, curArg++, value.data(), value.size(), borrowed ? SQLITE_STATIC : SQLITE_TRANSIENT))
+                   : bind();
 }
 
 SQLiteStmt::Use & SQLiteStmt::Use::apply(const unsigned char * data, size_t len, bool notNull)
 {
-    if (notNull) {
-        if (sqlite3_bind_blob(stmt, curArg++, data, len, SQLITE_TRANSIENT) != SQLITE_OK)
-            SQLiteError::throw_(stmt.db, "binding argument");
-    } else
-        bind();
-    return *this;
+    return notNull ? checkBind(sqlite3_bind_blob(stmt, curArg++, data, len, borrowed ? SQLITE_STATIC : SQLITE_TRANSIENT))
+                   : bind();
 }
 
 SQLiteStmt::Use & SQLiteStmt::Use::apply(int64_t value, bool notNull)
 {
-    if (notNull) {
-        if (sqlite3_bind_int64(stmt, curArg++, value) != SQLITE_OK)
-            SQLiteError::throw_(stmt.db, "binding argument");
-    } else
-        bind();
-    return *this;
+    return notNull ? checkBind(sqlite3_bind_int64(stmt, curArg++, value)) : bind();
 }
 
 SQLiteStmt::Use & SQLiteStmt::Use::bind()
 {
-    if (sqlite3_bind_null(stmt, curArg++) != SQLITE_OK)
-        SQLiteError::throw_(stmt.db, "binding argument");
-    return *this;
+    return checkBind(sqlite3_bind_null(stmt, curArg++));
 }
 
 int SQLiteStmt::Use::step()

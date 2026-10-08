@@ -67,10 +67,9 @@ void LocalBuildStoreConfig::anchor() {}
 void LocalStore::anchor() {}
 
 [[gnu::always_inline]]
-static inline void writeBlobRow(SQLiteStmt & statement, uint64_t ingestion, const GitObjectStore::Hold::Row & row)
+static inline void writeBlobRow(SQLiteStmt::Use use, uint64_t ingestion, const GitObjectStore::Hold::Row & row)
 {
-    statement.use()
-        .apply(row.id.hash, row.id.hashSize)
+    use.apply(row.id.hash, row.id.hashSize)
         .apply(int64_t(row.executable ? 1 : 0))
         .apply(static_cast<int64_t>(row.ino))
         .apply(static_cast<int64_t>(row.dev))
@@ -590,7 +589,7 @@ LocalStore::LocalStore(ref<const Config> config)
             retrySQLite<void>([&]() {
                 auto state(_state->lock());
                 writeBlobRow(
-                    state->stmts->DeleteBlob,
+                    state->stmts->DeleteBlob.use(),
                     holder.ingestion,
                     {id, executable, holder.ino, holder.dev, holder.size, name.string()});
             });
@@ -624,7 +623,7 @@ void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<con
     if (blobRows == BlobRows::NoRows)
         return;
     for (auto & row : rows)
-        writeBlobRow(state.stmts->InsertBlob, ingestion, row);
+        writeBlobRow(state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow), ingestion, row);
 }
 
 /* SQLite's selected 1,000,000,000-byte row limit and bind_blob's signed
@@ -715,7 +714,7 @@ void LocalStore::insertAuxiliaryRows(
         int64_t ordinal = 0;
         do {
             auto size = std::min(auxiliaryChunkSize, value.body.size() - offset);
-            state.stmts->InsertAuxiliary.use()
+            state.stmts->InsertAuxiliary.use(SQLiteStmt::Bindings::Borrow)
                 .apply(static_cast<int64_t>(entry.mode))
                 .apply(entry.hash.hash, entry.hash.hashSize)
                 .apply(static_cast<int64_t>(ingestion))
@@ -873,14 +872,14 @@ void LocalStore::coalesceBlobRows(
     }
     for (auto & collision : collisions)
         if (!collision.eligible)
-            writeBlobRow(state.stmts->DeleteBlob, ingestion, collision.row);
+            writeBlobRow(state.stmts->DeleteBlob.use(), ingestion, collision.row);
     for (auto & [row, holder] : rejected) {
         auto relative = std::filesystem::path(holder.file).lexically_relative(getRealStoreDir());
         std::filesystem::path name;
         for (auto i = ++relative.begin(); i != relative.end(); ++i)
             name /= *i;
         writeBlobRow(
-            state.stmts->DeleteBlob,
+            state.stmts->DeleteBlob.use(),
             holder.ingestion,
             {row.id, row.executable, holder.ino, holder.dev, holder.size, name.string()});
     }

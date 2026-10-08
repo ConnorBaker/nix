@@ -85,6 +85,119 @@ TEST(LocalStore, storeDir_empty_rejected)
     EXPECT_THROW(LocalStoreConfig("", {{"store", ""}}), UsageError);
 }
 
+TEST(SQLite, copiedAndBorrowedBindingsHaveExplicitStorageLifetimes)
+{
+    AutoDelete dir{createTempDir()};
+    SQLite db{dir.path() / "bindings.sqlite", {.useWAL = false}};
+    SQLiteStmt query{db, "select typeof(?1), hex(?1), typeof(?2), hex(?2), ?3"};
+    for (auto bindings : {SQLiteStmt::Bindings::Copy, SQLiteStmt::Bindings::Borrow}) {
+        std::string text("A_B", 3);
+        unsigned char blob[]{0xff, 0, 0x41};
+        {
+            auto use = query.use(bindings);
+            use.apply(text).apply(blob, sizeof(blob)).apply(19);
+            if (bindings == SQLiteStmt::Bindings::Copy) {
+                text[0] = 'Z';
+                blob[0] = 0x7f;
+            }
+            ASSERT_TRUE(use.next());
+            EXPECT_EQ(use.getStr(0), "text");
+            EXPECT_EQ(use.getStr(1), "415F42");
+            EXPECT_EQ(use.getStr(2), "blob");
+            EXPECT_EQ(use.getStr(3), "FF0041");
+            EXPECT_EQ(use.getInt(4), 19);
+        }
+        /* Observe the statement itself: Copy retains bindings after reset;
+           Borrow clears them before the original storage can expire. */
+        ASSERT_EQ(sqlite3_step(query), SQLITE_ROW);
+        EXPECT_EQ(sqlite3_column_type(query, 4), bindings == SQLiteStmt::Bindings::Copy ? SQLITE_INTEGER : SQLITE_NULL);
+        EXPECT_STREQ(reinterpret_cast<const char *>(sqlite3_column_text(query, 0)),
+                     bindings == SQLiteStmt::Bindings::Copy ? "text" : "null");
+        EXPECT_STREQ(reinterpret_cast<const char *>(sqlite3_column_text(query, 2)),
+                     bindings == SQLiteStmt::Bindings::Copy ? "blob" : "null");
+        sqlite3_reset(query);
+    }
+    auto use = query.use();
+    use.apply(std::string("C_D", 3)).apply(reinterpret_cast<const unsigned char *>("xy"), 2).apply(23);
+    ASSERT_TRUE(use.next());
+    EXPECT_EQ(use.getStr(1), "435F44");
+    EXPECT_EQ(use.getStr(3), "7879");
+}
+
+TEST(SQLite, borrowedBindingsPreserveEmptyNullAndFailureReuse)
+{
+    AutoDelete dir{createTempDir()};
+    SQLite db{dir.path() / "bindings.sqlite", {.useWAL = false}};
+    SQLiteStmt query{db, "select typeof(?1), typeof(?2), typeof(?3), ?4"};
+    std::string empty;
+    unsigned char byte = 0;
+    {
+        auto use = query.use(SQLiteStmt::Bindings::Borrow);
+        use.apply(empty).apply(&byte, 0).apply("ignored", false).apply(31);
+        ASSERT_TRUE(use.next());
+        EXPECT_EQ(use.getStr(0), "text");
+        EXPECT_EQ(use.getStr(1), "blob");
+        EXPECT_EQ(use.getStr(2), "null");
+        EXPECT_EQ(use.getInt(3), 31);
+    }
+    {
+        auto use = query.use(SQLiteStmt::Bindings::Borrow);
+        use.apply(static_cast<const unsigned char *>(nullptr), 0)
+            .apply(static_cast<const unsigned char *>(nullptr), 7)
+            .bind()
+            .apply(37);
+        ASSERT_TRUE(use.next());
+        EXPECT_EQ(use.getStr(0), "null");
+        EXPECT_EQ(use.getStr(1), "null");
+        EXPECT_EQ(use.getStr(2), "null");
+        EXPECT_EQ(use.getInt(3), 37);
+    }
+    SQLiteStmt one{db, "select ?1"};
+    EXPECT_THROW(
+        {
+            auto use = one.use(SQLiteStmt::Bindings::Borrow);
+            use.apply(empty);
+            use.apply(41);
+        },
+        SQLiteError);
+    auto use = one.use();
+    ASSERT_TRUE(use.next());
+    EXPECT_TRUE(use.isNull(0));
+    db.exec("create table item (value text unique)");
+    db.exec("insert into item values ('duplicate')");
+    SQLiteStmt insert{db, "insert into item values (?)"};
+    std::string value = "duplicate";
+    EXPECT_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec(), SQLiteError);
+    value = "accepted";
+    EXPECT_NO_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec());
+    SQLiteStmt count{db, "select count(*) from item"};
+    auto rows = count.use();
+    ASSERT_TRUE(rows.next());
+    EXPECT_EQ(rows.getInt(0), 2);
+}
+
+TEST(SQLite, busyBorrowedInsertionCanBeRetriedAfterItsOwnerChanges)
+{
+    AutoDelete dir{createTempDir()};
+    auto path = dir.path() / "bindings.sqlite";
+    SQLite first{path, {.useWAL = false}};
+    first.exec("create table item (value text)");
+    SQLite second{path, {.useWAL = false}};
+    ASSERT_EQ(sqlite3_busy_timeout(second, 0), SQLITE_OK);
+    SQLiteStmt insert{second, "insert into item values (?)"};
+    std::string value = "blocked";
+    first.exec("begin exclusive");
+    EXPECT_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec(), SQLiteBusy);
+    first.exec("commit");
+    value = "accepted after retry";
+    EXPECT_NO_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec());
+    SQLiteStmt query{second, "select value from item"};
+    auto use = query.use();
+    ASSERT_TRUE(use.next());
+    EXPECT_EQ(use.getStr(0), value);
+    EXPECT_FALSE(use.next());
+}
+
 TEST(SQLite, externallySynchronizedConnectionOmitsOnlyItsOwnMutex)
 {
     AutoDelete dir{createTempDir()};
