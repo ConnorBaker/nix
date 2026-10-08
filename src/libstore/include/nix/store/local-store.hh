@@ -548,22 +548,6 @@ public:
     bool materialisesFromObjects() const;
 
     /**
-     * How many threads `materialiseThroughObjects` walks a directory's
-     * *subdirectories* on (`HashingVisitor::hashDirectory`; `08`
-     * K17).  Not a setting: what the copy makes does not depend on it
-     * (01 §10, *no settings, single codepath*), so there is no decision
-     * for a user to make; the size is the machine's processor count
-     * capped at eight, computed where the pool is made.
-     *
-     * **Test-only.**  Zero means that fixed size.  The unit tests set it
-     * so that one worker and eight can be compared on the same tree
-     * (`LocalStoreObjectsTest.parallelCopyIsTheSequentialCopy`,
-     * `prop_parallel_copy_is_the_sequential_copy`); nothing else writes
-     * it, and no production path reads a non-zero value.
-     */
-    static std::atomic<size_t> copyWorkersForTest;
-
-    /**
      * Restore the tree at `path` into `dst` from the store's own objects
      * where it holds them, and through the composite of
      * `restoreThroughObjects` where it does not (01 §9.10, the second

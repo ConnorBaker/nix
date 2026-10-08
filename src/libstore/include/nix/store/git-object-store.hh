@@ -387,10 +387,10 @@ public:
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
 
-        /** Claim a completed file as this ingestion's holder. Return the
-         * existing holder if another worker published first. The claim
-         * remains stable until the ingestion finishes. */
-        std::optional<std::string> addRow(Row row) const;
+        /** Consume a completed row only when its key is new; otherwise leave
+         * it intact and return the first holder. Claims remain stable until
+         * the ingestion finishes. */
+        std::optional<std::string> addRow(Row && row) const;
 
         /**
          * The completed file this ingestion owns for (id, mode), if any:

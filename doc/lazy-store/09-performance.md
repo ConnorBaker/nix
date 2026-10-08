@@ -1,44 +1,40 @@
 # Evaluation performance and preserved behavior
 
-Measured **d40e83be736091ce3ae999c923fbb411d9a98e51**, with all thirteen providers rebuilt coherently, has lower paired elapsed-time medians in all nine cases against immutable branch base **8aad447**, winning **51/54** pairs. Cold-path and both warm-Git CPU medians remain higher in every pair. The [committed census](/tmp/nix-owned-coordinate-and-ordinal-debug-oct8/COMMITTED-SOURCE-CENSUS.json) is **180 runtime files, +13,076/−3,655, net +9,421**, including source comments/blanks. Uniform CPU improvement and source reduction remain unfinished.
+Measured **06f597e4b30e67557589074f85452b73d1de068d**, with all thirteen providers rebuilt coherently, has lower paired elapsed-time medians in all nine cases against immutable branch base **8aad447**, winning **53/54** pairs. Cold-path and both warm-Git CPU medians remain higher in all six pairs per case. The [committed census](/tmp/nix-post-d40-projection-successor-oct8/debug/COMMITTED-SOURCE-CENSUS.json) is **180 runtime files, +13,063/−3,652, net +9,411**, including source comments/blanks. Uniform CPU improvement and source reduction remain unfinished.
 
-The [sealed d40 comparison](/tmp/nix-current-d40-base-nine-benchmark-oct8/COMPLETE.json) retains **114 complete outputs, 54 balanced adjacent pairs and 21 complete store graphs**. All outputs and graphs pass [independent review](/tmp/nix-permissions-retry-oct7/INDEPENDENT-CURRENT-D40-BASE-NINE-BENCHMARK-RESULT-AUDIT.json); all **42 private states** are retired. Each case has six pairs, three AB and three BA. Warm states seed thirty-two attributes; GitHub uses real pinned acquisition. Cold denotes fresh private Nix state, with host page caches intact. Percentages are medians of paired d40/base ratios; negative is lower.
+The [sealed comparison](/tmp/nix-post-d40-base-nine-benchmark-oct8/COMPLETE.json) retains **114 complete outputs, 54 balanced adjacent pairs and 21 complete store graphs**. All outputs and graphs pass [independent review](/tmp/nix-permissions-retry-oct7/INDEPENDENT-POST-D40-BASE-NINE-BENCHMARK-RESULT-AUDIT.json); all **42 private states** are retired. Each case has six pairs, three AB and three BA. Warm states seed thirty-two attributes; GitHub uses real pinned acquisition. Cold denotes fresh private Nix state, with host page caches intact. Percentages are medians of paired current/base ratios; negative is lower.
 
 | Case | Wall change | CPU change | RSS change | Faster wall pairs |
 |---|---:|---:|---:|---:|
-| cold 32 path | −23.44% | +59.08% | +13.02% | 6/6 |
-| cold 32 git | −22.99% | −4.81% | −0.87% | 6/6 |
-| cold 32 github | −47.79% | −72.64% | +0.54% | 6/6 |
-| warm 8 path | −86.58% | −70.84% | −15.63% | 6/6 |
-| warm 8 git | −6.25% | +60.93% | −0.12% | 6/6 |
-| warm 8 github | −13.71% | −13.79% | +1.24% | 6/6 |
-| warm 32 path | −73.38% | −58.88% | −7.18% | 6/6 |
-| warm 32 git | −3.03% | +35.71% | −0.47% | 5/6 |
-| warm 32 github | −4.45% | −4.76% | +0.38% | 4/6 |
+| cold 32 path | −24.09% | +52.81% | +11.72% | 6/6 |
+| cold 32 git | −19.57% | −1.42% | −0.52% | 6/6 |
+| cold 32 github | −46.52% | −70.26% | +4.82% | 6/6 |
+| warm 8 path | −86.49% | −68.85% | −13.35% | 6/6 |
+| warm 8 git | −9.68% | +57.05% | −0.50% | 6/6 |
+| warm 8 github | −11.81% | −14.04% | +0.55% | 6/6 |
+| warm 32 path | −73.27% | −58.50% | −7.61% | 6/6 |
+| warm 32 git | −4.31% | +36.40% | −0.72% | 6/6 |
+| warm 32 github | −9.66% | −7.88% | +0.32% | 5/6 |
 
-[Every observation](/tmp/nix-current-d40-base-nine-benchmark-oct8/READOUT.md) is retained, including all adverse CPU/RSS metrics and individual pair losses. The 2,192 pressure observations separate into **976 timed, 107 seed, 1,027 graph and 82 guard** records. Timed CPU/I/O/memory some-PSI avg10 maxima are **15.98%/1.19%/18.99%**; graph-phase I/O reaches **66.99%**. Graph-phase pressure must not be assigned to evaluation. These observations establish no causal timing fraction. Base uses libgit2 **1.9.7** and an older SDK; d40 uses **2.0.0-rc.1** and its coherent current SDK. Whole-endpoint ratios cannot isolate a source increment or be subtracted from historical host windows.
+[Every observation](/tmp/nix-post-d40-base-nine-benchmark-oct8/READOUT.md) is retained, including adverse CPU/RSS metrics and the single wall-pair loss. The **1,499 pressure observations** separate into **898 timed, 82 seed, 451 graph and 68 guard** records. Timed CPU/I/O/memory some-PSI avg10 maxima are **7.14%/1.35%/5.31%**; graph-phase maxima are **3.07%/0.36%/0%**. Pressure monitoring runs during evaluations; postflight runtime checks and complete graph checks follow them. These observations establish no causal timing fraction. Base uses libgit2 **1.9.7** and an older SDK; current uses **2.0.0-rc.1** and its coherent SDK. Whole-endpoint ratios cannot isolate a source increment or be subtracted from historical host windows.
 
-The [actual optimized closure](/tmp/nix-regular-writer-value-optimized-oct8/closure/RESULT.json) and [18 functionals plus 12 real-overlay tests](/tmp/nix-regular-writer-value-functional-oct8/RESULT.json) pass. Complete [422 selected native extents](/tmp/nix-final-writer-posix-filter-aux-native-oct8-retry1/COVERAGE.json) conserve their captured instruction domains; costs are mixed. Returning scoped writers by value removes their object allocation, but unconditional filtering-coordinate moves add work for caching/fixed-set paths and are rejected as an optimization. The experimental d40 endpoint includes that change, so its results remain the evidence for that whole endpoint. Subsequent changes return linked size, reuse the existing query, borrow the scoped size callback and restore the filtering constructor, removing ten runtime lines to leave **+9,411**. Their [debug gate](/tmp/nix-post-d40-projection-successor-oct8/debug/TEST.json) passes both 931-case utility runs, 1,011 store cases and 179 fetcher cases with existing skips/disabled cases retained; optimized cost and evaluation remain pending.
+The [actual optimized closure](/tmp/nix-post-d40-projection-successor-oct8/optimized/closure/RESULT.json), [18 functionals plus 12 real overlays](/tmp/nix-post-d40-projection-successor-oct8/functional/RESULT.json), and [debug gate](/tmp/nix-post-d40-projection-successor-oct8/debug/TEST.json) pass. The debug gate retains both 931-case utility runs, 1,011 store cases and 179 fetcher cases with existing skips/disabled cases. These gates establish behavior, not reduced execution work.
+
+[Complete native review](/tmp/nix-current06f597-native-review-oct8/REVIEW-UNION.json) covers **223 commands, 219 extents and 446 raw streams**, with mixed costs. Borrowing the known-copy size callback removes one 40-byte object allocation. Returning linked size removes a full status output but adds some caller spills. Reusing the unmigrated query introduces outlining calls and adds **80/80/96 bytes of composed live frames** in uncached/migration/optimisation routes. Restoring the filtering constructor removes intermediate lvalue machinery but adds copies for temporary prefixes. These finite native results retain regressions and exclude callee execution; they prove no uniform generated-code improvement. Candidate followups remain outside this measured endpoint.
 
 The [sealed matched kernel pair](/tmp/nix-sql-borrow-kernel-instruction-profile-oct8/COMPLETE.json) compares retained 622065/d73207, not base or d40. All 20,575 native samples reconcile with physical frames; 280,928 core frames bind exact symbols/offsets, while 217 module frames retain unproved compiled identity. Directory-creation ancestry includes semaphore spinning; journal/checkpoint ancestry also changes. These are overlapping instruction-event samples, not syscall counts, bytes or causal seconds. User publication callers and lock-owner identities remain unproved. The [complete syscall census](/tmp/nix-sql-borrow-syscall-fault-final-oct8/READOUT.md) found nearly unchanged non-futex calls; that does not prove equal internal kernel work or explain earlier counter differences.
+
+## Prior d40 comparison
+
+The [sealed d40 comparison](/tmp/nix-current-d40-base-nine-benchmark-oct8/COMPLETE.json) measured **d40e83be736091ce3ae999c923fbb411d9a98e51**, retaining all **114 outputs, 54 pairs and 21 graphs**, with **51/54** wall wins and all **42 states** retired. Its source census was **+9,421 runtime lines**. CPU remained higher for cold path (**+59.08%**) and warm Git at eight/thirty-two attributes (**+60.93%/+35.71%**), losing all six CPU pairs in each case. The experimental unconditional filtering-coordinate move was rejected after native review found added work in caching/fixed-set paths; d40 remains preserved as its whole-endpoint measurement.
+
+[All d40 observations](/tmp/nix-current-d40-base-nine-benchmark-oct8/READOUT.md) remain retained. Its **2,192 pressure records** partition into **976 timed, 107 seed, 1,027 graph and 82 guard** observations; timed CPU/I/O/memory maxima were **15.98%/1.19%/18.99%**, while graph I/O reached **66.99%**. Those pressure windows and ratios are historical, not measurements of 06f597 or causal incremental effects.
 
 ## Prior coherent 622065 comparison
 
 Measured **622065309ebb790decd93465a04d9d79f99feef0**, with all thirteen runtime providers rebuilt together, has lower paired wall medians in all nine cases against immutable branch base **8aad447**. It wins **51/54** wall pairs. Cold-path and both warm-Git CPU medians remain higher in all six pairs per case. This measured source is **9,452 physical runtime-source lines above base**. Uniform performance and source reduction remain unfinished.
 
 The [sealed current comparison](/tmp/nix-current-full13-base-nine-benchmark-oct8/COMPLETE.json) retains **114 complete outputs, 54 balanced adjacent pairs and 21 complete store graphs**. All outputs and graphs pass; all **42 private states** are retired. [Independent byte closure](/tmp/nix-permissions-retry-oct7/INDEPENDENT-CURRENT-FULL13-BASE-NINE-BENCHMARK-CLOSURE-AUDIT.json) checks every retained leaf. Every warm state seeds thirty-two attributes. GitHub uses real pinned acquisition. Cold denotes fresh private application state, with kernel caches left intact. Percentages are medians of paired current/base ratios; negative is lower.
-
-| Case | Wall change | CPU change | RSS change | Faster wall pairs |
-|---|---:|---:|---:|---:|
-| cold 32 path | −19.02% | +58.29% | +14.16% | 6/6 |
-| cold 32 git | −21.33% | −2.87% | −0.67% | 6/6 |
-| cold 32 github | −32.52% | −68.20% | −10.27% | 6/6 |
-| warm 8 path | −86.12% | −68.72% | −14.69% | 6/6 |
-| warm 8 git | −4.16% | +63.76% | +0.20% | 6/6 |
-| warm 8 github | −16.48% | −14.04% | +1.00% | 6/6 |
-| warm 32 path | −70.23% | −56.73% | −6.51% | 6/6 |
-| warm 32 git | −5.63% | +32.47% | −1.11% | 4/6 |
-| warm 32 github | −8.54% | −9.09% | +0.21% | 5/6 |
 
 [Every observation and pressure sample](/tmp/nix-current-full13-base-nine-benchmark-oct8/READOUT.md) remains retained, including adverse CPU, RSS and individual wall results. Base uses libgit2 1.9.7 and current uses 2.0.0-rc.1; the comparison includes dependency and build differences. These results cannot establish causal incremental improvements over earlier host windows. The coherent optimized endpoint also passes [18 functionals and 12 real-overlay tests](/tmp/nix-current-thirteen-functional-oct8/COMPLETE.json), with no failures or skips.
 
@@ -68,19 +64,7 @@ Commit **b5121d567** removes duplicate fresh-store cache DDL, reusing the existi
 
 Measured **76b4cae3281b149f239396efcbe7b01b864bbfbf** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Cold-path and both warm-Git CPU medians remain higher in every pair. The uniform-performance and source-size goals remain open: the implementation is **9,456 physical runtime-source lines above base**, **45 fewer than measured v5**.
 
-The [sealed v7 comparison](/tmp/nix-combined-reductions-v7-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v5 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. The [independent result audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-COMBINED-REDUCTIONS-V7-BENCHMARK-RESULT-AUDIT.json) checks the complete finite comparison domains. Percentages below are medians of paired candidate/control ratios; negative is lower.
-
-| Case | Wall change | CPU change | RSS change | Faster wall pairs |
-|---|---:|---:|---:|---:|
-| cold 32 path | −20.45% | +59.13% | +15.56% | 6/6 |
-| cold 32 git | −20.16% | −2.25% | −0.40% | 6/6 |
-| cold 32 github | −35.18% | −67.81% | −9.60% | 6/6 |
-| warm 8 path | −86.66% | −68.85% | −12.47% | 6/6 |
-| warm 8 git | −4.53% | +65.58% | +1.44% | 6/6 |
-| warm 8 github | −13.64% | −14.29% | +2.17% | 6/6 |
-| warm 32 path | −71.27% | −57.12% | −6.93% | 6/6 |
-| warm 32 git | −5.01% | +33.35% | −0.02% | 5/6 |
-| warm 32 github | −9.66% | −7.59% | +0.91% | 5/6 |
+The [sealed v7 comparison](/tmp/nix-combined-reductions-v7-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v5 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. The [independent result audit](/tmp/nix-permissions-retry-oct7/INDEPENDENT-COMBINED-REDUCTIONS-V7-BENCHMARK-RESULT-AUDIT.json) checks the complete finite comparison domains. Percentages in the linked results are medians of paired candidate/control ratios; negative is lower.
 
 Against actual v5, focused cold-path wall/CPU changes are **−0.56%/−0.29%** (three of six faster wall pairs); warm-8 Git changes **+3.51%/+1.19%** (one of six faster wall pairs). The simplifications therefore establish no uniform incremental evaluation benefit. All warm states seed 32 attributes, including focused Git; earlier focused seed-eight cohorts remain distinct. CPU counters retain their original centisecond precision.
 
@@ -118,24 +102,11 @@ Declared malloc/aligned/realloc entry counts decrease; these observations do not
 
 Measured **43f45b07a3c9ca5484ec495ba7c337c09221cbce** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Three CPU medians remain higher. The source-size and uniform-performance goals remain open: the measured implementation is **9,501 physical runtime-source lines above base**.
 
-The [sealed v5 comparison](/tmp/nix-borrowed-driver-v5-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v4 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. [Independent byte closure](/tmp/nix-permissions-retry-oct7/INDEPENDENT-BORROWED-DRIVER-V5-BENCHMARK-CLOSURE-AUDIT.json) checks all 557 retained leaves. Percentages below are medians of paired candidate/control ratios; negative is lower.
-
-| Case | Wall change | CPU change | RSS change | Faster wall pairs |
-|---|---:|---:|---:|---:|
-| cold 32 path | −20.30% | +54.34% | +12.66% | 6/6 |
-| cold 32 git | −18.67% | −1.96% | −0.42% | 6/6 |
-| cold 32 github | −29.97% | −67.78% | −17.56% | 5/6 |
-| warm 8 path | −85.76% | −67.83% | −12.05% | 6/6 |
-| warm 8 git | −8.71% | +56.33% | +1.03% | 6/6 |
-| warm 8 github | −11.76% | −13.56% | +2.26% | 6/6 |
-| warm 32 path | −71.71% | −56.46% | −4.90% | 6/6 |
-| warm 32 git | −5.53% | +34.45% | −0.44% | 5/6 |
-| warm 32 github | −7.91% | −9.04% | +0.90% | 6/6 |
+The [sealed v5 comparison](/tmp/nix-borrowed-driver-v5-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case and twelve focused pairs against the actual v4 endpoint. All **140 complete outputs, 66 pairs and 28 complete store graphs** pass; all **56 private states** are retired. [Independent byte closure](/tmp/nix-permissions-retry-oct7/INDEPENDENT-BORROWED-DRIVER-V5-BENCHMARK-CLOSURE-AUDIT.json) checks all 557 retained leaves. Percentages in the linked results are medians of paired candidate/control ratios; negative is lower.
 
 Against actual v4, focused cold-path wall/CPU changes are **+1.51%/+3.70%** (three of six faster wall pairs); warm-8 Git changes **+2.99%/+0.81%** (two of six faster wall pairs). These results establish no causal evaluation benefit from the adapter simplification. All warm states in this cohort seed 32 attributes, including focused warm Git; earlier focused seed-eight cohorts remain distinct. CPU counters retain their original centisecond precision.
 
 [Every observation and pressure sample](/tmp/nix-borrowed-driver-v5-benchmark-oct7/READOUT.md) is retained. Timed load1 ranges **0.41–10.99**; CPU/I/O/memory some-PSI avg10 maxima are **6.60%/17.01%/0%**. Shared-host interference is possible, but these observations do not explain instruction counts or assign causal fractions. Base uses libgit2 **1.9.7**, while v4/v5 share identical **2.0.0-rc.1** images; the base comparison includes dependency differences. Cold means fresh private application state, not evicted kernel caches; GitHub uses real pinned network acquisition. This timing packet contains no PMU or syscall attribution.
-
 
 The separate [matched v4/v5 PMU diagnostic](/tmp/nix-v4-v5-pmu-oct7/COMPLETE.json) retains six balanced pairs per case, with warm Git seeded32. All24 four-event groups have positive unscaled counts and exact enabled==running; all26 complete outputs and seven complete graphs pass. Paired median v5/v4 changes are:
 
@@ -150,19 +121,7 @@ Target-inherited counts include setpriv/Python/taskset/ELF startup; they provide
 
 Measured **89bdfbbccb9cfd74ec6b67d5c8ece03504a6cdc7** has lower paired wall medians in all nine cases against immutable branch base **8aad447**, with **52/54** faster pairs. Cold-path and both warm-Git CPU medians remain higher; warm-32 Git loses two wall pairs. The source-size and uniform-performance goals remain open: this measured source is **9,518 physical runtime-source lines above base**.
 
-The [sealed v3 comparison](/tmp/nix-derived-state-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case, plus twelve direct pairs against the actual v2 endpoint. All **140 complete outputs and 28 complete store graphs** pass, and all **56 private states** are retired. Percentages below are paired medians; negative is lower.
-
-| Case | Wall change | CPU change | RSS change | Faster wall pairs |
-|---|---:|---:|---:|---:|
-| cold 32 path | −21.10% | +58.81% | +14.03% | 6/6 |
-| cold 32 git | −19.99% | −3.20% | −0.83% | 6/6 |
-| cold 32 github | −40.89% | −67.69% | −5.14% | 6/6 |
-| warm 8 path | −86.52% | −68.49% | −12.90% | 6/6 |
-| warm 8 git | −11.50% | +58.88% | −0.43% | 6/6 |
-| warm 8 github | −11.68% | −12.25% | −1.10% | 6/6 |
-| warm 32 path | −72.41% | −58.03% | −6.70% | 6/6 |
-| warm 32 git | −4.35% | +35.00% | −0.07% | 4/6 |
-| warm 32 github | −9.11% | −9.47% | −3.06% | 6/6 |
+The [sealed v3 comparison](/tmp/nix-derived-state-benchmark-oct7/COMPLETE.json) retains six balanced adjacent pairs per case, plus twelve direct pairs against the actual v2 endpoint. All **140 complete outputs and 28 complete store graphs** pass, and all **56 private states** are retired. Percentages in the linked results are paired medians; negative is lower.
 
 Against actual v2, focused cold-path wall/CPU changes are **−0.89%/−0.45%**; warm-8 Git **−2.10%/−0.39%**. These small CPU differences approach centisecond rounding and establish no causal work reduction. Main warm states seed 32 attributes; focused warm Git seeds eight. [Every observation, adverse metric and pressure sample](/tmp/nix-derived-state-benchmark-oct7/READOUT.md) remains retained. The quieter host differs from the v2 window; no historical unpaired ratio is used.
 
@@ -182,39 +141,15 @@ Both comparisons evaluate Nixpkgs `6aefcda9401be8acc2b74244fb3b37520ea1f0a8` on 
 
 [Completion 4e3894e2](/home/connorbaker/Benchmarks/nix-performance-fixes/combined-simplification-20260929/comparison/COMPLETE.json) binds the [release/source/binaries c43b9d51](/home/connorbaker/Benchmarks/nix-performance-fixes/combined-simplification-20260929/comparison/BINDING.json), [8aad report 8d6212cd](/home/connorbaker/Benchmarks/nix-performance-fixes/combined-simplification-20260929/comparison/vs-8aad.json), and [U report a2442081](/home/connorbaker/Benchmarks/nix-performance-fixes/combined-simplification-20260929/comparison/vs-f2fe32368.json). All 312 outputs pass. Eighteen base graph-verification records cover every base-comparison sample and establish equivalent complete contents after address rewriting. All 156 direct-U output values, and all 78 candidate values in the base comparison, equal the retained full-output oracle. The [independent audit 7bc0ee85](/home/connorbaker/Benchmarks/nix-performance-fixes/combined-simplification-20260929/numeric-audit/RESULT.json) rechecks all eighteen case/reference cells, ninety metric cells and complete schedules; it checks retained graph-verification records without rewalking graphs. Verified first-phase cold scratch states were retired with a retained receipt; outputs and graph records remain bound.
 
-Changes below are percentages, **separate/paired**, rounded to three decimals; negative is lower. Separate divides candidate/reference medians; paired takes the median of matched-trial ratios. L/E/H counts exact candidate lower/equal/higher observations. CPU sums user/system centiseconds per observation before aggregation; component medians need not add. RSS is peak resident memory, not allocation volume. No observation is excluded or pooled with another cohort.
+Changes in the linked tables are percentages, **separate/paired**, rounded to three decimals; negative is lower. Separate divides candidate/reference medians; paired takes the median of matched-trial ratios. L/E/H counts exact candidate lower/equal/higher observations. CPU sums user/system centiseconds per observation before aggregation; component medians need not add. RSS is peak resident memory, not allocation volume. No observation is excluded or pooled with another cohort.
 
 ### Against branch base 8aad
-
-| Case | Wall separate/paired | Wall L/E/H | CPU separate/paired | CPU L/E/H | RSS separate/paired |
-|---|---:|---:|---:|---:|---:|
-| cold 32 path | -23.272%/-23.270% | 5/0/0 | +46.106%/+48.607% | 0/0/5 | +9.788%/+12.780% |
-| cold 32 git | -19.660%/-17.526% | 5/0/0 | -4.000%/-4.240% | 3/0/2 | -1.084%/-1.048% |
-| cold 32 github | -17.554%/-16.232% | 4/0/1 | -67.367%/-68.326% | 5/0/0 | -18.666%/-16.565% |
-| warm 8 path | -88.122%/-88.279% | 10/0/0 | -70.833%/-71.052% | 10/0/0 | -13.948%/-13.950% |
-| warm 8 git | -8.051%/-8.319% | 10/0/0 | +56.250%/+56.250% | 0/0/10 | +1.401%/+1.400% |
-| warm 8 github | -14.712%/-14.282% | 10/0/0 | -14.754%/-14.961% | 10/0/0 | +2.169%/+2.171% |
-| warm 32 path | -75.288%/-75.337% | 10/0/0 | -59.064%/-58.981% | 10/0/0 | -6.948%/-6.023% |
-| warm 32 git | -5.543%/-4.277% | 9/0/1 | +32.847%/+32.978% | 0/0/10 | -0.706%/-0.707% |
-| warm 32 github | -9.502%/-7.543% | 8/0/2 | -8.523%/-7.252% | 10/0/0 | -3.217%/-3.216% |
 
 Cold-path CPU rises **+46.106%/+48.607%**, warm-8 Git **+56.250%/+56.250%**, and warm-32 Git **+32.847%/+32.978%**; every pair is higher in each domain. RSS rises for cold path, warm-8 Git and warm-8 GitHub; cold path and warm-8 GitHub are higher in every pair. Lower wall time does not erase these costs.
 
 ### Against U/f2fe32368
 
-| Case | Wall separate/paired | Wall L/E/H | CPU separate/paired | CPU L/E/H | RSS separate/paired |
-|---|---:|---:|---:|---:|---:|
-| cold 32 path | -11.243%/-11.119% | 5/0/0 | -5.794%/-5.009% | 4/0/1 | -0.386%/-1.667% |
-| cold 32 git | +1.257%/-1.652% | 3/0/2 | -0.722%/-2.787% | 3/0/2 | -0.411%/-0.007% |
-| cold 32 github | +1.118%/+4.820% | 2/0/3 | +5.700%/+2.146% | 2/0/3 | +1.694%/+1.201% |
-| warm 8 path | -0.228%/-0.432% | 6/0/4 | -0.599%/-0.581% | 5/2/3 | -0.588%/-0.659% |
-| warm 8 git | -0.743%/+0.526% | 4/0/6 | +1.200%/-0.403% | 5/1/4 | +0.027%/+0.071% |
-| warm 8 github | +2.845%/+2.241% | 4/0/6 | +4.000%/+3.923% | 0/4/6 | +0.436%/+0.422% |
-| warm 32 path | -1.300%/-0.820% | 6/0/4 | -0.717%/+0.000% | 3/3/4 | -0.013%/-0.270% |
-| warm 32 git | +1.705%/+1.676% | 3/0/7 | +0.820%/+0.832% | 3/0/7 | +0.374%/+0.231% |
-| warm 32 github | +2.770%/+0.388% | 5/0/5 | +1.818%/+0.575% | 2/3/5 | +0.087%/+0.080% |
-
-Paired wall medians regress for **cold GitHub, warm-8 Git, warm-8 GitHub, warm-32 Git and warm-32 GitHub**; four improve, with **38/75** faster pairs. Separate wall medians instead regress for cold Git, cold GitHub, warm-8 GitHub, warm-32 Git and warm-32 GitHub: cold Git reverses **+1.257%/−1.652%**, while warm-8 Git reverses **−0.743%/+0.526%**. Both views remain in the table.
+Paired wall medians regress for **cold GitHub, warm-8 Git, warm-8 GitHub, warm-32 Git and warm-32 GitHub**; four improve, with **38/75** faster pairs. Separate wall medians instead regress for cold Git, cold GitHub, warm-8 GitHub, warm-32 Git and warm-32 GitHub: cold Git reverses **+1.257%/−1.652%**, while warm-8 Git reverses **−0.743%/+0.526%**. Both views remain in the linked reports.
 
 Paired CPU medians regress for **cold GitHub, warm-8 GitHub, warm-32 Git and warm-32 GitHub**; four improve and warm-32 path ties. Warm-8 Git CPU reverses **+1.200%/−0.403%**, and warm-32 path is **−0.717%/0.000%**. RSS is higher under both statistics for cold GitHub and all four warm Git/GitHub cases; both warm GitHub widths are higher in every pair. The audit retains all ten sign/tie disagreements among separate ratios, paired ratios and paired deltas across the five metrics, including user/system components.
 
@@ -256,24 +191,9 @@ The earlier key-only suites include sandbox-denied socket failures and do not va
 
 The [latest four-file comparison against 8aad](/tmp/nix-current-four-base-six-20261003/comparison/READOUT.md) and [direct comparison against the immutable previous three-file endpoint](/tmp/nix-current-four-final-six-20261003/comparison/READOUT.md) each check 104 fresh outputs, twelve complete store graphs, fixture censuses and frozen source/runtime identities. Each retains all fifty pairs and retires its 24 private states after verification. The [candidate binding](/tmp/nix-pending-key-oct3/final-four/combined-runtime-binding.json) identifies optimized manually built libutil/libstore using the same established recipe and dependencies; only those two libraries differ among 75 bound runtime entries, and all executable CLI sections retain their original bytes. The actual previously measured three-file endpoint is reused as a binary reference, with fresh outputs/states/timings. Four production files differ from f307; two differ from that direct reference. The October 3 cohorts excluded GitHub because networking was restricted.
 
-| Case | Paired wall vs 8aad | Faster pairs | Paired CPU vs 8aad | Paired wall vs previous three-file endpoint | Faster pairs | Paired CPU vs previous endpoint |
-|---|---:|---:|---:|---:|---:|---:|
-| cold 32 path | -9.455% | 4/5 | +44.304% | -2.386% | 3/5 | +4.060% |
-| cold 32 git | -22.462% | 5/5 | -10.526% | -0.495% | 3/5 | -1.325% |
-| warm 8 path | -84.263% | 10/10 | -72.029% | -7.451% | 7/10 | +0.000% |
-| warm 8 git | +4.474% | 4/10 | +38.382% | -1.049% | 6/10 | +1.890% |
-| warm 32 path | -71.648% | 10/10 | -62.295% | +0.589% | 5/10 | -0.662% |
-| warm 32 git | -3.326% | 7/10 | +17.947% | +0.554% | 5/10 | -0.495% |
-
 Against base five wall medians improve (40/50 pairs), but warm-8 Git rises **4.474%**. Cold-path and both warm-Git CPU measurements rise in every pair. Against the previous measured endpoint four wall medians improve (29/50 pairs), while warm-32 path/Git rise **0.589%/0.554%** and cold-path CPU rises **4.060%**. The direct comparison measures the combined incremental edits without assigning gains to individual changes. Separate median ratios, component times, spreads and every original observation remain in the complete reports. Direct evaluation IO PSI avg10 spans 0–37.60%, CPU 0–3.89%, load 8.88–18.57; base IO spans 0–0.84%, CPU 0–2.72%, memory 0–6.40%, load 10.02–13.16. Pressure is observed rather than assigned as a cause. No observations are excluded or percentages subtracted across windows. The implementation does not meet the uniform-performance goal.
 
 With networking restored, [the October 7 GitHub cohort](/tmp/nix-current-four-github-three-20261007/comparison/vs-8aad.json) measures the same current optimized endpoint against 8aad. All 52 fresh outputs and six complete store graphs match; all 25 pairs are retained and twelve private states are retired after the source/runtime/helper guards pass. The complete pinned archive census also matches all 89,979 Git-tree nodes, raw bytes and executable modes. These three cases belong to a separate host window from the October 3 path/Git cases; observations and percentages are not pooled across those windows.
-
-| Case | Paired wall vs 8aad | Faster wall pairs | Paired CPU vs 8aad | Lower CPU pairs |
-|---|---:|---:|---:|---:|
-| cold 32 github | -39.660% | 5/5 | -68.333% | 5/5 |
-| warm 8 github | -12.251% | 9/10 | -12.903% | 10/10 |
-| warm 32 github | -4.332% | 7/10 | -6.202% | 10/10 |
 
 All three wall and CPU medians improve. Adverse paired metrics remain: cold system CPU **+9.574%**, warm-8 RSS **+2.468%**, and warm-32 RSS **+0.545%**. Evaluation-span PSI avg10 ranges are CPU 0–45.36%, IO 0.07–7.39%, memory 0.01–33.28%; these observations do not establish a causal share. The earlier warm-8 Git wall and three path/Git CPU regressions remain unresolved.
 
@@ -319,7 +239,7 @@ The [six U user FP profiles](/home/connorbaker/Benchmarks/nix-performance-fixes/
 
 ## Historical 469699 measurements
 
-Measured **46969915647c2a542172b42f0fd4b2511ecb1947**, source manifest `437bcb41d62ee71bad52c1f3ddc9822edf40454e10e6e192560dfb4992fb08ee`, does **not** improve every case. Warm-8 Git wall time is higher than branch base 8aad; cold GitHub, warm-8 Git and warm-32 path are higher than E8. The following results and source counts apply only to this historical release.
+Measured **46969915647c2a542172b42f0fd4b2511ecb1947**, source manifest `437bcb41d62ee71bad52c1f3ddc9822edf40454e10e6e192560dfb4992fb08ee`, does **not** improve every case. Warm-8 Git wall time is higher than branch base 8aad; cold GitHub, warm-8 Git and warm-32 path are higher than E8. The linked results and source counts apply only to this historical release.
 
 ### Complete repeated measurements
 
@@ -327,35 +247,7 @@ Both comparisons evaluate Nixpkgs `6aefcda9401be8acc2b74244fb3b37520ea1f0a8` on 
 
 [Completion](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-reuse-20260929/comparison/COMPLETE.json) binds the [release/source/binaries](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-reuse-20260929/comparison/BINDING.json), [8aad report](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-reuse-20260929/comparison/vs-8aad.json), and [E8 report](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-reuse-20260929/comparison/vs-E8.json). All 312 outputs pass: eighteen complete graph comparisons against 8aad establish equivalence after address rewriting; all 156 direct E8 outputs exactly match the retained 407f reference. The [independent audit](/home/connorbaker/Benchmarks/nix-performance-fixes/semantic-reuse-20260929/analysis/numeric-audit-469699/READOUT.md) rechecks every output and all ninety case/metric cells. Verified cold scratch states were retired after complete checking; logs, outputs and graph maps remain bound. The independent audit reuses these maps without rerunning physical graph walks.
 
-Changes below are percentages, **separate/paired**; negative is better. Separate divides candidate/reference medians; paired takes the median of matched-trial ratios. W/T/L counts exact candidate lower/equal/higher wall observations. CPU sums exact GNU-time user/system centiseconds per observation before aggregation; component medians need not add. RSS is peak resident memory, not allocation volume. No observation is excluded or pooled with another cohort.
-
-#### Against 8aad
-
-| Case | Wall separate/paired | Wall W/T/L | CPU separate/paired | RSS separate/paired |
-|---|---:|---:|---:|---:|
-| cold 32 path | -12.27%/-15.23% | 5/0/0 | +69.94%/+68.93% | +20.79%/+20.36% |
-| cold 32 git | -9.27%/-9.29% | 5/0/0 | -0.36%/+0.72% | -0.57%/-0.56% |
-| cold 32 github | -44.97%/-41.09% | 4/0/1 | -73.63%/-73.63% | +4.68%/+5.72% |
-| warm 8 path | -87.65%/-87.78% | 10/0/0 | -76.98%/-76.86% | -12.94%/-12.44% |
-| warm 8 git | +1.82%/+2.67% | 5/0/5 | +48.82%/+50.89% | -0.39%/-0.37% |
-| warm 8 github | -13.73%/-13.96% | 10/0/0 | -14.29%/-14.93% | +2.00%/+2.00% |
-| warm 32 path | -75.16%/-74.96% | 10/0/0 | -65.90%/-66.02% | +6.37%/+6.30% |
-| warm 32 git | -0.86%/-0.48% | 7/0/3 | +27.89%/+27.21% | -0.65%/-0.65% |
-| warm 32 github | -7.26%/-7.94% | 9/0/1 | -7.49%/-7.49% | -2.36%/-2.36% |
-
-#### Against E8
-
-| Case | Wall separate/paired | Wall W/T/L | CPU separate/paired | RSS separate/paired |
-|---|---:|---:|---:|---:|
-| cold 32 path | -1.41%/-0.36% | 3/0/2 | +10.22%/+10.39% | -1.26%/-0.85% |
-| cold 32 git | -4.65%/-7.61% | 4/0/1 | -2.04%/-4.76% | -0.06%/-0.06% |
-| cold 32 github | +2.81%/+0.19% | 2/0/3 | +1.10%/+0.56% | -0.38%/+2.07% |
-| warm 8 path | -0.73%/-0.23% | 5/0/5 | +0.00%/-0.58% | -2.13%/-2.08% |
-| warm 8 git | +3.55%/+1.13% | 3/0/7 | +1.20%/+0.39% | -0.09%/-0.48% |
-| warm 8 github | -1.40%/-1.38% | 7/0/3 | -1.92%/+0.00% | +0.06%/+0.05% |
-| warm 32 path | +0.97%/+1.73% | 3/0/7 | +0.71%/+0.01% | -0.46%/-0.49% |
-| warm 32 git | -1.84%/-1.11% | 7/0/3 | +0.00%/-0.54% | -0.44%/-0.43% |
-| warm 32 github | -0.38%/-0.50% | 5/0/5 | -0.60%/-1.18% | +0.05%/+0.05% |
+Changes in the linked tables are percentages, **separate/paired**; negative is better. Separate divides candidate/reference medians; paired takes the median of matched-trial ratios. W/T/L counts exact candidate lower/equal/higher wall observations. CPU sums exact GNU-time user/system centiseconds per observation before aggregation; component medians need not add. RSS is peak resident memory, not allocation volume. No observation is excluded or pooled with another cohort.
 
 Against 8aad, cold-path and both warm-Git CPU measurements are higher in every pair. Cold Git CPU reverses −0.3571% separately to +0.7220% paired. RSS rises in four cases; cold path, warm-8 GitHub and warm-32 path are higher in every pair. Lower wall time does not erase those costs.
 

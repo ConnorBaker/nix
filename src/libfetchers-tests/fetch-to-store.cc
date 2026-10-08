@@ -1167,12 +1167,12 @@ TEST_F(FetchToStoreLocalTest, pathInputsPreserveTheTreeForEveryStoreStateAndWidt
     auto input = fetchers::Input::fromAttrs({{"type", "path"}, {"path", inputDir.string()}});
     fetchers::Settings fetchSettings;
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     for (size_t size : {size_t(4096), size_t(65 * 1024 * 1024)}) {
         writeFile(inputDir / "large", std::string(size, 'q'));
         for (size_t workers = 1; workers <= 8; ++workers) {
             SCOPED_TRACE(fmt("size=%d workers=%d", size, workers));
-            LocalStore::copyWorkersForTest.store(workers);
+            HashingVisitor::workersForTest.store(workers);
             auto destinationConfig = std::make_shared<LocalStoreConfig>(
                 tempStoreDir.path() / fmt("destination-%d-%d", size, workers), StoreConfig::Params{});
             auto destination = std::make_shared<LocalStore>(ref{destinationConfig});
@@ -1541,8 +1541,6 @@ RC_GTEST_FIXTURE_PROP(FetchToStoreTest, prop_memoRowIsTheEntryHashForEveryRootKi
 TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
 {
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
-    Finally restoreHashWorkers{
         [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     const auto caller = std::this_thread::get_id();
     size_t cases = 0;
@@ -1589,7 +1587,6 @@ TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
                                 throw Error("filter stopped");
                             return !prune || !hasSuffix(path, "/drop");
                         };
-                        LocalStore::copyWorkersForTest.store(workers);
                         HashingVisitor::workersForTest.store(workers);
                         fetchers::Settings settings;
                         auto fetch = [&] {
@@ -1616,13 +1613,13 @@ TEST_F(FetchToStoreLocalTest, filtersKeepTheirCallerThreadAndDepthFirstEffects)
 TEST_F(FetchToStoreLocalTest, copiedIdentityFiltersPreserveTheTreeAtEveryWidth)
 {
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     auto source = make_ref<ConcurrentMemorySource>();
     source->root = namedTree(std::nullopt)->root;
     auto expected = narOf(*source);
     for (size_t workers = 1; workers <= 8; ++workers) {
         SCOPED_TRACE(workers);
-        LocalStore::copyWorkersForTest.store(workers);
+        HashingVisitor::workersForTest.store(workers);
         PathFilter copied = defaultPathFilter;
         auto path = store->materialise(
             fmt("identity-copy-%d", workers),

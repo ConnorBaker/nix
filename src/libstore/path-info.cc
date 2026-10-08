@@ -243,21 +243,16 @@ nlohmann::json UnkeyedValidPathInfo::toJSON(
             throw Error(
                 "cannot render path info as JSON format 4: the object hash is not known (the description came from a peer that does not carry one; use a lower format)");
         jsonObject["objectHash"] = objectHash->render();
-        if (assertedNarHash)
-            jsonObject["narHash"] = *assertedNarHash;
-    } else {
-        /* Formats 1 to 3 require the NAR hash: the one asserted to us, else
-           the shim's walk, else nothing to write. */
-        auto narHash = [&]() -> Hash {
-            if (assertedNarHash)
-                return *assertedNarHash;
-            if (narHashFor)
-                return (*narHashFor)();
+    }
+    if (assertedNarHash)
+        jsonObject["narHash"] = *assertedNarHash;
+    else if (format != PathInfoJsonFormat::V4) {
+        /* Formats 1 to 3 require the caller's NAR hash when none is asserted. */
+        if (!narHashFor)
             throw Error(
                 "cannot render path info as JSON format %d: it requires a NAR hash, and none is known (use format 4, or supply the shim)",
                 static_cast<int>(format));
-        }();
-        jsonObject["narHash"] = narHash;
+        jsonObject["narHash"] = (*narHashFor)();
     }
 
     jsonObject["narSize"] = narSize;

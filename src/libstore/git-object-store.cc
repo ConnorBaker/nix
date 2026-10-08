@@ -140,7 +140,7 @@ const std::filesystem::path & GitObjectStore::Hold::root() const
     return pending->root;
 }
 
-std::optional<std::string> GitObjectStore::Hold::addRow(Row row) const
+std::optional<std::string> GitObjectStore::Hold::addRow(Row && row) const
 {
     auto regular = pending->regular.lock();
     auto [i, inserted] = regular->insert(std::move(row));

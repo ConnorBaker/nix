@@ -111,7 +111,8 @@ public:
     {
     }
 
-    /** Zero selects the bounded machine width; tests enumerate 1..8. */
+    /** Test-only width for audited hash/copy walks; zero selects the bounded
+     * machine width, and tests enumerate 1..8. Permissions still gate concurrency. */
     static std::atomic<size_t> workersForTest;
 
     static size_t workerCountFor(SourceAccessor & accessor, PathFilter & filter);

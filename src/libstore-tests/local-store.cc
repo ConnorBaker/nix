@@ -4374,14 +4374,16 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
         return result;
     };
     auto claim = [&](const Row & row, const std::filesystem::path & expectedRoot) {
-        EXPECT_FALSE(hold.addRow(row));
+        EXPECT_FALSE(hold.addRow(Row(row)));
         EXPECT_EQ(hold.root(), expectedRoot);
         auto expected = (expectedRoot / row.name).string();
         auto duplicate = row;
         duplicate.name += "-rejected";
         ++duplicate.ino;
         ++duplicate.size;
+        auto duplicateName = duplicate.name;
         EXPECT_EQ(hold.addRow(std::move(duplicate)), expected);
+        EXPECT_EQ(duplicate.name, duplicateName);
         EXPECT_EQ(hold.pendingHolder(row.id, row.executable), expected);
     };
     auto complete = [&](const std::vector<Row> & expected) {
@@ -4496,9 +4498,12 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
     for (size_t length = 0; length <= Hash::maxHashSize; ++length)
         for (bool executable : {false, true}) {
             auto row = makeRow(length, HashAlgorithm::SHA256, executable);
-            ASSERT_FALSE(hold.addRow(row));
+            ASSERT_FALSE(hold.addRow(Row(row)));
             ASSERT_TRUE(expected.emplace(key(row.id, executable), row).second);
             ASSERT_EQ(hold.pendingHolder(row.id, executable), holder(row));
+            auto duplicate = row;
+            ASSERT_EQ(hold.addRow(std::move(duplicate)), holder(row));
+            ASSERT_EQ(duplicate.name, row.name);
         }
 
     /* Exhaust length x array position x byte value. These are the included
@@ -4536,7 +4541,7 @@ TEST_F(LocalStoreObjectsTest, pendingRowsProjectExactlyTheActiveHashBytesAndMode
         Relation firstRows;
         for (bool executable : {false, true}) {
             auto first = makeRow(32, firstTag, executable);
-            ASSERT_FALSE(hold.addRow(first));
+            ASSERT_FALSE(hold.addRow(Row(first)));
             ASSERT_TRUE(firstRows.emplace(key(first.id, executable), first).second);
             for (auto tag : tags) {
                 auto duplicate = first;
@@ -4989,7 +4994,7 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
                     .dev = 2,
                     .size = 3,
                     .name = fmt("holder-%d-%d-%d", position, byte, executable)};
-                auto prior = hold.addRow(row);
+                auto prior = hold.addRow(std::move(row));
                 if (position == 0 || byte != 0)
                     EXPECT_FALSE(prior);
                 else
@@ -8441,8 +8446,8 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
     };
 
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
-    LocalStore::copyWorkersForTest.store(2);
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    HashingVisitor::workersForTest.store(2);
     for (bool executable : {false, true})
         for (bool spill : {false, true}) {
             SCOPED_TRACE(fmt("executable=%d spill=%d", executable, spill));
@@ -8537,8 +8542,8 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
 TEST_F(LocalStoreObjectsTest, completedSubtreeMergesEveryAliasAndNeverRollsBackPublishedRows)
 {
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
-    LocalStore::copyWorkersForTest.store(1);
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    HashingVisitor::workersForTest.store(1);
     for (bool executable : {false, true})
         for (bool fail : {false, true}) {
             SCOPED_TRACE(fmt("executable=%d fail=%d", executable, fail));
@@ -9201,7 +9206,7 @@ TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionA
     }
     PathFilter all = AllPaths{};
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     for (bool sourcePermitted : {false, true})
         for (bool callbacksPermitted : {false, true})
             for (size_t workers = 1; workers <= 8; ++workers) {
@@ -9219,7 +9224,7 @@ TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionA
                 /* The first wave cannot complete until this many distinct
                    executing threads have entered a read. All waits are bounded. */
                 source->gateWidth = parallel ? workers : 0;
-                LocalStore::copyWorkersForTest.store(workers);
+                HashingVisitor::workersForTest.store(workers);
                 auto dst = config->realStoreDir.get() / label;
                 ObservedHooks hooks{
                     *source,
@@ -9254,7 +9259,7 @@ TEST_F(LocalStoreObjectsTest, concurrentCopyRequiresSourceAndCallbackPermissionA
    not depend on how many threads that is.  Both copies are made into the
    same store, which already holds every object, so each file is a link to
    the same blob and the two paths can be compared inode for inode as well
-   as byte for byte.  `LocalStore::copyWorkersForTest` is the test-only
+   as byte for byte.  `HashingVisitor::workersForTest` is the test-only
    seam for the pool's size (there is no setting: what the copy makes does
    not depend on the count); `1` is exactly the walk before the pool
    existed.
@@ -9284,7 +9289,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
     auto r0 = restore(reference, nar);
 
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()]() { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()]() { HashingVisitor::workersForTest.store(old); }};
 
     struct Copy
     {
@@ -9306,7 +9311,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
     for (auto & [label, src] : sources) {
         std::vector<Copy> copies;
         for (size_t workers = 1; workers <= 8; ++workers) {
-            LocalStore::copyWorkersForTest.store(workers);
+            HashingVisitor::workersForTest.store(workers);
             auto dst = realStoreDir / fmt("%s-w%d", label, workers);
             auto r = materialise(dst, src, noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
             copies.push_back({dst, r, filesCreated});
@@ -9346,9 +9351,9 @@ TEST_F(LocalStoreObjectsTest, parallelCopyIsTheSequentialCopy)
 TEST_F(LocalStoreObjectsTest, freshParallelCopySharesDuplicatesAtEveryWidth)
 {
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     for (size_t workers = 1; workers <= 8; ++workers) {
-        LocalStore::copyWorkersForTest.store(workers);
+        HashingVisitor::workersForTest.store(workers);
         Nodes nodes;
         auto bytes = fmt("width %d ", workers) + std::string(65536, 'x');
         for (size_t dir = 0; dir < 16; ++dir)
@@ -9407,9 +9412,9 @@ TEST_F(LocalStoreObjectsTest, nestedParallelCopyJoinsOnFailure)
     source->root = std::move(treeAccessor(nodes)->root);
     auto expected = narOf(*treeAccessor(nodes));
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     for (size_t workers = 1; workers <= 8; ++workers) {
-        LocalStore::copyWorkersForTest.store(workers);
+        HashingVisitor::workersForTest.store(workers);
         source->fail = true;
         auto dst = std::filesystem::path{config->realStoreDir.get()} / fmt("failure-%d", workers);
         EXPECT_THROW(
@@ -9467,7 +9472,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyPreservesLogicalAndPhysicalChildNames)
     writeFile(tempStoreDir.path() / "CaseSensitiveProbe", "");
     bool caseSensitive = !pathExists(tempStoreDir.path() / "casesensitiveprobe");
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()] { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     size_t cases = 0;
     for (bool caseHack : {false, true}) {
         if (!caseHack && !caseSensitive)
@@ -9483,7 +9488,7 @@ TEST_F(LocalStoreObjectsTest, parallelCopyPreservesLogicalAndPhysicalChildNames)
         }
         for (size_t workers = 1; workers <= 8; ++workers) {
             SCOPED_TRACE(fmt("caseHack=%d workers=%d", caseHack, workers));
-            LocalStore::copyWorkersForTest.store(workers);
+            HashingVisitor::workersForTest.store(workers);
             auto dst = config->realStoreDir.get() / fmt("names-h%d-w%d", caseHack, workers);
             auto result = materialise(
                 dst, SourcePath(tree), noNode(), NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true);
@@ -9526,14 +9531,14 @@ RC_GTEST_FIXTURE_PROP(LocalStoreObjectsTest, prop_parallel_copy_is_the_sequentia
     auto r0 = restore(reference, nar);
 
     Finally restoreWorkers{
-        [old = LocalStore::copyWorkersForTest.load()]() { LocalStore::copyWorkersForTest.store(old); }};
+        [old = HashingVisitor::workersForTest.load()]() { HashingVisitor::workersForTest.store(old); }};
 
     for (auto & label : {std::string("every"), std::string("none")}) {
         LocalStore::TreeNamer namer = label == "every" ? everyNode(tree) : noNode();
         std::vector<std::filesystem::path> dsts;
         std::vector<ObjectHashSink::Result> results;
         for (size_t workers : {size_t(1), size_t(8)}) {
-            LocalStore::copyWorkersForTest.store(workers);
+            HashingVisitor::workersForTest.store(workers);
             auto dst = realStoreDir / (label + fmt("-w%d", workers));
             results.push_back(materialise(
                 dst, SourcePath(tree), namer, NoRepair, defaultPathFilter, /*callbacksPermitParallelism=*/true));

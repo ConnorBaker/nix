@@ -896,10 +896,6 @@ ObjectHashSink::Result LocalStore::restoreThroughObjects(
     return result;
 }
 
-/* Test-only; zero means the fixed pool size computed in
-   `materialiseThroughObjects` (local-store.hh). */
-std::atomic<size_t> LocalStore::copyWorkersForTest{0};
-
 bool LocalStore::materialisesFromObjects() const
 {
 #ifdef _WIN32
@@ -927,21 +923,13 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
 #else
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = dst;
-    /* Worker count affects scheduling only. Accessor, filter and callback
-       permissions gate concurrency; zero selects the default bounded width. */
-    size_t workers = copyWorkersForTest.load(std::memory_order_relaxed);
-    /* Callbacks, filter and source must all permit reordered observations.
-       The AllPaths type survives copies of defaultPathFilter. */
-    if (!callbacksPermitParallelism || !filter.get_fn().target<AllPaths>()
-        || !path.accessor->allowsConcurrentTraversal())
-        workers = 1;
-    else if (!workers)
-        workers = CopyPool::defaultWorkers();
+    /* Callback permission additionally gates the audited source/filter policy. */
+    size_t workers = callbacksPermitParallelism ? HashingVisitor::workerCountFor(*path.accessor, filter) : 1;
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
         auto projection = attempt.takeProjection();
         std::vector<BlobCoalescing> collisions;
         for (auto & row : projection.regular) {
-            auto other = hold.addRow(row);
+            auto other = hold.addRow(std::move(row));
             if (!other)
                 continue;
             auto current = lstat(std::filesystem::path(*other));

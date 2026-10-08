@@ -2093,7 +2093,7 @@ void LocalStore::addToStore(
                             specified.render(),
                             printHashAlgo(specified.hash.algo));
                     }
-                    return merkle::objectHash(restored.root);
+                    return toRegister.objectHash->hash;
                 }
                 unreachable();
             }();

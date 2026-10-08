@@ -89,18 +89,12 @@ void CommonProto::Serialise<Signature>::write(
 std::pair<std::optional<ObjectHash>, std::optional<Hash>> CommonProto::readPathInfoHashes(
     Source & from, bool objectHashForm, const std::function<Hash(const std::string &)> & parseNarHash)
 {
-    auto narHash = [&](const std::string & s) -> std::optional<Hash> {
-        return s.empty() ? std::nullopt : std::optional{parseNarHash(s)};
+    auto objectHashS = objectHashForm ? readString(from) : std::string{};
+    auto narHashS = readString(from);
+    return {
+        objectHashS.empty() ? std::nullopt : std::optional{ObjectHash::parseOrThrow(objectHashS)},
+        narHashS.empty() ? std::nullopt : std::optional{parseNarHash(narHashS)},
     };
-    if (objectHashForm) {
-        auto objectHashS = readString(from);
-        auto narHashS = readString(from);
-        return {
-            objectHashS.empty() ? std::nullopt : std::optional{ObjectHash::parseOrThrow(objectHashS)},
-            narHash(narHashS),
-        };
-    } else
-        return {std::nullopt, narHash(readString(from))};
 }
 
 void CommonProto::writePathInfoHashes(
