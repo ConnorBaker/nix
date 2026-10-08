@@ -368,19 +368,19 @@ struct BufferedRegularFile
 static BufferedRegularFile readBufferedRegular(
     const CanonPath & path,
     fun<void(CreateRegularFileSink &)> read,
-    fun<std::unique_ptr<RegularFileWriter>()> open,
+    function_ref<std::unique_ptr<RegularFileWriter>()> open,
     Sink * contents = nullptr)
 {
     struct BufferThenStreamFile : HashingRegularFileSink
     {
-        const fun<std::unique_ptr<RegularFileWriter>()> & open;
+        const function_ref<std::unique_ptr<RegularFileWriter>()> & open;
         Sink * contents;
         bool executable = false;
         std::string buffer;
         std::unique_ptr<RegularFileWriter> writer;
 
         BufferThenStreamFile(
-            const CanonPath & path, const fun<std::unique_ptr<RegularFileWriter>()> & open, Sink * contents)
+            const CanonPath & path, const function_ref<std::unique_ptr<RegularFileWriter>()> & open, Sink * contents)
             : HashingRegularFileSink(path)
             , open(open)
             , contents(contents)
@@ -623,7 +623,7 @@ struct ObjectUnavailable
 struct MaterialisingVisitor : LinkingVisitor
 {
     LocalStore::TreeNamer namer;
-    std::function<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
+    function_ref<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
 
     /* A caller-supplied naming callback need not permit simultaneous
        calls. The directory walk and holder writes run outside this lock. */
@@ -639,7 +639,7 @@ struct MaterialisingVisitor : LinkingVisitor
         decltype(commitAttempt) commitAttempt)
         : LinkingVisitor(objects, hold, restore, repair, nullptr, workers)
         , namer(std::move(namer))
-        , commitAttempt(std::move(commitAttempt))
+        , commitAttempt(commitAttempt)
     {
     }
 
@@ -944,7 +944,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
         for (auto & auxiliary : projection.auxiliary)
             hold.addAuxiliary(std::move(auxiliary));
     };
-    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), workers, std::move(commitAttempt)};
+    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), workers, commitAttempt};
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every reused node carries the size of what it made, so the NAR
@@ -972,8 +972,7 @@ StorePath LocalStore::materialise(
     auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
 
     std::optional<GitObjectStore::Hold> hold;
-    AutoCloseFD tempDirFd;
-    std::optional<AutoDelete> delTempDir;
+    std::optional<std::pair<AutoCloseFD, AutoDelete>> tempDir;
     std::filesystem::path tempPath;
     RestoreSink restore{localSettings.fsyncStorePaths, hooks.get()};
     auto prepare = [&] {
@@ -983,10 +982,8 @@ StorePath LocalStore::materialise(
            root needs neither collection nor an ingestion's hold. */
         autoGC();
         hold.emplace(objects.hold());
-        auto [tempDir, fd] = createTempDirInStore();
-        tempDirFd = std::move(fd);
-        delTempDir.emplace(tempDir);
-        tempPath = tempDir / "x";
+        tempDir.emplace(createTempDirInStore());
+        tempPath = tempDir->second.path() / "x";
         restore.dstPath = tempPath;
     };
 
@@ -1056,7 +1053,7 @@ StorePath LocalStore::materialise(
             buffered.reset();
             objects.putRootTree(result.root, *hold);
         }
-        if (!moveIntoStore(tempPath, realPath, *delTempDir, hooks.get()))
+        if (!moveIntoStore(tempPath, realPath, tempDir->second, hooks.get()))
             result = enterPath(realPath, repair, *hold);
         return {result, *hold};
     };

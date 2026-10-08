@@ -378,7 +378,7 @@ public:
         swap(lhs.recursive, rhs.recursive);
     }
 
-    AutoDelete(const std::filesystem::path & p, bool recursive = true);
+    AutoDelete(std::filesystem::path p, bool recursive = true) noexcept;
     AutoDelete(const AutoDelete &) = delete;
     AutoDelete & operator=(const AutoDelete &) = delete;
     ~AutoDelete();

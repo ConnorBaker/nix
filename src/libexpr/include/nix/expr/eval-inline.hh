@@ -26,6 +26,15 @@ inline void * EvalMemory::allocBytes(size_t n)
     return p;
 }
 
+[[gnu::always_inline]] inline const StringData & StringData::make(std::string_view s)
+{
+    if (s.empty())
+        return ""_sds;
+    auto & res = alloc(s.size());
+    std::memcpy(&res.data_, s.data(), s.size());
+    res.data_[s.size()] = '\0';
+    return res;
+}
 [[gnu::always_inline]]
 Value * EvalMemory::allocValue()
 {

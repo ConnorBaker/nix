@@ -287,12 +287,8 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         assert(output && scratchPath);
         auto actualPath = realPathInHost(*scratchPath);
 
-        /* An optional file descriptor of a directory used for intermediate
-           operations. */
-        AutoCloseFD tempDirFd;
-        /* RAII cleanup of a temporary directory inside the store that is used
-           for intermediate operations. */
-        AutoDelete delTempDir;
+        /* An owned, GC-locked temporary directory for intermediate operations. */
+        std::optional<std::pair<AutoCloseFD, AutoDelete>> tempDir;
 
         auto finish = [&](StorePath finalStorePath) {
             /* Store the final path */
@@ -335,9 +331,8 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
                 /* Put the temporary copy in a directory inaccessible to the builder.
                    actualPath might point inside the build chroot, which is controlled
                    by the derivation builder. */
-                auto [rewriteTempDir, rewriteTempDirFd] = localStore.createTempDirInStore();
-                AutoDelete delRewriteTempDir(rewriteTempDir);
-                std::filesystem::path tmpPath = rewriteTempDir / "x";
+                auto [rewriteTempDirFd, rewriteTempDir] = localStore.createTempDirInStore();
+                std::filesystem::path tmpPath = rewriteTempDir.path() / "x";
                 auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(localSettings.ignoredAcls));
                 restorePath(tmpPath, *source, false, hooks.get());
                 deletePath(actualPath);
@@ -437,11 +432,9 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         };
 
         auto moveOutputToTempDir = [&]() -> void {
-            std::filesystem::path tempDir;
-            std::tie(tempDir, tempDirFd) = localStore.createTempDirInStore();
-            delTempDir = AutoDelete(tempDir);
+            tempDir.emplace(localStore.createTempDirInStore());
 
-            auto tmpOutput = tempDir / "x";
+            auto tmpOutput = tempDir->second.path() / "x";
 
             /* Copy files to break stale file descriptors. copyRecursive below will use
                reflinking to optimise the copying overhead. */

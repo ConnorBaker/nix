@@ -792,6 +792,30 @@ private:
         uint64_t ingestion,
         std::vector<GitObjectStore::Hold::Row> & rows);
 
+    /**
+     * A newly owned row snapshot under the lock: `objectHash` set when the
+     * column holds one, else `assertedNarHash` set to the NAR hash a
+     * schema-10 row holds.  Never migrates -- `addSignatures` calls
+     * this inside a transaction.
+     */
+    std::shared_ptr<ValidPathInfo> queryPathInfoInternal(State & state, const StorePath & path);
+
+    /**
+     * The migration behind `queryPathInfoUncached` and `migratePathInfo`
+     * (`08` §1.1): outside the lock, the row re-read before it is written
+     * (`recordObjectHash`), and no root taken -- the caller holds one, or
+     * is the collector.  A row whose path the walk finds modified, or
+     * whose files are missing, is returned as the database has it --
+     * `assertedNarHash` set, no object hash -- so that a query answers as
+     * master's did and the verifiers report what is wrong: the
+     * modification through the NAR hash (`contentMismatch`, `verifyStore
+     * --check-contents`), the missing files by `nix-store --verify`, which
+     * removes the row; nothing writes the column until then.
+     *
+     * @throws InvalidPath if the row was deleted before or during the walk.
+     */
+    std::shared_ptr<const ValidPathInfo> migratedPathInfo(std::shared_ptr<ValidPathInfo> info);
+
     /** The object store's index, `objects.index` (the constructor installs it). */
     GitObjectStore::Index blobIndex;
 
@@ -817,14 +841,6 @@ public:
      * Delete a path from the Nix store.
      */
     void invalidatePathChecked(const StorePath & path);
-
-    /**
-     * The row as it is, under the lock: `objectHash` set when the
-     * column holds one, else `assertedNarHash` set to the NAR hash a
-     * schema-10 row holds.  Never migrates -- `addSignatures` calls
-     * this inside a transaction.
-     */
-    std::shared_ptr<const ValidPathInfo> queryPathInfoInternal(State & state, const StorePath & path);
 
     /**
      * `queryPathInfoInternal` under the lock it takes: the row as the
@@ -865,22 +881,6 @@ public:
     OldRowWalk walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes = nullptr);
 
     /**
-     * The migration behind `queryPathInfoUncached` and `migratePathInfo`
-     * (`08` §1.1): outside the lock, the row re-read before it is written
-     * (`recordObjectHash`), and no root taken -- the caller holds one, or
-     * is the collector.  A row whose path the walk finds modified, or
-     * whose files are missing, is returned as the database has it --
-     * `assertedNarHash` set, no object hash -- so that a query answers as
-     * master's did and the verifiers report what is wrong: the
-     * modification through the NAR hash (`contentMismatch`, `verifyStore
-     * --check-contents`), the missing files by `nix-store --verify`, which
-     * removes the row; nothing writes the column until then.
-     *
-     * @throws InvalidPath if the row was deleted before or during the walk.
-     */
-    std::shared_ptr<const ValidPathInfo> migratedPathInfo(std::shared_ptr<const ValidPathInfo> info);
-
-    /**
      * The one write of an older row's object hash: the row re-read under
      * the lock, and written only if it still holds no object hash (another
      * process may have migrated, signed or deleted it meanwhile).  Nothing
@@ -906,7 +906,8 @@ public:
 
     void findRuntimeRoots(Roots & roots, bool censor);
 
-    std::pair<std::filesystem::path, AutoCloseFD> createTempDirInStore();
+    /** An owned temporary directory; its GC lock outlives automatic cleanup. */
+    std::pair<AutoCloseFD, AutoDelete> createTempDirInStore();
 
     /**
      * The verifier's walk of the path at `realPath` (`VerifyVisitor`; law 4

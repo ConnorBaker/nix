@@ -13,7 +13,6 @@
 #include <map>
 #include <atomic>
 #include <vector>
-#include <future>
 
 namespace nix {
 
@@ -97,7 +96,7 @@ class CopyPool
 
     struct Group
     {
-        const fun<void(size_t)> & run;
+        function_ref<void(size_t)> run;
         size_t failedIndex;
         std::exception_ptr failure;
         size_t remaining = 0;
@@ -114,8 +113,8 @@ class CopyPool
     std::vector<std::thread> threads;
     size_t capacity;
     bool stopping = false;
+    std::atomic<int> startupReady{0};
 
-    void work(std::promise<void> ready);
     /** Runs a removed job with the lock released, returning with it held. */
     static void execute(const Job & job, std::unique_lock<std::mutex> & lock);
     bool tryAsync(Group & group, size_t i);
@@ -131,9 +130,9 @@ public:
      * Visits and their results must be independent of consuming this sequence.
      * Every submitted job is joined before return, including on failure. Child
      * and consume failures are reported in traversal order, independently
-     * of completion order. Callbacks and their captured state must outlive
-     * this call; each child owns its result storage. */
-    void ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t)> run, fun<void(size_t)> consume);
+     * of completion order. Callbacks are borrowed until this call returns;
+     * each child owns its result storage, and captures must outlive the call. */
+    void ordered(size_t count, function_ref<bool(size_t)> canFork, function_ref<void(size_t)> run, function_ref<void(size_t)> consume);
 };
 
 /**

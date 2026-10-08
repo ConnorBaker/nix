@@ -401,8 +401,8 @@ AutoDelete::AutoDelete()
 {
 }
 
-AutoDelete::AutoDelete(const std::filesystem::path & p, bool recursive)
-    : _path(p)
+AutoDelete::AutoDelete(std::filesystem::path p, bool recursive) noexcept
+    : _path(std::move(p))
     , del(true)
     , recursive(recursive)
 {

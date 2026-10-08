@@ -67,22 +67,20 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
     auto owner = weak_from_this().lock();
     checkAllowed(path);
     next->readDirectoryWithEntries(prefix / path, [&](auto & inner, const auto & relative, auto && listing) {
-        auto admitted = std::move(listing).filter([&](const auto & entry) { return isAllowed(path / entry.first); });
-
         struct Scoped final : FilteringSourceAccessor
         {
             void anchor() override {}
 
             FilteringSourceAccessor * owner;
             CanonPath original;
-            const DirEntries & admitted;
+            const DirEntries admitted;
 
             Scoped(
                 SourceAccessor & inner,
                 const CanonPath & relative,
                 FilteringSourceAccessor & owner,
                 CanonPath original,
-                const DirEntries & admitted)
+                DirectoryListing && listing)
                 /* Borrowed only during readDirectoryWithEntries's scope.
                    No accessor or visitor may retain it after callback. */
                 : FilteringSourceAccessor(
@@ -93,7 +91,9 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                       [this](const CanonPath & p) { return this->owner->makeNotAllowedError(this->original / p); })
                 , owner(&owner)
                 , original(std::move(original))
-                , admitted(admitted)
+                , admitted(std::move(listing).filter([&](const auto & entry) {
+                    return this->owner->isAllowed(this->original / entry.first);
+                }))
             {
             }
 
@@ -122,11 +122,11 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
                 readDirectoryScoped(p, std::move(callback));
             }
         };
-        /* Compose the policy coordinate before constructing its owned value. */
-        auto * parent = dynamic_cast<Scoped *>(this);
+        /* Non-root scopes flatten coordinates; root rereads retain the prior admission. */
+        auto * parent = path.isRoot() ? nullptr : dynamic_cast<Scoped *>(this);
         Scoped scoped{
-            inner, relative, parent ? *parent->owner : *this, parent ? parent->original / path : path, admitted};
-        callback(scoped, CanonPath::root, DirectoryListing(std::cref(admitted)));
+            inner, relative, parent ? *parent->owner : *this, parent ? parent->original / path : path, std::move(listing)};
+        callback(scoped, CanonPath::root, DirectoryListing(std::cref(scoped.admitted)));
     });
 }
 

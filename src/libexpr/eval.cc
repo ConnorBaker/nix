@@ -93,16 +93,6 @@ StringData & StringData::alloc(size_t size)
     return *res;
 }
 
-const StringData & StringData::make(std::string_view s)
-{
-    if (s.empty())
-        return ""_sds;
-    auto & res = alloc(s.size());
-    std::memcpy(&res.data_, s.data(), s.size());
-    res.data_[s.size()] = '\0';
-    return res;
-}
-
 RootValue allocRootValue(Value * v)
 {
     return std::allocate_shared<Value *>(traceable_allocator<Value *>(), v);
@@ -2715,12 +2705,12 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
             Value & effective = *peeled;
             if (effective.type() == nPath)
                 return effective.path();
-            auto path = coerceToString(pos, effective, context, errorCtx, false, false, true).toOwned();
-            if (path == "" || path[0] != '/')
-                error<EvalError>("string '%1%' doesn't represent an absolute path", path)
+            auto path = coerceToString(pos, effective, context, errorCtx, false, false, true);
+            if (path->empty() || (*path)[0] != '/')
+                error<EvalError>("string '%1%' doesn't represent an absolute path", *path)
                     .withTrace(pos, errorCtx)
                     .debugThrow();
-            return rootPath(CanonPath(path));
+            return rootPath(CanonPath(*path));
         });
     return path;
 }

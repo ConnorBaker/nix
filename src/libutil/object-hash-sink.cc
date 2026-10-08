@@ -76,12 +76,11 @@ std::pair<HashedNode, std::string> HashingVisitor::hashDirectory(const CanonPath
             if (!pool)
                 pool = std::make_unique<CopyPool>(workers);
             std::vector<std::optional<HashedNode>> nodes(kids.size());
-            auto fold = [&](size_t i) { consume(std::move(kids[i].name), nodes[i].value()); };
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
                 [&](size_t i) { nodes[i] = kids[i].visit(); },
-                std::ref(fold));
+                [&](size_t i) { consume(std::move(kids[i].name), nodes[i].value()); });
         } else
             for (auto & child : kids)
                 consume(std::move(child.name), child.visit());

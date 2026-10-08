@@ -1389,14 +1389,11 @@ void LocalStore::queryPathInfoUncached(
     const StorePath & path, Callback<std::shared_ptr<const ValidPathInfo>> callback) noexcept
 {
     try {
-        auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+        auto info = retrySQLite<std::shared_ptr<ValidPathInfo>>(
             [&]() { return queryPathInfoInternal(*_state->lock(), path); });
 
         /* Outside the lock: a schema-10 row's migration may walk the path. */
-        if (info)
-            info = migratedPathInfo(std::move(info));
-
-        callback(std::move(info));
+        callback(info ? migratedPathInfo(std::move(info)) : nullptr);
 
     } catch (...) {
         callback.rethrow();
@@ -1411,7 +1408,7 @@ std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoUnmigrated(const S
 
 void LocalStore::migratePathInfo(const StorePath & path)
 {
-    auto info = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
+    auto info = retrySQLite<std::shared_ptr<ValidPathInfo>>(
         [&]() { return queryPathInfoInternal(*_state->lock(), path); });
 
     if (!info)
@@ -1419,9 +1416,8 @@ void LocalStore::migratePathInfo(const StorePath & path)
     if (info->objectHash)
         return;
 
-    ValidPathInfo row(*info);
     std::optional<std::pair<Hash, Hash>> narHashes;
-    switch (walkOldRow(row, &narHashes)) {
+    switch (walkOldRow(*info, &narHashes)) {
     case OldRowWalk::Migrated:
         return;
     case OldRowWalk::Modified:
@@ -1481,7 +1477,7 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
     return OldRowWalk::Migrated;
 }
 
-std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_ptr<const ValidPathInfo> info)
+std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_ptr<ValidPathInfo> info)
 {
     if (info->objectHash)
         return info;
@@ -1489,11 +1485,9 @@ std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_pt
     /* Preserve assertedNarHash until migration checks the bytes. Do not add
        a temp root here: GC calls this while holding its exclusive lock;
        other callers already hold a root or shared lock. */
-    auto migrated = std::make_shared<ValidPathInfo>(*info);
-
-    switch (walkOldRow(*migrated)) {
+    switch (walkOldRow(*info)) {
     case OldRowWalk::Migrated:
-        return migrated;
+        return info;
     case OldRowWalk::Modified:
         /* Return the unchanged row so verification can report corruption.
            Recording the observed hash would bless the modified bytes. */
@@ -1524,11 +1518,10 @@ bool LocalStore::recordObjectHash(const StorePath & path, const ObjectHash & obj
         auto current = queryPathInfoInternal(*state, path);
         bool written = current && !current->objectHash;
         if (written) {
-            ValidPathInfo row(*current);
-            row.objectHash = objectHash;
-            if (row.narSize == 0)
-                row.narSize = narSize;
-            updatePathInfo(*state, row);
+            current->objectHash = objectHash;
+            if (current->narSize == 0)
+                current->narSize = narSize;
+            updatePathInfo(*state, *current);
         }
 
         txn.commit();
@@ -1536,7 +1529,7 @@ bool LocalStore::recordObjectHash(const StorePath & path, const ObjectHash & obj
     });
 }
 
-std::shared_ptr<const ValidPathInfo> LocalStore::queryPathInfoInternal(State & state, const StorePath & path)
+std::shared_ptr<ValidPathInfo> LocalStore::queryPathInfoInternal(State & state, const StorePath & path)
 {
     /* Get the path info. */
     auto useQueryPathInfo(state.stmts->QueryPathInfo.use());
@@ -1906,7 +1899,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             /* A new path is made eligible only after all its candidates
                are reconciled. Later outputs may share this finished one. */
             if (publication) {
-                if (state->stmts->QueryValidPaths.use().next())
+                if (!pathIds.empty() || state->stmts->QueryValidPaths.use().next())
                     coalesceBlobRows(*state, path, *hold, publication->id, publication->projection.regular);
                 publish(*publication);
             }
@@ -2268,10 +2261,8 @@ StorePath LocalStore::addToStoreFromDump(
         }
     });
 
-    std::unique_ptr<AutoDelete> delTempDir;
+    std::optional<std::pair<AutoCloseFD, AutoDelete>> tempDir;
     std::filesystem::path tempPath;
-    std::filesystem::path tempDir;
-    AutoCloseFD tempDirFd;
     /* The result of the composite restore; a staged flat file or a
        cross-device copy needs its physical projection below instead. */
     std::optional<ObjectHashSink::Result> restored;
@@ -2310,9 +2301,8 @@ StorePath LocalStore::addToStoreFromDump(
         StringSource dumpSource{dump};
         ChainSource bothSource{dumpSource, source};
 
-        std::tie(tempDir, tempDirFd) = createTempDirInStore();
-        delTempDir = std::make_unique<AutoDelete>(tempDir);
-        tempPath = tempDir / "x";
+        tempDir.emplace(createTempDirInStore());
+        tempPath = tempDir->second.path() / "x";
         hold.emplace(objects.hold());
 
         if (dumpMethod == FileSerialisationMethod::NixArchive)
@@ -2349,7 +2339,7 @@ StorePath LocalStore::addToStoreFromDump(
             hold.emplace(objects.hold());
             StringSource dumpSource{dump};
             restored = restore(realPath, dumpSource);
-        } else if (!moveIntoStore(tempPath, realPath, *delTempDir, canonicalisingRestoreHooks.get()))
+        } else if (!moveIntoStore(tempPath, realPath, tempDir->second, canonicalisingRestoreHooks.get()))
             restored.reset();
 
         // A staged flat restore or cross-device copy needs its new physical projection.
@@ -2360,7 +2350,7 @@ StorePath LocalStore::addToStoreFromDump(
 
 /* Create a temporary directory in the store that won't be
    garbage-collected until the returned FD is closed. */
-std::pair<std::filesystem::path, AutoCloseFD> LocalStore::createTempDirInStore()
+std::pair<AutoCloseFD, AutoDelete> LocalStore::createTempDirInStore()
 {
     std::filesystem::path tmpDirFn;
     AutoCloseFD tmpDirFd;
@@ -2377,7 +2367,7 @@ std::pair<std::filesystem::path, AutoCloseFD> LocalStore::createTempDirInStore()
         }
         lockedByUs = lockFile(tmpDirFd.get(), ltWrite, true);
     } while (!pathExists(tmpDirFn) || !lockedByUs);
-    return {tmpDirFn, std::move(tmpDirFd)};
+    return {std::move(tmpDirFd), AutoDelete(std::move(tmpDirFn))};
 }
 
 void PathInUse::anchor() {}
@@ -2666,7 +2656,9 @@ void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signa
 
         SQLiteTxn txn(state->db);
 
-        auto info = std::const_pointer_cast<ValidPathInfo>(queryPathInfoInternal(*state, storePath));
+        auto info = queryPathInfoInternal(*state, storePath);
+        if (!info)
+            throw InvalidPath("path '%s' is not valid", printStorePath(storePath));
 
         info->sigs.insert(sigs.begin(), sigs.end());
 

@@ -33,29 +33,6 @@ size_t CopyPool::defaultWorkers()
     return std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
 }
 
-void CopyPool::work(std::promise<void> ready)
-{
-    /* Registration allocates. Report failure before accepting any work
-       on this thread, rather than letting it escape the thread entry. */
-    std::optional<ReceiveInterrupts> receiveInterrupts;
-    try {
-        receiveInterrupts.emplace();
-    } catch (...) {
-        ready.set_exception(std::current_exception());
-        return;
-    }
-    ready.set_value();
-    std::unique_lock lock(mutex);
-    while (true) {
-        wake.wait(lock, [&] { return stopping || !pending.empty(); });
-        if (pending.empty())
-            return;
-        auto job = pending.back();
-        pending.pop_back();
-        execute(job, lock);
-    }
-}
-
 void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
 {
     lock.unlock();
@@ -89,15 +66,36 @@ bool CopyPool::tryAsync(Group & group, size_t i)
     if (pending.size() == capacity)
         return false;
     if (threads.size() < capacity) {
-        std::promise<void> ready;
-        auto started = ready.get_future();
-        threads.emplace_back([this, ready = std::move(ready)]() mutable { work(std::move(ready)); });
-        try {
-            started.get();
-        } catch (...) {
+        std::exception_ptr failure;
+        startupReady.store(0, std::memory_order_relaxed);
+        threads.emplace_back([this, &failure] {
+            /* Registration allocates. Report failure before accepting any work
+               on this thread, rather than letting it escape the thread entry. */
+            std::optional<ReceiveInterrupts> receiveInterrupts;
+            try {
+                receiveInterrupts.emplace();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            startupReady.store(1, std::memory_order_release);
+            startupReady.notify_one();
+            if (!receiveInterrupts)
+                return;
+            std::unique_lock lock(mutex);
+            while (true) {
+                wake.wait(lock, [&] { return stopping || !pending.empty(); });
+                if (pending.empty())
+                    return;
+                auto job = pending.back();
+                pending.pop_back();
+                execute(job, lock);
+            }
+        });
+        startupReady.wait(0, std::memory_order_acquire);
+        if (failure) {
             threads.back().join();
             threads.pop_back();
-            throw;
+            std::rethrow_exception(failure);
         }
     }
     pending.push_back({&group, i});
@@ -122,7 +120,7 @@ void CopyPool::wait(Group & group)
     }
 }
 
-void CopyPool::ordered(size_t count, fun<bool(size_t)> canFork, fun<void(size_t)> run, fun<void(size_t)> consume)
+void CopyPool::ordered(size_t count, function_ref<bool(size_t)> canFork, function_ref<void(size_t)> run, function_ref<void(size_t)> consume)
 {
     if (count < 2) {
         if (count) {
