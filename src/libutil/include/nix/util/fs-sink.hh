@@ -5,8 +5,6 @@
 #include "nix/util/source-accessor.hh"
 #include "nix/util/file-system.hh"
 
-#include <memory>
-
 namespace nix {
 
 /**
@@ -95,8 +93,8 @@ class RestoreSinkHooks;
 /**
  * A file owned by `RestoreSink` while it is written. `finish()` flushes,
  * runs the completion hook and closes it; destruction cleans up unfinished writes.
- * The callback form keeps the writer on its stack. `beginRegularFile`
- * returns an owned writer when creation and completion have separate scopes.
+ * The factories return a stationary value; callers choose local or heap ownership.
+ * Creation and completion may have separate scopes; the writer must not move.
  */
 struct RegularFileWriter final : CreateRegularFileSink, FdSink
 {
@@ -186,7 +184,7 @@ public:
      * The owner writes it and calls `finish()` once, with the same file
      * operations as the stack-owned callback form `createRegularFile`.
      */
-    std::unique_ptr<RegularFileWriter> beginRegularFile(const CanonPath & path);
+    RegularFileWriter beginRegularFile(const CanonPath & path);
 
     void createSymlink(const CanonPath & path, const std::string & target) override;
 
@@ -207,8 +205,7 @@ public:
      * this call; the writer owns only the newly opened file. `path` retains
      * the original sink-relative spelling for diagnostics.
      */
-    std::unique_ptr<RegularFileWriter>
-    beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name);
+    RegularFileWriter beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name);
 #endif
 };
 

@@ -252,18 +252,15 @@ AutoCloseFD RestoreSink::openRegularFileAt(const CanonPath & path, Descriptor pa
     return file;
 }
 
-std::unique_ptr<RegularFileWriter>
-RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
+RegularFileWriter RestoreSink::beginRegularFileAt(const CanonPath & path, Descriptor parentFd, const CanonPath & name)
 {
-    auto file = openRegularFileAt(path, parentFd, name);
-    return std::unique_ptr<RegularFileWriter>{new RegularFileWriter(startFsync, hooks, std::move(file))};
+    return {startFsync, hooks, openRegularFileAt(path, parentFd, name)};
 }
 #endif
 
-std::unique_ptr<RegularFileWriter> RestoreSink::beginRegularFile(const CanonPath & path)
+RegularFileWriter RestoreSink::beginRegularFile(const CanonPath & path)
 {
-    auto file = openRegularFile(path);
-    return std::unique_ptr<RegularFileWriter>{new RegularFileWriter(startFsync, hooks, std::move(file))};
+    return {startFsync, hooks, openRegularFile(path)};
 }
 
 void RestoreSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)

@@ -607,14 +607,15 @@ TEST_F(FSSourceAccessorTest, regularFileAtRetainsItsSelectedParentAndOwnsItsFile
             std::filesystem::rename(parent, moved);
             createDirs(parent);
 
-            auto writer = sink.beginRegularFileAt(path, parentFd, name);
-            owned.close();
-            sink.dirFd.close();
-            if (executable)
-                writer->isExecutable();
-            (*writer)(contents);
-            writer->finish();
-            writer.reset();
+            {
+                auto writer = sink.beginRegularFileAt(path, parentFd, name);
+                owned.close();
+                sink.dirFd.close();
+                if (executable)
+                    writer.isExecutable();
+                writer(contents);
+                writer.finish();
+            }
 
             auto result = nix::lstat(moved / "leaf");
             EXPECT_TRUE(S_ISREG(result.st_mode));

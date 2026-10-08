@@ -557,7 +557,10 @@ struct LinkingVisitor : ObjectStoreVisitor
             readBufferedRegular(
                 path,
                 std::move(read),
-                [&] { return target.sink.beginRegularFile(target.name); },
+                [&] {
+                    return std::unique_ptr<RegularFileWriter>{
+                        new RegularFileWriter(target.sink.beginRegularFile(target.name))};
+                },
                 path.isRoot() ? rootContents : nullptr));
     }
 
@@ -607,12 +610,12 @@ struct LinkingVisitor : ObjectStoreVisitor
             auto written = target.sink.beginRegularFileAt(target.name, dirFd, name);
 #endif
             if (executable)
-                written->isExecutable();
-            written->preallocateContents(buffer.size());
+                written.isExecutable();
+            written.preallocateContents(buffer.size());
             /* The complete file is already buffered, and this writer is fresh. */
-            assert(!written->hasData());
-            written->writeUnbuffered(buffer);
-            written->finish();
+            assert(!written.hasData());
+            written.writeUnbuffered(buffer);
+            written.finish();
         }
         if (linkable)
             objects.enterWritten(entry.hash, executable, dirFd, name, where, repair, hold);
@@ -794,25 +797,26 @@ struct MaterialisingVisitor : LinkingVisitor
                         .entry = *entry,
                         .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
 
-                auto writer = target.sink.beginRegularFileAt(target.name, dirFd, name);
-                if (st.isExecutable)
-                    writer->isExecutable();
-                /* Stat need not know a packed blob's size. readFile must
-                   announce it before writing, so the copy obtains it only
-                   when it actually needs the bytes. */
                 std::optional<uint64_t> size;
-                accessor.readFile(from, *writer, [&](uint64_t announced) {
-                    if (st.fileSize && announced != *st.fileSize)
-                        throw Error("immutable file '%s' changed size while copying", accessor.showPath(from));
-                    size = announced;
-                    writer->preallocateContents(announced);
-                });
-                if (!size)
-                    throw Error("immutable file '%s' did not announce its size", accessor.showPath(from));
-                writer->finish();
-                if (writer->written != *size)
-                    throw Error("immutable file '%s' delivered the wrong number of bytes", accessor.showPath(from));
-                writer.reset();
+                {
+                    auto writer = target.sink.beginRegularFileAt(target.name, dirFd, name);
+                    if (st.isExecutable)
+                        writer.isExecutable();
+                    /* Stat need not know a packed blob's size. readFile must
+                       announce it before writing, so the copy obtains it only
+                       when it actually needs the bytes. */
+                    accessor.readFile(from, writer, [&](uint64_t announced) {
+                        if (st.fileSize && announced != *st.fileSize)
+                            throw Error("immutable file '%s' changed size while copying", accessor.showPath(from));
+                        size = announced;
+                        writer.preallocateContents(announced);
+                    });
+                    if (!size)
+                        throw Error("immutable file '%s' did not announce its size", accessor.showPath(from));
+                    writer.finish();
+                    if (writer.written != *size)
+                        throw Error("immutable file '%s' delivered the wrong number of bytes", accessor.showPath(from));
+                }
                 if (linkable)
                     objects.enterWritten(entry->hash, st.isExecutable, dirFd, name, where, repair, hold);
                 return HashedNode{.entry = *entry, .narSize = merkle::nar::regular(*size, st.isExecutable)};
@@ -1037,7 +1041,8 @@ StorePath LocalStore::materialise(
                     [&] {
                         prepare();
                         beginIngestion(*hold, tempPath);
-                        return restore.beginRegularFile(CanonPath::root);
+                        return std::unique_ptr<RegularFileWriter>{
+                            new RegularFileWriter(restore.beginRegularFile(CanonPath::root))};
                     }));
                 return ObjectHashSink::Result::of(buffered->node);
             }
