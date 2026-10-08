@@ -328,43 +328,129 @@ TEST_F(GitUtilsTest, namesFollowTheTreeObjects)
     EXPECT_EQ(acc1->getFingerprint(CanonPath("shared")), shared1);
 }
 
-TEST_F(GitUtilsTest, fingerprintsRequireCanonicalRawModes)
+TEST_F(GitUtilsTest, rawModesMetadataReadersAndNamesAgree)
 {
-    git_repository * rawRepo = nullptr;
-    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
-    Finally closeRepo{[&] { git_repository_free(rawRepo); }};
-    git_odb * odb = nullptr;
-    ASSERT_EQ(git_repository_odb(&odb, rawRepo), 0);
-    Finally closeOdb{[&] { git_odb_free(odb); }};
-    git_oid blob;
-    ASSERT_EQ(git_odb_write(&blob, odb, "x", 1, GIT_OBJECT_BLOB), 0);
+    for (auto algorithm : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+        SCOPED_TRACE(printHashAlgo(algorithm));
+        auto path = tmpDir / printHashAlgo(algorithm);
+        auto repo = GitRepo::openRepo(path, {.create = true, .bare = true, .oidType = algorithm});
+        git_repository * rawRepo = nullptr;
+        ASSERT_EQ(git_repository_open(&rawRepo, path.string().c_str()), 0);
+        Finally closeRepo{[&] { git_repository_free(rawRepo); }};
+        git_odb * odb = nullptr;
+        ASSERT_EQ(git_repository_odb(&odb, rawRepo), 0);
+        Finally closeOdb{[&] { git_odb_free(odb); }};
+        git_oid blob, emptyTree;
+        ASSERT_EQ(git_odb_write(&blob, odb, "x", 1, GIT_OBJECT_BLOB), 0);
+        ASSERT_EQ(git_odb_write(&emptyTree, odb, "", 0, GIT_OBJECT_TREE), 0);
+        const size_t oidSize = algorithm == HashAlgorithm::SHA1 ? GIT_OID_SHA1_SIZE : GIT_OID_SHA256_SIZE;
+        auto absent = blob;
+        std::fill_n(absent.id, oidSize, 0xff);
+        ASSERT_EQ(git_odb_exists(odb, &absent), 0);
 
-    /* Every uint16 raw mode in one tree. Fixed-width names are unique and
-       sorted even when a directory's comparison appends a slash. */
-    constexpr unsigned modes = 1u << 16;
-    std::string body;
-    body.reserve(32 * modes);
-    for (unsigned mode = 0; mode < modes; ++mode) {
-        body += fmt("%o %04x", mode, mode);
-        body += '\0';
-        body.append(reinterpret_cast<const char *>(blob.id), GIT_OID_SHA1_SIZE);
-    }
-    git_oid root;
-    ASSERT_EQ(git_odb_write(&root, odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
-    auto acc = openRepo()->getAccessor(Hash::parseAny(git_oid_tostr_s(&root), HashAlgorithm::SHA1), {}, "raw-modes");
-    unsigned named = 0;
-    for (unsigned mode = 0; mode < modes; ++mode) {
-        auto identity = acc->getFingerprint(CanonPath(fmt("%04x", mode)));
-        const bool canonical =
-            mode == 0040000 || mode == 0100644 || mode == 0100755 || mode == 0120000 || mode == 0160000;
-        EXPECT_EQ(identity.has_value(), canonical) << mode;
-        if (identity) {
-            ++named;
-            EXPECT_EQ(identity->first, CanonPath::root);
-            EXPECT_THAT(identity->second, ::testing::StartsWith("git-object-v2:"));
+        /* Every uint16 raw mode in one immutable tree, with just two
+           payload objects. Fixed-width names stay sorted with tree suffixes. */
+        constexpr unsigned modes = 1u << 16;
+        std::string body;
+        body.reserve((12 + oidSize) * modes);
+        for (unsigned mode = 0; mode < modes; ++mode) {
+            body += fmt("%o %04x", mode, mode);
+            body += '\0';
+            auto kind = mode & 0170000;
+            const auto & oid = kind == 0040000 ? emptyTree : kind == 0160000 ? absent : blob;
+            body.append(reinterpret_cast<const char *>(oid.id), oidSize);
+        }
+        git_oid root;
+        ASSERT_EQ(git_odb_write(&root, odb, body.data(), body.size(), GIT_OBJECT_TREE), 0);
+        git_tree * tree = nullptr;
+        ASSERT_EQ(git_tree_lookup(&tree, rawRepo, &root), 0);
+        Finally closeTree{[&] { git_tree_free(tree); }};
+        ASSERT_EQ(git_tree_entrycount(tree), modes);
+        auto acc = repo->getAccessor(Hash::parseAny(git_oid_tostr_s(&root), algorithm), {}, "raw-modes");
+        const auto entries = acc->readDirectory(CanonPath::root);
+        ASSERT_EQ(entries.size(), modes);
+        unsigned named = 0, corrected = 0;
+        unsigned typeMismatches = 0, executableMismatches = 0, listingMismatches = 0;
+        for (unsigned mode = 0; mode < modes; ++mode) {
+            SCOPED_TRACE(fmt("%o", mode));
+            const auto name = fmt("%04x", mode);
+            const CanonPath node(name);
+            const auto kind = mode & 0170000;
+            const bool executable = mode & 0100;
+            const auto objectType = kind == 0040000 ? GIT_OBJECT_TREE
+                                    : kind == 0160000 ? GIT_OBJECT_COMMIT : GIT_OBJECT_BLOB;
+            const auto normalized = kind == 0040000 ? GIT_FILEMODE_TREE
+                                    : executable ? GIT_FILEMODE_BLOB_EXECUTABLE
+                                    : kind == 0160000 ? GIT_FILEMODE_COMMIT
+                                    : kind == 0120000 ? GIT_FILEMODE_LINK : GIT_FILEMODE_BLOB;
+            const auto type = objectType != GIT_OBJECT_BLOB ? SourceAccessor::tDirectory
+                              : normalized == GIT_FILEMODE_LINK ? SourceAccessor::tSymlink : SourceAccessor::tRegular;
+            auto entry = git_tree_entry_byindex(tree, mode);
+            ASSERT_NE(entry, nullptr);
+            EXPECT_EQ(git_tree_entry_name(entry), name);
+            EXPECT_EQ(unsigned(git_tree_entry_filemode_raw(entry)), mode);
+            EXPECT_EQ(git_tree_entry_filemode(entry), normalized);
+            EXPECT_EQ(git_tree_entry_type(entry), objectType);
+            const auto stat = acc->lstat(node);
+            typeMismatches += stat.type != type;
+            executableMismatches += stat.isExecutable != (type == SourceAccessor::tRegular && executable);
+            EXPECT_FALSE(stat.fileSize);
+            listingMismatches += entries.at(name) != std::optional(type);
+            corrected += kind == 0160000 && executable;
+            if (type == SourceAccessor::tDirectory)
+                EXPECT_TRUE(acc->readDirectory(node).empty());
+            else
+                EXPECT_THROW(acc->readDirectory(node), Error);
+            if (type == SourceAccessor::tRegular) {
+                unsigned announcements = 0;
+                std::string contents;
+                LambdaSink sink{[&](std::string_view bytes) {
+                    EXPECT_EQ(announcements, 1u);
+                    contents += bytes;
+                }};
+                acc->readFile(node, sink, [&](uint64_t size) {
+                    EXPECT_EQ(size, 1u);
+                    ++announcements;
+                });
+                EXPECT_EQ(announcements, 1u);
+                EXPECT_EQ(contents, "x");
+            } else
+                EXPECT_THROW(acc->readFile(node), Error);
+            if (type == SourceAccessor::tSymlink)
+                EXPECT_EQ(acc->readLink(node), "x");
+            else
+                EXPECT_THROW(acc->readLink(node), Error);
+            auto identity = acc->getFingerprint(node);
+            const bool canonical =
+                mode == 0040000 || mode == 0100644 || mode == 0100755 || mode == 0120000 || mode == 0160000;
+            EXPECT_EQ(identity.has_value(), canonical);
+            EXPECT_FALSE(acc->getKnownEntry(node)) << "raw ODB writes have no canonical-writer provenance";
+            if (identity) {
+                ++named;
+                EXPECT_EQ(identity->first, CanonPath::root);
+                EXPECT_THAT(identity->second, ::testing::StartsWith("git-object-v2:"));
+            }
+        }
+        EXPECT_EQ(named, 5u);
+        EXPECT_EQ(corrected, 2048u);
+        /* Aggregate metadata contradictions so a negative control reads
+           every cell without printing thousands of identical failures. */
+        EXPECT_EQ(typeMismatches, 0u);
+        EXPECT_EQ(executableMismatches, 0u);
+        EXPECT_EQ(listingMismatches, 0u);
+        /* The parser rejects values outside uint16; it does not truncate.
+           Both 0 and 0177777 already round-tripped in the complete tree. */
+        for (auto mode : {"-1", "200000"}) {
+            auto invalid = std::string(mode) + " node";
+            invalid += '\0';
+            invalid.append(reinterpret_cast<const char *>(blob.id), oidSize);
+            git_oid oid;
+            ASSERT_EQ(git_odb_write(&oid, odb, invalid.data(), invalid.size(), GIT_OBJECT_TREE), 0);
+            git_tree * rejected = nullptr;
+            EXPECT_LT(git_tree_lookup(&rejected, rawRepo, &oid), 0);
+            git_tree_free(rejected);
         }
     }
-    EXPECT_EQ(named, 5u);
 }
 
 TEST_F(GitUtilsTest, malformedModesCannotReuseExecutableOrLegacyParentMemos)
@@ -392,7 +478,10 @@ TEST_F(GitUtilsTest, malformedModesCannotReuseExecutableOrLegacyParentMemos)
     auto bad = repo->getAccessor(badHash, {}, "gitlink-with-executable-bit");
     const CanonPath node("node");
     ASSERT_TRUE(good->lstat(node).isExecutable);
-    ASSERT_TRUE(bad->lstat(node).isExecutable);
+    EXPECT_EQ(bad->lstat(node).type, SourceAccessor::tDirectory);
+    EXPECT_FALSE(bad->lstat(node).isExecutable);
+    EXPECT_EQ(bad->readDirectory(CanonPath::root).at("node"), std::optional(SourceAccessor::tDirectory));
+    EXPECT_FALSE(bad->getFingerprint(node));
     EXPECT_EQ(good->readFile(node), "x");
     EXPECT_TRUE(bad->readDirectory(node).empty());
     EXPECT_THROW(bad->readFile(node), Error);
@@ -409,30 +498,51 @@ TEST_F(GitUtilsTest, malformedModesCannotReuseExecutableOrLegacyParentMemos)
     ASSERT_TRUE(row);
     EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(merkle::Mode::Executable));
 
-    auto rejects = [&](const fetchers::Settings & settings, const SourcePath & source) {
-        try {
-            (void) fetchToStore2(settings, *store, source, FetchMode::DryRun, "entry", method);
-            ADD_FAILURE() << "a memo bypassed the malformed entry's read";
-        } catch (Error & e) {
-            EXPECT_THAT(e.msg(), ::testing::HasSubstr("is not a regular file"));
-        }
+    const merkle::TreeEntry empty{merkle::Mode::Directory, merkle::treeId("")};
+    auto correct = [&](const fetchers::Settings & settings, const SourcePath & source, const merkle::TreeEntry & entry) {
+        EXPECT_NO_THROW({
+            auto result = fetchToStore2(settings, *store, source, FetchMode::DryRun, "entry", method);
+            EXPECT_EQ(result.second, merkle::objectHash(entry));
+        });
     };
-    /* The same Settings can hit the result memo; fresh Settings can hit
-       the persistent sourcePathToHash row. Neither may hide this error. */
-    rejects(settings, SourcePath(bad, node));
+    /* The same Settings may hit its result memo, fresh Settings persistent
+       rows. An unnamed malformed gitlink must never reuse the executable. */
+    correct(settings, SourcePath(bad, node), empty);
     fetchers::Settings fresh;
-    rejects(fresh, SourcePath(bad, node));
+    correct(fresh, SourcePath(bad, node), empty);
+    EXPECT_EQ(settings.getCache()->lookup(makeSourcePathToHashCacheKey(identity->second, method, identity->first)), row);
+    auto memory = make_ref<MemorySourceAccessor>();
+    MemorySink sink{*memory};
+    sink.createDirectory(CanonPath::root);
+    StringSink expectedNar, actualNar;
+    memory->dumpPath(CanonPath::root, expectedNar);
+    EXPECT_NO_THROW(bad->dumpPath(node, actualNar));
+    EXPECT_EQ(actualNar.s, expectedNar.s);
 
-    /* v1 could fold a bad child hit into a parent row. Even after fixing
-       leaf admission, the parent must not reuse that historical answer. */
+    /* v1 could fold a bad child hit into a parent row. Correct leaf
+       classification must not let that historical executable answer back in. */
     const merkle::Tree substituted{{"node", executable}};
     auto wrongParent = merkle::treeId(merkle::serialiseTree(substituted));
     auto legacyKey = makeSourcePathToHashCacheKey("git-object-v1:tree:" + badHash.gitRev(), method, CanonPath::root);
     settings.getCache()->upsert(
         legacyKey,
         {{"mode", uint64_t(merkle::Mode::Directory)}, {"hash", wrongParent.to_string(HashFormat::SRI, true)}});
-    ASSERT_TRUE(settings.getCache()->lookup(legacyKey));
-    rejects(fresh, SourcePath(bad));
+    const auto poisoned = settings.getCache()->lookup(legacyKey);
+    ASSERT_TRUE(poisoned);
+    merkle::Tree rendered;
+    merkle::insertEntry(rendered, "node", empty);
+    const merkle::TreeEntry parent{merkle::Mode::Directory, merkle::treeId(merkle::serialiseTree(rendered))};
+    EXPECT_NE(parent.hash, wrongParent);
+    correct(fresh, SourcePath(bad), parent);
+    fetchers::Settings again;
+    correct(again, SourcePath(bad), parent);
+    auto parentName = bad->getFingerprint(CanonPath::root);
+    ASSERT_TRUE(parentName);
+    auto parentRow = again.getCache()->lookup(makeSourcePathToHashCacheKey(parentName->second, method, parentName->first));
+    EXPECT_EQ(settings.getCache()->lookup(legacyKey), poisoned);
+    ASSERT_TRUE(parentRow);
+    EXPECT_EQ(fetchers::getIntAttr(*parentRow, "mode"), uint64_t(merkle::Mode::Directory));
+    EXPECT_EQ(fetchers::getStrAttr(*parentRow, "hash"), parent.hash.to_string(HashFormat::SRI, true));
 }
 
 /* Soundness over real Git trees: a subtree shared between two roots is stored
@@ -1377,16 +1487,17 @@ TEST_F(GitUtilsTest, entryReadsRequireMatchingObjectTypes)
         ASSERT_EQ(git_object_type(object), types[i]);
     }
 
-    const std::array modes{
-        std::pair{"100644", GIT_FILEMODE_BLOB},
-        std::pair{"100755", GIT_FILEMODE_BLOB_EXECUTABLE},
-        std::pair{"120000", GIT_FILEMODE_LINK},
-        std::pair{"40000", GIT_FILEMODE_TREE},
-        std::pair{"160000", GIT_FILEMODE_COMMIT},
-        /* Raw type precedes normalized mode: 0160100 is a gitlink even
-           though git_tree_entry_filemode reports executable. */
-        std::pair{"160100", GIT_FILEMODE_COMMIT},
-    };
+    std::vector<std::pair<std::string, git_filemode_t>> modes;
+    for (unsigned kind = 0; kind < 16; ++kind)
+        for (bool executable : {false, true}) {
+            const auto raw = (kind << 12) | (executable ? 0100 : 0);
+            const auto reader = kind == 4 ? GIT_FILEMODE_TREE : kind == 14 ? GIT_FILEMODE_COMMIT
+                                : executable ? GIT_FILEMODE_BLOB_EXECUTABLE
+                                : kind == 10 ? GIT_FILEMODE_LINK : GIT_FILEMODE_BLOB;
+            modes.emplace_back(fmt("%o", raw), reader);
+        }
+    modes.emplace_back("100644", GIT_FILEMODE_BLOB);
+    modes.emplace_back("100755", GIT_FILEMODE_BLOB_EXECUTABLE);
     const std::array names{"blob", "tree", "commit", "tag", "missing"};
     const CanonPath node("node");
     for (auto [modeString, readerKind] : modes)

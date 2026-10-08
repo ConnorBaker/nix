@@ -1216,7 +1216,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 winner.representative = where;
             return;
         }
-        auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, where.string()};
+        auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, {}};
         if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
             return;
         if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(where))

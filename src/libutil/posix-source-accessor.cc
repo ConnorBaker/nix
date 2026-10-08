@@ -82,12 +82,8 @@ void PosixSourceAccessorBase::anchor() {}
 
 #ifndef _WIN32
 
-class PosixDirectorySourceAccessor;
-
 class PosixFileSourceAccessor : public PosixSourceAccessorBase
 {
-    friend class PosixDirectorySourceAccessor;
-
     AutoCloseFD fd;
     std::filesystem::path fsPath;
     /**
@@ -100,19 +96,19 @@ class PosixFileSourceAccessor : public PosixSourceAccessorBase
      * then readFile will barf with an EOF exception. If it becomes larger then
      * we are just going to silently ignore the extra bytes.
      */
-    PosixStat st;
+    const Stat st;
 
 public:
     PosixFileSourceAccessor(AutoCloseFD fd, std::filesystem::path path, bool trackLastModified, const PosixStat & st_)
         : PosixSourceAccessorBase(trackLastModified)
         , fd(std::move(fd))
         , fsPath(std::move(path))
-        , st(st_)
+        , st(sourceAccessorStatFromPosixStat(st_))
     {
-        assert(S_ISREG(st.st_mode));
+        assert(st.type == tRegular);
         assert(fsPath.is_absolute()); /* Only used for error messages, but still nice to enforce this invariant. */
         setPathDisplay(fsPath.generic_string());
-        maybeUpdateMtime(st.st_mtime);
+        maybeUpdateMtime(st_.st_mtime);
     }
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
@@ -146,12 +142,10 @@ void PosixFileSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<
     if (!path.isRoot()) /* We are the parent and also a regular file. */
         throw NotADirectory("reading file '%1%': %2%", showPath(path), "Not a directory");
 
-    auto size = st.st_size;
-    sizeCallback(size);
-    /* The most important invariant we care about here is writing exactly size
-       bytes to the sink. copyFdRange should throw an EndOfFile if we fail to read
-       `size` bytes. */
-    copyFdRange(fd.get(), /*offset=*/0, size, sink, /*tryCoW=*/true);
+    sizeCallback(*st.fileSize);
+    /* Write the captured size to the sink. copyFdRange throws EndOfFile if
+       the file has become shorter. */
+    copyFdRange(fd.get(), /*offset=*/0, *st.fileSize, sink, /*tryCoW=*/true);
 }
 
 bool PosixFileSourceAccessor::pathExists(const CanonPath & path)
@@ -163,7 +157,7 @@ std::optional<SourceAccessor::Stat> PosixFileSourceAccessor::maybeLstat(const Ca
 {
     if (!path.isRoot())
         return std::nullopt;
-    return sourceAccessorStatFromPosixStat(st);
+    return st;
 }
 
 SourceAccessor::DirEntries PosixFileSourceAccessor::readDirectory(const CanonPath & path)

@@ -1006,35 +1006,22 @@ public:
         if (!entry)
             return std::nullopt;
 
-        auto mode = git_tree_entry_filemode(entry);
-
-        if (auto type = typeOfMode(mode))
-            /* Size is optional in Stat. Reading a packed delta's header
-               can inflate its delta chain; readFile announces the size
-               when the caller actually needs the contents. */
-            return Stat{.type = *type, .isExecutable = mode == GIT_FILEMODE_BLOB_EXECUTABLE};
-        throw Error("file '%s' has an unsupported Git file type");
+        return statOfEntry(entry);
     }
 
-    /**
-     * The node type an entry's mode gives, as `maybeLstat` reports it (a
-     * submodule an empty directory); nullopt for a mode neither reads.
-     */
-    static std::optional<Type> typeOfMode(git_filemode_t mode)
+    /* Match the content readers: raw trees and gitlinks are directories;
+       other modes are blobs, with owner-execute preceding symlink mode. */
+    static Stat statOfEntry(const git_tree_entry * entry)
     {
-        switch (mode) {
-        case GIT_FILEMODE_TREE:
-        case GIT_FILEMODE_COMMIT:
-            return tDirectory;
-        case GIT_FILEMODE_BLOB:
-        case GIT_FILEMODE_BLOB_EXECUTABLE:
-            return tRegular;
-        case GIT_FILEMODE_LINK:
-            return tSymlink;
-        case GIT_FILEMODE_UNREADABLE:
-            return std::nullopt;
-        }
-        return std::nullopt;
+        auto mode = git_tree_entry_filemode_raw(entry);
+        auto type = mode & 0170000; // Git's four type bits.
+        if (type == GIT_FILEMODE_TREE || type == GIT_FILEMODE_COMMIT)
+            return {.type = tDirectory};
+        bool executable = mode & 0100;
+        /* Size is optional: reading a packed delta's header can inflate its
+           chain; readFile announces the size when contents are needed. */
+        return {.type = type == GIT_FILEMODE_LINK && !executable ? tSymlink : tRegular,
+                .isExecutable = executable};
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -1047,11 +1034,11 @@ public:
             auto count = git_tree_entrycount(tree);
             for (size_t n = 0; n < count; ++n) {
                 auto entry = git_tree_entry_byindex(tree, n);
-                /* Typed from the mode the entry carries, so a
+                /* Typed as the content readers interpret the entry, so a
                    consumer that wants the types (`builtins.readDir`
                    attaches a `readFileType` lookup to every untyped
                    entry) looks nothing up. */
-                res.emplace(git_tree_entry_name(entry), typeOfMode(git_tree_entry_filemode(entry)));
+                res.emplace(git_tree_entry_name(entry), statOfEntry(entry).type);
             }
         }
         return res;
