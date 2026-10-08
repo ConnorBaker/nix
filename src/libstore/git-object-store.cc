@@ -60,7 +60,7 @@ std::filesystem::path GitObjectStore::tempPath(std::string_view kind) const
 /* The second a temporary file's name carries (`tempPath`), if it does. */
 static std::optional<time_t> tempTime(std::string_view name)
 {
-    auto parts = tokenizeString<std::vector<std::string>>(std::string{name}, "-");
+    auto parts = tokenizeString<std::vector<std::string>>(name, "-");
     if (parts.size() != 4)
         return std::nullopt;
     if (auto t = string2Int<long long>(parts[1]))
