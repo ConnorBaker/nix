@@ -42,7 +42,7 @@ TEST(closure, properlyHandlesDirectExceptions)
                 co_return std::set<std::string>{};
             }),
         TestExn);
-    ASSERT_EQ(callCount, 2);
+    ASSERT_EQ(callCount, 2u);
 }
 
 } // namespace nix

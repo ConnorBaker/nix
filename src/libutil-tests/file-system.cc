@@ -406,11 +406,11 @@ TEST_F(MovePathTest, nonWritableDirectories)
     createDir(srcDir, 0500);
     movePath(srcDir, dstDir);
     ASSERT_FALSE(pathExists(srcDir));
-    ASSERT_EQ(lstat(dstDir).st_mode & 0777, 0500);
+    ASSERT_EQ(lstat(dstDir).st_mode & 0777, mode_t{0500});
 
     ASSERT_THROW(movePath(dstDir, tmpDir / "nonexistent" / "dir"), SysError);
     // Permissions are restored on rename errors.
-    ASSERT_EQ(lstat(dstDir).st_mode & 0777, 0500);
+    ASSERT_EQ(lstat(dstDir).st_mode & 0777, mode_t{0500});
 }
 
 TEST_F(MovePathTest, symlinkReplacesSymlink)

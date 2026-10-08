@@ -50,7 +50,7 @@ TEST(ChunkedVector, NonTrivialType)
     v.add(std::vector{1, 2});
     v.add(std::vector{3, 4});
     v.add(std::vector{5, 6});
-    ASSERT_EQ(v.size(), 3);
+    ASSERT_EQ(v.size(), 3u);
 }
 
 TEST(ChunkedVector, ConcurrentAdd)
@@ -74,7 +74,7 @@ TEST(ChunkedVector, ConcurrentAdd)
     for (auto & t : threads)
         t.join();
 
-    ASSERT_EQ(v.size(), nThreads * perThread);
+    ASSERT_EQ(v.size(), uint32_t{nThreads * perThread});
 
     // All indices unique
     std::set<uint32_t> all;
