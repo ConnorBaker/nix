@@ -711,14 +711,13 @@ void LocalStore::insertAuxiliaryRows(
            production projections belong to a fresh ingestion; a retry rolled
            its previous inserts back. No value is overwritten. */
         size_t offset = 0;
-        int64_t ordinal = 0;
         do {
             auto size = std::min(auxiliaryChunkSize, value.body.size() - offset);
             state.stmts->InsertAuxiliary.use(SQLiteStmt::Bindings::Borrow)
                 .apply(static_cast<int64_t>(entry.mode))
                 .apply(entry.hash.hash, entry.hash.hashSize)
                 .apply(static_cast<int64_t>(ingestion))
-                .apply(ordinal++)
+                .apply(static_cast<int64_t>(offset / auxiliaryChunkSize))
                 /* string::data is non-null even for the one empty chunk. */
                 .apply(reinterpret_cast<const unsigned char *>(value.body.data() + offset), size)
                 .exec();

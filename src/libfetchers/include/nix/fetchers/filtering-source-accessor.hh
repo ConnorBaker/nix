@@ -27,9 +27,9 @@ struct FilteringSourceAccessor : SourceAccessor
     CanonPath prefix;
     MakeNotAllowedError makeNotAllowedError;
 
-    FilteringSourceAccessor(const SourcePath & src, MakeNotAllowedError && makeNotAllowedError)
-        : next(src.accessor)
-        , prefix(src.path)
+    FilteringSourceAccessor(SourcePath src, MakeNotAllowedError && makeNotAllowedError)
+        : next(std::move(src.accessor))
+        , prefix(std::move(src.path))
         , makeNotAllowedError(std::move(makeNotAllowedError))
     {
         displayPrefix.clear();
