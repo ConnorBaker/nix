@@ -6212,7 +6212,7 @@ TEST_F(LocalStoreObjectsTest, registeredBlobReuseValidatesTheAcquiredInode)
                                         EXPECT_EQ(result->entered, !reused);
                                     } else {
                                         EXPECT_EQ(
-                                            objects.link(id, executable, fd.get(), name, target, 4, repair, hold),
+                                            objects.link(id, executable, fd.get(), name, target, 4, repair, hold).has_value(),
                                             reused);
                                     }
                                     EXPECT_EQ(forgotten, accepted ? 0u : 1u);

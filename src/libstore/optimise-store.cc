@@ -706,11 +706,11 @@ struct MaterialisingVisitor : LinkingVisitor
             auto where = target.path();
             if (linkableOnThisSystem(where)) {
                 auto [owned, dirFd, name] = target.sink.parentOf(target.name);
-                PosixStat linked;
-                if (!objects.link(
-                        entry.hash, executable, dirFd, name, where, std::nullopt, repair, attemptHold, &linked))
+                auto linked = objects.link(
+                    entry.hash, executable, dirFd, name, where, std::nullopt, repair, attemptHold);
+                if (!linked)
                     throw ObjectUnavailable{};
-                return merkle::nar::regular(static_cast<uint64_t>(linked.st_size), executable);
+                return merkle::nar::regular(*linked, executable);
             }
             auto holder = objects.holderOrForget(entry.hash, executable, repair);
             if (!holder)
@@ -789,13 +789,12 @@ struct MaterialisingVisitor : LinkingVisitor
                 auto where = target.path();
                 auto [owned, dirFd, name] = target.sink.parentOf(target.name);
                 bool linkable = linkableOnThisSystem(where);
-                PosixStat linked;
-                if (linkable
-                    && objects.link(
-                        entry->hash, st.isExecutable, dirFd, name, where, st.fileSize, repair, hold, &linked))
-                    return HashedNode{
-                        .entry = *entry,
-                        .narSize = merkle::nar::regular(static_cast<uint64_t>(linked.st_size), st.isExecutable)};
+                if (linkable)
+                    if (auto linked = objects.link(
+                            entry->hash, st.isExecutable, dirFd, name, where, st.fileSize, repair, hold))
+                        return HashedNode{
+                            .entry = *entry,
+                            .narSize = merkle::nar::regular(*linked, st.isExecutable)};
 
                 std::optional<uint64_t> size;
                 {
@@ -805,12 +804,13 @@ struct MaterialisingVisitor : LinkingVisitor
                     /* Stat need not know a packed blob's size. readFile must
                        announce it before writing, so the copy obtains it only
                        when it actually needs the bytes. */
-                    accessor.readFile(from, writer, [&](uint64_t announced) {
+                    auto sizeCallback = [&](uint64_t announced) {
                         if (st.fileSize && announced != *st.fileSize)
                             throw Error("immutable file '%s' changed size while copying", accessor.showPath(from));
                         size = announced;
                         writer.preallocateContents(announced);
-                    });
+                    };
+                    accessor.readFile(from, writer, std::ref(sizeCallback));
                     if (!size)
                         throw Error("immutable file '%s' did not announce its size", accessor.showPath(from));
                     writer.finish();
@@ -1326,8 +1326,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         PathLocks outputLock;
         if (!locksHeld.count(printStorePath(i)))
             outputLock.lockPaths({pathRoot});
-        auto row = retrySQLite<std::shared_ptr<const ValidPathInfo>>(
-            [&]() { return queryPathInfoInternal(*_state->lock(), i); });
+        auto row = queryPathInfoUnmigrated(i);
         if (!row)
             continue; /* path was GC'ed, probably */
         Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));

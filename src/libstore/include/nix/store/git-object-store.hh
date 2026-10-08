@@ -206,18 +206,17 @@ public:
 
     /**
      * Link the store's valid file for the blob under its mode as `name`
-     * in the writable directory `dirFd`, where nothing stands yet: true
-     * when done, and the file need not be written; false when the store
+     * in the writable directory `dirFd`, where nothing stands yet: its size
+     * when done, and the file need not be written; nullopt when the store
      * lacks the blob (or its invalid candidate was forgotten), when it was
      * swept meanwhile, or at the filesystem's link limit -- the caller
      * writes the file instead.  `size` is the blob's, for the validity
      * check; without one (a materialisation from the store's objects,
      * which has no other measure of the file) the file is trusted as the
      * on-disk walk trusts an inode that is a blob's, its bytes re-hashed
-     * under repair alone.  `linked`, when given, receives the status of
-     * the store's file, whose size the caller may need.
+     * under repair alone. An engaged zero is a successful empty-file link.
      */
-    bool link(
+    std::optional<uint64_t> link(
         const Hash & id,
         bool executable,
         Descriptor dirFd,
@@ -225,8 +224,7 @@ public:
         const std::filesystem::path & where,
         std::optional<uint64_t> size,
         RepairFlag repair,
-        const Hold & hold,
-        PosixStat * linked = nullptr);
+        const Hold & hold);
 
     struct Placed
     {

@@ -453,7 +453,7 @@ static std::optional<GitObjectStore::Placed> placePending(
 
 #endif
 
-bool GitObjectStore::link(
+std::optional<uint64_t> GitObjectStore::link(
     const Hash & id,
     bool executable,
     Descriptor dirFd,
@@ -461,11 +461,10 @@ bool GitObjectStore::link(
     const std::filesystem::path & where,
     std::optional<uint64_t> size,
     RepairFlag repair,
-    const Hold & hold,
-    PosixStat * linked)
+    const Hold & hold)
 {
 #ifdef _WIN32
-    return false;
+    return std::nullopt;
 #else
     /* The holder: a file this ingestion already wrote for the blob (law 3
        within one path, before any row is committed), else the index's. */
@@ -479,11 +478,11 @@ bool GitObjectStore::link(
         if (st && size && static_cast<uint64_t>(st->st_size) != *size)
             st = std::nullopt;
         if (!st)
-            return false;
+            return std::nullopt;
         if (auto ec = linkPathIntoDir(*mine, dirFd, name)) {
             if (ec == std::errc::no_such_file_or_directory || ec == std::errc::too_many_links
                 || ec == std::errc::no_space_on_device)
-                return false;
+                return std::nullopt;
             throw Error(
                 "creating hard link from %1% to %2%: %3%",
                 PathFmt(std::filesystem::path(*mine)),
@@ -503,7 +502,7 @@ bool GitObjectStore::link(
                 continue;
             if (auto ec = linkPathIntoDir(holder->file, dirFd, name)) {
                 if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device)
-                    return false;
+                    return std::nullopt;
                 if (ec == std::errc::no_such_file_or_directory) {
                     forget();
                     continue;
@@ -538,18 +537,14 @@ bool GitObjectStore::link(
         }
     }
     if (!st)
-        return false;
+        return std::nullopt;
     /* This path now holds the blob even if the donor is collected before
        registration. Keep its own witness, using the status already read.
        A concurrent worker may have claimed a different holder meanwhile. */
     if (!mine)
         if (auto other = hold.addRow(rowOf(id, executable, *st, where, hold)))
-            if (auto placed =
-                    linkOver(*this, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; }))
-                st->st_ino = placed->ino;
-    if (linked)
-        *linked = *st;
-    return true;
+            linkOver(*this, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
+    return static_cast<uint64_t>(st->st_size);
 #endif
 }
 
