@@ -41,7 +41,7 @@ namespace {
 /**
  * Common base helper class for deduplicating common code paths for tracking mtime.
  */
-class PosixSourceAccessorBase : virtual public SourceAccessor
+class PosixSourceAccessorBase : public SourceAccessor
 {
 private:
     void anchor() override;
