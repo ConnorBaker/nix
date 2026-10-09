@@ -708,7 +708,7 @@ struct MaterialisingVisitor : LinkingVisitor
                 throw ObjectUnavailable{};
             auto bytes = nix::readFile(std::filesystem::path(holder->file));
             if (merkle::blobId(bytes) != entry.hash)
-                throw Error("blob object %s does not hash to its name", GitObjectStore::idString(entry.hash));
+                throw Error("blob object %s does not hash to its name", entry.hash.gitRev());
             target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & writer) {
                 if (executable)
                     writer.isExecutable();
@@ -1109,8 +1109,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                     throw Error(
                         "cannot publish ingestion holder %s: expected blob %s, observed %s",
                         PathFmt(own),
-                        GitObjectStore::idString(row.id),
-                        GitObjectStore::idString(observed));
+                        row.id.gitRev(),
+                        observed.gitRev());
                 useOwn = false;
                 collision.eligible = true;
                 break;
@@ -1282,7 +1282,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
     Activity act(*logger, actOptimiseStore);
 
     auto paths = queryAllValidPaths();
-    auto blobInodes = objects.blobInodes();
+    auto blobInodes = this->blobInodes();
 
     act.progress(0, paths.size());
 

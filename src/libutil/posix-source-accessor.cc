@@ -172,6 +172,7 @@ std::string PosixFileSourceAccessor::readLink(const CanonPath & path)
     throw NotASymlink("path '%1%' is not a symlink", showPath(path));
 }
 
+[[gnu::cold, gnu::noinline]]
 static unsigned getGlobalDirFdCacheLimit()
 {
     ::rlimit lim{};
@@ -338,8 +339,6 @@ PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool i
     std::shared_ptr<AutoCloseFD> parentFdOwning;
     Descriptor parentFd = dirFd;
     if (!parent.isRoot()) {
-        maybeEvictFromGlobalCaches();
-
         std::shared_ptr<AutoCloseFD> intermediateParentFd;
         CanonPath anchor = CanonPath::root;
 
@@ -359,6 +358,8 @@ PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool i
                 p.pop();
             }
         }
+
+        maybeEvictFromGlobalCaches();
 
         Descriptor startFd = intermediateParentFd ? intermediateParentFd->get() : dirFd;
         CanonPath relPath = intermediateParentFd ? parent.removePrefix(anchor) : parent;

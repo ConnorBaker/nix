@@ -33,13 +33,13 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
     if (!mount)
         return;
 
-    /* TODO: We could memoise this in-memory if necessary. */
+    /* Protect the demanded destination before deciding whether it needs a write. */
+    store->addTempRoot(path);
     auto storePath = fetchToStore(
         fetchSettings,
         *store,
         SourcePath{ref(mount)},
-        /* Force a copy. mountInput does a dryRun to just calculate the storePath and tree hash. */
-        FetchMode::Copy,
+        store->isValidPath(path) ? FetchMode::DryRun : FetchMode::Copy,
         path.name());
 
     /* This can happen if the source gets modified by another process while we are evaluaing

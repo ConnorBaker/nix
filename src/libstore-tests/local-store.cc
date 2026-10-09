@@ -576,6 +576,11 @@ protected:
        counted them; a file linked from the object store is not one. */
     unsigned filesCreated = 0;
 
+    auto blobInodes()
+    {
+        return store->blobInodes();
+    }
+
     auto lockStoreState()
     {
         return store->_state->lock();
@@ -701,7 +706,7 @@ protected:
     {
         auto holder = store->objects.holderOrForget(id, executable, NoRepair);
         if (!holder)
-            throw Error("no regular-file holder %s", GitObjectStore::idString(id));
+            throw Error("no regular-file holder %s", id.gitRev());
         return holder->file;
     }
 
@@ -719,7 +724,7 @@ protected:
     {
         auto body = store->objects.readAuxiliary({merkle::Mode::Directory, id});
         if (!body)
-            throw Error("no tree %s", GitObjectStore::idString(id));
+            throw Error("no tree %s", id.gitRev());
         return GitObjectStore::parseTreeBody(id, *body);
     }
 
@@ -3425,7 +3430,7 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
                         inodeOf(*std::min_element(files.begin(), files.end(), [&](const auto & a, const auto & b) {
                             return inodeOf(a) < inodeOf(b);
                         }));
-                    auto inodes = store->objects.blobInodes();
+                    auto inodes = blobInodes();
                     size_t expectedLinked = 0;
                     for (const auto & file : files) {
                         bool chosen = inodeOf(file) == canonical;
@@ -4499,7 +4504,7 @@ TEST_F(LocalStoreObjectsTest, sweepMakesAMissingObjectDirectory)
     EXPECT_FALSE(pathExists(objects.dir / "blobs"));
     EXPECT_FALSE(pathExists(objects.dir / "blobs-x"));
     EXPECT_TRUE(hasTree(result.root.hash));
-    EXPECT_FALSE(objects.blobInodes().empty());
+    EXPECT_FALSE(blobInodes().empty());
     auto hold = objects.hold();
     EXPECT_TRUE(pathExists(hold.directory())) << "the next lease recreates only its temporary namespace";
 }
@@ -4802,7 +4807,7 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
                 }
                 restore(target, narOf(*accessor));
                 auto file = bare ? target : target / "file";
-                auto hints = store->objects.blobInodes();
+                auto hints = blobInodes();
                 auto originalId = merkle::blobId(originalBytes);
                 ASSERT_TRUE(hints.contains(st(file).st_ino));
 
@@ -6623,16 +6628,16 @@ TEST_F(LocalStoreObjectsTest, lawFourHoldsForEveryValidPath)
         while (!todo.empty()) {
             auto [id, isRoot] = todo.back();
             todo.pop_back();
-            if (!visited.insert(GitObjectStore::idString(id)).second)
+            if (!visited.insert(id.gitRev()).second)
                 continue;
             if (!hasTree(id)) {
                 /* A plain file's object hash is its blob's id, which names
                    no tree; every other root names one. */
                 if (isRoot && hasBlob(id, false)) {
                     blobsNamed++;
-                    blobUses[GitObjectStore::idString(id)]++;
+                    blobUses[id.gitRev()]++;
                 } else
-                    missing.push_back(fmt("%s: no tree %s", name, GitObjectStore::idString(id)));
+                    missing.push_back(fmt("%s: no tree %s", name, id.gitRev()));
                 continue;
             }
             treesReached++;
@@ -6643,7 +6648,7 @@ TEST_F(LocalStoreObjectsTest, lawFourHoldsForEveryValidPath)
                 }
                 bool executable = entry.mode == merkle::Mode::Executable;
                 blobsNamed++;
-                blobUses[GitObjectStore::idString(entry.hash)]++;
+                blobUses[entry.hash.gitRev()]++;
                 if (entry.mode == merkle::Mode::Symlink ? !hasAuxiliary(entry.hash, merkle::Mode::Symlink)
                                                         : !hasBlob(entry.hash, executable))
                     missing.push_back(fmt("%s: no blob for %s%s", name, entryName, executable ? " (executable)" : ""));
@@ -6719,7 +6724,7 @@ TEST_F(LocalStoreObjectsTest, enospcLeftFileIsReportedNotRepairedForever)
 TEST_F(LocalStoreObjectsTest, parseTreeBodyErrorsNameTheTree)
 {
     auto id = merkle::treeId("");
-    auto named = ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id)));
+    auto named = ::testing::ThrowsMessage<Error>(::testing::HasSubstr(id.gitRev()));
     EXPECT_THAT([&] { parseTreeBody(id, "garbage"); }, named);
     EXPECT_THAT([&] { parseTreeBody(id, std::string("777777 name\0", 12) + std::string(32, 'h')); }, named);
 }
@@ -6746,7 +6751,7 @@ TEST_F(LocalStoreObjectsTest, canonicalTreeBodiesRejectReservedPhysicalNames)
                 const auto id = merkle::treeId(body);
                 EXPECT_THAT(
                     [&] { parseTreeBody(id, body); },
-                    ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                    ::testing::ThrowsMessage<Error>(::testing::HasSubstr(id.gitRev())));
                 ++cases;
             }
     }
@@ -6771,7 +6776,7 @@ TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresUniqueLogicalNamesInEveryMode
                 if (sameName) {
                     EXPECT_THAT(
                         [&] { parseTreeBody(id, body); },
-                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(id.gitRev())));
                 } else {
                     auto tree = parseTreeBody(id, body);
                     EXPECT_EQ(tree.size(), 2u);
@@ -6847,7 +6852,7 @@ TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresCanonicalModeSpellings)
                 } else {
                     EXPECT_THAT(
                         [&] { parseTreeBody(id, body); },
-                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                        ::testing::ThrowsMessage<Error>(::testing::HasSubstr(id.gitRev())));
                 }
                 ++cases;
             }
@@ -6883,7 +6888,7 @@ TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresCanonicalGitEntryOrder)
                     } else {
                         EXPECT_THAT(
                             [&] { parseTreeBody(id, body); },
-                            ::testing::ThrowsMessage<Error>(::testing::HasSubstr(GitObjectStore::idString(id))));
+                            ::testing::ThrowsMessage<Error>(::testing::HasSubstr(id.gitRev())));
                     }
                     ++cases;
                 } while (std::next_permutation(order.begin(), order.end()));

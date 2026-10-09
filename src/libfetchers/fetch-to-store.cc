@@ -278,6 +278,7 @@ struct MemoVisitor : HashingVisitor, MemoNamer
         /* This private visitor returns only the entry; it never publishes a NAR size. */
         auto result = entry ? HashedNode{.entry = *entry, .narSize = std::nullopt} : descend();
         if (!entry) {
+            result.narSize.reset();
             if (st.type == SourceAccessor::tSymlink)
                 key = keyOf(to, root.path / to);
             if (key) {

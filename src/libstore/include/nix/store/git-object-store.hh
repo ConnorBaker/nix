@@ -105,10 +105,8 @@ public:
         std::function<std::optional<Holder>(const Hash &, bool, Holder::Cursor)> lookup;
         /** Forget this candidate only if it is still the row observed. */
         std::function<void(const Hash &, bool, const Holder &)> forget;
-        /** The first registered candidate's inode for each (id, mode),
-         * with its identifier, for the optimiser's shortcut (`blobInodes`). */
-        std::function<void(boost::unordered_flat_map<ino_t, Hash> &)> inodes;
         /** A committed owned body whose framed hash matches the typed address.
+         * The caller supplies a canonical SHA-256 Directory or Symlink key.
          * The provider releases its statement/transaction before returning;
          * missing or corrupt candidates do not escape as usable bytes. */
         std::function<std::optional<std::string>(const merkle::TreeEntry &)> readAuxiliary;
@@ -180,8 +178,6 @@ public:
      * with the expected canonical blob identifier. This does not establish
      * a snapshot of a concurrently mutable file. */
     static Hash blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize);
-
-    static std::string idString(const Hash & id);
 
     /**
      * The index's holder for the blob under a mode when it is still what
@@ -409,8 +405,6 @@ public:
      * file's full physical metadata; an inode hint alone is insufficient.
      */
     using BlobInodes = boost::unordered_flat_map<ino_t, Hash>;
-
-    BlobInodes blobInodes() const;
 
     struct SweepStats
     {

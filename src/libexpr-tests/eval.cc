@@ -11,6 +11,7 @@
 #include "nix/util/archive.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/expr/value-to-json.hh"
 
 namespace nix {
@@ -447,6 +448,22 @@ TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupan
                 else
                     EXPECT_EQ(
                         readFile(real / "default.nix"), registered && physical == Physical::Different ? "7" : "42");
+
+                /* A valid destination needs no restore or free-space probe.
+                   Keep that probe unavailable through the changed-source check. */
+                auto previousFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
+                auto & gc = nix::settings.getLocalSettings().getGCSettings();
+                auto previousInterval = gc.minFreeCheckInterval.get();
+                Finally restoreCollectionProbe{[&] {
+                    gc.minFreeCheckInterval = previousInterval;
+                    if (previousFreeSpaceFile)
+                        setEnv("_NIX_TEST_FREE_SPACE_FILE", previousFreeSpaceFile->c_str());
+                    else
+                        unsetenv("_NIX_TEST_FREE_SPACE_FILE");
+                }};
+                gc.minFreeCheckInterval = 0;
+                setEnv("_NIX_TEST_FREE_SPACE_FILE", (root.path() / "missing-free-space").string().c_str());
+                EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
 
                 /* Mounting fixes an expected address, not mutable source bytes.
                    A valid old destination must not suppress the later check. */

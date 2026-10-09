@@ -150,20 +150,16 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryValidPaths;
     SQLiteStmt ReadAuxiliary;
     SQLiteStmt ReadAuxiliaryExact;
-    SQLiteStmt QueryAuxiliaryKeys;
     SQLiteStmt InsertAuxiliary;
     SQLiteStmt DeleteAuxiliary;
     /* The blob index (`06-holder-index.md`). */
     SQLiteStmt LookupBlob;
     SQLiteStmt InsertBlob;
     SQLiteStmt DeleteBlob;
-    SQLiteStmt QueryBlobInodes;
     SQLiteStmt QueryBlobCollisions;
     SQLiteStmt DeletePathIngestions;
     SQLiteStmt NewIngestion;
     SQLiteStmt SetIngestionPath;
-    SQLiteStmt QueryStaleIngestions;
-    SQLiteStmt DeleteIngestion;
 };
 
 static constexpr auto lookupBlobSql =
@@ -443,7 +439,6 @@ LocalStore::LocalStore(ref<const Config> config)
             state->db,
             "select ingestion, chunk, body from AuxValues"
             " where kind = ? and id = ? and ingestion = ? order by chunk;");
-        state->stmts->QueryAuxiliaryKeys.create(state->db, "select distinct kind, id, ingestion from AuxValues;");
         state->stmts->InsertAuxiliary.create(
             state->db, "insert into AuxValues (kind, id, ingestion, chunk, body) values (?, ?, ?, ?, ?);");
         state->stmts->DeleteAuxiliary.create(
@@ -457,16 +452,6 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->DeleteBlob.create(
             state->db,
             "delete from Blobs where id = ? and exec = ? and ino = ? and dev = ? and ingestion = ? and name = ? and size = ?;");
-        /* Only the first registered candidate is canonical to the optimiser's
-           inode shortcut. Other candidates must reach place() to coalesce. */
-        state->stmts->QueryBlobInodes.create(
-            state->db,
-            "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion "
-            "join ValidPaths v on v.path = i.path where not exists ("
-            "select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion "
-            "join ValidPaths ev on ev.path = ei.path "
-            "where earlier.id = b.id and earlier.exec = b.exec"
-            " and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));");
         state->stmts->QueryBlobCollisions.create(
             state->db,
             "select own.id, own.exec, own.ino, own.dev, own.size, own.name,"
@@ -481,14 +466,6 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->DeletePathIngestions.create(state->db, "delete from Ingestions where path = ?;");
         state->stmts->NewIngestion.create(state->db, "insert into Ingestions (path, hold) values (?, ?);");
         state->stmts->SetIngestionPath.create(state->db, "update Ingestions set path = ? where id = ?;");
-        /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
-           got its path, or whose path is no longer valid, names no holder. */
-        /* Dead-lease cleanup precedes this query. sweepStaleBlobRows checks each
-           returned hold path before removing its projection. */
-        state->stmts->QueryStaleIngestions.create(
-            state->db,
-            "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
-        state->stmts->DeleteIngestion.create(state->db, "delete from Ingestions where id = ?;");
     }
     if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
         state->stmts->RegisterRealisedOutput.create(
@@ -587,18 +564,36 @@ LocalStore::LocalStore(ref<const Config> config)
                     {id, executable, holder.ino, holder.dev, holder.size, name.string()});
             });
         };
-        blobIndex.inodes = [this](boost::unordered_flat_map<ino_t, Hash> & inodes) {
-            retrySQLite<void>([&]() {
-                auto state(_state->lock());
-                auto use(state->stmts->QueryBlobInodes.use());
-                while (use.next())
-                    inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobView(1)));
-            });
-        };
     }
     if (state->stmts->ReadAuxiliary)
         blobIndex.readAuxiliary = [this](const merkle::TreeEntry & entry) { return readAuxiliary(entry); };
     objects.index = &blobIndex;
+}
+
+GitObjectStore::BlobInodes LocalStore::blobInodes()
+{
+    GitObjectStore::BlobInodes inodes;
+#ifndef _WIN32
+    retrySQLite<void>([&] {
+        auto state(_state->lock());
+        if (!state->stmts->LookupBlob)
+            return;
+        /* Only the first registered candidate is canonical to the optimiser's
+           inode shortcut. Other candidates must reach place() to coalesce. */
+        SQLiteStmt queryBlobInodes(
+            state->db,
+            "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion "
+            "join ValidPaths v on v.path = i.path where not exists ("
+            "select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion "
+            "join ValidPaths ev on ev.path = ei.path "
+            "where earlier.id = b.id and earlier.exec = b.exec"
+            " and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));");
+        auto use(queryBlobInodes.use());
+        while (use.next())
+            inodes.insert_or_assign(static_cast<ino_t>(use.getInt(0)), blobIdOf(use.getBlobView(1)));
+    });
+#endif
+    return inodes;
 }
 
 void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
@@ -674,10 +669,6 @@ static bool auxiliaryBodyMatches(int64_t kind, std::string_view id, const std::o
 
 std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & entry)
 {
-    if ((entry.mode != merkle::Mode::Directory && entry.mode != merkle::Mode::Symlink)
-        || entry.hash.algo != GitObjectStore::hashAlgo
-        || entry.hash.hashSize != regularHashSize(GitObjectStore::hashAlgo))
-        throw Error("invalid auxiliary object key");
     std::optional<int64_t> cursor;
     while (true) {
         auto candidate = retrySQLite<std::optional<AuxiliaryCandidate>>([&] {
@@ -739,9 +730,10 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
     auto keys = retrySQLite<std::vector<Key>>([&] {
         auto state(_state->lock());
         std::vector<Key> keys;
-        if (!state->stmts->QueryAuxiliaryKeys)
+        if (!state->stmts->ReadAuxiliary)
             return keys;
-        auto use(state->stmts->QueryAuxiliaryKeys.use());
+        SQLiteStmt query(state->db, "select distinct kind, id, ingestion from AuxValues;");
+        auto use(query.use());
         while (use.next())
             keys.push_back({use.getInt(0), std::string(use.getBlobView(1)), use.getInt(2)});
         return keys;
@@ -951,7 +943,13 @@ void LocalStore::sweepStaleBlobRows()
         SQLiteTxn txn(state->db);
         std::vector<uint64_t> stale;
         {
-            auto use(state->stmts->QueryStaleIngestions.use());
+            /* The sweep's stale-row rule (schema.sql): a row whose ingestion never
+               got its path, or whose path is no longer valid, names no holder. */
+            /* Dead-lease cleanup precedes this query. sweepStaleBlobRows checks each
+               returned hold path before removing its projection. */
+            SQLiteStmt query(
+                state->db, "select id, hold from Ingestions where path is null or path not in (select path from ValidPaths);");
+            auto use(query.use());
             while (use.next()) {
                 auto id = static_cast<uint64_t>(use.getInt(0));
                 auto held = use.isNull(1) ? std::string() : use.getStr(1);
@@ -963,9 +961,10 @@ void LocalStore::sweepStaleBlobRows()
                 stale.push_back(id);
             }
         }
+        SQLiteStmt erase(state->db, "delete from Ingestions where id = ?;");
         for (auto id : stale) {
 
-            state->stmts->DeleteIngestion.use().apply(static_cast<int64_t>(id)).exec();
+            erase.use().apply(static_cast<int64_t>(id)).exec();
         }
         txn.commit();
     });

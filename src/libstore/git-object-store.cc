@@ -37,11 +37,6 @@ Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path, uint64_t o
     return hasher.finish();
 }
 
-std::string GitObjectStore::idString(const Hash & id)
-{
-    return id.to_string(HashFormat::Base16, false);
-}
-
 std::filesystem::path GitObjectStore::Hold::tempPath(std::string_view kind) const
 {
     /* Preserve the historical unique name format; the lease owns its lifetime. */
@@ -230,7 +225,7 @@ GitObjectStore::Hold::~Hold() = default;
 #ifndef _WIN32
 /* New leases contain only this ingestion's flat regular-file pins. Joined
    workers cannot add entries. Never descend a surprising directory. */
-static void releaseHoldContents(AutoCloseFD scan)
+static AutoCloseDir releaseHoldContents(AutoCloseFD scan)
 {
     auto fd = scan.get();
     AutoCloseDir entries{fdopendir(fd)};
@@ -246,6 +241,7 @@ static void releaseHoldContents(AutoCloseFD scan)
     }
     if (errno)
         throw SysError("reading ingestion lease");
+    return entries;
 }
 #endif
 
@@ -255,8 +251,8 @@ GitObjectStore::Hold::Lease::~Lease()
         return;
     try {
 #ifndef _WIN32
-        /* The descriptor retains the lease lock throughout pin removal. */
-        releaseHoldContents(std::move(fd));
+        /* The directory stream retains the lease lock through removal. */
+        auto entries = releaseHoldContents(std::move(fd));
         if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
             throw SysError("removing hold %s", PathFmt(dir));
 #else
@@ -676,20 +672,9 @@ merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view bod
     try {
         git::parseTreeBody(into, body, hashAlgo);
     } catch (Error & e) {
-        throw Error("malformed tree object %s: %s", idString(id), e.msg());
+        throw Error("malformed tree object %s: %s", id.gitRev(), e.msg());
     }
     return std::move(into.tree);
-}
-
-GitObjectStore::BlobInodes GitObjectStore::blobInodes() const
-{
-    BlobInodes inodes;
-#ifndef _WIN32
-    /* Only regular holders have inode hints; auxiliary values have none. */
-    if (index && index->inodes)
-        index->inodes(inodes);
-#endif
-    return inodes;
 }
 
 /* Legacy caches are no longer a readable representation. Descend only the

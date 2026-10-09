@@ -240,10 +240,8 @@ public:
                 ret.info.id = (int) r.getInt(0);
             }
 
-            state->caches[uri] = ret;
-
             txn.commit();
-            return ret.info.id;
+            return state->caches.emplace(uri, std::move(ret)).first->second.info.id;
         });
     }
 

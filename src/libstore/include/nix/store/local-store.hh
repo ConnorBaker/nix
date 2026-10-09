@@ -753,6 +753,8 @@ public:
     void endIngestion(const GitObjectStore::Hold & hold, const StorePath & path);
 
 private:
+    GitObjectStore::BlobInodes blobInodes();
+
     struct BlobCoalescing
     {
         GitObjectStore::Hold::Row row;

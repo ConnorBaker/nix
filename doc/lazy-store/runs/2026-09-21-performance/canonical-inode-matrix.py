@@ -16,7 +16,7 @@ def cpp_strings(text):
     return "".join(ast.literal_eval(s) for s in re.findall(r'"(?:[^"\\]|\\.)*"', text))
 
 
-query = cpp_strings(re.search(r'QueryBlobInodes\.create\(\s*state->db,\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\);', source)[1])
+query = cpp_strings(re.search(r'(?:QueryBlobInodes\.create|SQLiteStmt queryBlobInodes)\(\s*state->db,\s*((?:"(?:[^"\\]|\\.)*"\s*)+)\);', source)[1])
 lookup = cpp_strings(re.search(r"static constexpr auto lookupBlobSql =(.*?);\s*\n", source, re.S)[1])
 c = sqlite3.connect(":memory:")
 c.executescript("""
