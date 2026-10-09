@@ -33,9 +33,10 @@ struct HashedNode
  * their size is announced. Borrows path; finish once after delivery. */
 struct HashingRegularFileSink : CreateRegularFileSink
 {
+protected:
+    bool executable = false;
 private:
     const CanonPath & path;
-    bool executable = false;
     std::optional<merkle::ObjectHasher> hasher;
     uint64_t announced = 0;
     uint64_t received = 0;
@@ -137,8 +138,8 @@ public:
     HashedNode directory(const CanonPath & path, Children children) override;
 
 protected:
-    /** The directory summary and its encoding, for a consumer that publishes the body. */
-    std::pair<HashedNode, std::string> hashDirectory(const CanonPath & path, Children children);
+    /** Hash the directory and retain its encoding for a consumer that publishes the body. */
+    HashedNode hashDirectory(const CanonPath & path, Children children, std::string & body);
 };
 
 /**

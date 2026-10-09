@@ -198,14 +198,10 @@ struct ObjectStoreVisitor : HashingVisitor
 
     HashedNode directory(const CanonPath & path, Children children) override
     {
-        return publishDirectory(hashDirectory(path, std::move(children)));
-    }
-
-    HashedNode publishDirectory(std::pair<HashedNode, std::string> result)
-    {
-        auto & [node, body] = result;
+        std::string body;
+        auto node = hashDirectory(path, std::move(children), body);
         hold.addAuxiliary({node.entry, std::move(body)});
-        return std::move(node);
+        return node;
     }
 };
 
@@ -375,7 +371,6 @@ static BufferedRegularFile readBufferedRegular(
     {
         const function_ref<std::unique_ptr<RegularFileWriter>()> & open;
         Sink * contents;
-        bool executable = false;
         std::string buffer;
         std::unique_ptr<RegularFileWriter> writer;
 
@@ -389,7 +384,6 @@ static BufferedRegularFile readBufferedRegular(
 
         void isExecutable() override
         {
-            executable = true;
             HashingRegularFileSink::isExecutable();
             if (writer)
                 writer->isExecutable();
@@ -520,15 +514,17 @@ struct LinkingVisitor : ObjectStoreVisitor
     HashedNode directory(const CanonPath & path, Children children) override
     {
         auto target = at(path);
-        std::optional<std::pair<HashedNode, std::string>> result;
+        std::optional<HashedNode> result;
+        std::string body;
         auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
             assert(rel.isRoot());
             Scope scope{sub, currentFrame().diskName};
-            result = hashDirectory(path, std::move(children));
+            result = hashDirectory(path, std::move(children), body);
         };
         target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
-        return publishDirectory(std::move(*result));
+        hold.addAuxiliary({result->entry, std::move(body)});
+        return std::move(*result);
     }
 
     HashedNode symlink(const CanonPath & path, const std::string & target) override
@@ -541,10 +537,8 @@ struct LinkingVisitor : ObjectStoreVisitor
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
     {
         auto target = at(path);
-        auto where = target.path();
         return placeRegular(
             target,
-            where,
             readBufferedRegular(
                 path,
                 std::move(read),
@@ -555,8 +549,9 @@ struct LinkingVisitor : ObjectStoreVisitor
                 path.isRoot() ? rootContents : nullptr));
     }
 
-    HashedNode placeRegular(const Target & target, const std::filesystem::path & where, BufferedRegularFile file)
+    HashedNode placeRegular(const Target & target, BufferedRegularFile file)
     {
+        auto where = target.path();
         auto & node = file.node;
         auto & buffer = file.buffer;
         auto & writer = file.writer;
@@ -1042,7 +1037,7 @@ StorePath LocalStore::materialise(
                 beginIngestion(*hold, restore.dstPath);
             LinkingVisitor linking{objects, *hold, restore, repair};
             auto target = linking.at(CanonPath::root);
-            linking.placeRegular(target, target.path(), std::move(*buffered));
+            linking.placeRegular(target, std::move(*buffered));
             buffered.reset();
             objects.putRootTree(result.root, *hold);
         }

@@ -3,12 +3,11 @@
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/callback.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/util/json-utils.hh"
 #include "nix/store/dummy-store-impl.hh"
 #include "nix/store/realisation.hh"
 #include "nix/store/derivation/aterm.hh"
-
-#include <boost/unordered/concurrent_flat_map.hpp>
 
 namespace nix {
 
@@ -32,98 +31,6 @@ bool DummyStore::operator==(const DummyStore & other) const
 {
     return contents == other.contents && derivations == other.derivations && buildTrace == other.buildTrace;
 }
-
-namespace {
-
-class WholeStoreViewAccessor : public SourceAccessor
-{
-    void anchor() override {};
-
-    using BaseName = std::string;
-
-    /**
-     * Map from store path basenames to corresponding accessors.
-     */
-    boost::concurrent_flat_map<BaseName, ref<MemorySourceAccessor>> subdirs;
-
-    /**
-     * Helper accessor for accessing just the CanonPath::root.
-     */
-    MemorySourceAccessor rootPathAccessor;
-
-    /**
-     * Helper empty accessor.
-     */
-    MemorySourceAccessor emptyAccessor;
-
-    auto
-    callWithAccessorForPath(CanonPath path, std::invocable<MemorySourceAccessor &, const CanonPath &> auto callback)
-    {
-        if (path.isRoot())
-            return callback(rootPathAccessor, path);
-
-        BaseName baseName(*path.begin());
-        std::shared_ptr<MemorySourceAccessor> res;
-
-        subdirs.cvisit(baseName, [&](const auto & kv) {
-            path = path.removePrefix(CanonPath{baseName});
-            res = kv.second.get_ptr();
-        });
-
-        if (!res)
-            /* The accessor is truly empty, i.e. without any file at root so
-               any subsequent operation with it will fail. */
-            return callback(emptyAccessor, path);
-
-        return callback(*res, path);
-    }
-
-public:
-    WholeStoreViewAccessor()
-    {
-        MemorySink sink{rootPathAccessor};
-        sink.createDirectory(CanonPath::root);
-    }
-
-    void addObject(std::string_view baseName, ref<MemorySourceAccessor> accessor)
-    {
-        subdirs.emplace(baseName, std::move(accessor));
-    }
-
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
-    {
-        return callWithAccessorForPath(path, [&](SourceAccessor & accessor, const CanonPath & path) {
-            return accessor.readFile(path, sink, std::move(sizeCallback));
-        });
-    }
-
-    bool pathExists(const CanonPath & path) override
-    {
-        return callWithAccessorForPath(
-            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.pathExists(path); });
-    }
-
-    std::optional<Stat> maybeLstat(const CanonPath & path) override
-    {
-        return callWithAccessorForPath(
-            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.maybeLstat(path); });
-    }
-
-    DirEntries readDirectory(const CanonPath & path) override
-    {
-        /* FIXME: Special-case the root directory to read the whole store, not just an empty root. */
-        return callWithAccessorForPath(
-            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.readDirectory(path); });
-    }
-
-    std::string readLink(const CanonPath & path) override
-    {
-        return callWithAccessorForPath(
-            path, [](SourceAccessor & accessor, const CanonPath & path) { return accessor.readLink(path); });
-    }
-};
-
-} // namespace
 
 ref<Store> DummyStoreConfig::openStore() const
 {
@@ -150,13 +57,18 @@ public:
      *
      * This is needed just in order to implement `Store::getFSAccessor`.
      */
-    ref<WholeStoreViewAccessor> wholeStoreView = make_ref<WholeStoreViewAccessor>();
+    ref<MountedSourceAccessor> wholeStoreView;
 
     DummyStoreImpl(ref<const Config> config)
         : Store{*config}
         , DummyStore{config}
+        , wholeStoreView([&] {
+            auto root = make_ref<MemorySourceAccessor>();
+            root->root = MemorySourceAccessor::File::Directory{};
+            root->setPathDisplay(config->storeDir);
+            return makeMountedSourceAccessor({{CanonPath::root, root}});
+        }())
     {
-        wholeStoreView->setPathDisplay(config->storeDir);
     }
 
     void queryPathInfoUncached(
@@ -239,6 +151,7 @@ public:
             return;
         }
 
+        accessor->setPathDisplay(printStorePath(path));
         contents.insert({
             path,
             PathInfoAndContents{
@@ -246,7 +159,7 @@ public:
                 accessor,
             },
         });
-        wholeStoreView->addObject(path.to_string(), accessor);
+        wholeStoreView->mount(CanonPath(path.to_string()), accessor);
     }
 
     StorePath addToStoreFromDump(
@@ -307,6 +220,7 @@ public:
 
         auto path = info.path;
         auto accessor = make_ref<MemorySourceAccessor>(std::move(*temp));
+        accessor->setPathDisplay(printStorePath(path));
         contents.insert({
             path,
             PathInfoAndContents{
@@ -314,7 +228,7 @@ public:
                 accessor,
             },
         });
-        wholeStoreView->addObject(path.to_string(), accessor);
+        wholeStoreView->mount(CanonPath(path.to_string()), accessor);
 
         return path;
     }

@@ -487,7 +487,8 @@ TEST_F(GitTest, both_roundrip)
 
             HashedNode directory(const CanonPath & path, Children children) override
             {
-                auto [node, body] = hashDirectory(path, std::move(children));
+                std::string body;
+                auto node = hashDirectory(path, std::move(children), body);
                 StringSink s;
                 merkle::feedHeader(s, "tree", body.size());
                 s(body);

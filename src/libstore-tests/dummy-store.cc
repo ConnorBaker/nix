@@ -203,6 +203,7 @@ TEST(DummyStore, wholeStoreReadOwnsItsSelectedChildAcrossCallbacks)
                 auto config = make_ref<DummyStoreConfig>(StoreReference::Params{});
                 config->readOnly = false;
                 auto store = config->openDummyStore().get_ptr();
+                EXPECT_TRUE(store->getFSAccessor()->readDirectory(CanonPath::root).empty());
                 const std::string expected = "owned callback bytes";
                 StringSource source{expected};
                 auto path = store->addToStoreFromDump(
@@ -215,6 +216,11 @@ TEST(DummyStore, wholeStoreReadOwnsItsSelectedChildAcrossCallbacks)
                     NoRepair);
                 std::weak_ptr<SourceAccessor> child = store->getFSAccessor(path);
                 auto view = store->getFSAccessor().get_ptr();
+                EXPECT_EQ(
+                    view->readDirectory(CanonPath::root),
+                    (SourceAccessor::DirEntries{{std::string(path.to_string()), SourceAccessor::tRegular}}));
+                EXPECT_EQ(view->showPath(CanonPath::root), config->storeDir + "/");
+                EXPECT_EQ(view->showPath(CanonPath(path.to_string())), store->printStorePath(path) + "/");
                 std::weak_ptr<SourceAccessor> outer = view;
                 unsigned entered = 0;
                 auto callback = [&] {
