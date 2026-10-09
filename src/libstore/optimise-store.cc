@@ -241,47 +241,41 @@ struct EnterVisitor : ObjectStoreVisitor
         const SourceAccessor::Stat & st,
         function_ref<HashedNode()> descend) override
     {
-        if (auto result = tryKnown(path, st))
-            return std::move(*result);
-        return descend();
-    }
-
-    std::optional<HashedNode> tryKnown(const CanonPath & path, const SourceAccessor::Stat & st)
-    {
-        if (!inodes || repair || st.type != SourceAccessor::tRegular)
-            return std::nullopt;
-        auto where = onDisk(root, path);
-        auto file = lstat(where);
-        auto i = inodes->find(file.st_ino);
-        if (i == inodes->end() || !linkableOnThisSystem(where))
-            return std::nullopt;
-        /* A preloaded inode can have lost its holder, been replaced, or
-           belong to another device. The map only suggests a hash to query;
-           a current canonical holder of this exact inode is the witness. */
-        auto holder = objects.holderOrForget(i->second, st.isExecutable, NoRepair);
-        if (!holder || !GitObjectStore::validHolderMetadata(*holder, st.isExecutable, file))
-            return std::nullopt;
-        auto node = HashedNode{
-            .entry = {.mode = st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = i->second},
-            .narSize = merkle::nar::regular(static_cast<uint64_t>(file.st_size), st.isExecutable),
-        };
-        /* Keep this path's own witness if the queried donor is collected.
-           If an earlier file won this ingestion's claim, use the existing
-           placement operation to resolve a different inode before return. */
-        if (auto first = hold.addRow({
-                .id = node.entry.hash,
-                .executable = st.isExecutable,
-                .ino = file.st_ino,
-                .dev = file.st_dev,
-                .size = static_cast<uint64_t>(file.st_size),
-                .name = std::string(path.rel()),
-            })) {
-            auto earlier = maybeLstat(std::filesystem::path(*first));
-            if (!earlier || earlier->st_ino != file.st_ino || earlier->st_dev != file.st_dev) {
-                placeRegularFile(store, where, node.entry, repair, hold, inodes, stats, act);
+        if (inodes && !repair && st.type == SourceAccessor::tRegular) {
+            auto where = onDisk(root, path);
+            auto file = lstat(where);
+            auto i = inodes->find(file.st_ino);
+            if (i != inodes->end() && linkableOnThisSystem(where)) {
+                /* A preloaded inode can have lost its holder, been replaced, or
+                   belong to another device. The map only suggests a hash to query;
+                   a current canonical holder of this exact inode is the witness. */
+                auto holder = objects.holderOrForget(i->second, st.isExecutable, NoRepair);
+                if (holder && GitObjectStore::validHolderMetadata(*holder, st.isExecutable, file)) {
+                    auto node = HashedNode{
+                        .entry = {.mode = st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = i->second},
+                        .narSize = merkle::nar::regular(static_cast<uint64_t>(file.st_size), st.isExecutable),
+                    };
+                    /* Keep this path's own witness if the queried donor is collected.
+                       If an earlier file won this ingestion's claim, use the existing
+                       placement operation to resolve a different inode before return. */
+                    if (auto first = hold.addRow({
+                            .id = node.entry.hash,
+                            .executable = st.isExecutable,
+                            .ino = file.st_ino,
+                            .dev = file.st_dev,
+                            .size = static_cast<uint64_t>(file.st_size),
+                            .name = std::string(path.rel()),
+                        })) {
+                        auto earlier = maybeLstat(std::filesystem::path(*first));
+                        if (!earlier || earlier->st_ino != file.st_ino || earlier->st_dev != file.st_dev) {
+                            placeRegularFile(store, where, node.entry, repair, hold, inodes, stats, act);
+                        }
+                    }
+                    return node;
+                }
             }
         }
-        return node;
+        return descend();
     }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override

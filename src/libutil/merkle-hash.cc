@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <charconv>
 #include <iterator>
+#include <stdexcept>
 
 #include "nix/util/merkle-hash.hh"
 #include "nix/util/archive.hh"
@@ -64,41 +65,32 @@ Hash blobId(std::string_view bytes)
 
 std::string serialiseTree(const Tree & tree)
 {
-    using namespace std::string_view_literals;
     std::string body;
-
     for (auto & [key, entry] : tree) {
         std::string_view name = key;
-        switch (entry.mode) {
-        case Mode::Directory:
+        if (entry.mode == Mode::Directory) {
             assert(!name.empty());
             assert(name.back() == '/');
             name.remove_suffix(1);
-            body += "40000 "sv;
-            break;
-        case Mode::Regular:
-            body += "100644 "sv;
-            break;
-        case Mode::Executable:
-            body += "100755 "sv;
-            break;
-        case Mode::Symlink:
-            body += "120000 "sv;
-            break;
-        default: {
-            /* Every uint32_t RawMode fits in eleven octal digits. */
-            char digits[11];
-            auto [end, ec] = std::to_chars(digits, digits + sizeof(digits), static_cast<RawMode>(entry.mode), 8);
-            assert(ec == std::errc{});
-            body.append(digits, static_cast<size_t>(end - digits));
-            body += ' ';
         }
-        }
-        body += name;
-        body += '\0';
-        body.append(entry.hash.bytes());
+        char mode[12];
+        auto [end, ec] = std::to_chars(mode, mode + 11, static_cast<RawMode>(entry.mode), 8);
+        assert(ec == std::errc{});
+        *end++ = ' ';
+        const auto hash = entry.hash.bytes();
+        const auto modeSize = static_cast<size_t>(end - mode);
+        const auto previousSize = body.size();
+        const auto suffixSize = modeSize + 1 + hash.size();
+        if (name.size() > body.max_size() - suffixSize || previousSize > body.max_size() - name.size() - suffixSize)
+            throw std::length_error("tree body exceeds string capacity");
+        body.resize_and_overwrite(previousSize + name.size() + suffixSize, [&](char * begin, size_t) {
+            auto * out = std::char_traits<char>::copy(begin + previousSize, mode, modeSize) + modeSize;
+            out = std::char_traits<char>::copy(out, name.data(), name.size()) + name.size();
+            *out++ = '\0';
+            out = std::char_traits<char>::copy(out, hash.data(), hash.size()) + hash.size();
+            return static_cast<size_t>(out - begin);
+        });
     }
-
     return body;
 }
 

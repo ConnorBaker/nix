@@ -152,6 +152,16 @@ public:
          */
         std::optional<uint64_t> narOffset;
 
+        /** The mode for root kinds whose node hash is also their object hash. */
+        std::optional<merkle::Mode> directObjectMode() const
+        {
+            if (type == tDirectory)
+                return merkle::Mode::Directory;
+            if (type == tRegular && !isExecutable)
+                return merkle::Mode::Regular;
+            return std::nullopt;
+        }
+
         bool isNotNARSerialisable();
         std::string typeString();
     };

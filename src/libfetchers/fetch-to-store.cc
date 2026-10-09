@@ -101,13 +101,7 @@ SourcePath filteredTree(const SourcePath & tree, PathFilter & filter)
 static void recordRootEntry(
     fetchers::Cache & cache, const fetchers::Cache::Key & key, const SourcePath & root, const Hash & objectHash)
 {
-    auto st = root.lstat();
-    std::optional<merkle::Mode> mode;
-    if (st.type == SourceAccessor::tDirectory)
-        mode = merkle::Mode::Directory;
-    else if (st.type == SourceAccessor::tRegular && !st.isExecutable)
-        mode = merkle::Mode::Regular;
-    if (mode)
+    if (auto mode = root.lstat().directObjectMode())
         cache.upsert(key, entryRow({.mode = *mode, .hash = objectHash}));
 }
 
@@ -358,57 +352,55 @@ std::pair<StorePath, Hash> fetchToStore2(
             name,
             (method.getFileSerialisationMethod() == FileSerialisationMethod::NixArchive) && isCaseHackEnabled());
 
-    auto useResult = [&](SrcToStore::Result result) -> std::optional<SrcToStore::Result> {
-        if (mode != FetchMode::DryRun) {
-            /* Root before checking validity: a cached name does not establish
-               existence in this store, nor protect it against collection. */
-            store.addTempRoot(result.first);
-            if (!store.isValidPath(result.first))
-                return std::nullopt;
-        }
-        return result;
-    };
-
+    /* Naming and destination presence are separate facts. Once an address
+       is known, another naming cache cannot make that destination present. */
+    std::optional<SrcToStore::Result> named;
     if (srcToStoreKey)
-        if (auto cached = getConcurrent(settings.srcToStore->cache, *srcToStoreKey))
-            if (auto result = useResult(std::move(*cached)))
-                return std::move(*result);
+        named = getConcurrent(settings.srcToStore->cache, *srcToStoreKey);
 
-    auto useHash = [&](const Hash & hash) {
+    auto fromHash = [&](const Hash & hash) {
         SrcToStore::Result result{
             store.makeFixedOutputPathFromCA(name, ContentAddressWithReferences::fromParts(method, hash, {})), hash};
         if (srcToStoreKey)
             settings.srcToStore->cache.emplace(*srcToStoreKey, result);
-        return useResult(std::move(result));
+        return result;
     };
 
-    std::optional<fetchers::Cache::Key> cacheKey;
-
-    if (!filter && !repair && method == ContentAddressMethod::Raw::Git)
+    if (!named && !filter && !repair && method == ContentAddressMethod::Raw::Git)
         if (auto entry = path.accessor->getKnownEntry(path.path))
-            if (auto result = useHash(merkle::objectHash(*entry)))
-                return std::move(*result);
+            named = fromHash(merkle::objectHash(*entry));
 
-    if (rootName && !repair) {
+    std::optional<fetchers::Cache::Key> cacheKey;
+    if (!named && rootName && !repair) {
         cacheKey = makeSourcePathToHashCacheKey(rootName->second, method, rootName->first);
-        if (auto cache = cacheIfAvailable(settings); cache)
-            if (auto res = cache->lookup(*cacheKey)) {
-                /* Under the git method the row is the root's entry and the
-                   address its object hash; under the NAR method the hash. */
-                auto hash = method == ContentAddressMethod::Raw::Git
-                                ? merkle::objectHash(rowEntry(*res))
-                                : Hash::parseSRI(fetchers::getStrAttr(*res, "hash"));
-                if (auto result = useHash(hash)) {
-                    debug(
-                        "source path '%s' cache hit in '%s' (hash '%s')",
-                        path,
-                        store.printStorePath(result->first),
-                        hash.to_string(HashFormat::SRI, true));
-                    return std::move(*result);
-                }
-                debug("source path '%s' not in store", path);
-            }
-    } else {
+        if (auto cache = cacheIfAvailable(settings))
+            if (auto res = cache->lookup(*cacheKey))
+                named = fromHash(
+                    method == ContentAddressMethod::Raw::Git ? merkle::objectHash(rowEntry(*res))
+                                                             : Hash::parseSRI(fetchers::getStrAttr(*res, "hash")));
+    }
+
+    if (named) {
+        /* Root before checking validity: a name does not establish presence
+           in this store, nor protect it against collection. */
+        if (mode != FetchMode::DryRun)
+            store.addTempRoot(named->first);
+        if (mode == FetchMode::DryRun || store.isValidPath(named->first)) {
+            if (cacheKey)
+                debug(
+                    "source path '%s' cache hit in '%s' (hash '%s')",
+                    path,
+                    store.printStorePath(named->first),
+                    named->second.to_string(HashFormat::SRI, true));
+            return std::move(*named);
+        }
+        if (cacheKey)
+            debug("source path '%s' not in store", path);
+        named.reset();
+    }
+    if (!cacheKey && rootName && !repair)
+        cacheKey = makeSourcePathToHashCacheKey(rootName->second, method, rootName->first);
+    if (!rootName || repair) {
         static auto barf = getEnv("_NIX_TEST_BARF_ON_UNCACHEABLE") == "1";
         if (barf && !filter)
             throw Error("source path '%s' is uncacheable (filter=%d)", path, (bool) filter);

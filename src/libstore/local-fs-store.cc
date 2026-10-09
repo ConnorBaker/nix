@@ -180,14 +180,8 @@ public:
         auto info = store->queryPathInfo(*object);
         if (!info->objectHash)
             return std::nullopt;
-        auto st = accessor->lstat(path);
-        /* Executables and symlinks have synthetic object roots: their
-           entry hash cannot be recovered from the object hash alone. */
-        if (st.type == tDirectory)
-            return merkle::TreeEntry{.mode = merkle::Mode::Directory, .hash = info->objectHash->hash};
-        if (st.type == tRegular && !st.isExecutable)
-            return merkle::TreeEntry{.mode = merkle::Mode::Regular, .hash = info->objectHash->hash};
-        return std::nullopt;
+        return accessor->lstat(path).directObjectMode().transform(
+            [&](merkle::Mode mode) { return merkle::TreeEntry{.mode = mode, .hash = info->objectHash->hash}; });
     }
 
     std::optional<time_t> getLastModified() override
@@ -223,11 +217,8 @@ std::shared_ptr<SourceAccessor> LocalFSStore::getFSAccessor(const StorePath & pa
         auto info = queryPathInfo(path);
         if (info->objectHash) {
             accessor->fingerprint = info->objectHash->render();
-            auto st = accessor->lstat(CanonPath::root);
-            if (st.type == SourceAccessor::tDirectory)
-                accessor->knownRoot = {.mode = merkle::Mode::Directory, .hash = info->objectHash->hash};
-            else if (st.type == SourceAccessor::tRegular && !st.isExecutable)
-                accessor->knownRoot = {.mode = merkle::Mode::Regular, .hash = info->objectHash->hash};
+            if (auto mode = accessor->lstat(CanonPath::root).directObjectMode())
+                accessor->knownRoot.emplace(*mode, info->objectHash->hash);
         }
     }
     return accessor;
