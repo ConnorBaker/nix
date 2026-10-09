@@ -8,7 +8,7 @@ The [fresh cohort seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resum
 
 The [matching build audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/parent-matched-v3-config-audit.json), [release build](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/refined-release-build.json), [debug suites](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/debug-tests-refined.json) and [functional results](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/functional-validation-plan/FUNCTIONAL-RESULT.json) are retained. All 38 ordinary semantic cases pass, including the separately rerun legacy executable-root case with the fixed-base reference executable. All 12 overlay cases pass in a privileged private mount namespace; their canonical unprivileged runs retain 12 host user-namespace skips. The malformed-URI test now executes and checks all three coordinates. [Source binding](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/committed-candidate-benchmark-binding.json) explicitly records the header comment-only difference from tested sources; it does not claim a post-comment rebuild.
 
-The committed simplifications share direct root-mode classification, separate cached naming from store presence, serialize each tree entry in one checked append and construct reused nodes directly in return storage. [Complete selected native bodies](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/candidate-native-refined-v3/NATIVE-REVIEW.txt) show mixed costs: serialization and several accessor bodies shrink, while the fetcher's main frame grows. Assembly size is not an evaluation speedup. Direct hardware counts and stack diagnostics are separate from the latency cohort and remain under investigation.
+The committed simplifications share direct root-mode classification, separate cached naming from store presence, serialize each tree entry in one checked append and construct reused nodes directly in return storage. [Complete selected native bodies](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/candidate-native-refined-v3/NATIVE-REVIEW.txt) show mixed costs: serialization and several accessor bodies shrink, while the fetcher's main frame grows. Assembly size is not an evaluation speedup. The separate instruction, stack and syscall investigations below identify additional work; its elimination remains unfinished.
 
 Ratios below are medians of the six adjacent candidate/base ratios per case; lower is better. Each case retains three AB and three BA pairs.
 
@@ -25,6 +25,28 @@ Ratios below are medians of the six adjacent candidate/base ratios per case; low
 | warm | 32 | github | 0.949 | 0.938 | 1.008 |
 
 The workload evaluates multiple Nixpkgs attributes at pinned revision **6aefcda9401be8acc2b74244fb3b37520ea1f0a8**, with evaluation cache disabled. Schemes are `path:`, `git+file:` and `github:`. Warm states seed all 32 attributes once. Hardware counts, syscall traces and sampled stacks must not be substituted for these latency observations or compared across different source endpoints as incremental speedups.
+
+### Additional work in the measured implementation
+
+[Direct user-mode hardware counts](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/protocol/profiling/analysis-p9r2/READOUT.md) cover all nine cases and all 54 balanced pairs. Cold path executes 1.097 times the base's instructions; warm Git executes 1.111 times at eight attributes and 1.042 times at thirty-two. These three instruction regressions occur in every pair. The other six cases execute fewer user instructions in every pair. All native PMU measurements have full enabled/running coverage.
+
+The [separate user/kernel captures](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/protocol/profiling/analysis-p9r3/READOUT.md) retain six pairs for each regressing case. Median kernel-instruction ratios are 1.126 for cold path, 1.946 for warm eight-attribute Git and 1.777 for warm thirty-two-attribute Git. Context switches also rise. The privileged collector includes its unchanged launcher startup; these ratios are not subtracted from the direct user-only batch.
+
+The [complete syscall census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/p9r5-syscall-census/READOUT-v2.md) reconciles all 11,217,373 calls across twelve captures, with two balanced pairs per case, without unmatched or unparsed records. Both pairs agree on these filesystem counts:
+
+| Case | Raw file bytes, base → candidate | Raw directory reads, base → candidate |
+| --- | ---: | ---: |
+| cold 32 path | 189,657,925 → 189,657,925 | 74,252 → 74,252 |
+| warm 8 git | 4,556,678 → 195,269,564 | 75,803 → 150,057 |
+| warm 32 git | 7,017,767 → 198,384,228 | 75,813 → 150,079 |
+
+Every nonempty cold-reference file is read by the warm candidate. Both endpoints read the Git index as 20 + 7,221,989 + 20 bytes; this is not three complete index scans. Store/fetcher SQLite traffic differs independently: warm thirty-two-attribute main-file `fstat` counts move from 561 fetcher / 4 store to 8 fetcher / 4,273 store, while store WAL reads fall from 65,397,624 bytes to zero. File status calls are not SQL-statement counts. Different warmed database histories and tracing overhead prevent treating these counts as isolated query costs or causal seconds.
+
+`getAccessorFromWorkdir` deliberately supplies no fingerprint: a revision or clean Git status does not identify raw rendered bytes when normalization, filters or ignored changes apply. `fetchToStore2` consequently cannot use a persistent root-name hit; `LocalStore::materialise` prepares and traverses the directory before learning its address. A hash-only pass followed by another mutable-source read would repeat source observations and could copy different bytes. Avoiding that work requires retaining the delivered value or a valid identity, rather than assuming HEAD is that identity. The [filesystem source audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/warm-git-filesystem-source-audit/READOUT.md) separately accounts for libgit2, descriptor scopes, permissions and mutation.
+
+[Sampled stacks](/home/connorbaker/Benchmarks/p9r6/analysis/READOUT.md) observe raw directory traversal and file-copy frames in the warm candidate where the base has none. All 5,152 samples reconcile, but 1,417 contain an unknown DSO frame and 118 stacks reach the 1,024-frame limit. The sampled copy frames do not establish the entire outer caller chain; no missing frames are inferred.
+
+The [complete source census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-f05adeff-vs-8aad/READOUT.md) counts **+8,849** production source lines over base, or **+9,387** when test support is included. This is still excessive. Changing the classification does not shrink the implementation; private representation experiments are not committed reductions or measured improvements.
 
 ## Historical comparisons
 
