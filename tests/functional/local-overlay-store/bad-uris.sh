@@ -21,10 +21,11 @@ TODO_NixOS
 for i in "${storesBad[@]}"; do
     echo "$i"
     # shellcheck disable=SC2119
-    execUnshare <<EOF
+    ( execUnshare <<EOF
         source common.sh
         setupStoreDirs
         mountOverlayfs
         expectStderr 1 nix doctor --store "$i" | grepQuiet "overlay filesystem .* mounted incorrectly"
 EOF
+    )
 done
