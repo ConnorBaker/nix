@@ -1,5 +1,33 @@
 # Evaluation performance and preserved behavior
 
+## Current matched comparison
+
+Measured **f05adeff82965dc67d91ee00110e61d811e40578** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, using matching release builds and dependencies. It wins **40/54 wall**, **33/54 CPU** and **18/54 RSS** pairs. Both warm-Git cases regress in wall and CPU; cold path regresses in CPU. Cold Git's CPU median is only marginally lower, with three wins and three losses. Uniform performance and substantial source reduction remain unfinished.
+
+The [fresh cohort seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/fresh-cohort-seal.json) retains **114 outputs, 54 balanced pairs and 21 complete store graphs**, including returned derivation addresses, contents, modes and SQLite reference edges. [Every paired measurement](/home/connorbaker/Benchmarks/b9r1/paired-metrics.json) is retained. Fresh private stores define cold application state; host page caches are not flushed. The 42 benchmark states remain available for separate profiling. Earlier results below describe earlier endpoints, and historical `/tmp` links may no longer resolve; they are not current validation receipts.
+
+The [matching build audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/parent-matched-v3-config-audit.json), [release build](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/refined-release-build.json), [debug suites](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/debug-tests-refined.json) and [functional results](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/functional-validation-plan/FUNCTIONAL-RESULT.json) are retained. All 38 ordinary semantic cases pass, including the separately rerun legacy executable-root case with the fixed-base reference executable. All 12 overlay cases pass in a privileged private mount namespace; their canonical unprivileged runs retain 12 host user-namespace skips. The malformed-URI test now executes and checks all three coordinates. [Source binding](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/committed-candidate-benchmark-binding.json) explicitly records the header comment-only difference from tested sources; it does not claim a post-comment rebuild.
+
+The committed simplifications share direct root-mode classification, separate cached naming from store presence, serialize each tree entry in one checked append and construct reused nodes directly in return storage. [Complete selected native bodies](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/candidate-native-refined-v3/NATIVE-REVIEW.txt) show mixed costs: serialization and several accessor bodies shrink, while the fetcher's main frame grows. Assembly size is not an evaluation speedup. Direct hardware counts and stack diagnostics are separate from the latency cohort and remain under investigation.
+
+Ratios below are medians of the six adjacent candidate/base ratios per case; lower is better. Each case retains three AB and three BA pairs.
+
+| State | Attributes | Scheme | Wall / base | CPU / base | RSS / base |
+| --- | ---: | --- | ---: | ---: | ---: |
+| cold | 32 | path | 0.931 | 1.295 | 1.126 |
+| cold | 32 | git | 0.884 | 0.995 | 1.006 |
+| cold | 32 | github | 0.675 | 0.320 | 0.779 |
+| warm | 8 | path | 0.188 | 0.268 | 0.852 |
+| warm | 8 | git | 1.202 | 1.655 | 1.007 |
+| warm | 8 | github | 0.938 | 0.881 | 1.019 |
+| warm | 32 | path | 0.327 | 0.399 | 0.934 |
+| warm | 32 | git | 1.071 | 1.331 | 1.002 |
+| warm | 32 | github | 0.949 | 0.938 | 1.008 |
+
+The workload evaluates multiple Nixpkgs attributes at pinned revision **6aefcda9401be8acc2b74244fb3b37520ea1f0a8**, with evaluation cache disabled. Schemes are `path:`, `git+file:` and `github:`. Warm states seed all 32 attributes once. Hardware counts, syscall traces and sampled stacks must not be substituted for these latency observations or compared across different source endpoints as incremental speedups.
+
+## Historical comparisons
+
 Measured **bc4ffccb6106250cacc241873b5bb144d281bc24** has lower paired wall medians in **seven of nine cases** and CPU medians in **five of nine cases** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, rebuilt with the matching SDK. It wins **42/54 wall**, **32/54 CPU** and **17/54 RSS** pairs. Both warm-Git cases regress under wall and CPU medians; cold path and cold Git retain higher CPU medians. Uniform performance and substantial source reduction remain unfinished.
 
 The [complete audit](/tmp/nix-p6-all-nine-matched-benchmark-preparation-oct8/RESULT-AUDIT.json) checks **114 outputs, 54 adjacent pairs and 21 complete graphs**, including contents, modes and SQLite references. Each case has three AB and three BA pairs. Warm states seed thirty-two attributes; GitHub uses pinned acquisition. Cold means fresh private Nix state with host page caches intact. Ratios below are paired candidate/base medians; below 1 is faster or smaller. Every adverse pair and tie is retained. [All 42 states are retired](/tmp/nix-p6-all-nine-matched-benchmark-preparation-oct8/RETIREMENT.json), superseding the readout's pending-retirement line.
