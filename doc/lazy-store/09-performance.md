@@ -28,6 +28,24 @@ Ratios below are medians of the six adjacent candidate/base ratios per case; low
 
 The workload evaluates multiple Nixpkgs attributes at pinned revision **6aefcda9401be8acc2b74244fb3b37520ea1f0a8**, with evaluation cache disabled. Schemes are `path:`, `git+file:` and `github:`. Warm states seed all 32 attributes once. Hardware counts, syscall traces and sampled stacks must not be substituted for these latency observations or compared across different source endpoints as incremental speedups.
 
+### Separate scoped-consumer comparison
+
+The [independently sealed v4 experiment](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/protocol/scoped-v4-cohort/INDEPENDENT-SEAL.json) compares the private map-free visitor simplification with immutable f05, rather than with branch base. All 114 outputs, 54 balanced pairs and 21 complete graphs pass, and runtime, source and fixture identities remain unchanged. The endpoint excludes the subsequent lease and registration fixes.
+
+| Case | Wall / f05 | CPU / f05 | Wall wins | CPU wins |
+| --- | ---: | ---: | ---: | ---: |
+| cold 32 path | 1.000005 | 1.011625 | 3/6 | 3/6 |
+| cold 32 git | 0.999354 | 1.001645 | 4/6 | 3/6 |
+| cold 32 github | 1.100456 | 1.029702 | 0/6 | 0/6 |
+| warm 8 path | 1.000356 | 1.018829 | 3/6 | 2/6 |
+| warm 8 git | 1.000308 | 0.991525 | 3/6 | 3/6 |
+| warm 8 github | 0.999859 | 0.983333 | 4/6 | 3/6 |
+| warm 32 path | 0.979519 | 0.996528 | 4/6 | 3/6 |
+| warm 32 git | 0.999903 | 1.013828 | 3/6 | 1/6 |
+| warm 32 github | 0.999140 | 1.000000 | 4/6 | 2/6 |
+
+The simplification removes 33 production lines but establishes no general evaluation speedup. [Every observation and pressure sample](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/protocol/scoped-v4-cohort/READOUT.md) is retained. Linux case-hack is disabled in these captures, so the case-hack closure branch is unreachable. Per-directory scoped consumer construction and generic callback costs remain candidates for investigation; neither static assembly extent nor shared-host pressure attributes the observed waiting time.
+
 ### Additional work in the measured implementation
 
 [Direct user-mode hardware counts](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/protocol/profiling/analysis-p9r2/READOUT.md) cover all nine cases and all 54 balanced pairs. Cold path executes 1.097 times the base's instructions; warm Git executes 1.111 times at eight attributes and 1.042 times at thirty-two. These three instruction regressions occur in every pair. The other six cases execute fewer user instructions in every pair. All native PMU measurements have full enabled/running coverage.

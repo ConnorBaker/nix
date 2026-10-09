@@ -251,35 +251,47 @@ void Store::addMultipleToStore(
     CheckSigsFlag checkSigs,
     const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
-    /* A singleton has no inter-path order or parallel work; avoid building
-       a dependency graph and worker pool. */
-    if (pathsToCopy.size() == 1) {
-        auto & [info, source_] = pathsToCopy.front();
-        act.setExpected(actCopyPath, info.narSize);
-        size_t failed = 0;
+    using PathWithInfo = PathsSource::value_type;
+
+    auto copyPath = [&](PathWithInfo & value, auto & nrDone, auto & nrFailed, auto & nrRunning, auto showProgress) {
+        checkInterrupt();
+        auto info = value.first;
+        info.ultimate = false;
+        /* A source may own a coroutine stack or connection lock. Release it
+           when this action finishes, even if the path is already valid. */
+        auto source = std::move(value.second);
+        std::function<Hash()> hashForPath;
+        if (narHash)
+            hashForPath = [&] { return narHash(info.path, *source); };
+
+        bool failed = false;
         if (!isValidPath(info.path)) {
-            auto one = info;
-            one.ultimate = false;
-            /* The source is destroyed when this is done, as the graph's
-               worker destroys its own: a `SinkToSource` holds a coroutine
-               stack, and a peer's source a connection lock. */
-            auto source = std::move(source_);
-            std::function<Hash()> hashForPath;
-            if (narHash)
-                hashForPath = [&] { return narHash(one.path, *source); };
-            act.progress(0, 1, 1, 0);
+            MaintainCount mc(nrRunning);
+            showProgress();
             try {
-                addToStore(one, *source, repair, checkSigs, hashForPath);
+                addToStore(info, *source, repair, checkSigs, hashForPath);
             } catch (Error & e) {
-                /* As the graph's worker below: with `keep-going` a failure
-                   is reported and counted, and this call does not throw. */
+                nrFailed++;
                 if (!settings.getWorkerSettings().keepGoing)
                     throw;
-                failed = 1;
                 printMsg(lvlError, "could not copy %s: %s", printStorePath(info.path), e.what());
+                failed = true;
             }
         }
-        act.progress(failed ? 0 : 1, 1, 0, failed);
+        if (!failed)
+            nrDone++;
+        showProgress();
+    };
+
+    /* A singleton has no inter-path order or parallel work. Its counters
+       belong to this thread; only the graph needs atomic counters. */
+    if (pathsToCopy.size() == 1) {
+        auto & value = pathsToCopy.front();
+        act.setExpected(actCopyPath, value.first.narSize);
+        size_t nrDone = 0, nrFailed = 0;
+        uint64_t nrRunning = 0;
+        ReceiveInterrupts receiveInterrupts;
+        copyPath(value, nrDone, nrFailed, nrRunning, [&] { act.progress(nrDone, 1, nrRunning, nrFailed); });
         return;
     }
 
@@ -287,10 +299,7 @@ void Store::addMultipleToStore(
     std::atomic<size_t> nrFailed{0};
     std::atomic<uint64_t> nrRunning{0};
 
-    using PathWithInfo = PathsSource::value_type;
-
     uint64_t bytesExpected = 0;
-
     std::map<StorePath, PathWithInfo *> infosMap;
     StorePathSet storePathsToAdd;
     for (auto & thingToAdd : pathsToCopy) {
@@ -298,60 +307,17 @@ void Store::addMultipleToStore(
         infosMap.insert_or_assign(thingToAdd.first.path, &thingToAdd);
         storePathsToAdd.insert(thingToAdd.first.path);
     }
-
     act.setExpected(actCopyPath, bytesExpected);
-
     auto showProgress = [&, nrTotal = pathsToCopy.size()]() { act.progress(nrDone, nrTotal, nrRunning, nrFailed); };
 
     processGraph<StorePath>(
         storePathsToAdd,
-
         [&](const StorePath & path) {
-            auto & [info, _] = *infosMap.at(path);
-
-            if (isValidPath(info.path)) {
-                nrDone++;
-                showProgress();
-                return StorePathSet();
-            }
-
-            return info.references;
+            auto & info = infosMap.at(path)->first;
+            return isValidPath(info.path) ? StorePathSet{} : info.references;
         },
-
         [&](const StorePath & path) {
-            checkInterrupt();
-
-            auto & [info_, source_] = *infosMap.at(path);
-            auto info = info_;
-            info.ultimate = false;
-
-            /* Make sure that the Source object is destroyed when
-               we're done. In particular, a SinkToSource object must
-               be destroyed to ensure that the destructors on its
-               stack frame are run; this includes
-               LegacySSHStore::narFromPath()'s connection lock. */
-            auto source = std::move(source_);
-            std::function<Hash()> hashForPath;
-            if (narHash)
-                hashForPath = [&] { return narHash(info.path, *source); };
-
-            if (!isValidPath(info.path)) {
-                MaintainCount<decltype(nrRunning)> mc(nrRunning);
-                showProgress();
-                try {
-                    addToStore(info, *source, repair, checkSigs, hashForPath);
-                } catch (Error & e) {
-                    nrFailed++;
-                    if (!settings.getWorkerSettings().keepGoing)
-                        throw e;
-                    printMsg(lvlError, "could not copy %s: %s", printStorePath(path), e.what());
-                    showProgress();
-                    return;
-                }
-            }
-
-            nrDone++;
-            showProgress();
+            copyPath(*infosMap.at(path), nrDone, nrFailed, nrRunning, showProgress);
         });
 }
 

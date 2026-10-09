@@ -2591,6 +2591,164 @@ TEST_F(LocalStoreObjectsTest, aStoreThatSweepsItsOwnObjectsStillSweepsItsStaleRo
     store = own;
 }
 
+
+namespace {
+struct BatchCopySource final : Source
+{
+    std::atomic<unsigned> & destroyed;
+    explicit BatchCopySource(std::atomic<unsigned> & destroyed) : destroyed(destroyed) {}
+    ~BatchCopySource() override { ++destroyed; }
+    size_t read(char *, size_t) override { throw EndOfFile("probe source is not read"); }
+};
+
+struct BatchCopyProgress final : Logger
+{
+    std::mutex mutex;
+    std::set<std::array<uint64_t, 4>> observed;
+    void log(Verbosity, std::string_view) noexcept override {}
+    void logEI(const ErrorInfo &) noexcept override {}
+    void result(ActivityId, ResultType type, std::span<const Field> fields) noexcept override
+    {
+        if (type != resProgress)
+            return;
+        std::lock_guard lock(mutex);
+        std::array<uint64_t, 4> state;
+        for (size_t i = 0; i != state.size(); ++i)
+            state[i] = std::get<uint64_t>(fields[i]);
+        observed.insert(state);
+    }
+};
+
+struct BatchCopyProbeStore final : LocalStore
+{
+    struct CopyError : Error { using Error::Error; };
+    enum class Outcome { Success, Error, DerivedError, OtherError, HashError };
+    Outcome outcome = Outcome::Success;
+    RepairFlag expectedRepair = NoRepair;
+    CheckSigsFlag expectedCheckSigs = NoCheckSigs;
+    std::atomic<unsigned> calls = 0;
+    explicit BatchCopyProbeStore(ref<const LocalStore::Config> config)
+        : Store{*config}, LocalFSStore{*config}, LocalStore{config} {}
+    void addToStore(const ValidPathInfo & info, Source &, RepairFlag repair, CheckSigsFlag checkSigs,
+        const std::function<Hash()> & narHash) override
+    {
+        ++calls;
+        EXPECT_FALSE(info.ultimate);
+        EXPECT_EQ(repair, expectedRepair);
+        EXPECT_EQ(checkSigs, expectedCheckSigs);
+        if (narHash)
+            (void) narHash();
+        if (outcome == Outcome::Error)
+            throw Error("batch copy error");
+        if (outcome == Outcome::DerivedError)
+            throw CopyError("batch copy derived error");
+        if (outcome == Outcome::OtherError)
+            throw std::runtime_error("batch copy other error");
+    }
+};
+} // namespace
+
+TEST_F(TempLocalStoreTest, batchActionsReleaseSourcesAndPreserveFailures)
+{
+    BatchCopyProbeStore target{ref{config}};
+    ValidPathInfo valid{StorePath::random("batch-valid"),
+        UnkeyedValidPathInfo{target, ObjectHash{merkle::blobId("valid seed")}}};
+    target.registerValidPath(valid);
+    auto peer = valid;
+    peer.path = StorePath::random("batch-valid-peer");
+    target.registerValidPath(peer);
+    auto & keepGoing = settings.getWorkerSettings().keepGoing;
+    auto savedKeepGoing = keepGoing.get();
+    Finally restore{[&] { keepGoing = savedKeepGoing; }};
+    using Outcome = BatchCopyProbeStore::Outcome;
+    size_t cases = 0;
+    for (size_t width : {size_t{1}, size_t{2}})
+        for (bool alreadyValid : {false, true})
+            for (bool keep : {false, true})
+                for (RepairFlag repair : {NoRepair, Repair})
+                    for (CheckSigsFlag checkSigs : {NoCheckSigs, CheckSigs})
+                        for (bool sourcePresent : {false, true})
+                        for (bool hash : {false, true})
+                            for (Outcome outcome : {Outcome::Success, Outcome::Error, Outcome::DerivedError,
+                                     Outcome::OtherError, Outcome::HashError}) {
+                                if ((!sourcePresent && !alreadyValid) || (!hash && outcome == Outcome::HashError))
+                                    continue;
+                                SCOPED_TRACE(fmt("case=%d width=%d valid=%d keep=%d repair=%d sigs=%d source=%d hash=%d outcome=%d",
+                                    cases++, width, alreadyValid, keep, int(repair), int(checkSigs), sourcePresent, hash, int(outcome)));
+                                keepGoing = keep;
+                                target.outcome = outcome;
+                                target.expectedRepair = repair;
+                                target.expectedCheckSigs = checkSigs;
+                                auto callsBefore = target.calls.load();
+                                auto info = valid;
+                                if (!alreadyValid)
+                                    info.path = StorePath::random("batch-missing");
+                                info.ultimate = true;
+                                std::atomic<unsigned> destroyed = 0, hashes = 0;
+                                Store::PathsSource paths;
+                                paths.emplace_back(info, sourcePresent ? std::make_unique<BatchCopySource>(destroyed) : nullptr);
+                                auto * original = paths.front().second.get();
+                                if (width == 2)
+                                    paths.emplace_back(peer, nullptr); // a valid path never reads its source
+                                std::function<Hash(const StorePath &, const Source &)> replay;
+                                if (hash)
+                                    replay = [&](const StorePath & path, const Source & source) {
+                                        ++hashes;
+                                        EXPECT_EQ(path, info.path);
+                                        EXPECT_EQ(&source, original);
+                                        EXPECT_EQ(destroyed.load(), 0u);
+                                        if (outcome == Outcome::HashError)
+                                            throw BatchCopyProbeStore::CopyError("hash replay error");
+                                        return hashString(HashAlgorithm::SHA256, "probe hash");
+                                    };
+                                BatchCopyProgress progress;
+                                Activity act{progress, lvlTalkative, actUnknown};
+                                auto run = [&] { target.addMultipleToStore(std::move(paths), act, repair, checkSigs, replay); };
+                                bool caught = !alreadyValid && outcome != Outcome::Success
+                                    && (outcome == Outcome::OtherError || !keep);
+                                if (caught) {
+                                    if (outcome == Outcome::OtherError)
+                                        EXPECT_THROW(run(), std::runtime_error);
+                                    else if (outcome == Outcome::Error)
+                                        EXPECT_THROW(run(), Error);
+                                    else
+                                        EXPECT_THROW(run(), BatchCopyProbeStore::CopyError);
+                                } else {
+                                    ASSERT_NO_THROW(run());
+                                    auto failed = !alreadyValid && outcome != Outcome::Success;
+                                    EXPECT_TRUE(progress.observed.contains(
+                                        std::array<uint64_t, 4>{width - failed, width, 0, failed}));
+                                }
+                                EXPECT_EQ(destroyed.load(), sourcePresent ? 1u : 0u);
+                                EXPECT_FALSE(paths.front().second);
+                                EXPECT_EQ(target.calls.load() - callsBefore, alreadyValid ? 0u : 1u);
+                                EXPECT_EQ(hashes.load(), hash && !alreadyValid ? 1u : 0u);
+                            }
+    EXPECT_EQ(cases, 432u);
+}
+
+TEST_F(TempLocalStoreTest, aSingletonCopyObservesPendingInterrupts)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "checkInterrupt is a no-op on Windows";
+#else
+    ValidPathInfo valid{StorePath::random("interrupted-valid"),
+        UnkeyedValidPathInfo{*store, ObjectHash{merkle::blobId("valid seed")}}};
+    store->registerValidPath(valid);
+    auto saved = getInterrupted();
+    Finally restore{[&] { setInterrupted(saved); }};
+    std::atomic<unsigned> destroyed = 0;
+    Store::PathsSource paths;
+    paths.emplace_back(valid, std::make_unique<BatchCopySource>(destroyed));
+    Activity act{*logger, lvlTalkative, actUnknown};
+    setInterrupted(true);
+    EXPECT_THROW(store->addMultipleToStore(std::move(paths), act, NoRepair, NoCheckSigs), Interrupted);
+    setInterrupted(saved);
+    EXPECT_TRUE(paths.front().second) << "interruption precedes beginning the path action";
+    EXPECT_EQ(destroyed.load(), 0u);
+#endif
+}
+
 /* Each path of a batch registers independently and is its own ingestion: its own `Ingestions` row, its own
    root (a row's name is relative to the path that holds it, `schema.sql`) and
    its own pending projection. Every path's blob is held by that path's own
