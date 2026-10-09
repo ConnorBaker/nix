@@ -135,9 +135,9 @@ typedef std::unique_ptr<git_config_entry, Deleter<git_config_entry_free>> GitCon
 static std::string getLfsEndpointUrl(git_repository * repo)
 {
     GitConfig config;
-    if (git_repository_config(Setter(config), repo)) {
+    if (git_repository_config(std::out_ptr(config), repo)) {
         GitConfigEntry entry;
-        if (!git_config_get_entry(Setter(entry), config.get(), "lfs.url")) {
+        if (!git_config_get_entry(std::out_ptr(entry), config.get(), "lfs.url")) {
             auto value = std::string(entry->value);
             if (!value.empty()) {
                 debug("Found explicit lfs.url value: %s", value);

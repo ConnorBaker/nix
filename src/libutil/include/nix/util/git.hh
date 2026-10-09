@@ -43,10 +43,7 @@ using nix::RawMode;
  */
 using merkle::Tree;
 
-inline std::optional<Mode> decodeMode(RawMode m)
-{
-    return merkle::decodeMode(m);
-}
+using merkle::decodeMode;
 
 /**
  * Parse the "blob " or "tree " prefix.

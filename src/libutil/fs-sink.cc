@@ -60,18 +60,18 @@ static std::filesystem::path append(const std::filesystem::path & src, const Can
  * `Descriptor` borrows from `dirFd`. When `dirFd` is not set,
  * temporarily opens the parent of `dstPath`.
  */
-static std::tuple<AutoCloseFD, Descriptor, CanonPath>
-getParentFdAndName(Descriptor dirFd, const std::filesystem::path & dstPath, const CanonPath & path)
+std::tuple<AutoCloseFD, Descriptor, CanonPath> RestoreSink::parentOf(const CanonPath & path) const
 {
-    if (dirFd != INVALID_DESCRIPTOR) {
+    const auto rootFd = dirFd.get();
+    if (rootFd != INVALID_DESCRIPTOR) {
         /* dirFd is the root of the restore tree, which means we already created
            a root directory, which means that path must be relative (i.e. not
            root) within it. */
         assert(!path.isRoot());
         auto parent = path.parent();
         if (parent->isRoot())
-            return {AutoCloseFD{}, dirFd, CanonPath::fromFilename(*path.baseName())};
-        auto parentFd = openFileEnsureBeneathNoSymlinks(dirFd, *parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
+            return {AutoCloseFD{}, rootFd, CanonPath::fromFilename(*path.baseName())};
+        auto parentFd = openFileEnsureBeneathNoSymlinks(rootFd, *parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC, 0);
         if (!parentFd)
             throw SysError("opening parent directory of %s", PathFmt(append(dstPath, path)));
         auto fd = parentFd.get();
@@ -102,11 +102,6 @@ getParentFdAndName(Descriptor dirFd, const std::filesystem::path & dstPath, cons
         throw SysError("opening parent directory of %s", PathFmt(p));
     auto fd = parentFd.get();
     return {std::move(parentFd), fd, CanonPath::fromFilename(filename.native())};
-}
-
-std::tuple<AutoCloseFD, Descriptor, CanonPath> RestoreSink::parentOf(const CanonPath & path) const
-{
-    return getParentFdAndName(dirFd.get(), dstPath, path);
 }
 #endif
 
@@ -161,7 +156,7 @@ void RestoreSink::createDirectory(const CanonPath & path)
         /* Trying to create a directory that we already have a file descriptor for. */
         throw Error("path %s already exists", PathFmt(append(dstPath, path)));
 
-    auto [_parentFd, fd, name] = getParentFdAndName(dirFd.get(), dstPath, path);
+    auto [_parentFd, fd, name] = parentOf(path);
 
     if (::mkdirat(fd, name.rel_c_str(), 0777) == -1)
         throw SysError("creating directory %s", PathFmt(append(dstPath, path)));
@@ -306,7 +301,7 @@ void RegularFileWriter::preallocateContents(uint64_t len)
 void RestoreSink::createSymlink(const CanonPath & path, const std::string & target)
 {
 #ifndef _WIN32
-    auto [_parentFd, fd, name] = getParentFdAndName(dirFd.get(), dstPath, path);
+    auto [_parentFd, fd, name] = parentOf(path);
     if (::symlinkat(requireCString(target), fd, name.rel_c_str()) == -1)
         throw SysError("creating symlink from %1% -> '%2%'", PathFmt(append(dstPath, path)), target);
     if (hooks)

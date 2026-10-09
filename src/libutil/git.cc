@@ -25,14 +25,6 @@ static std::string getStringUntil(Source & source, char byte)
     return s;
 }
 
-static std::string getString(Source & source, int n)
-{
-    std::string v;
-    v.resize(n);
-    source(v);
-    return v;
-}
-
 uint64_t parseBlob(Source & source)
 {
     auto sizeStr = getStringUntil(source, 0);
@@ -109,7 +101,9 @@ void parseTreeBody(merkle::DirectorySink & sink, std::string_view body, HashAlgo
 
 ObjectType parseObjectType(Source & source)
 {
-    auto type = getString(source, 5);
+    char bytes[5];
+    source(bytes, sizeof(bytes));
+    auto type = std::string_view{bytes, sizeof(bytes)};
 
     if (type == "blob ") {
         return ObjectType::Blob;

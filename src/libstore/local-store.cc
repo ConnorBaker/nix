@@ -67,7 +67,7 @@ void LocalBuildStoreConfig::anchor() {}
 void LocalStore::anchor() {}
 
 [[gnu::always_inline]]
-static inline void writeBlobRow(SQLiteStmt::Use use, uint64_t ingestion, const GitObjectStore::Hold::Row & row)
+static inline void writeBlobRow(auto && use, uint64_t ingestion, const GitObjectStore::Hold::Row & row)
 {
     use.apply(row.id.hash, row.id.hashSize)
         .apply(int64_t(row.executable ? 1 : 0))
@@ -613,10 +613,14 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
 
 void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows)
 {
-    if (blobRows == BlobRows::NoRows)
+    if (blobRows == BlobRows::NoRows || rows.empty())
         return;
-    for (auto & row : rows)
-        writeBlobRow(state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow), ingestion, row);
+    auto use = state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow);
+    for (auto & row : rows) {
+        if (&row != rows.data())
+            use.reset();
+        writeBlobRow(use, ingestion, row);
+    }
 }
 
 /* SQLite's selected 1,000,000,000-byte row limit and bind_blob's signed
@@ -698,6 +702,9 @@ std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & e
 void LocalStore::insertAuxiliaryRows(
     State & state, uint64_t ingestion, std::span<const GitObjectStore::Auxiliary> values)
 {
+    if (values.empty())
+        return;
+    auto use = state.stmts->InsertAuxiliary.use(SQLiteStmt::Bindings::Borrow);
     for (auto & value : values) {
         auto & entry = value.entry;
         /* Hold::addAuxiliary validated these keys before staging. Nonempty
@@ -706,8 +713,9 @@ void LocalStore::insertAuxiliaryRows(
         size_t offset = 0;
         do {
             auto size = std::min(auxiliaryChunkSize, value.body.size() - offset);
-            state.stmts->InsertAuxiliary.use(SQLiteStmt::Bindings::Borrow)
-                .apply(static_cast<int64_t>(entry.mode))
+            if (offset || &value != values.data())
+                use.reset();
+            use.apply(static_cast<int64_t>(entry.mode))
                 .apply(entry.hash.hash, entry.hash.hashSize)
                 .apply(static_cast<int64_t>(ingestion))
                 .apply(static_cast<int64_t>(offset / auxiliaryChunkSize))

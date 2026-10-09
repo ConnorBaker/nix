@@ -89,7 +89,6 @@ struct SQLiteStmt
 {
     sqlite3 * db = 0;
     sqlite3_stmt * stmt = 0;
-    std::string sql;
 
     SQLiteStmt() {}
 
@@ -117,7 +116,7 @@ struct SQLiteStmt
     private:
         SQLiteStmt & stmt;
         unsigned int curArg = 1;
-        bool borrowed;
+        const bool borrowed;
         Use(SQLiteStmt & stmt, Bindings bindings);
         Use & checkBind(int result);
 
@@ -135,7 +134,8 @@ struct SQLiteStmt
         Use & apply(int64_t value, bool notNull = true);
         Use & bind(); // null
 
-        int step();
+        /** Restart parameter binding/execution, retaining current bound values. */
+        void reset();
 
         /**
          * Execute a statement that does not return rows.
@@ -149,7 +149,7 @@ struct SQLiteStmt
         bool next();
 
         std::string getStr(int col);
-        /** BLOB view; invalidated by step/next, reset (Use exit), finalize, or conversion of that column. */
+        /** BLOB view; invalidated by exec/next, reset, Use exit, finalize, or conversion of that column. */
         std::string_view getBlobView(int col);
         int64_t getInt(int col);
         bool isNull(int col);

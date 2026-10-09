@@ -40,7 +40,7 @@ static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
         void operator()(std::string_view data) override {}
     };
 
-    struct NarIndexer : FileSystemObjectSink, Source
+    struct NarIndexer : NullFileSystemObjectSink, Source
     {
         std::optional<NarListing> root;
         Source & source;
@@ -59,11 +59,6 @@ static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
             if (!parent)
                 return root.emplace(std::move(member));
             return parent->entries.emplace(*path.baseName(), std::move(member)).first->second;
-        }
-
-        void createDirectory(const CanonPath & path) override
-        {
-            createMember(path, NarListing::Directory{});
         }
 
         void createDirectory(const CanonPath & path, DirectoryCreatedCallback callback) override

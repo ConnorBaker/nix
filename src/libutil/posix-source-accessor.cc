@@ -107,7 +107,7 @@ public:
     {
         assert(st.type == tRegular);
         assert(fsPath.is_absolute()); /* Only used for error messages, but still nice to enforce this invariant. */
-        setPathDisplay(fsPath.generic_string());
+        displayPrefix = fsPath.generic_string();
         maybeUpdateMtime(st_.st_mtime);
     }
 
@@ -257,34 +257,6 @@ private:
      */
     std::pair<Descriptor, std::shared_ptr<AutoCloseFD>> openParentAndUpsert(const CanonPath & path, bool ignoreMissing);
 
-    /**
-     * Result of `openParent()`.
-     */
-    struct OpenedParent
-    {
-        Descriptor fd;
-
-        /**
-         * Owning file descriptor, unless `path.parent().isRoot()`.
-         */
-        std::shared_ptr<AutoCloseFD> fdOwning;
-
-        /**
-         * `path.parent()`, so that callers don't recompute it (which copies a string).
-         */
-        CanonPath parent;
-
-        /**
-         * Whether `fdOwning` came out of `dirFdCache` under exactly `parent`.
-         */
-        bool fromCache = false;
-    };
-
-    /**
-     * Get the parent directory of path.
-     */
-    OpenedParent openParent(const CanonPath & path);
-
     AutoCloseFD openSubdirectory(const CanonPath & path);
 
     std::pair<AutoCloseDir, DirEntries> openDirectoryWithEntries(const CanonPath & path);
@@ -298,7 +270,7 @@ public:
         , fsPath(std::move(path))
     {
         assert(fsPath.is_absolute()); /* Only used for error messages, but still nice to enforce this invariant. */
-        setPathDisplay(fsPath.generic_string());
+        displayPrefix = fsPath.generic_string();
 
         if (dirFdCacheSize)
             dirFdCache = std::make_shared<Sync<LRUCache<CanonPath, ref<AutoCloseFD>>>>(dirFdCacheSize);
@@ -309,7 +281,7 @@ public:
         , dirFd(borrowedFd)
         , fsPath(std::move(path))
     {
-        setPathDisplay(fsPath.generic_string());
+        displayPrefix = fsPath.generic_string();
     }
 
     PosixDirectorySourceAccessor(PosixDirectorySourceAccessor &&) = delete;
@@ -358,85 +330,75 @@ public:
     }
 };
 
-PosixDirectorySourceAccessor::OpenedParent PosixDirectorySourceAccessor::openParent(const CanonPath & path)
-{
-    assert(!path.isRoot());
-    auto parent = path.parent().value();
-    if (parent.isRoot())
-        return {dirFd, nullptr, std::move(parent)};
-
-    maybeEvictFromGlobalCaches();
-
-    std::shared_ptr<AutoCloseFD> intermediateParentFd;
-    CanonPath anchor = CanonPath::root;
-
-    if (dirFdCache) {
-        auto cache = dirFdCache->lock();
-        auto p = parent;
-        while (true) {
-            if (auto intermediateDirFdHit = cache->getOrNullptr(p)) {
-                if (p == parent)
-                    return {
-                        .fd = (*intermediateDirFdHit)->get(),
-                        .fdOwning = intermediateDirFdHit->get_ptr(),
-                        .parent = std::move(parent),
-                        .fromCache = true,
-                    };
-                intermediateParentFd = intermediateDirFdHit->get_ptr();
-                anchor = p;
-                break;
-            }
-            if (p.isRoot())
-                break;
-            p.pop();
-        }
-    }
-
-    Descriptor startFd = intermediateParentFd ? intermediateParentFd->get() : dirFd;
-    CanonPath relPath = intermediateParentFd ? parent.removePrefix(anchor) : parent;
-
-    /* The fallback reports directories synchronously. Borrow its anchor:
-       openat2 does not use this callback, and needs no copied path or
-       heap-owned closure just to attempt the lookup. */
-    auto cacheDirectory = [&](AutoCloseFD fd, CanonPath relKey) {
-        assert(fd);
-        insertIntoDirFdCache(
-            anchor.isRoot() ? std::move(relKey) : anchor / relKey, make_ref<AutoCloseFD>(std::move(fd)));
-    };
-    std::function<void(AutoCloseFD, CanonPath)> cb;
-    if (dirFdCache)
-        cb = std::ref(cacheDirectory);
-
-    try {
-        AutoCloseFD parentFdOwning = openFileEnsureBeneathNoSymlinks(
-            startFd,
-            relPath,
-#  ifdef O_PATH
-            /* As to not require read permissions on the directory. */
-            O_PATH |
-#  else
-            /* Sadly this will require read permissison for path resolution,
-               but without O_PATH that's unavoidable. */
-            O_RDONLY |
-#  endif
-                O_DIRECTORY | O_CLOEXEC,
-            0,
-            std::move(cb));
-        /* A failed lookup owns no descriptor. Preserve its errno without
-           allocating an owner for the invalid descriptor. */
-        if (!parentFdOwning)
-            return {INVALID_DESCRIPTOR, nullptr, std::move(parent)};
-        return {parentFdOwning.get(), make_ref<AutoCloseFD>(std::move(parentFdOwning)), std::move(parent)};
-    } catch (SymlinkNotAllowed & e) {
-        /* Need to fixup the error message to include the actual path relative to the (possibly) cached fd. */
-        throw SymlinkNotAllowed(anchor / e.path, "path '%s' (or its ancestor) is a symlink", showPath(anchor / e.path));
-    }
-}
-
 std::pair<Descriptor, std::shared_ptr<AutoCloseFD>>
 PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool ignoreMissing)
 {
-    auto [parentFd, parentFdOwning, parent, fromCache] = openParent(path);
+    assert(!path.isRoot());
+    auto parent = path.parent().value();
+    std::shared_ptr<AutoCloseFD> parentFdOwning;
+    Descriptor parentFd = dirFd;
+    if (!parent.isRoot()) {
+        maybeEvictFromGlobalCaches();
+
+        std::shared_ptr<AutoCloseFD> intermediateParentFd;
+        CanonPath anchor = CanonPath::root;
+
+        if (dirFdCache) {
+            auto cache = dirFdCache->lock();
+            auto p = parent;
+            while (true) {
+                if (auto intermediateDirFdHit = cache->getOrNullptr(p)) {
+                    if (p == parent)
+                        return {(*intermediateDirFdHit)->get(), intermediateDirFdHit->get_ptr()};
+                    intermediateParentFd = intermediateDirFdHit->get_ptr();
+                    anchor = p;
+                    break;
+                }
+                if (p.isRoot())
+                    break;
+                p.pop();
+            }
+        }
+
+        Descriptor startFd = intermediateParentFd ? intermediateParentFd->get() : dirFd;
+        CanonPath relPath = intermediateParentFd ? parent.removePrefix(anchor) : parent;
+
+        /* The fallback reports directories synchronously. Borrow its anchor:
+           openat2 does not use this callback, and needs no copied path or
+           heap-owned closure just to attempt the lookup. */
+        auto cacheDirectory = [&](AutoCloseFD fd, CanonPath relKey) {
+            assert(fd);
+            insertIntoDirFdCache(
+                anchor.isRoot() ? std::move(relKey) : anchor / relKey, make_ref<AutoCloseFD>(std::move(fd)));
+        };
+        std::function<void(AutoCloseFD, CanonPath)> cb;
+        if (dirFdCache)
+            cb = std::ref(cacheDirectory);
+
+        try {
+            AutoCloseFD opened = openFileEnsureBeneathNoSymlinks(
+                startFd,
+                relPath,
+#  ifdef O_PATH
+                /* As to not require read permissions on the directory. */
+                O_PATH |
+#  else
+                /* Sadly this will require read permissison for path resolution,
+                   but without O_PATH that's unavoidable. */
+                O_RDONLY |
+#  endif
+                    O_DIRECTORY | O_CLOEXEC,
+                0,
+                std::move(cb));
+            /* Allocate an owner only for a successful lookup. */
+            if (opened)
+                parentFdOwning = make_ref<AutoCloseFD>(std::move(opened)).get_ptr();
+        } catch (SymlinkNotAllowed & e) {
+            /* Need to fixup the error message to include the actual path relative to the (possibly) cached fd. */
+            throw SymlinkNotAllowed(anchor / e.path, "path '%s' (or its ancestor) is a symlink", showPath(anchor / e.path));
+        }
+        parentFd = parentFdOwning ? parentFdOwning->get() : INVALID_DESCRIPTOR;
+    }
     if (parentFd == INVALID_DESCRIPTOR) {
         if (errno == ENOENT || errno == ENOTDIR) /* Intermediate component might not exist. */ {
             if (ignoreMissing)
@@ -447,8 +409,8 @@ PosixDirectorySourceAccessor::openParentAndUpsert(const CanonPath & path, bool i
         throw SysError("opening directory '%1%'", showPath(parent));
     }
 
-    /* A cached fd needs no upsert: `LRUCache::get()` has already promoted it. */
-    if (dirFdCache && parentFdOwning && !fromCache) {
+    /* Cached hits returned above after promotion; only a fresh parent needs an upsert. */
+    if (dirFdCache && parentFdOwning) {
         assert(*parentFdOwning);
         insertIntoDirFdCache(parent, ref<AutoCloseFD>(parentFdOwning));
     }

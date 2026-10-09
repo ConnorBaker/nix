@@ -225,7 +225,7 @@ static git_oid hashToOID(const Hash & hash)
 static Object lookupObject(git_repository * repo, const git_oid & oid, git_object_t type = GIT_OBJECT_ANY)
 {
     Object obj;
-    if (git_object_lookup(Setter(obj), repo, &oid, type)) {
+    if (git_object_lookup(std::out_ptr(obj), repo, &oid, type)) {
         throw GitError("getting Git object '%s'", oid);
     }
     return obj;
@@ -235,7 +235,7 @@ template<typename T>
 static T peelObject(git_object * obj, git_object_t type)
 {
     T obj2;
-    if (git_object_peel((git_object **) (typename T::pointer *) Setter(obj2), obj, type)) {
+    if (git_object_peel((git_object **) (typename T::pointer *) std::out_ptr(obj2), obj, type)) {
         throw Error("peeling Git object '%s'", *git_object_id(obj));
     }
     return obj2;
@@ -245,7 +245,7 @@ template<typename T>
 static T dupObject(typename T::pointer obj)
 {
     T obj2;
-    if (git_object_dup((git_object **) (typename T::pointer *) Setter(obj2), (git_object *) obj))
+    if (git_object_dup((git_object **) (typename T::pointer *) std::out_ptr(obj2), (git_object *) obj))
         throw GitError("duplicating object '%s'", *git_object_id((git_object *) obj));
     return obj2;
 }
@@ -325,7 +325,7 @@ static void initRepoAtomically(std::filesystem::path & path, GitRepo::Options op
     if (options.oidType != HashAlgorithm::SHA1)
         throw Error("creating a SHA-256 Git repository requires libgit2 2.0");
 #endif
-    if (git_repository_init_ext(Setter(tmpRepo), tmpDir.string().c_str(), &initOpts))
+    if (git_repository_init_ext(std::out_ptr(tmpRepo), tmpDir.string().c_str(), &initOpts))
         throw GitError("creating Git repository %s", PathFmt(path));
     try {
         std::filesystem::rename(tmpDir, path);
@@ -400,12 +400,12 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         initLibGit2();
 
         initRepoAtomically(path, options);
-        if (git_repository_open(Setter(repo), path.string().c_str()))
+        if (git_repository_open(std::out_ptr(repo), path.string().c_str()))
             throw GitError("opening Git repository %s", PathFmt(path));
 
         if (options.dontFindDeltas) {
             GitConfig config;
-            if (git_repository_config(Setter(config), *this))
+            if (git_repository_config(std::out_ptr(config), *this))
                 throw GitError("getting Git repository config");
 
             /* Override delta search without modifying the config file on disk. */
@@ -414,7 +414,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             const char * configValues[] = {"pack.window=0"};
 
             GitConfigBackend memBackend;
-            if (git_config_backend_from_values(Setter(memBackend), configValues, 1, &configOpts))
+            if (git_config_backend_from_values(std::out_ptr(memBackend), configValues, 1, &configOpts))
                 throw GitError("creating an in-memory Git config");
 
             if (git_config_add_backend(config.get(), memBackend.get(), GIT_CONFIG_LEVEL_APP, *this, /*force=*/false))
@@ -436,10 +436,10 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 #if LIBGIT2_VERSION_CHECK(2, 0, 0)
             git_odb_options odbOpts = GIT_ODB_OPTIONS_INIT;
             odbOpts.oid_type = git_repository_oid_type(repo.get());
-            if (git_odb_new_ext(Setter(odb), &odbOpts))
+            if (git_odb_new_ext(std::out_ptr(odb), &odbOpts))
                 throw GitError("creating Git object database");
 #else
-            if (git_odb_new(Setter(odb)))
+            if (git_odb_new(std::out_ptr(odb)))
                 throw GitError("creating Git object database");
 #endif
 
@@ -459,7 +459,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             if (git_odb_add_backend(odb.get(), packBackend, 1))
                 throw GitError("adding pack backend to Git object database");
         } else {
-            if (git_repository_odb(Setter(odb), repo.get()))
+            if (git_repository_odb(std::out_ptr(odb), repo.get()))
                 throw GitError("getting Git object database");
         }
 
@@ -495,7 +495,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
         PackBuilder packBuilder;
         PackBuilderContext packBuilderContext;
-        if (git_packbuilder_new(Setter(packBuilder), *this))
+        if (git_packbuilder_new(std::out_ptr(packBuilder), *this))
             throw GitError("creating git pack builder");
 
         if (git_packbuilder_set_callbacks(packBuilder.get(), PACKBUILDER_PROGRESS_CHECK_INTERRUPT, &packBuilderContext))
@@ -515,7 +515,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         indexerOpts.oid_type = git_repository_oid_type(repo.get());
 #endif
         if (git_indexer_new(
-                Setter(indexer),
+                std::out_ptr(indexer),
                 packFilesPath.string().c_str(),
 #if LIBGIT2_VERSION_CHECK(2, 0, 0)
                 &indexerOpts
@@ -604,7 +604,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         // This is to handle the case where it may be an annotated tag which itself has
         // an object_id.
         std::string peeledRef = ref + "^{commit}";
-        if (git_revparse_single(Setter(object), *this, requireCString(peeledRef)))
+        if (git_revparse_single(std::out_ptr(object), *this, requireCString(peeledRef)))
             throw GitError("resolving Git reference '%s'", ref);
         auto oid = git_object_id(object.get());
         return toHash(*oid);
@@ -613,11 +613,11 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
     std::vector<Submodule> parseSubmodules(const std::filesystem::path & configFile)
     {
         GitConfig config;
-        if (git_config_open_ondisk(Setter(config), configFile.string().c_str()))
+        if (git_config_open_ondisk(std::out_ptr(config), configFile.string().c_str()))
             throw GitError("parsing .gitmodules file");
 
         ConfigIterator it;
-        if (git_config_iterator_glob_new(Setter(it), config.get(), "^submodule\\..*\\.(path|url|branch)$"))
+        if (git_config_iterator_glob_new(std::out_ptr(it), config.get(), "^submodule\\..*\\.(path|url|branch)$"))
             throw GitError("iterating over .gitmodules");
 
         StringMap entries;
@@ -672,7 +672,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             options.flags |= GIT_STATUS_OPT_INCLUDE_UNMODIFIED;
             options.flags |= GIT_STATUS_OPT_EXCLUDE_SUBMODULES;
             StatusList status;
-            if (git_status_list_new(Setter(status), *this, &options))
+            if (git_status_list_new(std::out_ptr(status), *this, &options))
                 throw GitError("getting working directory status");
 
             auto count = git_status_list_entrycount(status.get());
@@ -701,7 +701,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
                 configured.emplace(submodule.path, submodule);
 
         Index index;
-        if (git_repository_index(Setter(index), *this))
+        if (git_repository_index(std::out_ptr(index), *this))
             throw GitError("opening index of Git repository %s", PathFmt(path));
         for (size_t n = 0, count = git_index_entrycount(index.get()); n < count; ++n) {
             auto entry = git_index_get_byindex(index.get(), n);
@@ -720,7 +720,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
     std::optional<std::string> getWorkdirRef() override
     {
         Reference ref;
-        if (git_reference_lookup(Setter(ref), *this, "HEAD"))
+        if (git_reference_lookup(std::out_ptr(ref), *this, "HEAD"))
             throw Error("looking up HEAD: %s", git_error_last()->message);
 
         if (auto target = git_reference_symbolic_target(ref.get()))
@@ -747,7 +747,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
         auto oid = hashToOID(oid_);
 
         Object obj;
-        if (auto errCode = git_object_lookup(Setter(obj), *this, &oid, GIT_OBJECT_ANY)) {
+        if (auto errCode = git_object_lookup(std::out_ptr(obj), *this, &oid, GIT_OBJECT_ANY)) {
             if (errCode == GIT_ENOTFOUND)
                 return false;
             throw GitError("getting Git object '%s'", oid);
@@ -1189,7 +1189,7 @@ public:
             return nullptr;
 
         Tree tree;
-        if (git_tree_lookup(Setter(tree), *state.repo, git_tree_entry_id(entry)))
+        if (git_tree_lookup(std::out_ptr(tree), *state.repo, git_tree_entry_id(entry)))
             throw GitError("looking up directory '%s'", showPath(path));
 
         return treeCache.emplace(path, std::move(tree)).first->second.get();
@@ -1241,7 +1241,7 @@ public:
             notExpected();
 
         Blob blob;
-        if (git_blob_lookup(Setter(blob), *state.repo, git_tree_entry_id(entry)))
+        if (git_blob_lookup(std::out_ptr(blob), *state.repo, git_tree_entry_id(entry)))
             throw GitError("looking up file '%s'", showPath(path));
 
         return blob;
@@ -1315,10 +1315,10 @@ static std::optional<std::vector<std::filesystem::path>> attributesFilesOutsideT
     git_buf_dispose(&buf);
 
     GitConfig config;
-    if (git_repository_config_snapshot(Setter(config), repo))
+    if (git_repository_config_snapshot(std::out_ptr(config), repo))
         return std::nullopt;
     std::unique_ptr<git_config_entry, Deleter<git_config_entry_free>> entry;
-    auto error = git_config_get_entry(Setter(entry), config.get(), "core.attributesfile");
+    auto error = git_config_get_entry(std::out_ptr(entry), config.get(), "core.attributesfile");
     if (error == GIT_ENOTFOUND) {
         auto dirs = gitSearchPath(GIT_CONFIG_LEVEL_XDG);
         if (!dirs)
@@ -1361,10 +1361,10 @@ bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attri
 {
     Object commit;
     auto oid = hashToOID(rev);
-    if (git_object_lookup(Setter(commit), *this, &oid, GIT_OBJECT_ANY))
+    if (git_object_lookup(std::out_ptr(commit), *this, &oid, GIT_OBJECT_ANY))
         return true;
     Object tree;
-    if (git_object_peel(Setter(tree), commit.get(), GIT_OBJECT_TREE))
+    if (git_object_peel(std::out_ptr(tree), commit.get(), GIT_OBJECT_TREE))
         return true;
     struct Search { GitRepoImpl & repo; std::string_view attribute; } search{*this, attribute};
     auto callback = [](const char *, const git_tree_entry * entry, void * payload) -> int {
@@ -1373,7 +1373,7 @@ bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attri
             return 0;
         auto & search = *static_cast<Search *>(payload);
         Blob blob;
-        if (git_blob_lookup(Setter(blob), search.repo, git_tree_entry_id(entry)))
+        if (git_blob_lookup(std::out_ptr(blob), search.repo, git_tree_entry_id(entry)))
             return -1;
         return attributesMention(blobContents(blob), search.attribute) ? -1 : 0;
     };
@@ -1428,16 +1428,16 @@ public:
     {
         if (!rev)
             return;
-        if (git_repository_open(Setter(commitAttributesRepo), repo->path.string().c_str()))
+        if (git_repository_open(std::out_ptr(commitAttributesRepo), repo->path.string().c_str()))
             throw GitError("opening Git repository %s to read its attributes", PathFmt(repo->path));
         /* The repository's object database, so that this handle reads every
            object that one does, the unflushed ones included. */
         ObjectDb odb;
-        if (git_repository_odb(Setter(odb), *repo))
+        if (git_repository_odb(std::out_ptr(odb), *repo))
             throw GitError("getting the Git object database");
         if (git_repository_set_odb(commitAttributesRepo.get(), odb.get()))
             throw GitError("setting the Git object database for attribute lookups");
-        if (git_index_new(Setter(emptyIndex)))
+        if (git_index_new(std::out_ptr(emptyIndex)))
             throw GitError("creating an empty Git index");
         if (git_repository_set_index(commitAttributesRepo.get(), emptyIndex.get()))
             throw GitError("setting the empty Git index for attribute lookups");
@@ -1659,7 +1659,7 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
     {
         auto body = merkle::serialiseTree(entries);
         ObjectDb odb;
-        if (git_repository_odb(Setter(odb), repo))
+        if (git_repository_odb(std::out_ptr(odb), repo))
             throw GitError("getting Git object database");
         git_oid oid;
         if (git_odb_write(&oid, odb.get(), body.data(), body.size(), GIT_OBJECT_TREE))

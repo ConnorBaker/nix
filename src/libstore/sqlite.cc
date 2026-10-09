@@ -1,4 +1,5 @@
 #include "nix/store/sqlite.hh"
+#include "nix/util/deleter.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/util/util.hh"
 #include "nix/util/url.hh"
@@ -11,6 +12,7 @@
 
 #include <sqlite3.h>
 
+#include <memory>
 #include <thread>
 
 namespace nix {
@@ -158,14 +160,13 @@ void SQLiteStmt::create(sqlite3 * db, const std::string & sql)
     if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK)
         SQLiteError::throw_(db, "creating statement '%s'", sql);
     this->db = db;
-    this->sql = sql;
 }
 
 SQLiteStmt::~SQLiteStmt()
 {
     try {
         if (stmt && sqlite3_finalize(stmt) != SQLITE_OK)
-            SQLiteError::throw_(db, "finalizing statement '%s'", sql);
+            SQLiteError::throw_(db, "finalizing SQLite statement");
     } catch (...) {
         ignoreExceptionInDestructor();
     }
@@ -219,24 +220,31 @@ SQLiteStmt::Use & SQLiteStmt::Use::bind()
     return checkBind(sqlite3_bind_null(stmt, curArg++));
 }
 
-int SQLiteStmt::Use::step()
+void SQLiteStmt::Use::reset()
 {
-    return sqlite3_step(stmt);
+    sqlite3_reset(stmt);
+    curArg = 1;
+}
+
+[[gnu::noinline, gnu::cold, noreturn]] static void throwSQLiteError(SQLiteStmt & stmt, const char * format)
+{
+    std::unique_ptr<char, Deleter<sqlite3_free>> sql{sqlite3_expanded_sql(stmt)};
+    SQLiteError::throw_(stmt.db, format, Uncolored(sql ? sql.get() : sqlite3_sql(stmt)));
 }
 
 void SQLiteStmt::Use::exec()
 {
-    int r = step();
+    int r = sqlite3_step(stmt);
     assert(r != SQLITE_ROW);
     if (r != SQLITE_DONE)
-        SQLiteError::throw_(stmt.db, fmt("executing SQLite statement '%s'", sqlite3_expanded_sql(stmt.stmt)));
+        throwSQLiteError(stmt, "executing SQLite statement '%s'");
 }
 
 bool SQLiteStmt::Use::next()
 {
-    int r = step();
+    int r = sqlite3_step(stmt);
     if (r != SQLITE_DONE && r != SQLITE_ROW)
-        SQLiteError::throw_(stmt.db, fmt("executing SQLite query '%s'", sqlite3_expanded_sql(stmt.stmt)));
+        throwSQLiteError(stmt, "executing SQLite query '%s'");
     return r == SQLITE_ROW;
 }
 

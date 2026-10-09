@@ -96,7 +96,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
             function_ref<std::monostate()> descend) override
         {
             paths.insert(path);
-            if (st.type == SourceAccessor::tDirectory)
+            if (st.type != SourceAccessor::tRegular && st.type != SourceAccessor::tSymlink)
                 return descend();
             return std::monostate{};
         }

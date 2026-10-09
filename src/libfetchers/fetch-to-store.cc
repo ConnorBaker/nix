@@ -275,16 +275,8 @@ struct MemoVisitor : HashingVisitor, MemoNamer
         /* Symlinks are named only when recorded; filtered directories
            are neither answered nor recorded. A hit has no node action. */
         auto entry = lookup(to, st, &key);
-        /* A directory's NAR size is unknown: nothing beneath it is
-           seen. A file's is the stat's. */
-        auto result = entry
-                          ? HashedNode{
-                                .entry = *entry,
-                                .narSize = st.type == SourceAccessor::tRegular && st.fileSize
-                                               ? std::optional(merkle::nar::regular(*st.fileSize, st.isExecutable))
-                                               : std::nullopt,
-                            }
-                          : descend();
+        /* This private visitor returns only the entry; it never publishes a NAR size. */
+        auto result = entry ? HashedNode{.entry = *entry, .narSize = std::nullopt} : descend();
         if (!entry) {
             if (st.type == SourceAccessor::tSymlink)
                 key = keyOf(to, root.path / to);
@@ -300,7 +292,7 @@ struct MemoVisitor : HashingVisitor, MemoNamer
 
     merkle::TreeEntry hashTree(PathFilter & filter)
     {
-        auto entry = objectHashOf(*root.accessor, root.path, filter, *this).root;
+        auto entry = traverse(*root.accessor, root.path, filter, *this).entry;
         flush();
         return entry;
     }

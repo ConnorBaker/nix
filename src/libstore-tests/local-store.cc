@@ -47,6 +47,7 @@
 #include <cerrno>
 #include <cstring>
 #include <future>
+#include <memory>
 #ifndef _WIN32
 #  include <poll.h>
 #  include <sys/socket.h>
@@ -124,6 +125,53 @@ TEST(SQLite, copiedAndBorrowedBindingsHaveExplicitStorageLifetimes)
     EXPECT_EQ(use.getStr(3), "7879");
 }
 
+TEST(SQLite, borrowedResetRetainsValuesUntilFullRebindAndScopeExit)
+{
+    AutoDelete dir{createTempDir()};
+    SQLite db{dir.path() / "bindings.sqlite", {.useWAL = false}};
+    const std::array<std::string, 3> names{std::string("first\0tail", 10), "second", ""};
+    const std::array<std::array<unsigned char, 3>, 3> blobs{{{0xff, 0, 1}, {2, 0, 3}, {0, 4, 5}}};
+    for (unsigned arity : {5u, 7u}) {
+        std::string sql = "select ?1";
+        for (unsigned arg = 2; arg <= arity; ++arg)
+            sql += ", ?" + std::to_string(arg);
+        SQLiteStmt query{db, sql};
+        for (unsigned count : {0u, 1u, 3u}) {
+            SCOPED_TRACE(fmt("arity=%d count=%d", arity, count));
+            if (count) {
+                auto use = query.use(SQLiteStmt::Bindings::Borrow);
+                for (unsigned row = 0; row < count; ++row) {
+                    if (row) {
+                        use.reset();
+                        /* Reset retains the complete preceding row, including its owners. */
+                        ASSERT_TRUE(use.next());
+                        EXPECT_EQ(use.getStr(0), names[row - 1]);
+                        EXPECT_EQ(use.getBlobView(1), std::string_view(
+                            reinterpret_cast<const char *>(blobs[row - 1].data()), blobs[row - 1].size()));
+                        for (unsigned col = 2; col < arity; ++col)
+                            EXPECT_EQ(use.getInt(col), 100 * (row - 1) + col + 1);
+                        use.reset();
+                    }
+                    use.apply(names[row]).apply(blobs[row].data(), blobs[row].size());
+                    for (unsigned arg = 3; arg <= arity; ++arg)
+                        use.apply(static_cast<int64_t>(100 * row + arg));
+                    ASSERT_TRUE(use.next());
+                    EXPECT_EQ(use.getStr(0), names[row]);
+                    EXPECT_EQ(use.getBlobView(1), std::string_view(
+                        reinterpret_cast<const char *>(blobs[row].data()), blobs[row].size()));
+                    for (unsigned col = 2; col < arity; ++col)
+                        EXPECT_EQ(use.getInt(col), 100 * row + col + 1);
+                }
+            }
+            /* The owners still exist, but Borrow exit must have removed every pointer/value. */
+            ASSERT_EQ(sqlite3_step(query), SQLITE_ROW);
+            for (unsigned col = 0; col < arity; ++col)
+                EXPECT_EQ(sqlite3_column_type(query, col), SQLITE_NULL);
+            ASSERT_EQ(sqlite3_reset(query), SQLITE_OK);
+        }
+    }
+}
+
 TEST(SQLite, borrowedBindingsPreserveEmptyNullAndFailureReuse)
 {
     AutoDelete dir{createTempDir()};
@@ -152,28 +200,67 @@ TEST(SQLite, borrowedBindingsPreserveEmptyNullAndFailureReuse)
         EXPECT_EQ(use.getStr(2), "null");
         EXPECT_EQ(use.getInt(3), 37);
     }
-    SQLiteStmt one{db, "select ?1"};
-    EXPECT_THROW(
-        {
-            auto use = one.use(SQLiteStmt::Bindings::Borrow);
-            use.apply(empty);
-            use.apply(41);
-        },
-        SQLiteError);
-    auto use = one.use();
-    ASSERT_TRUE(use.next());
-    EXPECT_TRUE(use.isNull(0));
+    /* Every attempted bind position, with one fewer real parameters, must clear on unwind. */
+    for (unsigned arity : {5u, 7u})
+        for (unsigned failed = 1; failed <= arity; ++failed) {
+            SCOPED_TRACE(fmt("arity=%d failed=%d", arity, failed));
+            std::string sql = "select null";
+            for (unsigned arg = 1; arg < failed; ++arg)
+                sql += ", ?" + std::to_string(arg);
+            SQLiteStmt partial{db, sql};
+            ASSERT_EQ(sqlite3_bind_parameter_count(partial), static_cast<int>(failed - 1));
+            EXPECT_THROW(
+                {
+                    auto use = partial.use(SQLiteStmt::Bindings::Borrow);
+                    /* A successful preceding row tests reset before this partial rebinding. */
+                    for (unsigned arg = 1; arg < failed; ++arg)
+                        use.apply(empty);
+                    ASSERT_TRUE(use.next());
+                    use.reset();
+                    for (unsigned arg = 1; arg <= failed; ++arg)
+                        use.apply(empty);
+                },
+                SQLiteError);
+            ASSERT_EQ(sqlite3_step(partial), SQLITE_ROW);
+            for (unsigned col = 0; col < failed; ++col)
+                EXPECT_EQ(sqlite3_column_type(partial, col), SQLITE_NULL);
+            ASSERT_EQ(sqlite3_reset(partial), SQLITE_OK);
+        }
     db.exec("create table item (value text unique)");
-    db.exec("insert into item values ('duplicate')");
-    SQLiteStmt insert{db, "insert into item values (?)"};
-    std::string value = "duplicate";
-    EXPECT_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec(), SQLiteError);
-    value = "accepted";
-    EXPECT_NO_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec());
+    for (unsigned arity : {5u, 7u}) {
+        std::string sql = "insert into item values (?1", cleared = "insert into item values (NULL";
+        for (unsigned arg = 2; arg <= arity; ++arg) {
+            sql += " || ?" + std::to_string(arg);
+            cleared += " || NULL";
+        }
+        SQLiteStmt insert{db, sql + ")"};
+        std::string value = fmt("duplicate-%d", arity);
+        EXPECT_THROW(
+            {
+                auto use = insert.use(SQLiteStmt::Bindings::Borrow);
+                for (unsigned arg = 0; arg < arity; ++arg)
+                    use.apply(value);
+                use.exec();
+                use.reset();
+                for (unsigned arg = 0; arg < arity; ++arg)
+                    use.apply(value);
+                use.exec();
+            },
+            SQLiteError);
+        EXPECT_FALSE(sqlite3_stmt_busy(insert));
+        std::unique_ptr<char, decltype(&sqlite3_free)> expanded{sqlite3_expanded_sql(insert), sqlite3_free};
+        ASSERT_NE(expanded, nullptr);
+        EXPECT_STREQ(expanded.get(), (cleared + ")").c_str());
+        value = fmt("accepted-%d", arity);
+        auto use = insert.use(SQLiteStmt::Bindings::Borrow);
+        for (unsigned arg = 0; arg < arity; ++arg)
+            use.apply(value);
+        EXPECT_NO_THROW(use.exec());
+    }
     SQLiteStmt count{db, "select count(*) from item"};
     auto rows = count.use();
     ASSERT_TRUE(rows.next());
-    EXPECT_EQ(rows.getInt(0), 2);
+    EXPECT_EQ(rows.getInt(0), 4);
 }
 
 TEST(SQLite, busyBorrowedInsertionCanBeRetriedAfterItsOwnerChanges)
@@ -183,19 +270,67 @@ TEST(SQLite, busyBorrowedInsertionCanBeRetriedAfterItsOwnerChanges)
     SQLite first{path, {.useWAL = false}};
     first.exec("create table item (value text)");
     SQLite second{path, {.useWAL = false}};
+    ASSERT_EQ(sqlite3_busy_timeout(first, 0), SQLITE_OK);
     ASSERT_EQ(sqlite3_busy_timeout(second, 0), SQLITE_OK);
-    SQLiteStmt insert{second, "insert into item values (?)"};
-    std::string value = "blocked";
-    first.exec("begin exclusive");
-    EXPECT_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec(), SQLiteBusy);
-    first.exec("commit");
-    value = "accepted after retry";
-    EXPECT_NO_THROW(insert.use(SQLiteStmt::Bindings::Borrow).apply(value).exec());
-    SQLiteStmt query{second, "select value from item"};
-    auto use = query.use();
+    for (unsigned arity : {5u, 7u}) {
+        std::string sql = "insert into item values (?1", cleared = "insert into item values (NULL";
+        for (unsigned arg = 2; arg <= arity; ++arg) {
+            sql += " || ?" + std::to_string(arg);
+            cleared += " || NULL";
+        }
+        SQLiteStmt insert{second, sql + ")"};
+        const std::string preceding = fmt("preceding-%d", arity);
+        std::string value = "blocked";
+        EXPECT_THROW(
+            {
+                auto use = insert.use(SQLiteStmt::Bindings::Borrow);
+                for (unsigned arg = 0; arg < arity; ++arg)
+                    use.apply(preceding);
+                use.exec();
+                use.reset();
+                ASSERT_NO_THROW(first.exec("begin exclusive"));
+                for (unsigned arg = 0; arg < arity; ++arg)
+                    use.apply(value);
+                use.exec();
+            },
+            SQLiteBusy);
+        EXPECT_FALSE(sqlite3_stmt_busy(insert));
+        std::unique_ptr<char, decltype(&sqlite3_free)> expanded{sqlite3_expanded_sql(insert), sqlite3_free};
+        ASSERT_NE(expanded, nullptr);
+        EXPECT_STREQ(expanded.get(), (cleared + ")").c_str());
+        first.exec("commit");
+        value = fmt("accepted after retry-%d", arity);
+        auto use = insert.use(SQLiteStmt::Bindings::Borrow);
+        for (unsigned arg = 0; arg < arity; ++arg)
+            use.apply(value);
+        EXPECT_NO_THROW(use.exec());
+    }
+    SQLiteStmt count{second, "select count(*) from item where value like 'accepted after retry-%'"};
+    auto use = count.use();
     ASSERT_TRUE(use.next());
-    EXPECT_EQ(use.getStr(0), value);
-    EXPECT_FALSE(use.next());
+    EXPECT_EQ(use.getInt(0), 2);
+}
+
+TEST(SQLite, failedDiagnosticExpansionFallsBackToPreparedSQL)
+{
+    AutoDelete dir{createTempDir()};
+    SQLite db{dir.path() / "diagnostics.sqlite", {.useWAL = false}};
+    const std::string sql = "select abs(-9223372036854775808), ?1";
+    SQLiteStmt query{db, sql};
+    const std::string value(512, 'x');
+    auto use = query.use(SQLiteStmt::Bindings::Borrow);
+    use.apply(value);
+    auto previous = sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 128);
+    Finally restoreLimit{[&] { sqlite3_limit(db, SQLITE_LIMIT_LENGTH, previous); }};
+    std::unique_ptr<char, decltype(&sqlite3_free)> expanded{sqlite3_expanded_sql(query), sqlite3_free};
+    ASSERT_EQ(expanded, nullptr);
+    EXPECT_THAT(
+        [&] { use.next(); },
+        ::testing::ThrowsMessage<SQLiteError>(::testing::HasSubstr(sql)));
+    use.reset();
+    EXPECT_THAT(
+        [&] { use.exec(); },
+        ::testing::ThrowsMessage<SQLiteError>(::testing::HasSubstr(sql)));
 }
 
 TEST(SQLite, externallySynchronizedConnectionOmitsOnlyItsOwnMutex)

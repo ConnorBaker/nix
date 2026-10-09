@@ -505,6 +505,68 @@ TEST(MerkleHash, unhackNameAndUnhackedEntries)
     }
 }
 
+TEST(MerkleHash, filteredPathsRefusesUnsupportedTypesWithoutReadingAdmittedLeaves)
+{
+    struct Probe : MemorySourceAccessor
+    {
+        Type unsupportedType = tUnknown;
+        CanonPath unsupportedPath = CanonPath::root;
+        std::vector<CanonPath> stats;
+        unsigned contents = 0;
+
+        std::optional<Stat> maybeLstat(const CanonPath & path) override
+        {
+            stats.push_back(path);
+            auto st = MemorySourceAccessor::maybeLstat(path);
+            if (path == unsupportedPath)
+                st->type = unsupportedType;
+            return st;
+        }
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            ++contents;
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+
+        std::string readLink(const CanonPath & path) override
+        {
+            ++contents;
+            return MemorySourceAccessor::readLink(path);
+        }
+    };
+
+    for (auto type : {SourceAccessor::tChar, SourceAccessor::tBlock, SourceAccessor::tSocket,
+                      SourceAccessor::tFifo, SourceAccessor::tUnknown})
+        for (bool atRoot : {false, true}) {
+            SCOPED_TRACE(static_cast<int>(type));
+            SCOPED_TRACE(atRoot);
+            Probe probe;
+            probe.root = directory({{"bad", regular("unread")}, {"later", regular("unread")}, {"link", symlink("unread")}});
+            probe.unsupportedType = type;
+            probe.unsupportedPath = atRoot ? CanonPath::root : CanonPath("bad");
+            std::vector<std::string> filtered;
+            PathFilter accept = [&](const std::string & path) {
+                filtered.push_back(path);
+                return true;
+            };
+            ASSERT_THAT(
+                [&] { filteredPaths(probe, CanonPath::root, accept); },
+                ::testing::ThrowsMessage<Error>(testing::HasSubstrIgnoreANSIMatcher("has an unsupported type of")));
+            EXPECT_EQ(filtered, atRoot ? std::vector<std::string>{} : std::vector<std::string>{"/bad"});
+            EXPECT_EQ(probe.contents, 0u);
+            if (!atRoot) {
+                probe.stats.clear();
+                PathFilter reject = [](const std::string & path) { return path != "/bad"; };
+                EXPECT_EQ(
+                    filteredPaths(probe, CanonPath::root, reject),
+                    (std::set<CanonPath>{CanonPath::root, CanonPath("later"), CanonPath("link")}));
+                EXPECT_EQ(probe.stats, (std::vector<CanonPath>{CanonPath::root, CanonPath("later"), CanonPath("link")}));
+                EXPECT_EQ(probe.contents, 0u);
+            }
+        }
+}
+
 /* The NAR's fixed arithmetic, against `dumpPath` itself where a node is
    small enough to write.  `writeString` is 8 bytes of length, the bytes,
    and zero padding to a multiple of 8: 8, 16, 16, 24 for 0, 1, 8, 9
