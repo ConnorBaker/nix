@@ -1786,7 +1786,6 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
         }
     };
 
-    auto self = ref<GitRepoImpl>(shared_from_this());
     ref<SourceAccessor> fileAccessor =
         make_ref<WorkdirSourceAccessor>(path, std::move(wd), std::move(makeNotAllowedError));
     /* Status determines tracked membership, not filesystem-object identity:
@@ -1797,7 +1796,7 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
        macros. Keep its native lookup instead of proving absence from a
        fresh scan of files that may no longer describe that cache. */
     if (options.exportIgnore)
-        fileAccessor = make_ref<GitExportIgnoreSourceAccessor>(self, fileAccessor, std::nullopt);
+        fileAccessor = make_ref<GitExportIgnoreSourceAccessor>(ref<GitRepoImpl>(shared_from_this()), fileAccessor, std::nullopt);
     return fileAccessor;
 }
 

@@ -437,9 +437,8 @@ LocalStore::LocalStore(ref<const Config> config)
             state->db,
             "select a.ingestion, a.chunk, a.body from AuxValues a"
             " where a.kind = ?1 and a.id = ?2 and a.ingestion = ("
-            " select min(c.ingestion) from AuxValues c join Ingestions i on i.id = c.ingestion"
-            " where c.kind = ?1 and c.id = ?2 and (?3 is null or c.ingestion > ?3))"
-            " order by a.chunk;");
+            " select min(ingestion) from AuxValues where typeof(ingestion) = 'integer'"
+            " and kind = ?1 and id = ?2 and (?3 is null or ingestion > ?3)) order by a.chunk;");
         state->stmts->ReadAuxiliaryExact.create(
             state->db,
             "select ingestion, chunk, body from AuxValues"
@@ -1816,7 +1815,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         auto state(_state->lock());
 
         SQLiteTxn txn(state->db);
-        StorePathSet paths;
         /* Within this transaction, the finite path/reference domain has
            stable row ids. Retain each lookup through reference insertion. */
         std::map<StorePath, uint64_t> pathIds;
@@ -1852,7 +1850,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                     updated.insert(pathIds.emplace(i.path, static_cast<uint64_t>(use.getInt(0))).first->first);
                 }
             }
-            paths.insert(i.path);
             for (auto & reference : i.references)
                 if (!infos.contains(reference) && !pathIds.contains(reference))
                     pathIds.emplace(reference, queryValidPathId(*state, reference));
@@ -1863,7 +1860,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            transaction.  Cycles can only occur when a derivation
            has multiple outputs. */
         if (auto cycle = visitDependencies(
-                paths,
+                infos,
                 [&](const StorePath & path) -> const StorePathSet & { return infos.at(path).references; },
                 [](const StorePath &) {}))
             throw BuildError(

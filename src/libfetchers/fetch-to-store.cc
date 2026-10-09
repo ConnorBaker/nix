@@ -166,51 +166,26 @@ void assertNarHash(
         throw inputHashMismatch("NAR hash", inputDescription, asserted, narHash);
 }
 
-/* The subtree memo of 01 §9.9 as a visitor: each node either answers from
-   its named row or records the descended entry (mode and hash).
+/* Subtree naming shared by the memo visitor and copy route (01 §9.9–9.10):
+   the visitor answers named rows or records descended entries (mode and hash).
    While a filter is in force a directory's name is neither used nor
    recorded, since the filter decides its entries; a symlink is read
    without a lookup, which would cost the same. */
 namespace {
 
-struct MemoVisitor : HashingVisitor
+struct MemoNamer
 {
     const fetchers::Settings & settings;
     const SourcePath & root;
     const std::optional<std::pair<CanonPath, std::string>> & rootName;
     bool filtered;
-    bool wholeViewFingerprint;
-    std::shared_ptr<fetchers::Cache> cache;
+    bool wholeViewFingerprint =
+        rootName && root.accessor->fingerprint && rootName->second == *root.accessor->fingerprint;
+    std::shared_ptr<fetchers::Cache> cache{};
 
     /* Only named facts need synchronization. Once initialized, `cache`
        never changes; unnamed worktree observations take no memo lock. */
-    std::mutex mutex;
-
-    /* The rows this walk has named but not yet written.  They go in one
-       commit rather than one apiece (`01` section 9.9, the memo's rule says
-       what a row means, not when it is written; `05` section 6 measures the
-       per-row commit).  The bound keeps a walk of a large tree from holding
-       them all: a row is about two hundred bytes, so this is a few
-       megabytes.  A walk that throws writes nothing it had not flushed,
-       which costs the next walk exactly the work this one did. */
-    static constexpr size_t maxPendingWrites = 16384;
-    std::vector<std::pair<fetchers::Cache::Key, fetchers::Attrs>> writes;
-
-    MemoVisitor(
-        const fetchers::Settings & settings,
-        const SourcePath & root,
-        bool filtered,
-        const std::optional<std::pair<CanonPath, std::string>> & rootName,
-        size_t workers = 1)
-        : HashingVisitor(workers)
-        , settings(settings)
-        , root(root)
-        , rootName(rootName)
-        , filtered(filtered)
-        , wholeViewFingerprint(
-              rootName && root.accessor->fingerprint && rootName->second == *root.accessor->fingerprint)
-    {
-    }
+    std::mutex mutex{};
 
     /* The walk's paths are relative to `root` and carry the on-disk names;
        the accessor is asked about `root.path / to`. */
@@ -245,30 +220,48 @@ struct MemoVisitor : HashingVisitor
     /* Whether the memo is consulted for a node of this kind at all: a
        symlink is read without a lookup, and a directory under a filter is
        never answered, since the filter decides its entries. */
-    bool consulted(const SourceAccessor::Stat & st) const
-    {
-        return !(st.type == SourceAccessor::tSymlink || (st.type == SourceAccessor::tDirectory && filtered));
-    }
-
     std::optional<merkle::TreeEntry>
     lookup(const CanonPath & to, const SourceAccessor::Stat & st, std::optional<fetchers::Cache::Key> * key = nullptr)
     {
-        if (!consulted(st))
+        if (st.type == SourceAccessor::tSymlink || (st.type == SourceAccessor::tDirectory && filtered))
             return std::nullopt;
         auto lookupAt = [this, &to, key](const CanonPath & sourcePath) -> std::optional<merkle::TreeEntry> {
             if (auto entry = root.accessor->getKnownEntry(sourcePath))
                 return entry;
             auto k = keyOf(to, sourcePath);
-            std::optional<merkle::TreeEntry> entry;
-            if (k)
-                if (auto res = cache->lookup(*k))
-                    entry = rowEntry(*res);
+            if (!k)
+                return std::nullopt;
+            auto entry = cache->lookup(*k).transform(rowEntry);
             if (key)
                 *key = std::move(k);
             return entry;
         };
         /* At the accessor root the walk already owns the source path. */
         return root.path.isRoot() ? lookupAt(to) : lookupAt(root.path / to);
+    }
+};
+
+struct MemoVisitor : HashingVisitor, MemoNamer
+{
+    /* The rows this walk has named but not yet written.  They go in one
+       commit rather than one apiece (`01` section 9.9, the memo's rule says
+       what a row means, not when it is written; `05` section 6 measures the
+       per-row commit).  The bound keeps a walk of a large tree from holding
+       them all: a row is about two hundred bytes, so this is a few
+       megabytes.  A walk that throws writes nothing it had not flushed,
+       which costs the next walk exactly the work this one did. */
+    static constexpr size_t maxPendingWrites = 16384;
+    std::vector<std::pair<fetchers::Cache::Key, fetchers::Attrs>> writes;
+
+    MemoVisitor(
+        const fetchers::Settings & settings,
+        const SourcePath & root,
+        bool filtered,
+        const std::optional<std::pair<CanonPath, std::string>> & rootName,
+        PathFilter & filter)
+        : HashingVisitor(workerCountFor(*root.accessor, filter))
+        , MemoNamer{settings, root, rootName, filtered}
+    {
     }
 
     HashedNode node(
@@ -305,6 +298,13 @@ struct MemoVisitor : HashingVisitor
         return result;
     }
 
+    merkle::TreeEntry hashTree(PathFilter & filter)
+    {
+        auto entry = objectHashOf(*root.accessor, root.path, filter, *this).root;
+        flush();
+        return entry;
+    }
+
     /* Writes are excluded by mutex during the walk, or by joining all
        visits before the final flush. */
     void flush()
@@ -317,19 +317,6 @@ struct MemoVisitor : HashingVisitor
 };
 
 } // namespace
-
-static merkle::TreeEntry gitTreeHashMemoised(
-    const fetchers::Settings & settings,
-    const SourcePath & root,
-    PathFilter & filter,
-    bool filtered,
-    const std::optional<std::pair<CanonPath, std::string>> & rootName)
-{
-    MemoVisitor memo{settings, root, filtered, rootName, HashingVisitor::workerCountFor(*root.accessor, filter)};
-    auto root2 = objectHashOf(*root.accessor, root.path, filter, memo).root;
-    memo.flush();
-    return root2;
-}
 
 StorePath fetchToStore(
     const fetchers::Settings & settings,
@@ -449,9 +436,9 @@ std::pair<StorePath, Hash> fetchToStore2(
             if (method == ContentAddressMethod::Raw::Git) {
                 /* Repair reads the tree itself, bypassing known entries
                    and subtree memo rows as well as the root caches. */
-                auto hash = merkle::objectHash(
-                    repair ? objectHashOf(*path.accessor, path.path, filter2).root
-                           : gitTreeHashMemoised(settings, path, filter2, filter != nullptr, rootName));
+                auto entry = repair ? objectHashOf(*path.accessor, path.path, filter2).root
+                                    : MemoVisitor{settings, path, filter != nullptr, rootName, filter2}.hashTree(filter2);
+                auto hash = merkle::objectHash(entry);
                 auto storePath = gitTreePath(store, name, hash);
                 debug(
                     "named '%s' as '%s' (tree hash '%s')",
@@ -472,7 +459,7 @@ std::pair<StorePath, Hash> fetchToStore2(
                                   : [&]() {
                                         // FIXME: ideally addToStore() would return the hash
                                         // right away (like computeStorePath()).
-                                        MemoVisitor memo{settings, path, filter != nullptr, rootName};
+                                        MemoNamer memo{settings, path, rootName, filter != nullptr};
                                         auto storePath = store.addToStore(
                                             name,
                                             path,

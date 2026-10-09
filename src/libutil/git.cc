@@ -1,5 +1,4 @@
 #include <cerrno>
-#include <algorithm>
 #include <charconv>
 #include <regex>
 #include <strings.h> // for strcasecmp
@@ -70,16 +69,14 @@ static void parseTreeEntries(
         left -= 1;
 
         const auto hashSize = regularHashSize(hashAlgo);
-        char hashs[Hash::maxHashSize] = {};
-        source(hashs, hashSize);
+        /* Unsupported algorithms still consume their width before rejection. */
+        Hash hash(hashAlgo == HashAlgorithm::SHA256 ? HashAlgorithm::SHA256 : HashAlgorithm::SHA1);
+        source(reinterpret_cast<char *>(hash.hash), hashSize);
         left -= hashSize;
 
         if (!(hashAlgo == HashAlgorithm::SHA1 || hashAlgo == HashAlgorithm::SHA256)) {
             throw Error("Unsupported hash algorithm for git trees: %s", printHashAlgo(hashAlgo));
         }
-
-        Hash hash(hashAlgo);
-        std::copy_n(hashs, hashSize, hash.hash);
 
         sink.insertChild(name, TreeEntry{.mode = mode, .hash = hash});
         if (requireCanonical) {

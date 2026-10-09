@@ -5364,45 +5364,48 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupEnumeratesTheFullSignedIngestionCur
     const std::array<int64_t, 4> ids{std::numeric_limits<int64_t>::min(), -1, 0, std::numeric_limits<int64_t>::max()};
     size_t cases = 0;
     for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
-        for (size_t sound = 0; sound <= ids.size(); ++sound) {
-            SCOPED_TRACE(fmt("mode=%o sound=%d", (RawMode) mode, sound));
-            std::string body = fmt("signed-cursor-%d", cases);
-            auto hash = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
-            merkle::TreeEntry entry{mode, hash};
-            auto path = config->realStoreDir.get() / fmt("signed-owner-%d", cases);
-            auto initial = publishAuxiliary(path, {{entry, body}});
-            SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
-            auto logical = (std::filesystem::path(config->storeDir) / path.filename()).string();
-            {
-                SQLiteTxn txn{db};
-                SQLiteStmt clear{db, "delete from AuxValues where ingestion = ?;"};
-                clear.use().apply(static_cast<int64_t>(initial)).exec();
-                SQLiteStmt owner{db, "insert or replace into Ingestions(id, path, hold) values (?, ?, null);"};
-                SQLiteStmt value{db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, 0, ?);"};
-                for (size_t i = 0; i < ids.size(); ++i) {
-                    owner.use().apply(ids[i]).apply(logical).exec();
-                    std::string bytes = i == sound ? body : "corrupt";
-                    value.use()
-                        .apply(static_cast<int64_t>(mode))
-                        .apply(hash.hash, hash.hashSize)
-                        .apply(ids[i])
-                        .apply(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size())
-                        .exec();
+        for (bool hasOwner : {false, true})
+            for (size_t sound = 0; sound <= ids.size(); ++sound) {
+                SCOPED_TRACE(fmt("mode=%o owner=%d sound=%d", (RawMode) mode, hasOwner, sound));
+                std::string body = fmt("signed-cursor-%d", cases);
+                auto hash = mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body);
+                merkle::TreeEntry entry{mode, hash};
+                auto path = config->realStoreDir.get() / fmt("signed-owner-%d", cases);
+                auto initial = publishAuxiliary(path, {{entry, body}});
+                SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                db.exec("pragma foreign_keys = off;");
+                auto logical = (std::filesystem::path(config->storeDir) / path.filename()).string();
+                {
+                    SQLiteTxn txn{db};
+                    SQLiteStmt clear{db, "delete from AuxValues where ingestion = ?;"};
+                    clear.use().apply(static_cast<int64_t>(initial)).exec();
+                    SQLiteStmt owner{db, "insert or replace into Ingestions(id, path, hold) values (?, ?, null);"};
+                    SQLiteStmt value{db, "insert into AuxValues(kind, id, ingestion, chunk, body) values (?, ?, ?, 0, ?);"};
+                    for (size_t i = 0; i < ids.size(); ++i) {
+                        if (hasOwner)
+                            owner.use().apply(ids[i]).apply(logical).exec();
+                        std::string bytes = i == sound ? body : "corrupt";
+                        value.use()
+                            .apply(static_cast<int64_t>(mode))
+                            .apply(hash.hash, hash.hashSize)
+                            .apply(ids[i])
+                            .apply(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size())
+                            .exec();
+                    }
+                    txn.commit();
                 }
-                txn.commit();
+                auto read = store->objects.readAuxiliary(entry);
+                if (sound < ids.size())
+                    EXPECT_EQ(read, body);
+                else
+                    EXPECT_FALSE(read);
+                db.exec("delete from AuxValues where ingestion in (-9223372036854775808, -1, 0, 9223372036854775807);");
+                db.exec("delete from Ingestions where id in (-9223372036854775808, -1, 0, 9223372036854775807);");
+                db.exec(
+                    "update sqlite_sequence set seq = (select coalesce(max(id), 0) from Ingestions) where name = 'Ingestions';");
+                ++cases;
             }
-            auto read = store->objects.readAuxiliary(entry);
-            if (sound < ids.size())
-                EXPECT_EQ(read, body);
-            else
-                EXPECT_FALSE(read);
-            db.exec("delete from AuxValues where ingestion in (-9223372036854775808, -1, 0, 9223372036854775807);");
-            db.exec("delete from Ingestions where id in (-9223372036854775808, -1, 0, 9223372036854775807);");
-            db.exec(
-                "update sqlite_sequence set seq = (select coalesce(max(id), 0) from Ingestions) where name = 'Ingestions';");
-            ++cases;
-        }
-    EXPECT_EQ(cases, 10u);
+    EXPECT_EQ(cases, 20u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliaryValuesBelongToEveryPublishingIngestion)
@@ -5667,6 +5670,97 @@ TEST_F(LocalStoreObjectsTest, auxiliarySQLStorageClassesAreCheckedAtTheirBoundar
                 ++cases;
             }
     EXPECT_EQ(cases, 20u);
+}
+
+TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
+{
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    /* Preserve actual classes, without INTEGER affinity coercing REAL or TEXT. */
+    db.exec("create table UnconstrainedAux(kind integer, id blob, ingestion, chunk integer, body blob); "
+            "insert into UnconstrainedAux select * from AuxValues; drop table AuxValues; "
+            "alter table UnconstrainedAux rename to AuxValues;");
+    using Identity = std::tuple<const char *, const char *, int64_t>;
+    const std::array<Identity, 10> identities{{
+        {"-9223372036854775808", "integer", std::numeric_limits<int64_t>::min()},
+        {"-1", "integer", -1},
+        {"0", "integer", 0},
+        {"9223372036854775807", "integer", std::numeric_limits<int64_t>::max()},
+        {"0.5", "real", 0},
+        {"7.0", "real", 7},
+        {"'opaque'", "text", 0},
+        {"'7'", "text", 7},
+        {"x'00'", "blob", 0},
+        {"null", "null", 0},
+    }};
+    size_t cases = 0, duplicates = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (bool hasOwner : {false, true})
+            for (bool corrupt : {false, true})
+                for (auto & [expression, storage, ownerId] : identities) {
+                    SCOPED_TRACE(fmt("mode=%o owner=%d bad=%d id=%s", (RawMode) mode, hasOwner, corrupt, expression));
+                    auto body = fmt("incarnation-domain-%d", cases);
+                    merkle::TreeEntry entry{
+                        mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+                    auto publish = [&](std::string_view name) {
+                        return publishAuxiliary(
+                            config->realStoreDir.get() / fmt("%s-%d", name, cases), {{entry, body}});
+                    };
+                    auto initial = publish("first-incarnation");
+                    SQLiteStmt change{
+                        db,
+                        fmt("update AuxValues set ingestion = %s, body = %s where ingestion = ?;",
+                            expression, corrupt ? "zeroblob(length(body))" : "body")};
+                    change.use().apply(static_cast<int64_t>(initial)).exec();
+                    SQLiteStmt remove{db, "delete from Ingestions where id = ?;"};
+                    remove.use().apply(static_cast<int64_t>(initial)).exec();
+                    remove.use().apply(ownerId).exec();
+                    if (hasOwner) {
+                        SQLiteStmt owner{db, "insert into Ingestions(id, path, hold) values (?, null, null);"};
+                        owner.use().apply(ownerId).exec();
+                    }
+                    {
+                        SQLiteStmt type{db, "select typeof(ingestion) from AuxValues where kind = ? and id = ?;"};
+                        auto use = type.use();
+                        use.apply(static_cast<int64_t>(mode)).apply(entry.hash.hash, entry.hash.hashSize);
+                        ASSERT_TRUE(use.next());
+                        EXPECT_EQ(use.getStr(0), storage);
+                        EXPECT_FALSE(use.next());
+                    }
+                    SQLiteStmt owner{db, "select 1 from Ingestions where id = ?;"};
+                    EXPECT_EQ(owner.use().apply(ownerId).next(), hasOwner);
+                    bool integer = std::string_view(storage) == "integer";
+                    if (integer && !corrupt)
+                        EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                    else
+                        EXPECT_FALSE(store->objects.readAuxiliary(entry));
+                    if (integer && ownerId == 0 && !corrupt) {
+                        /* Outer numeric equality selects both chunk-zero rows. */
+                        SQLiteStmt duplicate{
+                            db,
+                            "insert into AuxValues select kind, id, cast(ingestion as real), chunk, body"
+                            " from AuxValues where kind = ? and id = ?;"};
+                        duplicate.use()
+                            .apply(static_cast<int64_t>(mode))
+                            .apply(entry.hash.hash, entry.hash.hashSize)
+                            .exec();
+                        EXPECT_FALSE(store->objects.readAuxiliary(entry));
+                        ++duplicates;
+                    }
+                    /* MAX is terminal within one lookup. A later publication below
+                       MAX starts a new lookup; its failed candidate remains present. */
+                    if (ownerId == std::numeric_limits<int64_t>::max())
+                        remove.use().apply(ownerId).exec();
+                    db.exec("update sqlite_sequence set seq = (select coalesce(max(id), 0) from Ingestions "
+                            "where id > 0) where name = 'Ingestions';");
+                    auto sound = publish("later-sound-incarnation");
+                    if (integer && ownerId != std::numeric_limits<int64_t>::max())
+                        EXPECT_GT(static_cast<int64_t>(sound), ownerId);
+                    EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                    remove.use().apply(ownerId).exec();
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 80u);
+    EXPECT_EQ(duplicates, 4u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliarySchemaRejectsIncompleteOwnershipAndDuplicateChunks)
