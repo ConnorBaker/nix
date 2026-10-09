@@ -175,13 +175,33 @@ std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, 
     return name.empty() ? pending->root.string() : (pending->root / name).string();
 }
 
+/* Preserve existing directory permissions, including directory symlinks.
+   Only directories created by this call need owner access restored. */
+static void createAccessibleDirs(const std::filesystem::path & path)
+{
+    try {
+        std::error_code error;
+        if (path.empty() || std::filesystem::is_directory(path, error))
+            return;
+        if (error && error != std::errc::no_such_file_or_directory)
+            throw SystemError(error, "creating directory %s", PathFmt(path));
+        createAccessibleDirs(path.parent_path());
+        if (std::filesystem::create_directory(path))
+            std::filesystem::permissions(
+                path, std::filesystem::perms::owner_all,
+                std::filesystem::perm_options::add | std::filesystem::perm_options::nofollow);
+    } catch (const std::filesystem::filesystem_error & e) {
+        throw SystemError(e.code(), "creating directory %s", PathFmt(path));
+    }
+}
+
 GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
 {
     /* GC may remove the empty directory before its lock is acquired.
        Retry under a fresh name until the lease exists while locked. A
        reused PID must not adopt a previous ingestion's directory. */
     static std::atomic<uint32_t> counter(0);
-    createDirs(tmp);
+    createAccessibleDirs(tmp);
     while (true) {
         dir = tmp / fmt("hold-%d-%d", getpid(), counter.fetch_add(1));
         /* A PID may have been reused since a crashed ingestion. Its hold

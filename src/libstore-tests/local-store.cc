@@ -5671,6 +5671,30 @@ TEST_F(LocalStoreObjectsTest, auxiliaryVerificationRepairsOnlyCorruptIncarnation
     EXPECT_EQ(cases, 2u);
 }
 
+TEST_F(LocalStoreObjectsTest, physicalLeaseAndSweepWorkForEveryNamespaceStateAndUmask)
+{
+    size_t cases = 0;
+    for (unsigned present = 0; present != 3; ++present)
+        for (mode_t mask = 0; mask <= 0777; ++mask) {
+            SCOPED_TRACE(fmt("namespace-prefix=%d umask=%o", present, mask));
+            deletePath(store->objects.dir);
+            if (present)
+                createDirs(present == 1 ? store->objects.dir : store->objects.dir / "tmp");
+            auto old = ::umask(mask);
+            Finally restoreMask{[&] { ::umask(old); }};
+            auto hold = store->objects.hold();
+            EXPECT_NO_THROW({
+                auto directory = hold.directory();
+                EXPECT_EQ(lstat(directory).st_mode & 0777, 0700u);
+                EXPECT_TRUE(std::filesystem::is_empty(directory));
+                EXPECT_EQ(store->objects.sweep().holds, 1u);
+                EXPECT_TRUE(pathExists(directory));
+            });
+            ++cases;
+        }
+    EXPECT_EQ(cases, 3u * 512u);
+}
+
 TEST_F(LocalStoreObjectsTest, auxiliaryPublicationDoesNotCreateFilesForAnyUmask)
 {
     auto path = config->realStoreDir.get() / "all-umasks";
