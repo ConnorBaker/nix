@@ -52,8 +52,8 @@ HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children childr
             size->add(nameSize, *child.narSize);
     };
     if (workers == 1 || !children.canDefer) {
-        children.each([&](std::string_view name, bool, fun<HashedNode()> visit) {
-            auto child = visit();
+        children.each([&](std::string_view name, bool, NodeVisitor<HashedNode>::Visit visit) {
+            auto child = visit(*this);
             consume(std::string(name), child);
         });
     } else {
@@ -61,7 +61,7 @@ HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children childr
         {
             std::string name;
             bool subdirectory;
-            fun<HashedNode()> visit;
+            NodeVisitor<HashedNode>::Visit visit;
         };
         boost::container::small_vector<
             Child,
@@ -70,21 +70,22 @@ HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children childr
             boost::container::small_vector_options_t<
                 boost::container::growth_factor<boost::container::growth_factor_100>>>
             kids;
-        children.each([&](std::string_view name, bool subdirectory, fun<HashedNode()> visit) {
+        children.each([&](std::string_view name, bool subdirectory, NodeVisitor<HashedNode>::Visit visit) {
             kids.push_back({std::string(name), subdirectory, std::move(visit)});
         });
         if (kids.size() > 1 && std::ranges::any_of(kids.data(), kids.data() + kids.size(), &Child::subdirectory)) {
+            auto & pool = (scheduler ? *scheduler : *this).pool;
             if (!pool)
                 pool = std::make_unique<CopyPool>(workers);
             std::vector<std::optional<HashedNode>> nodes(kids.size());
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
-                [&](size_t i) { nodes[i] = kids[i].visit(); },
+                [&](size_t i) { nodes[i] = kids[i].visit(*this); },
                 [&](size_t i) { consume(std::move(kids[i].name), nodes[i].value()); });
         } else
             for (auto & child : kids)
-                consume(std::move(child.name), child.visit());
+                consume(std::move(child.name), child.visit(*this));
     }
 
     body = merkle::serialiseTree(tree);
@@ -102,12 +103,12 @@ ObjectHashSink::Result ObjectHashSink::Result::of(const HashedNode & root)
     };
 }
 
-void ObjectHashSink::deliver(const CanonPath & path, fun<HashedNode()> visit)
+void ObjectHashSink::deliver(const CanonPath & path, NodeVisitor<HashedNode>::Visit visit)
 {
     if (path.isRoot()) {
         if (root)
             throw Error("object hash sink: the root object was delivered twice");
-        root = visit();
+        root = visit(visitor);
         return;
     }
     if (!open)
@@ -128,7 +129,7 @@ void ObjectHashSink::createDirectory(const CanonPath & path)
 
 void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
 {
-    auto visit = [&] {
+    auto visit = [&](NodeVisitor<HashedNode> & childVisitor) {
         auto children = [&](NodeVisitor<HashedNode>::Children::Each each) {
             auto previous = std::exchange(open, &each);
             Finally restore{[&] { open = previous; }};
@@ -136,20 +137,20 @@ void ObjectHashSink::createDirectory(const CanonPath & path, DirectoryCreatedCal
                the children arrive at `path / name`. */
             callback(*this, path);
         };
-        return visitor.directory(path, {children});
+        return childVisitor.directory(path, {children});
     };
     deliver(path, std::ref(visit));
 }
 
 void ObjectHashSink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
-    auto visit = [&] { return visitor.regular(path, std::move(func)); };
+    auto visit = [&](NodeVisitor<HashedNode> & childVisitor) { return childVisitor.regular(path, std::move(func)); };
     deliver(path, std::ref(visit));
 }
 
 void ObjectHashSink::createSymlink(const CanonPath & path, const std::string & target)
 {
-    auto visit = [&] { return visitor.symlink(path, target); };
+    auto visit = [&](NodeVisitor<HashedNode> & childVisitor) { return childVisitor.symlink(path, target); };
     deliver(path, std::ref(visit));
 }
 

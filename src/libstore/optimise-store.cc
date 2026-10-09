@@ -189,6 +189,9 @@ struct ObjectStoreVisitor : HashingVisitor
     {
     }
 
+    ObjectStoreVisitor(ObjectStoreVisitor & parent, std::nullptr_t)
+        : HashingVisitor(parent, nullptr), objects(parent.objects), hold(parent.hold) {}
+
     HashedNode symlink(const CanonPath & path, const std::string & target) override
     {
         auto node = HashingVisitor::symlink(path, target);
@@ -433,38 +436,21 @@ struct LinkingVisitor : ObjectStoreVisitor
     RepairFlag repair;
     Sink * rootContents;
 
-    /* Frames borrow from scopes that outlive all joined visits. Thread-local
-       save/restore covers recursion, helped jobs and reentrant visitors. */
-    struct Frame
+    RestoreSink & sink;
+    const std::string * diskName = nullptr;
+
+#ifndef _WIN32
+    struct Naming
     {
-        RestoreSink * sink = nullptr;
-        const std::string * diskName = nullptr;
+        using Lock = std::lock_guard<std::mutex>;
+        SyncBase<LocalStore::TreeNamer, std::mutex, Lock, Lock, std::condition_variable> namer;
+        function_ref<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
+
+        Naming(LocalStore::TreeNamer namer, decltype(commitAttempt) commitAttempt)
+            : namer(std::move(namer)), commitAttempt(commitAttempt) {}
     };
-
-    static Frame & currentFrame() noexcept
-    {
-        static thread_local Frame f;
-        return f;
-    }
-
-    struct Scope
-    {
-        Frame saved;
-
-        Scope(RestoreSink & sink, const std::string * diskName) noexcept
-            : saved(currentFrame())
-        {
-            currentFrame() = {&sink, diskName};
-        }
-
-        ~Scope()
-        {
-            currentFrame() = saved;
-        }
-    };
-
-    /* The walking thread's seed, for this visitor's whole life. */
-    Scope scope;
+    Naming * naming = nullptr;
+#endif
 
     LinkingVisitor(
         GitObjectStore & objects,
@@ -476,9 +462,17 @@ struct LinkingVisitor : ObjectStoreVisitor
         : ObjectStoreVisitor(objects, hold, workers)
         , repair(repair)
         , rootContents(rootContents)
-        , scope(restore, nullptr)
+        , sink(restore)
     {
     }
+
+    LinkingVisitor(LinkingVisitor & parent, RestoreSink & sink, const std::string * diskName = nullptr)
+        : ObjectStoreVisitor(parent, nullptr)
+        , repair(parent.repair), rootContents(parent.rootContents), sink(sink), diskName(diskName)
+#ifndef _WIN32
+        , naming(parent.naming)
+#endif
+    {}
 
     /* Where the node at `path` goes: the innermost open sink, under `/name`
        (the root node under `/`). */
@@ -495,14 +489,9 @@ struct LinkingVisitor : ObjectStoreVisitor
 
     Target at(const CanonPath & path)
     {
-        auto & frame = currentFrame();
-        auto & sink = *frame.sink;
-        /* Pull children supply their case-hacked name; push paths already
-           carry the NAR restorer's physical spelling. */
-        auto name = path.isRoot()
-                        ? path
-                        : CanonPath::root / (frame.diskName ? std::string_view(*frame.diskName) : *path.baseName());
-        return {sink, std::move(name)};
+        if (path.isRoot())
+            return {sink, path};
+        return {sink, CanonPath::root / (diskName ? std::string_view(*diskName) : *path.baseName())};
     }
 
     HashedNode directory(const CanonPath & path, Children children) override
@@ -512,8 +501,23 @@ struct LinkingVisitor : ObjectStoreVisitor
         std::string body;
         auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
             assert(rel.isRoot());
-            Scope scope{sub, currentFrame().diskName};
-            result = hashDirectory(path, std::move(children), body);
+            LinkingVisitor child{*this, sub};
+#ifndef _WIN32
+            if (naming && isCaseHackEnabled()) {
+                auto named = [&](Children::Each each) {
+                    CaseHackNames hack;
+                    children.each([&](std::string_view name, bool directory, Visit visit) {
+                        each(name, directory, [disk = hack.diskName(name), visit = std::move(visit)](auto & consumer) {
+                            auto & parent = static_cast<LinkingVisitor &>(consumer);
+                            LinkingVisitor target{parent, parent.sink, &disk};
+                            return visit(target);
+                        });
+                    });
+                };
+                result = child.hashDirectory(path, {named, children.canDefer}, body);
+            } else
+#endif
+                result = child.hashDirectory(path, children, body);
         };
         target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
@@ -601,52 +605,8 @@ struct LinkingVisitor : ObjectStoreVisitor
             objects.enterWritten(entry.hash, executable, dirFd, name, where, repair, hold);
         return std::move(file.node);
     }
-};
-
 #ifndef _WIN32
-struct ObjectUnavailable
-{};
-
-/* Reuse verified immutable files or named root/directory subtrees; other
-   nodes descend through LinkingVisitor. Child scopes retain physical names. */
-struct MaterialisingVisitor : LinkingVisitor
-{
-    /* Naming is serialized; walking and holder writes run outside its lock. */
-    using Lock = std::lock_guard<std::mutex>;
-    SyncBase<LocalStore::TreeNamer, std::mutex, Lock, Lock, std::condition_variable> namer;
-    function_ref<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
-
-    MaterialisingVisitor(
-        GitObjectStore & objects,
-        const GitObjectStore::Hold & hold,
-        RestoreSink & restore,
-        RepairFlag repair,
-        LocalStore::TreeNamer namer,
-        size_t workers,
-        decltype(commitAttempt) commitAttempt)
-        : LinkingVisitor(objects, hold, restore, repair, nullptr, workers)
-        , namer(std::move(namer))
-        , commitAttempt(commitAttempt)
-    {
-    }
-
-    HashedNode directory(const CanonPath & path, Children children) override
-    {
-        // Allocate physical names in listing order, before concurrent visits.
-        auto withDiskNames = [&](Children::Each each) {
-            CaseHackNames hack;
-            children.each([&](std::string_view name, bool directory, fun<HashedNode()> visit) {
-                each(
-                    std::string_view(name),
-                    bool(directory),
-                    [disk = hack.diskName(name), sink = currentFrame().sink, visit = std::move(visit)] {
-                        Scope scope{*sink, &disk};
-                        return visit();
-                    });
-            });
-        };
-        return LinkingVisitor::directory(path, {withDiskNames, children.canDefer});
-    }
+    struct ObjectUnavailable {};
 
     HashedNode node(
         SourceAccessor & accessor,
@@ -655,8 +615,9 @@ struct MaterialisingVisitor : LinkingVisitor
         const SourceAccessor::Stat & st,
         function_ref<HashedNode()> descend) override
     {
-        if (auto result = tryKnown(accessor, from, path, st))
-            return std::move(*result);
+        if (naming)
+            if (auto result = tryKnown(accessor, from, path, st))
+                return std::move(*result);
         return descend();
     }
 
@@ -671,12 +632,12 @@ struct MaterialisingVisitor : LinkingVisitor
     /* Materialise validated Merkle values directly. Directory scopes own their
        parsed children and original bodies until all child visits complete. */
     uint64_t materialise(
-        const merkle::TreeEntry & entry, const CanonPath & path, size_t depth, const GitObjectStore::Hold & attemptHold)
+        const merkle::TreeEntry & entry, const CanonPath & path, size_t depth,
+        const GitObjectStore::Hold & attemptHold, const Target & target)
     {
         checkInterrupt();
         if (depth >= narMaxDepth)
             throw Error("path '%s' exceeds maximum NAR directory depth of %d", path, narMaxDepth);
-        auto target = at(path);
         switch (entry.mode) {
         case merkle::Mode::Regular:
         case merkle::Mode::Executable: {
@@ -740,8 +701,8 @@ struct MaterialisingVisitor : LinkingVisitor
                 CaseHackNames hack;
                 for (auto & [name, child] : tree) {
                     auto diskName = hack.diskName(name);
-                    Scope childScope{sub, &diskName};
-                    size.add(name.size(), materialise(child, path / name, depth + 1, attemptHold));
+                    size.add(name.size(), materialise(
+                        child, path / name, depth + 1, attemptHold, {sub, CanonPath::root / diskName}));
                 }
             };
             target.sink.createSubdirectory(target.name, std::ref(populate));
@@ -801,7 +762,7 @@ struct MaterialisingVisitor : LinkingVisitor
             }
         if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
             return std::nullopt;
-        auto entry = (*namer.lock())(path, st);
+        auto entry = (*naming->namer.lock())(path, st);
         if (!entry)
             return std::nullopt;
         auto target = at(path);
@@ -825,7 +786,7 @@ struct MaterialisingVisitor : LinkingVisitor
                     AutoCloseFD owned{std::move(target.sink.dirFd)};
                 }
             }};
-            narSize = materialise(*entry, path, std::ranges::distance(path), attempt ? *attempt : hold);
+            narSize = materialise(*entry, path, std::ranges::distance(path), attempt ? *attempt : hold, target);
         } catch (ObjectUnavailable &) {
         } catch (Error & e) {
             warn(
@@ -843,11 +804,11 @@ struct MaterialisingVisitor : LinkingVisitor
         /* Publishing a completed name ends rollback's authority over it.
            A merge error aborts the ingestion; it never resumes fallback. */
         if (attempt)
-            commitAttempt(where, *attempt);
+            naming->commitAttempt(where, *attempt);
         return HashedNode{.entry = *entry, .narSize = narSize};
     }
-};
 #endif
+};
 
 } // namespace
 
@@ -928,7 +889,9 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
         for (auto & auxiliary : projection.auxiliary)
             hold.addAuxiliary(std::move(auxiliary));
     };
-    MaterialisingVisitor visitor{objects, hold, restore, repair, std::move(namer), workers, commitAttempt};
+    LinkingVisitor::Naming naming{std::move(namer), commitAttempt};
+    LinkingVisitor visitor{objects, hold, restore, repair, nullptr, workers};
+    visitor.naming = &naming;
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every reused node carries the size of what it made, so the NAR

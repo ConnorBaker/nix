@@ -1,5 +1,4 @@
 #include "nix/util/tree-traversal.hh"
-#include "nix/util/finally.hh"
 
 #include <variant>
 
@@ -10,15 +9,14 @@ void copyRecursive(
 {
     struct Copy : NodeVisitor<std::monostate>
     {
-        /* Each synchronous directory scope owns its copied coordinate;
-           recursive calls retain their enclosing frame on the C++ stack. */
-        using Target = std::pair<FileSystemObjectSink *, CanonPath>;
-        const Target * open = nullptr;
+        FileSystemObjectSink & sink;
+        const CanonPath & under;
+
+        Copy(FileSystemObjectSink & sink, const CanonPath & under) : sink(sink), under(under) {}
 
         std::pair<FileSystemObjectSink &, CanonPath> at(const CanonPath & path)
         {
-            auto & [sink, under] = *open;
-            return {*sink, path.isRoot() ? CanonPath(under) : under / *path.baseName()};
+            return {sink, path.isRoot() ? CanonPath(under) : under / *path.baseName()};
         }
 
         std::monostate regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
@@ -39,17 +37,12 @@ void copyRecursive(
         {
             auto [sink, p] = at(path);
             sink.createDirectory(p, [&](FileSystemObjectSink & dirSink, const CanonPath & rel) {
-                const Target target{&dirSink, rel};
-                auto previous = std::exchange(open, &target);
-                Finally restore{[&] { open = previous; }};
-                children.each([](std::string_view, bool, fun<std::monostate()> visit) { visit(); });
+                Copy child{dirSink, rel};
+                children.each([&](std::string_view, bool, Visit visit) { visit(child); });
             });
             return {};
         }
-    } copy;
-
-    const Copy::Target root{&sink, destPath};
-    copy.open = &root;
+    } copy{sink, destPath};
     traverse(accessor, sourcePath, defaultPathFilter, copy);
 }
 

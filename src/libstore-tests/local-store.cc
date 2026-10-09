@@ -9942,6 +9942,67 @@ TEST_F(LocalStoreObjectsTest, parallelCopyPreservesLogicalAndPhysicalChildNames)
     EXPECT_EQ(cases, caseSensitive ? 16u : 8u);
 }
 
+/* A source spelling is not a destination spelling. Re-allocate physical
+   names from the logical listing even when the source has arbitrary old
+   counters; with the hack off, reject that listing before visiting children. */
+TEST_F(LocalStoreObjectsTest, preHackedCopyReallocatesPhysicalNamesInListingOrder)
+{
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    size_t cases = 0;
+    for (bool caseHack : {false, true})
+        for (char kind : {'f', 'x', 'l', 'd'})
+            for (size_t workers = 1; workers <= 8; ++workers) {
+                SCOPED_TRACE(fmt("caseHack=%d kind=%c workers=%d", caseHack, kind, workers));
+                WithCaseHack policy{caseHack};
+                HashingVisitor::workersForTest.store(workers);
+                Nodes physical, logical;
+                auto add = [&](std::string actual, std::string name) {
+                    auto tail = kind == 'd' ? "/payload" : "";
+                    auto leafKind = kind == 'd' ? 'f' : kind;
+                    physical.emplace_back(actual + tail, name, leafKind);
+                    logical.emplace_back(name + tail, name, leafKind);
+                };
+                add("Foo", "Foo");
+                add("foo" + std::string(caseHackSuffix) + "9", "foo");
+                add("solo" + std::string(caseHackSuffix) + "not-a-number", "solo");
+                for (size_t i = 0; i < 8; ++i) {
+                    auto path = fmt("scope%d/payload", i);
+                    physical.emplace_back(path, path, 'f');
+                    logical.emplace_back(path, path, 'f');
+                }
+                auto inner = make_ref<ConcurrentMemorySourceAccessor>();
+                inner->root = std::move(treeAccessor(physical)->root);
+                auto source = make_ref<CountingAccessor>(inner);
+                auto dst = std::filesystem::path(config->realStoreDir.get()) / fmt("prehacked-%d", cases++);
+                if (!caseHack) {
+                    EXPECT_THROW(
+                        materialise(dst, SourcePath(source), noNode(), NoRepair, defaultPathFilter, true), Error);
+                    EXPECT_EQ(source->stats, 1u);
+                    EXPECT_EQ(source->listings, 1u);
+                    EXPECT_EQ(source->reads, 0u);
+                    EXPECT_EQ(source->links, 0u);
+                    continue;
+                }
+                auto oracle = treeAccessor(logical);
+                auto result = materialise(dst, SourcePath(source), noNode(), NoRepair, defaultPathFilter, true);
+                EXPECT_EQ(result.root, referenceObjectEntry(*oracle, CanonPath::root));
+                auto expectedNar = narOf(*oracle);
+                EXPECT_EQ(result.narSize, expectedNar.size());
+                StringSink actualNar;
+                dumpPath(dst, actualNar);
+                EXPECT_EQ(actualNar.s, expectedNar);
+                std::set<std::string> expectedNames{"Foo", "foo" + std::string(caseHackSuffix) + "1", "solo"};
+                for (size_t i = 0; i < 8; ++i)
+                    expectedNames.insert(fmt("scope%d", i));
+                std::set<std::string> actualNames;
+                for (auto & entry : DirectoryIterator{dst})
+                    actualNames.insert(entry.path().filename().string());
+                EXPECT_EQ(actualNames, expectedNames);
+            }
+    EXPECT_EQ(cases, 64u);
+}
+
 /* The same law over generated trees, the namers of
    `prop_materialised_path_is_the_restored_path` included: whatever the
    naming names, the copy on one thread and the copy on eight make the same
@@ -10856,11 +10917,7 @@ TEST_F(TempLocalStoreTest, registrationCacheAdmitsOnlyRoundTripMetadata)
     Finally restore{[&] { ttl.ttlPositive = oldPositive; }};
     ttl.ttlPositive = 600;
     unsigned cases = 0;
-#ifdef NDEBUG
-    constexpr unsigned firstHashSize = 0;
-#else
-    constexpr unsigned firstHashSize = 1; // Hash::to_string asserts nonzero when assertions are enabled.
-#endif
+    constexpr unsigned firstHashSize = 1; // Supported Nix builds require assertions.
     auto check = [&](ValidPathInfo info, bool roundTrips) {
         auto name = fmt("round-trip-metadata-%d", cases++);
         info.path = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, name), name);
@@ -10919,16 +10976,14 @@ TEST_F(TempLocalStoreTest, registrationCacheAdmitsOnlyRoundTripMetadata)
             check(info, info.objectHash->hash.algo == HashAlgorithm::SHA256 && size == 32);
         }
     /* Enumerate all CA method/algorithm states that store naming admits.
-       Assert-enabled Text naming requires SHA256; disabling assertions admits other known algorithms.
+       Text naming requires SHA256.
        Git naming admits legacy SHA1 and SHA256. */
     for (auto method : {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat,
                         ContentAddressMethod::Raw::NixArchive, ContentAddressMethod::Raw::Git})
         for (auto algorithm : {HashAlgorithm::MD5, HashAlgorithm::SHA1, HashAlgorithm::SHA256,
                                HashAlgorithm::SHA512, HashAlgorithm::BLAKE3}) {
-#ifndef NDEBUG
             if (method == ContentAddressMethod::Raw::Text && algorithm != HashAlgorithm::SHA256)
                 continue;
-#endif
             if (method == ContentAddressMethod::Raw::Git
                 && algorithm != HashAlgorithm::SHA1 && algorithm != HashAlgorithm::SHA256)
                 continue;
@@ -10942,11 +10997,7 @@ TEST_F(TempLocalStoreTest, registrationCacheAdmitsOnlyRoundTripMetadata)
                                     || experimentalFeatureSettings.isEnabled(Xp::BLAKE3Hashes)));
             }
         }
-#ifdef NDEBUG
-    EXPECT_EQ(cases, 18259u); // 514 signatures + 256*65 object hashes + 17*65 CAs.
-#else
     EXPECT_EQ(cases, 17730u); // 514 signatures + 256*64 object hashes + 13*64 CAs.
-#endif
 }
 
 TEST_F(TempLocalStoreTest, pathInfoCacheAdmitsOnlyTheRequestedIdentity)

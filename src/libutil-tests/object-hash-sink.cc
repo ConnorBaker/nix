@@ -16,6 +16,7 @@
 #include <array>
 #include <condition_variable>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <thread>
 #include <type_traits>
@@ -209,16 +210,17 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
                 {
                     decltype(each) & consume;
                     size_t & completed;
+                    NodeVisitor<HashedNode> & visitor;
                     size_t ordinal = 0;
-                } context{each, completed};
+                } context{each, completed, *this};
                 children.each([context = &context, ordinal = size_t{0}](
-                             std::string_view name, bool isDirectory, fun<HashedNode()> visit) mutable {
-                    auto child = visit();
+                             std::string_view name, bool isDirectory, Visit visit) mutable {
+                    auto child = visit(context->visitor);
                     /* Both captures must remain valid after nested directory
                        callbacks, and the owned ordinal must persist. */
                     EXPECT_EQ(++ordinal, ++context->ordinal);
                     ++context->completed;
-                    context->consume(std::string_view(name), bool(isDirectory), [&] { return child; });
+                    context->consume(std::string_view(name), bool(isDirectory), [&](auto &) { return child; });
                 });
             }});
         }
@@ -262,7 +264,7 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                     tail, acceptedSize ? std::optional(merkle::nar::regular(4, false)) : std::nullopt};
                 std::vector<std::string> visits;
                 auto actual = visitor.directory(CanonPath::root, {[&](auto each) {
-                    each("keep", false, [&] {
+                    each("keep", false, [&](auto &) {
                         visits.push_back("first");
                         return first;
                     });
@@ -272,12 +274,12 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                         each(
                             duplicate ? "keep" : "bad/name",
                             false,
-                            [&] {
+                            [&](auto &) {
                                 visits.push_back("rejected");
                                 return rejected;
                             }),
                         Error);
-                    each("tail", false, [&] {
+                    each("tail", false, [&](auto &) {
                         visits.push_back("last");
                         return last;
                     });
@@ -426,7 +428,7 @@ TEST(TreeTraversal, borrowedChildrenKeepsMoveOnlyEmitterStateThroughTheDirectory
                 wide.front() = 'z';
                 calls = ++*state;
                 for (auto & [name, node] : entries)
-                    each(std::string_view(name), true, [&, node] {
+                    each(std::string_view(name), true, [&, node](auto &) {
                         EXPECT_EQ(emitted.load(), workers > 1);
                         EXPECT_EQ(wide.front(), 'z');
                         ++visited;
@@ -501,15 +503,15 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
         std::string directory(const CanonPath &, Children children) override
         {
             EXPECT_TRUE(children.canDefer);
-            std::vector<std::pair<std::string, fun<std::string()>>> pending;
-            children.each([&](std::string_view name, bool isDirectory, fun<std::string()> visit) {
+            std::vector<std::pair<std::string, Visit>> pending;
+            children.each([&](std::string_view name, bool isDirectory, Visit visit) {
                 EXPECT_EQ(isDirectory, directories);
                 pending.emplace_back(name, std::move(visit));
             });
             std::string result;
             /* Every enumeration/emitter stack frame has returned. */
             for (auto & [name, visit] : pending)
-                result += name + ":" + visit() + "|";
+                result += name + ":" + visit(*this) + "|";
             return result;
         }
     };
@@ -862,8 +864,8 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
                     CanonPath("warm"),
                     HashingVisitor::Children{
                         [&](auto each) {
-                            each("directory", true, [&] { return empty; });
-                            each("file", false, [&] { return file; });
+                            each("directory", true, [&](auto &) { return empty; });
+                            each("file", false, [&](auto &) { return file; });
                         },
                         /*canDefer=*/true});
                 const std::array selected{first, second};
@@ -876,7 +878,7 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
                         HashingVisitor::Children{
                             [&](auto each) {
                                 for (size_t i = 0; i < selected.size(); ++i)
-                                    each(names[i], false, [&, i] {
+                                    each(names[i], false, [&, i](auto &) {
                                         ++active;
                                         ++started;
                                         Finally done{[&] {
@@ -928,17 +930,17 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
             CanonPath::root,
             HashingVisitor::Children{
                 [&](auto each) {
-                    each("directory", false, [&] {
+                    each("directory", false, [&](auto &) {
                         return visitor.directory(
                             CanonPath("directory"),
                             HashingVisitor::Children{
                                 [&](auto nested) {
-                                    nested("a", true, [&] { return file; });
-                                    nested("b", true, [&] { return file; });
+                                    nested("a", true, [&](auto &) { return file; });
+                                    nested("b", true, [&](auto &) { return file; });
                                 },
                                 /*canDefer=*/true});
                     });
-                    each("file", false, [&] { return file; });
+                    each("file", false, [&](auto &) { return file; });
                 },
                 /*canDefer=*/true});
         EXPECT_EQ(result.entry, expected);
@@ -2083,6 +2085,310 @@ RC_GTEST_PROP(ObjectHashSink, prop_both_routes_match_reference_and_nar_length, (
     auto viaWalk = objectHashOf(*acc, CanonPath::root);
     RC_ASSERT(viaWalk.root == expected);
     RC_ASSERT(viaWalk.narSize == nar.size());
+}
+
+/* Child continuation substitution is an operation on the consumer, not a
+   replacement of the source path or a deferred push callback. Scoped consumers
+   must remain live through every accepted child, including failed nested work. */
+TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
+{
+    struct Event
+    {
+        std::string path, environment;
+        size_t consumer;
+        bool node;
+    };
+    struct State
+    {
+        std::mutex mutex;
+        size_t next = 0;
+        std::vector<size_t> live;
+        std::vector<Event> events;
+        std::string failAt;
+        unsigned failure = 0;
+
+        size_t enter()
+        {
+            std::lock_guard lock(mutex);
+            live.push_back(++next);
+            return next;
+        }
+        size_t liveCount()
+        {
+            std::lock_guard lock(mutex);
+            return live.size();
+        }
+    };
+    struct Consumer : HashingVisitor
+    {
+        State & state;
+        const std::string environment;
+        const size_t id;
+
+        Consumer(State & state, size_t workers)
+            : HashingVisitor(workers), state(state), environment("/original"), id(state.enter()) {}
+        Consumer(Consumer & parent, std::string environment)
+            : HashingVisitor(parent, nullptr), state(parent.state), environment(std::move(environment)), id(state.enter()) {}
+        ~Consumer() override
+        {
+            std::lock_guard lock(state.mutex);
+            std::erase(state.live, id);
+        }
+        static std::string logical(const CanonPath & path)
+        {
+            return path.isRoot() ? path.abs()
+                                 : (*path.parent() / unhackName(*path.baseName())).abs();
+        }
+        void record(const CanonPath & path, bool node = false)
+        {
+            std::lock_guard lock(state.mutex);
+            EXPECT_TRUE(std::find(state.live.begin(), state.live.end(), id) != state.live.end());
+            state.events.push_back({logical(path), environment, id, node});
+        }
+        void fail(const CanonPath & path, unsigned phase)
+        {
+            if (state.failure == phase && logical(path) == state.failAt)
+                throw std::runtime_error("scoped consumer failure");
+        }
+        HashedNode node(
+            SourceAccessor &, const CanonPath &, const CanonPath & path,
+            const SourceAccessor::Stat &, function_ref<HashedNode()> descend) override
+        {
+            record(path, true);
+            return descend();
+        }
+        HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+        {
+            record(path);
+            fail(path, 1);
+            auto result = HashingVisitor::regular(path, std::move(read));
+            fail(path, 2);
+            return result;
+        }
+        HashedNode symlink(const CanonPath & path, const std::string & target) override
+        {
+            record(path);
+            fail(path, 1);
+            auto result = HashingVisitor::symlink(path, target);
+            fail(path, 2);
+            return result;
+        }
+        HashedNode directory(const CanonPath & path, Children children) override
+        {
+            record(path);
+            std::string body;
+            if (path.isRoot()) {
+                Consumer scoped{*this, "/substituted"};
+                auto select = [&](Children::Each each) {
+                    children.each([&](std::string_view name, bool directory, Visit visit) {
+                        if (name == "selected")
+                            each(name, directory, [visit = std::move(visit), &scoped](NodeVisitor<HashedNode> &) {
+                                return visit(scoped);
+                            });
+                        else
+                            each(name, directory, std::move(visit));
+                    });
+                };
+                return hashDirectory(path, {select, children.canDefer}, body);
+            }
+            Consumer scoped{*this, environment + "/" + std::string(unhackName(*path.baseName()))};
+            return scoped.hashDirectory(path, children, body);
+        }
+    };
+    struct Source final : MemorySourceAccessor
+    {
+        bool allowsConcurrentTraversal() override { return true; }
+    };
+
+    size_t cases = 0;
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool push : {false, true})
+            for (bool hacked : {false, true})
+                for (auto rootMode : {merkle::Mode::Regular, merkle::Mode::Executable,
+                                      merkle::Mode::Symlink, merkle::Mode::Directory})
+                    for (unsigned failure = 0; failure < 3; ++failure) {
+                        SCOPED_TRACE(fmt("workers=%d push=%d hack=%d mode=%o failure=%d",
+                            workers, push, hacked, static_cast<RawMode>(rootMode), failure));
+                        WithCaseHack setting{hacked};
+                        auto source = make_ref<Source>();
+                        if (rootMode == merkle::Mode::Directory) {
+                            source->addFile(CanonPath("selected/deep/first"), "nested");
+                            source->addFile(CanonPath("selected/Foo"), "upper");
+                            source->addFile(CanonPath("selected/foo"), "lower");
+                            source->addFile(CanonPath("sibling"), "original consumer");
+                            source->addFile(CanonPath("tail/data"), "another scope");
+                            source->open(CanonPath("empty"), File{File::Directory{}});
+                            source->open(CanonPath("link"), File{File::Symlink{"sibling"}});
+                        } else if (rootMode == merkle::Mode::Symlink)
+                            source->root = File{File::Symlink{"target"}};
+                        else
+                            source->root = File{File::Regular{rootMode == merkle::Mode::Executable, "root bytes"}};
+                        auto expected = referenceObjectEntry(*source, CanonPath::root);
+                        auto nar = narOf(*source);
+                        State state;
+                        state.failure = failure;
+                        state.failAt = rootMode == merkle::Mode::Directory ? "/selected/deep/first" : "/";
+                        {
+                            Consumer original{state, workers};
+                            bool failed = false;
+                            try {
+                                auto result = [&] {
+                                    if (!push)
+                                        return objectHashOf(*source, CanonPath::root, defaultPathFilter, original);
+                                    StringSource input{nar};
+                                    ObjectHashSink sink{original};
+                                    parseDump(sink, input);
+                                    return sink.finish();
+                                }();
+                                EXPECT_EQ(result.root, expected);
+                                EXPECT_EQ(result.narSize, nar.size());
+                            } catch (const std::runtime_error & error) {
+                                failed = true;
+                                EXPECT_EQ(std::string(error.what()), "scoped consumer failure");
+                            }
+                            EXPECT_EQ(failed, failure != 0);
+                            EXPECT_EQ(state.liveCount(), 1u) << "scoped consumers must have joined and unwound";
+                            std::map<std::string, size_t> actions, nodes;
+                            for (auto & event : state.events) {
+                                auto path = CanonPath(event.path);
+                                auto parent = path.parent().value_or(CanonPath::root);
+                                bool selected = path.isWithin(CanonPath("selected"));
+                                auto prefix = selected ? "/substituted" : "/original";
+                                auto expectedEnvironment = std::string(prefix) + (parent.isRoot() ? "" : parent.abs());
+                                EXPECT_EQ(event.environment, expectedEnvironment) << event.path;
+                                if (event.path == "/sibling")
+                                    EXPECT_EQ(event.consumer, original.id) << "ordinary siblings retain the original consumer";
+                                if (event.path == "/selected")
+                                    EXPECT_NE(event.consumer, original.id) << "the selected child uses the supplied consumer";
+                                ++(event.node ? nodes : actions)[event.path];
+                            }
+                            if (!failure) {
+                                EXPECT_EQ(actions.size(), rootMode == merkle::Mode::Directory ? 11u : 1u);
+                                for (auto & [path, count] : actions)
+                                    EXPECT_EQ(count, 1u) << path;
+                                EXPECT_EQ(nodes.size(), push ? 0u : actions.size());
+                                for (auto & [path, count] : nodes)
+                                    EXPECT_EQ(count, 1u) << path;
+                            }
+                        }
+                        EXPECT_EQ(state.liveCount(), 0u);
+                        ++cases;
+                    }
+    EXPECT_EQ(cases, 384u);
+}
+
+/* Moving a root between complete operations must preserve its tree meaning,
+   scheduling width and ordered failure selection. Zero at the configuration
+   seam means the machine default; it is not an explicit zero-width pool. */
+TEST(HashingVisitor, movingARootPreservesItsResultsAndFirstFailure)
+{
+    struct Source final : MemorySourceAccessor
+    {
+        bool failReads = false;
+        size_t gateWidth = 0, arrived = 0;
+        std::mutex mutex;
+        std::condition_variable wake;
+        std::set<std::thread::id> threads;
+        bool allowsConcurrentTraversal() override { return true; }
+        void observe()
+        {
+            std::unique_lock lock(mutex);
+            threads.insert(std::this_thread::get_id());
+            if (gateWidth && arrived < gateWidth) {
+                ++arrived;
+                wake.notify_all();
+                if (!wake.wait_for(lock, std::chrono::seconds(5), [&] { return arrived == gateWidth; }))
+                    throw Error("moved visitor did not exercise its worker width");
+            }
+        }
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            observe();
+            if (failReads)
+                throw Error("failed observation of %s", path.abs());
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+        std::string readLink(const CanonPath & path) override
+        {
+            observe();
+            if (failReads)
+                throw Error("failed observation of %s", path.abs());
+            return MemorySourceAccessor::readLink(path);
+        }
+    };
+    auto source = make_ref<Source>();
+    for (size_t i = 0; i < 16; ++i)
+        source->addFile(CanonPath(fmt("d%02d/file", i)), fmt("directory %d", i));
+    source->addFile(CanonPath("plain"), "regular");
+    source->open(CanonPath("exec"), File{File::Regular{true, "executable"}});
+    source->open(CanonPath("link"), File{File::Symlink{"plain"}});
+    PathFilter all = AllPaths{};
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    size_t cases = 0;
+    for (size_t configuredWidth = 0; configuredWidth <= 8; ++configuredWidth)
+        for (bool warmed : {false, true})
+            for (bool assignment : {false, true})
+                for (auto root : {CanonPath::root, CanonPath("plain"), CanonPath("exec"), CanonPath("link")})
+                    for (bool fail : {false, true}) {
+                        SCOPED_TRACE(fmt("width=%d warm=%d assignment=%d root=%s fail=%d",
+                            configuredWidth, warmed, assignment, root, fail));
+                        HashingVisitor::workersForTest.store(configuredWidth);
+                        auto workers = HashingVisitor::workerCountFor(*source, all);
+                        EXPECT_GE(workers, 1u);
+                        EXPECT_LE(workers, 8u);
+                        source->failReads = false;
+                        source->gateWidth = 0;
+                        HashingVisitor original{workers};
+                        if (warmed)
+                            EXPECT_EQ(objectHashOf(*source, CanonPath::root, all, original).root,
+                                referenceObjectEntry(*source, CanonPath::root));
+                        source->failReads = fail;
+                        std::optional<ObjectHashSink::Result> expected;
+                        std::string expectedError;
+                        HashingVisitor reference{workers};
+                        try {
+                            expected = objectHashOf(*source, root, all, reference);
+                        } catch (const Error & error) {
+                            expectedError = error.msg();
+                        }
+                        auto observe = [&](HashingVisitor & moved) {
+                            source->arrived = 0;
+                            source->threads.clear();
+                            source->gateWidth = !fail && root.isRoot() ? workers : 0;
+                            std::string actualError;
+                            std::optional<ObjectHashSink::Result> actual;
+                            try {
+                                actual = objectHashOf(*source, root, all, moved);
+                            } catch (const Error & error) {
+                                actualError = error.msg();
+                            }
+                            EXPECT_EQ(actualError, expectedError);
+                            if (!fail)
+                                EXPECT_EQ(source->threads.size(), root.isRoot() ? workers : 1u);
+                            ASSERT_EQ(actual.has_value(), expected.has_value());
+                            if (actual) {
+                                EXPECT_EQ(actual->root, expected->root);
+                                EXPECT_EQ(actual->narSize, expected->narSize);
+                            }
+                        };
+                        if (assignment) {
+                            HashingVisitor moved{workers};
+                            if (warmed) {
+                                source->failReads = false;
+                                EXPECT_EQ(objectHashOf(*source, CanonPath::root, all, moved).root,
+                                    referenceObjectEntry(*source, CanonPath::root));
+                                source->failReads = fail;
+                            }
+                            moved = std::move(original);
+                            observe(moved);
+                        } else {
+                            HashingVisitor moved{std::move(original)};
+                            observe(moved);
+                        }
+                        ++cases;
+                    }
+    EXPECT_EQ(cases, 288u);
 }
 
 } // namespace nix

@@ -102,6 +102,7 @@ struct HashingVisitor : NodeVisitor<HashedNode>
 private:
     size_t workers;
     std::unique_ptr<CopyPool> pool;
+    HashingVisitor * scheduler = nullptr;
 
 public:
     /* The default, including the push driver and arbitrary subclasses,
@@ -138,7 +139,12 @@ public:
     HashedNode directory(const CanonPath & path, Children children) override;
 
 protected:
-    /** Hash the directory and retain its encoding for a consumer that publishes the body. */
+    HashingVisitor(HashingVisitor & parent, std::nullptr_t)
+        : workers(parent.workers), scheduler(parent.scheduler ? parent.scheduler : &parent)
+    {
+    }
+
+    /** Hash the directory with this scoped consumer and retain its encoding. */
     HashedNode hashDirectory(const CanonPath & path, Children children, std::string & body);
 };
 
@@ -210,7 +216,7 @@ private:
      * A node delivered at `path`: the root's, visited here, or an entry
      * of the innermost open directory, visited by its function.
      */
-    void deliver(const CanonPath & path, fun<HashedNode()> visit);
+    void deliver(const CanonPath & path, NodeVisitor<HashedNode>::Visit visit);
 };
 
 /**
