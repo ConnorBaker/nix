@@ -10724,6 +10724,231 @@ struct ValidityObservedStore : LocalStore
 
 } // namespace
 
+TEST_F(TempLocalStoreTest, registrationCacheEqualsCommittedDescription)
+{
+    StringSource source{std::string_view{"registration metadata"}};
+    auto reference = store->addToStoreFromDump(
+        source, "metadata-reference", FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Text,
+        HashAlgorithm::SHA256, {}, NoRepair);
+    auto templateInfo = *store->queryPathInfo(reference);
+    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+    /* Each tested path is fresh to this independently opened store's L1.
+       Its first query therefore obtains the committed backend row. */
+    auto backend = std::make_shared<LocalStore>(ref{config});
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get();
+    Finally restore{[&] { ttl.ttlPositive = oldPositive; }};
+    ttl.ttlPositive = 600;
+    unsigned cells = 0;
+    for (bool updated : {false, true})
+        for (bool suppliedTime : {false, true})
+            for (bool asserted : {false, true})
+                for (bool foreignStoreDir : {false, true})
+                    /* All combinations, not correlated optional fields:
+                       deriver, NAR size, ultimate, signature, CA, references. */
+                    for (unsigned fields = 0; fields < 64; ++fields) {
+                        auto info = templateInfo;
+                        info.registrationTime = suppliedTime ? 733 : 0;
+                        info.assertedNarHash = asserted
+                                                   ? std::optional(hashString(HashAlgorithm::SHA256, "sender NAR"))
+                                                   : std::nullopt;
+                        info.storeDir = foreignStoreDir ? "/foreign/store" : observed->storeDir;
+                        info.deriver = fields & 1 ? std::optional(reference) : std::nullopt;
+                        info.narSize = fields & 2 ? 17 : 0;
+                        info.ultimate = fields & 4;
+                        info.sigs.clear();
+                        if (fields & 8)
+                            info.sigs.insert(Signature{.keyName = "metadata-key", .sig = "signature bytes"});
+                        if (!(fields & 16))
+                            info.ca.reset();
+                        info.references.clear();
+                        if (fields & 32)
+                            info.references.insert(reference);
+                        auto name = fmt("registered-metadata-%d", cells++);
+                        info.path = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, name), name);
+                        if (info.ca)
+                            info.path = observed->makeFixedOutputPathFromCA(name, *info.contentAddressWithReferences());
+                        if (updated) {
+                            auto previous = info;
+                            previous.registrationTime = 711;
+                            previous.deriver = reference;
+                            previous.narSize = 19;
+                            previous.ca.reset();
+                            previous.references.insert(reference);
+                            observed->registerValidPath(previous);
+                        }
+                        observed->registerValidPath(info);
+                        auto cached = observed->queryPathInfoFromClientCache(info.path);
+                        EXPECT_EQ(bool(cached), !updated);
+                        auto actual = observed->queryPathInfo(info.path);
+                        auto committed = backend->queryPathInfo(info.path);
+                        EXPECT_EQ(*actual, *committed);
+                        EXPECT_EQ(actual->registrationTime, updated ? 711 : suppliedTime ? 733 : committed->registrationTime);
+                        EXPECT_NE(actual->registrationTime, 0);
+                        EXPECT_FALSE(actual->assertedNarHash);
+                        EXPECT_EQ(actual->storeDir, observed->storeDir);
+                        if (!updated)
+                            ASSERT_TRUE(cached && *cached);
+                    }
+    EXPECT_EQ(cells, 1024u);
+    EXPECT_EQ(observed->infoQueries, 512u); // Only updated paths need a description query.
+}
+
+TEST_F(TempLocalStoreTest, rejectedRegistrationDoesNotPublishNormalizedDescription)
+{
+    StringSource source{std::string_view{"rollback metadata"}};
+    auto original = store->addToStoreFromDump(
+        source, "rollback-original", FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256, {}, NoRepair);
+    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+    auto info = *store->queryPathInfo(original);
+    info.ca.reset();
+    info.path = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, "rollback-new"), "rollback-new");
+    info.registrationTime = 0;
+    info.assertedNarHash = hashString(HashAlgorithm::SHA256, "sender NAR");
+    auto missing = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, "missing-reference"), "missing");
+    info.references.insert(missing);
+    EXPECT_THROW(observed->registerValidPath(info), InvalidPath);
+    EXPECT_FALSE(observed->cached(info.path));
+    EXPECT_FALSE(observed->isValidPath(info.path));
+    EXPECT_FALSE(observed->queryPathInfoUnmigrated(info.path));
+}
+
+TEST_F(TempLocalStoreTest, updatedRegistrationRetainsZeroAndNonzeroSqlTime)
+{
+    StringSource source{std::string_view{"retained SQL registration time"}};
+    auto original = store->addToStoreFromDump(
+        source, "retained-time-original", FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256, {}, NoRepair);
+    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+    auto backend = std::make_shared<LocalStore>(ref{config});
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    SQLiteStmt setTime{db, "update ValidPaths set registrationTime = ? where path = ?"};
+    for (time_t retained : {time_t{0}, time_t{711}})
+        for (time_t supplied : {time_t{0}, time_t{733}}) {
+            auto info = *store->queryPathInfo(original);
+            info.ca.reset();
+            auto name = fmt("retained-time-%d-%d", retained, supplied);
+            info.path = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, name), name);
+            observed->registerValidPath(info);
+            setTime.use().apply(retained).apply(observed->printStorePath(info.path)).exec();
+            info.registrationTime = supplied;
+            observed->registerValidPath(info);
+            EXPECT_FALSE(observed->queryPathInfoFromClientCache(info.path));
+            auto cached = observed->queryPathInfo(info.path);
+            auto committed = backend->queryPathInfo(info.path);
+            EXPECT_EQ(*cached, *committed);
+            EXPECT_EQ(cached->registrationTime, retained);
+        }
+}
+
+TEST_F(TempLocalStoreTest, registrationCacheAdmitsOnlyRoundTripMetadata)
+{
+    StringSource source{std::string_view{"round-trip metadata"}};
+    auto original = store->addToStoreFromDump(
+        source, "round-trip-original", FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Flat,
+        HashAlgorithm::SHA256, {}, NoRepair);
+    auto templateInfo = *store->queryPathInfo(original);
+    auto observed = std::make_shared<ValidityObservedStore>(ref{config});
+    auto backend = std::make_shared<LocalStore>(ref{config});
+    auto & ttl = settings.getNarInfoDiskCacheSettings();
+    auto oldPositive = ttl.ttlPositive.get();
+    Finally restore{[&] { ttl.ttlPositive = oldPositive; }};
+    ttl.ttlPositive = 600;
+    unsigned cases = 0;
+#ifdef NDEBUG
+    constexpr unsigned firstHashSize = 0;
+#else
+    constexpr unsigned firstHashSize = 1; // Hash::to_string asserts nonzero when assertions are enabled.
+#endif
+    auto check = [&](ValidPathInfo info, bool roundTrips) {
+        auto name = fmt("round-trip-metadata-%d", cases++);
+        info.path = observed->makeStorePath("source", hashString(HashAlgorithm::SHA256, name), name);
+        if (info.ca)
+            info.path = observed->makeFixedOutputPathFromCA(name, *info.contentAddressWithReferences());
+        auto queries = observed->infoQueries;
+        ASSERT_NO_THROW(observed->registerValidPath(info));
+        EXPECT_TRUE(observed->isValidPath(info.path));
+        auto cached = observed->queryPathInfoFromClientCache(info.path);
+        EXPECT_EQ(bool(cached), roundTrips);
+        std::optional<std::string> error;
+        std::shared_ptr<const ValidPathInfo> committed;
+        try {
+            committed = backend->queryPathInfo(info.path).get_ptr();
+        } catch (Error & e) {
+            error = e.msg();
+        }
+        if (error) {
+            EXPECT_FALSE(roundTrips);
+            try {
+                observed->queryPathInfo(info.path);
+                ADD_FAILURE() << "metadata query unexpectedly accepted malformed row";
+            } catch (Error & e) {
+                EXPECT_EQ(e.msg(), *error);
+            }
+        } else {
+            auto actual = observed->queryPathInfo(info.path);
+            ASSERT_TRUE(committed);
+            EXPECT_EQ(*actual, *committed);
+            EXPECT_EQ(actual->objectHash->hash.algo, committed->objectHash->hash.algo);
+            if (actual->ca && committed->ca)
+                EXPECT_EQ(actual->ca->hash.algo, committed->ca->hash.algo);
+        }
+        EXPECT_EQ(observed->infoQueries - queries, roundTrips ? 0u : 1u);
+    };
+    /* Signature::parse permits arbitrary key bytes except the record's first
+       colon. SQL tokenizes literal spaces and reads sigs as a C string. */
+    for (bool payload : {false, true})
+        for (unsigned key = 0; key <= 256; ++key) {
+            auto info = templateInfo;
+            info.ca.reset();
+            info.sigs = {Signature{
+                .keyName = key == 256 ? "" : std::string(1, static_cast<char>(key)),
+                .sig = payload ? "bytes" : ""}};
+            check(info, payload && key != 256 && key != 0 && key != ' ' && key != ':');
+        }
+    /* ObjectHash::render never reads the algo when rendering unprefixed
+       bytes. All char-backed enum bit patterns and array-safe sizes therefore
+       have defined encoding, even the non-constructor algorithm values. */
+    for (unsigned algorithm = 0; algorithm < 256; ++algorithm)
+        for (unsigned size = firstHashSize; size <= Hash::maxHashSize; ++size) {
+            auto info = templateInfo;
+            info.ca.reset();
+            info.objectHash->hash.algo = static_cast<HashAlgorithm>(static_cast<char>(algorithm));
+            info.objectHash->hash.hashSize = size;
+            check(info, info.objectHash->hash.algo == HashAlgorithm::SHA256 && size == 32);
+        }
+    /* Enumerate all CA method/algorithm states that store naming admits.
+       Assert-enabled Text naming requires SHA256; disabling assertions admits other known algorithms.
+       Git naming admits legacy SHA1 and SHA256. */
+    for (auto method : {ContentAddressMethod::Raw::Text, ContentAddressMethod::Raw::Flat,
+                        ContentAddressMethod::Raw::NixArchive, ContentAddressMethod::Raw::Git})
+        for (auto algorithm : {HashAlgorithm::MD5, HashAlgorithm::SHA1, HashAlgorithm::SHA256,
+                               HashAlgorithm::SHA512, HashAlgorithm::BLAKE3}) {
+#ifndef NDEBUG
+            if (method == ContentAddressMethod::Raw::Text && algorithm != HashAlgorithm::SHA256)
+                continue;
+#endif
+            if (method == ContentAddressMethod::Raw::Git
+                && algorithm != HashAlgorithm::SHA1 && algorithm != HashAlgorithm::SHA256)
+                continue;
+            for (unsigned size = firstHashSize; size <= Hash::maxHashSize; ++size) {
+                auto info = templateInfo;
+                info.ca->method = method;
+                info.ca->hash.algo = algorithm;
+                info.ca->hash.hashSize = size;
+                check(info, size == regularHashSize(algorithm)
+                                && (algorithm != HashAlgorithm::BLAKE3
+                                    || experimentalFeatureSettings.isEnabled(Xp::BLAKE3Hashes)));
+            }
+        }
+#ifdef NDEBUG
+    EXPECT_EQ(cases, 18259u); // 514 signatures + 256*65 object hashes + 17*65 CAs.
+#else
+    EXPECT_EQ(cases, 17730u); // 514 signatures + 256*64 object hashes + 13*64 CAs.
+#endif
+}
+
 TEST_F(TempLocalStoreTest, pathInfoCacheAdmitsOnlyTheRequestedIdentity)
 {
     /* A controlled hash-indexed disk description also permits a wrong-hash

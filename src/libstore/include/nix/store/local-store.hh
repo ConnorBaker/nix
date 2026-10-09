@@ -835,7 +835,7 @@ public:
 
     BlobRows blobRows = BlobRows::Write;
 
-    uint64_t addValidPath(State & state, const ValidPathInfo & info);
+    std::pair<uint64_t, time_t> addValidPath(State & state, const ValidPathInfo & info);
 
     void invalidatePath(State & state, const StorePath & path);
 

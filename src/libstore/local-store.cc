@@ -1346,18 +1346,19 @@ void LocalStore::cacheDrvOutputMapping(
     });
 }
 
-uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
+std::pair<uint64_t, time_t> LocalStore::addValidPath(State & state, const ValidPathInfo & info)
 {
     if (info.ca.has_value() && !info.isContentAddressed(*this))
         throw Error(
             "cannot add path '%s' to the Nix store because it claims to be content-addressed but isn't",
             printStorePath(info.path));
 
+    time_t registrationTime;
     /* Legacy NAR-only descriptions must pass ingestion to obtain an object hash. */
     state.stmts->RegisterValidPath.use()
         .apply(printStorePath(info.path))
         .apply(info.requireObjectHash(*this).render())
-        .apply(info.registrationTime == 0 ? time(nullptr) : info.registrationTime)
+        .apply(registrationTime = info.registrationTime == 0 ? time(nullptr) : info.registrationTime)
         .apply(info.deriver ? printStorePath(*info.deriver) : "", (bool) info.deriver)
         .apply(info.narSize, info.narSize != 0)
         .apply(info.ultimate ? 1 : 0, info.ultimate)
@@ -1388,7 +1389,7 @@ uint64_t LocalStore::addValidPath(State & state, const ValidPathInfo & info)
         }
     }
 
-    return id;
+    return {id, registrationTime};
 }
 
 void LocalStore::queryPathInfoUncached(
@@ -1814,8 +1815,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         SQLiteTxn txn(state->db);
         /* Within this transaction, the finite path/reference domain has
            stable row ids. Retain each lookup through reference insertion. */
-        std::map<StorePath, uint64_t> pathIds;
-        std::set<std::reference_wrapper<const StorePath>, std::less<StorePath>> updated;
+        std::map<StorePath, std::pair<uint64_t, std::optional<time_t>>> pathIds;
         for (auto publication = publications.begin(); publication != publications.end();) {
             /* Retry active IDs from the unchanged hold; completed IDs are stable. */
             auto id = ingestion ? *ingestion : std::optional(publication->id);
@@ -1844,12 +1844,12 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 auto use(state->stmts->QueryValidPathId.use());
                 use.apply(printStorePath(i.path));
                 if (use.next()) {
-                    updated.insert(pathIds.emplace(i.path, static_cast<uint64_t>(use.getInt(0))).first->first);
+                    pathIds.emplace(i.path, std::pair{static_cast<uint64_t>(use.getInt(0)), std::nullopt});
                 }
             }
             for (auto & reference : i.references)
                 if (!infos.contains(reference) && !pathIds.contains(reference))
-                    pathIds.emplace(reference, queryValidPathId(*state, reference));
+                    pathIds.emplace(reference, std::pair{queryValidPathId(*state, reference), std::nullopt});
         }
 
         /* Do a topological sort of the paths.  This will throw an
@@ -1870,7 +1870,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
            rolls back. Reconcile all of those against committed witnesses
            before exposing any of their new candidate rows. */
         for (auto & publication : publications)
-            if (updated.contains(publication.info->path))
+            if (pathIds.contains(publication.info->path))
                 coalesceBlobRows(*state, publication.info->path, *hold, publication.id, publication.projection.regular);
         auto publish = [&](const Publication & publication) {
             auto logical = printStorePath(publication.info->path);
@@ -1878,14 +1878,14 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(publication.id)).exec();
         };
         for (auto & publication : publications)
-            if (updated.contains(publication.info->path))
+            if (pathIds.contains(publication.info->path))
                 publish(publication);
 
         auto nextPublication = publications.begin();
         for (auto & [path, info] : infos) {
             auto * publication =
                 nextPublication != publications.end() && nextPublication->info == &info ? &*nextPublication++ : nullptr;
-            if (updated.contains(path)) {
+            if (pathIds.contains(path)) {
                 updatePathInfo(*state, info);
                 continue;
             }
@@ -1899,9 +1899,9 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             pathIds.emplace(path, addValidPath(*state, info));
         }
         for (auto & [_, info] : infos) {
-            auto referrer = pathIds.at(info.path);
+            auto referrer = pathIds.at(info.path).first;
             for (auto & reference : info.references)
-                state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference)).exec();
+                state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference).first).exec();
         }
         txn.commit();
         if (ingestion && !publications.empty())
@@ -1912,10 +1912,26 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         if (pathInfoCache) {
             auto cache = pathInfoCache->lock();
             for (auto & [path, info] : infos)
-                if (updated.contains(path))
+                if (auto registrationTime = pathIds.at(path).second) {
+                    auto & hash = info.objectHash->hash;
+                    if (hash.algo != HashAlgorithm::SHA256 || hash.hashSize != regularHashSize(HashAlgorithm::SHA256)
+                        || (info.ca && (info.ca->hash.hashSize != regularHashSize(info.ca->hash.algo)
+                                        || (info.ca->hash.algo == HashAlgorithm::BLAKE3
+                                            && !experimentalFeatureSettings.isEnabled(Xp::BLAKE3Hashes))))
+                        || !std::ranges::all_of(info.sigs, [](const Signature & sig) {
+                               return !sig.keyName.empty() && !sig.sig.empty()
+                                      && sig.keyName.find_first_of(" :\0", 0, 3) == std::string::npos;
+                           })) {
+                        cache->upsert(path, PathInfoCacheValue{.value = PathInfoCacheValue::ValidWithoutInfo{}});
+                        continue;
+                    }
+                    auto registered = std::make_shared<ValidPathInfo>(info);
+                    registered->registrationTime = *registrationTime;
+                    registered->storeDir = storeDir;
+                    registered->assertedNarHash.reset();
+                    cache->upsert(path, PathInfoCacheValue{.value = std::move(registered)});
+                } else
                     cache->erase(path);
-                else
-                    cache->upsert(path, PathInfoCacheValue{.value = std::make_shared<const ValidPathInfo>(info)});
         }
     });
 }
