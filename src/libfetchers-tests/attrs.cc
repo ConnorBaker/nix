@@ -79,7 +79,7 @@ TEST(LazyAttr, resolvedConsumersPreserveTypesAcrossEagerAndLazyAttrs)
         for (bool lazy : {false, true}) {
             SCOPED_TRACE(::testing::Message() << "value=" << c.json.dump() << " lazy=" << lazy);
             unsigned calls = 0;
-            auto computation = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() {
+            auto computation = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() {
                 ++calls;
                 return c.value;
             }});
@@ -143,7 +143,7 @@ TEST(LazyAttr, missingAttrsDoNotForceUnrelatedComputations)
     EXPECT_TRUE(attrsToJSON(Attrs{}).is_null());
     EXPECT_TRUE(attrsToQuery(Attrs{}).empty());
     unsigned calls = 0;
-    Attrs attrs{{"other", LazyAttr(make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+    Attrs attrs{{"other", LazyAttr(make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                      ++calls;
                      throw AttrTestFailure{17};
                  }}))}};
@@ -161,7 +161,7 @@ TEST(LazyAttr, missingAttrsDoNotForceUnrelatedComputations)
 TEST(LazyAttr, lazyFailuresPropagateWithoutRetry)
 {
     unsigned calls = 0;
-    Attrs attrs{{"x", LazyAttr(make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+    Attrs attrs{{"x", LazyAttr(make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                      ++calls;
                      throw AttrTestFailure{42};
                  }}))}};
@@ -185,15 +185,15 @@ TEST(LazyAttr, conversionsObserveOrderedMutationAndOwnTheirOutputs)
         Attrs attrs;
         std::vector<std::string> calls;
         /* Owners outlive the call, including the replaced computation. */
-        auto oldC = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+        auto oldC = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
             calls.push_back("old-c");
             return uint64_t(0);
         }});
-        auto newC = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+        auto newC = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
             calls.push_back("c");
             return after;
         }});
-        auto b = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+        auto b = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
             calls.push_back("b");
             attrs.insert_or_assign("a", std::string("changed"));
             attrs.insert_or_assign("c", LazyAttr(newC));
@@ -229,7 +229,7 @@ TEST(LazyAttr, replacingALazyAttrKeepsItsComputedResult)
         {
             Attrs attrs;
             /* Keep the executing callable alive while it replaces its map entry. */
-            auto computation = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+            auto computation = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                 ++calls;
                 attrs.insert_or_assign("x", std::string("replacement"));
                 return expected;
@@ -256,19 +256,19 @@ TEST(LazyAttr, wrongStringDiagnosticsReevaluateInMapOrder)
             SCOPED_TRACE(::testing::Message() << "required=" << required << " diagnosticThrows=" << diagnosticThrows);
             unsigned xCalls = 0;
             std::vector<std::string> calls;
-            auto x = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+            auto x = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                 calls.push_back("x");
                 if (++xCalls == 1)
                     return uint64_t(7);
                 return std::string("second");
             }});
-            auto a = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+            auto a = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                 calls.push_back("a");
                 if (diagnosticThrows)
                     throw Error("diagnostic failed");
                 return uint64_t(1);
             }});
-            auto z = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+            auto z = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
                 calls.push_back("z");
                 return Explicit<bool>{true};
             }});
@@ -301,7 +301,7 @@ TEST(LazyAttr, failedAttrConstructionPreservesItsObservableState)
         SCOPED_TRACE(nullComputation);
         Attr broken = uint64_t(7);
         if (nullComputation) {
-            EXPECT_THROW(broken.emplace<LazyAttr>(std::shared_ptr<LazyAttrComputation>{}), std::invalid_argument);
+            EXPECT_THROW(broken.emplace<LazyAttr>(std::shared_ptr<LazyAttr::element_type>{}), std::invalid_argument);
         } else {
             EXPECT_THROW(broken.emplace<std::string>(tooLong, 'x'), std::length_error);
         }
@@ -330,7 +330,7 @@ TEST(LazyAttr, failedResolvedConstructionKeepsTypedErrorsAndReevaluation)
     if (!valueless)
         ASSERT_EQ(failed, ResolvedAttr(uint64_t(7)));
     unsigned calls = 0;
-    auto computation = make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = [&]() -> ResolvedAttr {
+    auto computation = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
         if (++calls == 1)
             return failed;
         return std::string("diagnostic");
@@ -490,7 +490,7 @@ TEST(AttrsCodec, lazyAttrIsForcedAsAttrsToJSONForcesIt)
 {
     Attrs attrs;
     attrs.insert_or_assign(
-        "x", LazyAttr(make_ref<LazyAttrComputation>(LazyAttrComputation{.compute = []() -> ResolvedAttr {
+        "x", LazyAttr(make_ref<LazyAttr::element_type>(LazyAttr::element_type{[]() -> ResolvedAttr {
             return uint64_t(99);
         }})));
     EXPECT_EQ(encodeAttrs(attrs), "i1:x99;");

@@ -137,14 +137,11 @@ struct GitIndexerSink final : public BufferedSink
 } // namespace
 
 typedef std::unique_ptr<git_repository, Deleter<git_repository_free>> Repository;
-typedef std::unique_ptr<git_tree_entry, Deleter<git_tree_entry_free>> TreeEntry;
 typedef std::unique_ptr<git_tree, Deleter<git_tree_free>> Tree;
-typedef std::unique_ptr<git_treebuilder, Deleter<git_treebuilder_free>> TreeBuilder;
 typedef std::unique_ptr<git_blob, Deleter<git_blob_free>> Blob;
 typedef std::unique_ptr<git_object, Deleter<git_object_free>> Object;
 typedef std::unique_ptr<git_commit, Deleter<git_commit_free>> Commit;
 typedef std::unique_ptr<git_reference, Deleter<git_reference_free>> Reference;
-typedef std::unique_ptr<git_describe_result, Deleter<git_describe_result_free>> DescribeResult;
 typedef std::unique_ptr<git_status_list, Deleter<git_status_list_free>> StatusList;
 typedef std::unique_ptr<git_remote, Deleter<git_remote_free>> Remote;
 typedef std::unique_ptr<git_config, Deleter<git_config_free>> GitConfig;
@@ -1117,22 +1114,17 @@ public:
         if (!entry)
             return std::nullopt;
 
-        switch (git_tree_entry_filemode_raw(entry)) {
-        case GIT_FILEMODE_TREE:
-            return std::pair{CanonPath::root, name("tree", *git_tree_entry_id(entry))};
-        case GIT_FILEMODE_BLOB:
-            return std::pair{CanonPath::root, name("blob", *git_tree_entry_id(entry))};
-        case GIT_FILEMODE_BLOB_EXECUTABLE:
-            return std::pair{CanonPath::root, name("blob-executable", *git_tree_entry_id(entry))};
-        case GIT_FILEMODE_LINK:
-            return std::pair{CanonPath::root, name("symlink", *git_tree_entry_id(entry))};
-        case GIT_FILEMODE_COMMIT:
+        auto rawMode = git_tree_entry_filemode_raw(entry);
+        if (rawMode == GIT_FILEMODE_COMMIT)
             /* Rendered as an empty directory whatever the commit is. */
             return std::pair{CanonPath::root, std::string("git-object-v2:empty-directory")};
-        case GIT_FILEMODE_UNREADABLE:
+        auto mode = merkle::decodeMode(rawMode);
+        if (!mode)
             return std::nullopt;
-        }
-        return std::nullopt;
+        auto kind = *mode == merkle::Mode::Directory ? "tree"
+                  : *mode == merkle::Mode::Regular ? "blob"
+                  : *mode == merkle::Mode::Executable ? "blob-executable" : "symlink";
+        return std::pair{CanonPath::root, name(kind, *git_tree_entry_id(entry))};
     }
 
     /**
@@ -1245,11 +1237,7 @@ public:
 
         auto entry = need(state, path);
 
-        if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB)
-            notExpected();
-
-        auto mode = git_tree_entry_filemode(entry);
-        if ((mode == GIT_FILEMODE_LINK) != expectSymlink)
+        if (statOfEntry(entry).type != (expectSymlink ? tSymlink : tRegular))
             notExpected();
 
         Blob blob;
@@ -1369,46 +1357,27 @@ static std::optional<std::vector<std::filesystem::path>> attributesFilesOutsideT
     return files;
 }
 
-/* Walk the tree of `rev` in pre-order; `f` gets each entry's directory
-   within the tree (with a trailing slash, or empty at the root) and the
-   entry, and stops the walk by returning true.  Whether it did, or the walk
-   failed. */
-static bool
-forEachTreeEntry(GitRepoImpl & repo, const Hash & rev, fun<bool(const char * root, const git_tree_entry * entry)> f)
+bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attribute)
 {
     Object commit;
     auto oid = hashToOID(rev);
-    if (git_object_lookup(Setter(commit), repo, &oid, GIT_OBJECT_ANY))
+    if (git_object_lookup(Setter(commit), *this, &oid, GIT_OBJECT_ANY))
         return true;
-    Object treeObject;
-    if (git_object_peel(Setter(treeObject), commit.get(), GIT_OBJECT_TREE))
+    Object tree;
+    if (git_object_peel(Setter(tree), commit.get(), GIT_OBJECT_TREE))
         return true;
-
-    struct Walk
-    {
-        decltype(f) & visit;
-        bool stopped = false;
-    } walk{f};
-
-    auto callback = [](const char * root, const git_tree_entry * entry, void * payload) -> int {
-        auto & w = *(Walk *) payload;
-        w.stopped = w.visit(root, entry);
-        return w.stopped ? -1 : 0;
-    };
-    return git_tree_walk((git_tree *) treeObject.get(), GIT_TREEWALK_PRE, callback, &walk) || walk.stopped;
-}
-
-bool GitRepoImpl::treeMentionsAttribute(const Hash & rev, std::string_view attribute)
-{
-    return forEachTreeEntry(*this, rev, [&](const char *, const git_tree_entry * entry) {
+    struct Search { GitRepoImpl & repo; std::string_view attribute; } search{*this, attribute};
+    auto callback = [](const char *, const git_tree_entry * entry, void * payload) -> int {
         if (git_tree_entry_type(entry) != GIT_OBJECT_BLOB
             || std::string_view(git_tree_entry_name(entry)) != ".gitattributes")
-            return false;
+            return 0;
+        auto & search = *static_cast<Search *>(payload);
         Blob blob;
-        if (git_blob_lookup(Setter(blob), *this, git_tree_entry_id(entry)))
-            return true;
-        return attributesMention(blobContents(blob), attribute);
-    });
+        if (git_blob_lookup(Setter(blob), search.repo, git_tree_entry_id(entry)))
+            return -1;
+        return attributesMention(blobContents(blob), search.attribute) ? -1 : 0;
+    };
+    return git_tree_walk(reinterpret_cast<git_tree *>(tree.get()), GIT_TREEWALK_PRE, callback, &search) != 0;
 }
 
 bool GitRepoImpl::attributesOutsideTheTreeMention(std::string_view attribute)

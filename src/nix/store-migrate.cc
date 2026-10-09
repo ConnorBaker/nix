@@ -49,7 +49,7 @@ struct CmdStoreMigrate : StoreCommand
            rerunning loses nothing.  The path is rooted here, as
            `optimiseStore` roots each path before entering it (the other
            writer of an older row's object hash, through the same
-           `recordObjectHash`); `migratedPathInfo` itself takes no root,
+           `walkOldRow`); `migratedPathInfo` itself takes no root,
            since the collector queries infos under its own lock. */
         auto doPath = [&](const StorePath & path) {
             try {

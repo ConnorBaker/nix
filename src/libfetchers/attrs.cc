@@ -13,22 +13,16 @@ namespace nix::fetchers {
 template<typename Consumer>
 static decltype(auto) withAttr(const Attr & attr, Consumer && consume)
 {
-    auto lazy = std::visit(
-        overloaded{
-            [](const LazyAttr & lazy) { return &lazy; },
-            [](const auto &) -> const LazyAttr * { return nullptr; },
-        },
-        attr);
-    if (lazy)
-        return consume((*lazy)->compute());
-    return consume(attr);
+    if (attr.index() < std::variant_size_v<ResolvedAttr>)
+        return consume(attr);
+    return consume((*std::get<LazyAttr>(attr))());
 }
 
 ResolvedAttr forceAttr(const Attr & attr)
 {
     return std::visit(
         overloaded{
-            [](const LazyAttr & lazy) -> ResolvedAttr { return lazy->compute(); },
+            [](const LazyAttr & lazy) -> ResolvedAttr { return (*lazy)(); },
             [](const auto & value) -> ResolvedAttr { return value; },
         },
         attr);
@@ -103,24 +97,21 @@ std::string encodeAttrs(const Attrs & attrs)
     for (auto & [name, attr] : attrs)
         withAttr(attr, [&](auto && resolved) {
             std::visit(
-                overloaded{
-                    [&](const std::string & v) {
-                        out += 's';
+                [&](const auto & value) {
+                    using T = std::remove_cvref_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, LazyAttr>)
+                        unreachable();
+                    else {
+                        out += std::is_same_v<T, std::string> ? 's' : std::is_same_v<T, uint64_t> ? 'i' : 'b';
                         appendLengthPrefixed(out, name);
-                        appendLengthPrefixed(out, v);
-                    },
-                    [&](uint64_t v) {
-                        out += 'i';
-                        appendLengthPrefixed(out, name);
-                        appendDecimal(out, v);
-                        out += ';';
-                    },
-                    [&](const Explicit<bool> & v) {
-                        out += 'b';
-                        appendLengthPrefixed(out, name);
-                        out += v.t ? '1' : '0';
-                    },
-                    [](const LazyAttr &) { unreachable(); },
+                        if constexpr (std::is_same_v<T, std::string>)
+                            appendLengthPrefixed(out, value);
+                        else if constexpr (std::is_same_v<T, uint64_t>) {
+                            appendDecimal(out, value);
+                            out += ';';
+                        } else
+                            out += value.t ? '1' : '0';
+                    }
                 },
                 resolved);
         });

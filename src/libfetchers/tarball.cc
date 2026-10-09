@@ -304,7 +304,9 @@ struct CurlInputScheme : InputScheme
            HTTP request. Now that we've processed the Nix-specific
            attributes above, remove them so we don't also send them as
            part of the HTTP request. */
-        for (auto & [param, _] : allowedAttrs())
+        url.query.erase("narHash");
+        url.query.erase("treeHash");
+        for (auto & [param, _] : schemeAttrs())
             url.query.erase(param);
 
         input.attrs.insert_or_assign("type", std::string{schemeName()});

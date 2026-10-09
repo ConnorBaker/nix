@@ -16,10 +16,10 @@
 #include "nix/util/strings.hh"
 #include "nix/util/util.hh"
 #include "nix/util/thread-pool.hh"
+#include "nix/util/sync.hh"
 
 #include <algorithm>
 #include <map>
-#include <mutex>
 #include <set>
 #include <fcntl.h>
 #include <regex>
@@ -622,12 +622,10 @@ struct ObjectUnavailable
    nodes descend through LinkingVisitor. Child scopes retain physical names. */
 struct MaterialisingVisitor : LinkingVisitor
 {
-    LocalStore::TreeNamer namer;
+    /* Naming is serialized; walking and holder writes run outside its lock. */
+    using Lock = std::lock_guard<std::mutex>;
+    SyncBase<LocalStore::TreeNamer, std::mutex, Lock, Lock, std::condition_variable> namer;
     function_ref<void(const std::filesystem::path &, const GitObjectStore::Hold &)> commitAttempt;
-
-    /* A caller-supplied naming callback need not permit simultaneous
-       calls. The directory walk and holder writes run outside this lock. */
-    std::mutex namerLock;
 
     MaterialisingVisitor(
         GitObjectStore & objects,
@@ -814,10 +812,7 @@ struct MaterialisingVisitor : LinkingVisitor
             }
         if (!path.isRoot() && st.type != SourceAccessor::tDirectory)
             return std::nullopt;
-        auto entry = [&] {
-            std::lock_guard<std::mutex> lock(namerLock);
-            return namer(path, st);
-        }();
+        auto entry = (*namer.lock())(path, st);
         if (!entry)
             return std::nullopt;
         auto target = at(path);
@@ -973,7 +968,6 @@ StorePath LocalStore::materialise(
 
     std::optional<GitObjectStore::Hold> hold;
     std::optional<std::pair<AutoCloseFD, AutoDelete>> tempDir;
-    std::filesystem::path tempPath;
     RestoreSink restore{localSettings.fsyncStorePaths, hooks.get()};
     auto prepare = [&] {
         if (hold)
@@ -983,8 +977,7 @@ StorePath LocalStore::materialise(
         autoGC();
         hold.emplace(objects.hold());
         tempDir.emplace(createTempDirInStore());
-        tempPath = tempDir->second.path() / "x";
-        restore.dstPath = tempPath;
+        restore.dstPath = tempDir->second.path() / "x";
     };
 
     std::optional<BufferedRegularFile> buffered;
@@ -1016,7 +1009,7 @@ StorePath LocalStore::materialise(
                     },
                     [&] {
                         prepare();
-                        beginIngestion(*hold, tempPath);
+                        beginIngestion(*hold, restore.dstPath);
                         return std::unique_ptr<RegularFileWriter>{
                             new RegularFileWriter(restore.beginRegularFile(CanonPath::root))};
                     }));
@@ -1025,7 +1018,7 @@ StorePath LocalStore::materialise(
         }
         prepare();
         return materialiseThroughObjects(
-            tempPath,
+            restore.dstPath,
             path,
             filter,
             localSettings.fsyncStorePaths,
@@ -1046,14 +1039,14 @@ StorePath LocalStore::materialise(
         if (buffered) {
             prepare();
             if (!buffered->writer)
-                beginIngestion(*hold, tempPath);
+                beginIngestion(*hold, restore.dstPath);
             LinkingVisitor linking{objects, *hold, restore, repair};
             auto target = linking.at(CanonPath::root);
             linking.placeRegular(target, target.path(), std::move(*buffered));
             buffered.reset();
             objects.putRootTree(result.root, *hold);
         }
-        if (!moveIntoStore(tempPath, realPath, tempDir->second, hooks.get()))
+        if (!moveIntoStore(restore.dstPath, realPath, tempDir->second, hooks.get()))
             result = enterPath(realPath, repair, *hold);
         return {result, *hold};
     };

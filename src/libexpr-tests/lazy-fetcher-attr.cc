@@ -41,8 +41,8 @@ TEST_F(LazyFetcherAttrTest, lazyAttrProducesThunk)
     input.attrs.insert_or_assign(
         "revCount",
         fetchers::LazyAttr(
-            make_ref<fetchers::LazyAttrComputation>(
-                fetchers::LazyAttrComputation{.compute = [&calls]() -> fetchers::ResolvedAttr {
+            make_ref<fetchers::LazyAttr::element_type>(
+                fetchers::LazyAttr::element_type{[&calls]() -> fetchers::ResolvedAttr {
                     calls++;
                     return uint64_t(42);
                 }})));
@@ -72,8 +72,8 @@ TEST_F(LazyFetcherAttrTest, lazyFunctionOnlyCalledOnAccess)
     input.attrs.insert_or_assign(
         "revCount",
         fetchers::LazyAttr(
-            make_ref<fetchers::LazyAttrComputation>(
-                fetchers::LazyAttrComputation{.compute = [&calls]() -> fetchers::ResolvedAttr {
+            make_ref<fetchers::LazyAttr::element_type>(
+                fetchers::LazyAttr::element_type{[&calls]() -> fetchers::ResolvedAttr {
                     calls++;
                     return uint64_t(99);
                 }})));

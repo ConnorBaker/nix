@@ -105,7 +105,7 @@ static void prim_parseFlakeRef(EvalState & state, CallSite callSite, Value * con
     for (const auto & [key, value] : attrs) {
         auto s = state.symbols.create(key);
         auto & vv = binds.alloc(s);
-        auto resolved = forceAttr(value);
+        auto resolved = fetchers::forceAttr(value);
         std::visit(
             overloaded{
                 [&vv, &state](const std::string & value) { vv.mkString(value, state.mem); },

@@ -24,12 +24,7 @@ using ResolvedAttr = std::variant<std::string, uint64_t, Explicit<bool>>;
  * pointer-identity equality/ordering, which is correct: two lazy
  * attrs are equal iff they are the same computation.
  */
-struct LazyAttrComputation
-{
-    fun<ResolvedAttr()> compute;
-};
-
-using LazyAttr = ref<LazyAttrComputation>;
+using LazyAttr = ref<fun<ResolvedAttr()>>;
 
 using Attr = std::variant<std::string, uint64_t, Explicit<bool>, LazyAttr>;
 

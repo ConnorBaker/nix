@@ -88,7 +88,7 @@ static void prim_forceLazyFetcherAttr(EvalState & state, CallSite callSite, Valu
     auto * ext = dynamic_cast<LazyFetcherAttr *>(args[0]->external());
     assert(ext);
 
-    resolvedAttrToValue(state, v, ext->lazy->compute());
+    resolvedAttrToValue(state, v, (*ext->lazy)());
 }
 
 /**
@@ -140,17 +140,16 @@ void emitTreeAttrs(
     if (auto narHash = input.getNarHash())
         attrs.alloc("narHash", callPos).mkString(narHash->to_string(HashFormat::SRI, true), state.mem);
     else if (treeHash) {
-        auto lazy = make_ref<fetchers::LazyAttrComputation>(fetchers::LazyAttrComputation{
-            .compute =
-                memo<fetchers::ResolvedAttr>([&state, storePath, treeHash = *treeHash]() -> fetchers::ResolvedAttr {
-                    /* The mounted accessor when there is one (the shim memoises
-                       by its fingerprint), else the store's own object. */
-                    auto mount = state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath)));
-                    SourcePath tree =
-                        mount ? SourcePath{ref(mount)} : SourcePath{state.store->requireStoreObjectAccessor(storePath)};
-                    return narHashOf(state.fetchSettings, *state.store, tree, treeHash)
-                        .to_string(HashFormat::SRI, true);
-                })});
+        auto lazy = make_ref<fetchers::LazyAttr::element_type>(
+            memo<fetchers::ResolvedAttr>([&state, storePath, treeHash = *treeHash]() -> fetchers::ResolvedAttr {
+                /* The mounted accessor when there is one (the shim memoises
+                   by its fingerprint), else the store's own object. */
+                auto mount = state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath)));
+                SourcePath tree =
+                    mount ? SourcePath{ref(mount)} : SourcePath{state.store->requireStoreObjectAccessor(storePath)};
+                return narHashOf(state.fetchSettings, *state.store, tree, treeHash)
+                    .to_string(HashFormat::SRI, true);
+            }));
         emitLazyAttrThunk(state, lazy, attrs.alloc("narHash", callPos));
     }
 
@@ -170,7 +169,7 @@ void emitTreeAttrs(
             attrs.alloc("shortRev", callPos).mkString(emptyHash.gitShortRev(), state.mem);
         }
 
-        if (auto revCount = maybeGetLazyAttr(input.attrs, "revCount"))
+        if (auto revCount = fetchers::maybeGetLazyAttr(input.attrs, "revCount"))
             emitLazyAttrThunk(state, *revCount, attrs.alloc("revCount", callPos));
         else if (auto revCount = input.getRevCount())
             attrs.alloc("revCount", callPos).mkInt(*revCount);

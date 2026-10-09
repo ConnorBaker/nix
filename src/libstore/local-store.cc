@@ -1472,7 +1472,23 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
     info.objectHash = ObjectHash::of(object->root);
     if (info.narSize == 0)
         info.narSize = object->narSize.value();
-    recordObjectHash(path, *info.objectHash, object->narSize.value());
+    if (!config->readOnly)
+        retrySQLite<void>([&]() {
+            auto state(_state->lock());
+            SQLiteTxn txn(state->db);
+
+            /* Re-read under the lock: another process may have migrated the
+               row, signed it, or deleted the path meanwhile. Only the hash
+               and a missing size are ours to write. */
+            auto current = queryPathInfoInternal(*state, path);
+            if (current && !current->objectHash) {
+                current->objectHash = *info.objectHash;
+                if (current->narSize == 0)
+                    current->narSize = object->narSize.value();
+                updatePathInfo(*state, *current);
+            }
+            txn.commit();
+        });
     return OldRowWalk::Migrated;
 }
 
@@ -1500,32 +1516,6 @@ std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_pt
         return info;
     }
     unreachable();
-}
-
-bool LocalStore::recordObjectHash(const StorePath & path, const ObjectHash & objectHash, uint64_t narSize)
-{
-    if (config->readOnly)
-        return false;
-    return retrySQLite<bool>([&]() {
-        auto state(_state->lock());
-
-        SQLiteTxn txn(state->db);
-
-        /* Re-read under the lock: another process may have migrated the
-           row, signed it, or deleted the path meanwhile.  Only the hash
-           and a missing size are ours to write. */
-        auto current = queryPathInfoInternal(*state, path);
-        bool written = current && !current->objectHash;
-        if (written) {
-            current->objectHash = objectHash;
-            if (current->narSize == 0)
-                current->narSize = narSize;
-            updatePathInfo(*state, *current);
-        }
-
-        txn.commit();
-        return written;
-    });
 }
 
 std::shared_ptr<ValidPathInfo> LocalStore::queryPathInfoInternal(State & state, const StorePath & path)

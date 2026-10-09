@@ -803,7 +803,7 @@ private:
     /**
      * The migration behind `queryPathInfoUncached` and `migratePathInfo`
      * (`08` §1.1): outside the lock, the row re-read before it is written
-     * (`recordObjectHash`), and no root taken -- the caller holds one, or
+     * (`walkOldRow`), and no root taken -- the caller holds one, or
      * is the collector.  A row whose path the walk finds modified, or
      * whose files are missing, is returned as the database has it --
      * `assertedNarHash` set, no object hash -- so that a query answers as
@@ -872,22 +872,13 @@ public:
      * one the row asserts -- as `--load-db` checks a registration
      * (`nix-store.cc`).  On `Migrated`, `info` carries the object hash (and
      * the size when the row lacked it) and the column is written
-     * (`recordObjectHash`); on `Modified` the two NAR hashes -- asserted,
-     * walked -- are stored in `narHashes` when given.  No root is taken
-     * (see `migratedPathInfo`).
+     * (`walkOldRow`); on `Modified` the two NAR hashes -- asserted,
+     * walked -- are stored in `narHashes` when given. Read-only stores do not write.
+     * No root is taken (see `migratedPathInfo`).
      *
      * @throws InvalidPath if the row was deleted before or during the walk.
      */
     OldRowWalk walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes = nullptr);
-
-    /**
-     * Record a validated legacy walk after a fresh transactional reread.
-     * Write only while the row still lacks its object hash, preserving
-     * concurrent migration, signing or deletion. Read-only stores are not written.
-     *
-     * @return Whether the row was written.
-     */
-    bool recordObjectHash(const StorePath & path, const ObjectHash & objectHash, uint64_t narSize);
 
     /**
      * Write the row from `info`.

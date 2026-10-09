@@ -102,10 +102,10 @@ Input Input::fromAttrs(Attrs && attrs)
 
     experimentalFeatureSettings.require(inputScheme->experimentalFeature());
 
-    auto allowedAttrs = inputScheme->allowedAttrs();
+    const auto & allowed = inputScheme->schemeAttrs();
 
     for (auto & [name, _] : attrs)
-        if (name != "type" && name != "__final" && allowedAttrs.count(name) == 0)
+        if (name != "type" && name != "__final" && name != "narHash" && name != "treeHash" && !allowed.count(name))
             throw Error("input attribute '%s' not supported by scheme '%s'", name, schemeName);
 
     auto res = inputScheme->inputFromAttrs(attrs);
@@ -469,9 +469,7 @@ std::optional<Hash> Input::getNarHash() const
 
 std::optional<std::string> Input::getRef() const
 {
-    if (auto s = maybeGetStrAttr(attrs, "ref"))
-        return *s;
-    return {};
+    return maybeGetStrAttr(attrs, "ref");
 }
 
 std::optional<Hash> Input::getRev() const

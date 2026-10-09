@@ -175,7 +175,7 @@ struct CacheImpl : Cache
         auto storePathS = getStrAttr(res->value, "storePath");
         res->value.erase("storePath");
 
-        ResultWithStorePath res2(*res, StorePath(storePathS));
+        ResultWithStorePath res2(std::move(*res), StorePath(storePathS));
 
         store.addTempRoot(res2.storePath);
         if (!store.isValidPath(res2.storePath)) {
@@ -201,7 +201,7 @@ struct CacheImpl : Cache
     std::optional<ResultWithStorePath> lookupStorePathWithTTL(Key key, Store & store) override
     {
         auto res = lookupStorePath(std::move(key), store);
-        return res && !res->expired ? res : std::nullopt;
+        return res && !res->expired ? std::move(res) : std::nullopt;
     }
 };
 
