@@ -188,9 +188,17 @@ GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std:
            and unfinished temporary names are still its own: claim a new
            directory rather than adopting whatever is already here. */
         try {
-            createDir(dir);
+            createDir(dir, 0700);
         } catch (const SystemError & e) {
             if (e.is(std::errc::file_exists))
+                continue;
+            throw;
+        }
+        /* This private lease must remain accessible under every umask. */
+        try {
+            chmod(dir, 0700);
+        } catch (const SystemError & e) {
+            if (e.is(std::errc::no_such_file_or_directory))
                 continue;
             throw;
         }
