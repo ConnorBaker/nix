@@ -3241,13 +3241,14 @@ SourcePath resolveExprPath(SourcePath path, bool addDefaultNix)
         if (++followCount >= maxFollow)
             throw Error("too many symbolic links encountered while traversing the path '%s'", path);
         auto p = path.parent().resolveSymlinks() / path.baseName();
-        if (p.lstat().type != SourceAccessor::tSymlink)
-            break;
+        auto type = p.lstat().type;
+        if (type != SourceAccessor::tSymlink)
+            return addDefaultNix && type == SourceAccessor::tDirectory ? path / "default.nix" : path;
         path = {path.accessor, CanonPath(p.readLink(), path.path.parent().value_or(CanonPath::root))};
     }
 
     /* If `path' refers to a directory, append `/default.nix'. */
-    if (addDefaultNix && path.resolveSymlinks().lstat().type == SourceAccessor::tDirectory)
+    if (addDefaultNix && path.lstat().type == SourceAccessor::tDirectory)
         return path / "default.nix";
 
     return path;

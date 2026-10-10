@@ -507,10 +507,17 @@ public:
      * (`ValidPathInfo::objectHash`, the database's fact). `hold` owns the
      * pending projection until publication and acquires a physical lease
      * only when needed (`GitObjectStore::Hold`; `08` K16). The caller keeps
-     * it through registration; physical paths retain their normal roots.
+     * it through registration; physical paths retain their normal roots. Inode
+     * hints require current holder witnesses; optional observers count entry
+     * and sharing work without changing the walk.
      */
-    ObjectHashSink::Result
-    enterPath(const std::filesystem::path & path, RepairFlag repair, const GitObjectStore::Hold & hold);
+    ObjectHashSink::Result enterPath(
+        const std::filesystem::path & path,
+        RepairFlag repair,
+        const GitObjectStore::Hold & hold,
+        Activity * act = nullptr,
+        OptimiseStats * stats = nullptr,
+        GitObjectStore::BlobInodes * blobInodes = nullptr);
 
     /**
      * Call the filesystem-node producer once synchronously to restore into
@@ -881,20 +888,6 @@ public:
     std::pair<ObjectHashSink::Result, std::vector<std::filesystem::path>>
     verifyObjects(const std::filesystem::path & realPath);
 
-    /**
-     * The walk behind `enterPath` and `optimiseStore` (`EnterVisitor`,
-     * `08` §1.6): a file whose inode is in `blobInodes` (when given) is
-     * not read; `act` and `stats`, when given, count the files entered and
-     * replaced.
-     */
-    ObjectHashSink::Result enterIntoObjects(
-        const std::filesystem::path & path,
-        RepairFlag repair,
-        const GitObjectStore::Hold & hold,
-        Activity * act = nullptr,
-        OptimiseStats * stats = nullptr,
-        GitObjectStore::BlobInodes * blobInodes = nullptr);
-
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, std::string_view logical);
     void queryReferrers(State & state, const StorePath & path, StorePathSet & referrers);
@@ -905,7 +898,6 @@ public:
     friend struct DerivationGoal;
     /* Only used for createTempDirInStore. */
     friend class DerivationBuilderImpl;
-    /* Drives `enterIntoObjects` alone (src/libstore-tests/local-store.cc). */
     friend class LocalStoreObjectsTest;
 };
 

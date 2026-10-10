@@ -896,7 +896,7 @@ protected:
     enter(OptimiseStats & stats, const std::filesystem::path & p, GitObjectStore::BlobInodes & inodes)
     {
         auto hold = store->objects.hold();
-        auto result = store->enterIntoObjects(p, NoRepair, hold, nullptr, &stats, &inodes);
+        auto result = store->enterPath(p, NoRepair, hold, nullptr, &stats, &inodes);
         recordBlobsAtPath(hold, p);
         return result;
     }
@@ -1781,7 +1781,7 @@ TEST_F(LocalStoreObjectsTest, placementRestoresTheOpenedDirectoryAfterEveryNameC
                         deletePath(donor);
                     }};
                     auto hold = store->objects.hold();
-                    EXPECT_NO_THROW(store->enterIntoObjects(file, repair, hold));
+                    EXPECT_NO_THROW(store->enterPath(file, repair, hold));
                     EXPECT_EQ(callbacks, 1u);
                     ASSERT_TRUE(untouched);
                     const auto after = nix::fstat(observed.get());
@@ -5968,7 +5968,7 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
                 Finally restoreIndex([&] { store->objects.index = originalIndex; });
                 auto hold = store->objects.hold();
                 OptimiseStats stats;
-                auto result = store->enterIntoObjects(
+                auto result = store->enterPath(
                     target, hint == Hint::Repair ? Repair : NoRepair, hold, nullptr, &stats, &hints);
                 EXPECT_EQ(result.root, expected);
                 auto rows = hold.takeProjection().regular;
@@ -9655,6 +9655,75 @@ TEST_F(LocalStoreObjectsTest, temporaryRootFilePrecedesCollectorAcknowledgement)
         EXPECT_NO_THROW(done.get());
         EXPECT_EQ(readFile(store->fnTempRoots), expected);
     }
+}
+
+TEST_F(LocalStoreObjectsTest, temporaryDirectoryGcLockCoversDeletionAndUnwinds)
+{
+    setenv("_NIX_TEST_NO_LSOF", "1", 1);
+    Finally unset{[] { unsetenv("_NIX_TEST_NO_LSOF"); }};
+
+    struct DeletionProbe : LocalStore
+    {
+        explicit DeletionProbe(ref<const LocalStore::Config> config)
+            : Store{*config}, LocalFSStore{*config}, LocalStore{config} {}
+
+        std::filesystem::path target;
+        AutoCloseFD contender;
+        bool failDeletion = false;
+        unsigned visits = 0;
+
+        void expectExclusion()
+        {
+            bool acquired = lockFile(contender.get(), ltWrite, false);
+            EXPECT_FALSE(acquired) << "GC must own the temporary-directory lock during deletion";
+            if (acquired)
+                lockFile(contender.get(), ltNone, false);
+        }
+
+        void deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath) override
+        {
+            if (path != target)
+                return LocalStore::deleteStorePath(path, bytesFreed, isKnownPath);
+            ++visits;
+            EXPECT_FALSE(isKnownPath);
+            expectExclusion();
+            if (failDeletion)
+                throw Error("deliberate temporary-directory deletion failure");
+            LocalStore::deleteStorePath(path, bytesFreed, isKnownPath);
+            expectExclusion();
+        }
+    };
+
+    store.reset();
+    for (bool initiallyLocked : {false, true})
+        for (bool failDeletion : {false, true}) {
+            SCOPED_TRACE(fmt("initiallyLocked=%d failDeletion=%d", initiallyLocked, failDeletion));
+            auto probe = std::make_shared<DeletionProbe>(ref{config});
+            AutoDelete staging{createTempDir(config->realStoreDir.get(), "tmp", 0700)};
+            probe->target = staging.path();
+            probe->contender = openDirectory(staging.path(), FinalSymlink::DontFollow);
+            ASSERT_TRUE(probe->contender);
+            writeFile(staging.path() / "payload", "unfinished ingestion");
+            probe->failDeletion = failDeletion;
+            GCOptions options;
+            options.action = GCOptions::gcDeleteDead;
+            GCResults results;
+            if (initiallyLocked) {
+                ASSERT_TRUE(lockFile(probe->contender.get(), ltWrite, false));
+                EXPECT_NO_THROW(probe->collectGarbage(options, results));
+                EXPECT_EQ(probe->visits, 0u);
+                EXPECT_TRUE(pathExists(staging.path()));
+                lockFile(probe->contender.get(), ltNone, false);
+            }
+            if (failDeletion)
+                EXPECT_THROW(probe->collectGarbage(options, results), Error);
+            else
+                EXPECT_NO_THROW(probe->collectGarbage(options, results));
+            EXPECT_EQ(probe->visits, 1u);
+            EXPECT_EQ(pathExists(staging.path()), failDeletion);
+            EXPECT_TRUE(lockFile(probe->contender.get(), ltWrite, false)) << "GC must release the lock on return or error";
+            probe->contender.close();
+        }
 }
 
 TEST_F(LocalStoreObjectsTest, garbageCollectorClientsCompleteOrJoinAtShutdown)

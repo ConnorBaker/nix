@@ -458,7 +458,9 @@ static std::optional<GitObjectStore::Placed> placePending(
         return std::nullopt;
     if (st->st_ino == before.st_ino && st->st_dev == before.st_dev)
         return GitObjectStore::Placed{before.st_ino, false};
-    return GitObjectStore::linkOver(hold, {AT_FDCWD, file}, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
+    return GitObjectStore::linkOver(
+        hold, {AT_FDCWD, file}, [&] { return PathFmt(std::filesystem::path(file)); },
+        dirFd, name, where, before, [](auto &, const auto &) { return true; });
 }
 
 #endif
@@ -561,7 +563,9 @@ std::optional<uint64_t> GitObjectStore::link(
     if (mine)
         hold.appendNames(std::move(row));
     else if (auto other = hold.addRow(std::move(row))) {
-        linkOver(hold, {AT_FDCWD, *other}, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
+        linkOver(
+            hold, {AT_FDCWD, *other}, [&] { return PathFmt(std::filesystem::path(*other)); },
+            dirFd, name, where, *st, [](auto &, const auto &) { return true; });
         hold.appendNames(std::move(row));
     }
     return static_cast<uint64_t>(st->st_size);
@@ -610,7 +614,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
                 continue;
             }
             if (auto placed = linkOver(
-                    hold, {std::get<1>(*source), std::get<2>(*source)}, holder->file().native(),
+                    hold, {std::get<1>(*source), std::get<2>(*source)}, [&] { return PathFmt(holder->file()); },
                     dirFd, name, where, after, [&](const auto & pin, const std::optional<PosixStat> & acquired) {
                     if (acquired && validHolderMetadata(*holder, executable, *acquired)
                         && (!repair || blobIdOfFile(pin.first, pin.second, holder->size) == id))
@@ -635,7 +639,9 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
     auto row = rowOf(id, executable, after, where, hold);
     auto other = hold.addRow(std::move(row));
     if (other) {
-        auto placed = linkOver(hold, {AT_FDCWD, *other}, *other, dirFd, name, where, after, [](auto &, const auto &) { return true; });
+        auto placed = linkOver(
+            hold, {AT_FDCWD, *other}, [&] { return PathFmt(std::filesystem::path(*other)); },
+            dirFd, name, where, after, [](auto &, const auto &) { return true; });
         hold.appendNames(std::move(row));
         return placed;
     }

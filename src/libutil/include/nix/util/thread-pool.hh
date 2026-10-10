@@ -115,8 +115,9 @@ class CopyPool
     bool stopping = false;
     std::atomic<int> startupReady{0};
 
-    /** Runs a removed job with the lock released, returning with it held. */
-    static void execute(const Job & job, std::unique_lock<std::mutex> & lock);
+    /** Runs a removed job with the lock released, returning with it held.
+     * Returns whether the group has no outstanding jobs. */
+    static bool execute(const Job & job, std::unique_lock<std::mutex> & lock);
     bool tryAsync(Group & group, size_t i);
     void wait(Group & group);
 

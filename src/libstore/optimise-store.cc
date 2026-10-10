@@ -1135,7 +1135,8 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 if (!GitObjectStore::validHolderMetadata(expected, row.executable, before))
                     continue;
                 if (!GitObjectStore::linkOver(
-                        hold, {AT_FDCWD, cleanup.path().native()}, cleanup.path().native(), dir.fd.get(), name, where, before,
+                        hold, {AT_FDCWD, cleanup.path().native()}, [&] { return PathFmt(cleanup.path()); },
+                        dir.fd.get(), name, where, before,
                         [](auto &, const auto &) { return true; }, &candidate))
                     continue;
                 result.modified = true;
@@ -1164,7 +1165,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
 #endif
 }
 
-ObjectHashSink::Result LocalStore::enterIntoObjects(
+ObjectHashSink::Result LocalStore::enterPath(
     const std::filesystem::path & path,
     RepairFlag repair,
     const GitObjectStore::Hold & hold,
@@ -1220,7 +1221,7 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
         /* Current inode witnesses skip regular reads. Publish the complete
            regular and auxiliary projection after traversal joins. */
         auto hold = objects.hold();
-        enterIntoObjects(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
+        enterPath(pathRoot, NoRepair, hold, &act, &stats, &blobInodes);
         /* `nix-store --optimise` is what re-establishes an index a
            collection or an older Nix left incomplete. */
         endIngestion(hold, i);
@@ -1254,12 +1255,6 @@ void LocalStore::optimiseStore()
         stats.filesLinked,
         stats.filesEntered,
         stats.rowsMigrated);
-}
-
-ObjectHashSink::Result
-LocalStore::enterPath(const std::filesystem::path & path, RepairFlag repair, const GitObjectStore::Hold & hold)
-{
-    return enterIntoObjects(path, repair, hold);
 }
 
 } // namespace nix

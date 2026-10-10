@@ -2359,22 +2359,21 @@ StorePath LocalStore::addToStoreFromDump(
    garbage-collected until the returned FD is closed. */
 std::pair<AutoCloseFD, AutoDelete> LocalStore::createTempDirInStore()
 {
-    std::filesystem::path tmpDirFn;
-    AutoCloseFD tmpDirFd;
-    bool lockedByUs = false;
-    do {
+    for (;;) {
         /* There is a slight possibility that `tmpDir' gets deleted by
            the GC between createTempDir() and when we acquire a lock on it.
            We'll repeat until 'tmpDir' exists and we've locked it.
            Make the directory accessible only to the current user. */
-        tmpDirFn = createTempDir(std::filesystem::path{config->realStoreDir.get()}, "tmp", /*mode=*/0700);
-        tmpDirFd = openDirectory(tmpDirFn, FinalSymlink::DontFollow);
+        auto tmpDirFn = createTempDir(std::filesystem::path{config->realStoreDir.get()}, "tmp", /*mode=*/0700);
+        auto tmpDirFd = openDirectory(tmpDirFn, FinalSymlink::DontFollow);
         if (!tmpDirFd) {
             continue;
         }
-        lockedByUs = lockFile(tmpDirFd.get(), ltWrite, true);
-    } while (!pathExists(tmpDirFn) || !lockedByUs);
-    return {std::move(tmpDirFd), AutoDelete(std::move(tmpDirFn))};
+        bool lockedByUs = lockFile(tmpDirFd.get(), ltWrite, true);
+        if (pathExists(tmpDirFn) && lockedByUs)
+            return {std::move(tmpDirFd), AutoDelete(std::move(tmpDirFn))};
+        tmpDirFd.close();
+    }
 }
 
 void PathInUse::anchor() {}

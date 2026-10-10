@@ -1505,8 +1505,8 @@ struct GitRepoHandle
     }
 
     GitRepoHandle(ref<GitRepoImpl> repo)
-        : owner(repo)
-        , repo(repo.get())
+        : owner(std::move(repo))
+        , repo(std::get<ref<GitRepoImpl>>(owner).get())
     {
     }
 

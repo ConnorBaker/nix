@@ -2,7 +2,7 @@
 
 ## Latest matched comparison
 
-The latest measured committed endpoint **bf502aa89ee799884af3280b766a213acbf12e54** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path CPU and both warm-Git CPU regress in all six pairs. **The performance goal remains unmet.** The newer ownership commit **61d76d867** and five pending production patches are **unmeasured**; correctness checks and static native comparisons do not extend these timings to them.
+The latest measured committed endpoint **bf502aa89ee799884af3280b766a213acbf12e54** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path CPU and both warm-Git CPU regress in all six pairs. **The performance goal remains unmet.** Subsequent ownership, publication and traversal changes are **unmeasured**; correctness checks and static native comparisons do not extend these timings to them.
 
 | Case | Wall / base | CPU / base | Wall wins | CPU wins |
 | --- | ---: | ---: | ---: | ---: |
@@ -21,6 +21,8 @@ The [c9r4 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-600
 The separate [bf502 cold-path capture](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/cold-path-bf502-profile-source-oct10/ACTUAL-CAPTURE-JOB-CLOSURE.json) retains two PMU pairs, one AB and one BA, plus four syscall traces and four graph comparisons. Every counter has equal enabled/running time. Candidate/base user-instruction ratios are **1.090884/1.090816**, kernel-instruction ratios **1.172705/1.196586**, and task-clock ratios **1.288543/1.284297**. The inherited launcher is included; these instrumented observations are not another latency cohort or native caller attribution.
 
 The [complete four-trace fold](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/cold-path-bf502-profile-source-oct10/PARSER-COMPLETE-READOUT.json) reconciles every raw byte and syscall count, separates the Nix epoch from the launcher, and retains unavailable results and observed task lineage. The [semantic-operation comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/cold-path-bf502-profile-source-oct10/SEMANTIC-OPERATION-SUPPLEMENT.json) corrects the misleading openat-only increase: combined **openat + openat2 attempts decrease by 41,645/41,646**, while **fstat + newfstatat increase by 58,677/58,675**. Main store-DB `db.sqlite-shm` F_SETLK commands increase by **112,704/112,702**. These are observed command counts, not transactions or proof of extra writes: short read snapshots also acquire locks. Futex attempts rise by 66,636/64,053, but their mutex owners and native callers remain unproved. The original openat2 arguments are opaque pointers, so its pathname domain cannot be reconstructed from those traces; lexical descriptor spellings do not establish file identity. Temporal syscall scope does not recover the C++ caller chain.
+
+The [K3 publication reconciliation](08-store-model.md#15-the-object-stores-invariants) is not an unconditional corruption-recovery guarantee. While a corrupted target still owns a shared inode, donor hashing can reject or throw; rejecting that witness cannot preserve independent bytes of aliases sharing the same inode. Once no surviving donor owns that inode, repair can replace the target independently.
 
 ## Historical 6d3b matched comparison
 

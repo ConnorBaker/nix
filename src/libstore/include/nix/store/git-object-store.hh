@@ -427,7 +427,7 @@ public:
     static std::optional<Placed> linkOver(
         const GitObjectStore::Hold & hold,
         const std::pair<Descriptor, const std::string &> & source,
-        const std::string & file,
+        function_ref<PathFmt()> filePath,
         Descriptor dirFd,
         const CanonPath & name,
         const std::filesystem::path & where,
@@ -435,7 +435,6 @@ public:
         Accept && accept,
         const Holder * pinned = nullptr)
     {
-        auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
         auto tempLink = hold.tempPath("link");
         if (::linkat(source.first, source.second.c_str(), AT_FDCWD, tempLink.c_str(), 0) == -1) {
             auto ec = std::error_code(errno, std::generic_category());

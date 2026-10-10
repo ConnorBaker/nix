@@ -33,7 +33,7 @@ size_t CopyPool::defaultWorkers()
     return std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
 }
 
-void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
+bool CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
 {
     lock.unlock();
     std::exception_ptr failure;
@@ -54,10 +54,7 @@ void CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
         failure = nullptr;
         lock.lock();
     }
-    /* Notify before unlocking: the waiter may destroy this group as soon
-       as it observes completion under the same mutex. */
-    if (!--job.group->remaining)
-        job.group->done.notify_one();
+    return !--job.group->remaining;
 }
 
 bool CopyPool::tryAsync(Group & group, size_t i)
@@ -88,7 +85,10 @@ bool CopyPool::tryAsync(Group & group, size_t i)
                     return;
                 auto job = pending.back();
                 pending.pop_back();
-                execute(job, lock);
+                /* Notify before unlocking: the waiter may destroy this group as soon
+                   as it observes completion under the same mutex. */
+                if (execute(job, lock))
+                    job.group->done.notify_one();
             }
         });
         startupReady.wait(0, std::memory_order_acquire);
