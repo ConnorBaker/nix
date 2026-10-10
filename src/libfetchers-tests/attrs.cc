@@ -228,13 +228,16 @@ TEST(LazyAttr, replacingALazyAttrKeepsItsComputedResult)
         unsigned calls = 0;
         {
             Attrs attrs;
-            /* Keep the executing callable alive while it replaces its map entry. */
-            auto computation = make_ref<LazyAttr::element_type>(LazyAttr::element_type{[&]() -> ResolvedAttr {
-                ++calls;
-                attrs.insert_or_assign("x", std::string("replacement"));
-                return expected;
-            }});
-            attrs.emplace("x", LazyAttr(computation));
+            attrs.emplace(
+                "x", LazyAttr(make_ref<LazyAttr::element_type>(
+                         LazyAttr::element_type{[&, hold = std::make_shared<int>(0)]() -> ResolvedAttr {
+                             auto alive = std::weak_ptr(hold);
+                             auto result = expected;
+                             ++calls;
+                             attrs.insert_or_assign("x", std::string("replacement"));
+                             EXPECT_FALSE(alive.expired());
+                             return result;
+                         }})));
             if (consumer == 0)
                 result = forceAttr(attrs.at("x"));
             if (consumer == 1)

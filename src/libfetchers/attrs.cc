@@ -15,14 +15,14 @@ static decltype(auto) withAttr(const Attr & attr, Consumer && consume)
 {
     if (attr.index() < std::variant_size_v<ResolvedAttr>)
         return consume(attr);
-    return consume((*std::get<LazyAttr>(attr))());
+    return consume((*LazyAttr{std::get<LazyAttr>(attr)})());
 }
 
 ResolvedAttr forceAttr(const Attr & attr)
 {
     return std::visit(
         overloaded{
-            [](const LazyAttr & lazy) -> ResolvedAttr { return (*lazy)(); },
+            [](LazyAttr lazy) -> ResolvedAttr { return (*lazy)(); },
             [](const auto & value) -> ResolvedAttr { return value; },
         },
         attr);
