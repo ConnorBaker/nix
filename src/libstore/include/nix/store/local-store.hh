@@ -822,19 +822,6 @@ private:
     GitObjectStore::Index blobIndex;
 
 public:
-    /**
-     * Whether an ingestion writes regular-holder rows.  The *only* value
-     * anything but a test may run under is `Write`; `NoRows` is the
-     * ablation that separates what writing the index costs from what
-     * everything else does. The earlier writer/probe lock experiment is
-     * recorded in `06-holder-index.md` sections 4.8 and 5. A store left
-     * under `NoRows` retains auxiliary metadata but writes no regular holders, so it is
-     * reachable by `_NIX_TEST_HOLDER_NO_ROWS` alone.
-     */
-    enum struct BlobRows { Write, NoRows };
-
-    BlobRows blobRows = BlobRows::Write;
-
     std::pair<uint64_t, time_t> addValidPath(State & state, const ValidPathInfo & info);
 
     void invalidatePath(State & state, const StorePath & path);

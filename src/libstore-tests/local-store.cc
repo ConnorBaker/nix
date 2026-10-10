@@ -1686,6 +1686,102 @@ TEST_F(LocalStoreObjectsTest, everyBuildModeEntersWithItsRepairFlag)
     }
 }
 
+#ifndef _WIN32
+TEST_F(LocalStoreObjectsTest, placementRestoresTheOpenedDirectoryAfterEveryNameChange)
+{
+    enum class Change { None, Rename, Delete, File, Directory, Symlink };
+    std::filesystem::path root{config->realStoreDir.get()};
+    auto mtime = [](const PosixStat & st) {
+#ifdef __APPLE__
+        return std::pair{st.st_mtimespec.tv_sec, st.st_mtimespec.tv_nsec};
+#else
+        return std::pair{st.st_mtim.tv_sec, st.st_mtim.tv_nsec};
+#endif
+    };
+    const auto originalIndex = store->objects.index;
+    store->objects.index = nullptr;
+    Finally restoreIndex{[&] { store->objects.index = originalIndex; }};
+    size_t cases = 0;
+    for (bool toggle : {false, true})
+        for (auto change : {Change::None, Change::Rename, Change::Delete, Change::File, Change::Directory, Change::Symlink})
+            for (auto repair : {NoRepair, Repair})
+                for (bool executable : {false, true}) {
+                    SCOPED_TRACE(fmt("toggle=%d change=%d repair=%d executable=%d", toggle, static_cast<int>(change), repair, executable));
+                    ASSERT_TRUE(std::filesystem::is_empty(root));
+                    auto parent = toggle ? root / "parent" : root;
+                    auto file = parent / "file";
+                    auto moved = root.parent_path() / "opened-parent";
+                    auto donor = root.parent_path() / "symlink-donor";
+                    createDirs(parent);
+                    createDirs(donor);
+                    writeFile(file, "one observed file");
+                    canonicalisePathMetaData(file, {NIX_WHEN_SUPPORT_ACLS(noAclsToIgnore)});
+                    chmod(file, executable ? 0555 : 0444);
+                    chmod(parent, toggle ? 0555 : 0755);
+                    chmod(donor, 0777);
+                    auto observed = openDirectory(parent);
+                    ASSERT_TRUE(observed);
+                    std::optional<PosixStat> replacement, untouched;
+                    size_t callbacks = 0;
+                    store->objects.failPlaceWithNoSpace = [&](const std::filesystem::path & where) {
+                        EXPECT_EQ(where, file);
+                        ++callbacks;
+                        if (change == Change::Delete) {
+                            /* This mutation is independent of the permission toggle. */
+                            chmod(parent, 0755);
+                            unlinkIfExists(file);
+                            EXPECT_TRUE(std::filesystem::remove(parent));
+                        } else if (change != Change::None) {
+                            std::filesystem::rename(parent, moved);
+                            if (change == Change::File) {
+                                writeFile(parent, "replacement file");
+                                chmod(parent, 0777);
+                            } else if (change == Change::Directory) {
+                                createDir(parent);
+                                chmod(parent, 0777);
+                            } else if (change == Change::Symlink)
+                                createSymlink(donor, parent);
+                            replacement = maybeLstat(parent);
+                        }
+                        untouched = nix::fstat(observed.get());
+                        return true;
+                    };
+                    Finally restoreNamespace{[&] {
+                        store->objects.failPlaceWithNoSpace = {};
+                        if (change != Change::None && change != Change::Delete) {
+                            if (maybeLstat(parent))
+                                std::filesystem::remove(parent);
+                            chmod(moved, 0755);
+                            std::filesystem::rename(moved, parent);
+                        }
+                        if (maybeLstat(parent))
+                            deletePath(parent);
+                        createDirs(root);
+                        chmod(root, 0755);
+                        deletePath(donor);
+                    }};
+                    auto hold = store->objects.hold();
+                    EXPECT_NO_THROW(store->enterIntoObjects(file, repair, hold));
+                    EXPECT_EQ(callbacks, 1u);
+                    ASSERT_TRUE(untouched);
+                    const auto after = nix::fstat(observed.get());
+                    EXPECT_EQ(after.st_ino, untouched->st_ino);
+                    EXPECT_EQ(after.st_dev, untouched->st_dev);
+                    EXPECT_EQ(after.st_mode & 07777, toggle ? 0555u : untouched->st_mode & 07777);
+                    EXPECT_EQ(mtime(after), toggle ? (std::pair<time_t, long>{1, 0}) : mtime(*untouched));
+                    if (replacement) {
+                        const auto current = lstat(parent);
+                        EXPECT_EQ(current.st_ino, replacement->st_ino);
+                        EXPECT_EQ(current.st_mode, replacement->st_mode);
+                        EXPECT_EQ(mtime(current), mtime(*replacement));
+                    }
+                    EXPECT_EQ(lstat(donor).st_mode & 07777, 0777u);
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 48u);
+}
+#endif
+
 TEST_F(LocalStoreObjectsTest, enterIntoObjectsAndMigrate)
 {
     /* A path written plainly (an older store), then entered: its files become links, its trees written, its root the

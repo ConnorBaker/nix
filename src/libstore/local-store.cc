@@ -504,9 +504,6 @@ LocalStore::LocalStore(ref<const Config> config)
     }
 
     /* Install the holder provider after its statements exist; bare stores miss. */
-    /* The ablation, test-only (`local-store.hh`, `BlobRows`). */
-    if (auto v = getEnv("_NIX_TEST_HOLDER_NO_ROWS"); v && *v == "1")
-        blobRows = BlobRows::NoRows;
     if (state->stmts->LookupBlob) {
         blobIndex.lookup = [this](const Hash & id, bool executable, GitObjectStore::Holder::Cursor cursor)
             -> std::optional<GitObjectStore::Holder> {
@@ -608,7 +605,7 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
 
 void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows)
 {
-    if (blobRows == BlobRows::NoRows || rows.empty())
+    if (rows.empty())
         return;
     auto use = state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow);
     for (auto & row : rows) {
@@ -877,12 +874,11 @@ void LocalStore::coalesceBlobRows(
 
 /* Order each initial publication by its SQLite primary key. Ingestion is
    constant; auxiliary chunks are already emitted in increasing ordinal order. */
-static void sortProjectionForPublication(GitObjectStore::Hold::Projection & projection, bool writeBlobs)
+static void sortProjectionForPublication(GitObjectStore::Hold::Projection & projection)
 {
     static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Hold::Row>);
     static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Auxiliary>);
-    if (writeBlobs)
-        std::ranges::sort(projection.regular, {}, blobRowKey);
+    std::ranges::sort(projection.regular, {}, blobRowKey);
     std::ranges::sort(projection.auxiliary, {}, [&](const auto & value) noexcept {
         return std::pair{value.entry.mode, value.entry.hash.bytes()};
     });
@@ -896,7 +892,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
        candidates before reconciling the complete projection. */
     auto * ingestion = &*hold.ingestion;
     auto projection = hold.takeProjection();
-    sortProjectionForPublication(projection, blobRows != BlobRows::NoRows);
+    sortProjectionForPublication(projection);
     auto & rows = projection.regular;
     auto logical = printStorePath(path);
     auto & completed = hold.completedIngestions;
@@ -1787,7 +1783,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         if (ingestion) {
             assert(infos.size() == 1);
             publications.push_back({&infos.begin()->second, 0, hold->takeProjection()});
-            sortProjectionForPublication(publications.back().projection, blobRows != BlobRows::NoRows);
+            sortProjectionForPublication(publications.back().projection);
         } else {
             for (auto & [path, info] : infos) {
                 auto logical = printStorePath(path);

@@ -98,9 +98,13 @@ struct WritableDirectory
     ~WritableDirectory()
     {
         try {
-            /* Read-only again, and its timestamp back to 0. */
+            /* Restore the directory we opened, including its canonical timestamp. */
             if (path)
+#ifndef _WIN32
+                canonicaliseTimestampAndPermissions(fd.get(), true);
+#else
                 canonicaliseTimestampAndPermissions(*path);
+#endif
         } catch (...) {
             ignoreExceptionInDestructor();
         }
@@ -174,18 +178,35 @@ static void placeRegularFile(
 
 namespace {
 
-/* Stage hashed directory bodies and symlink targets; drivers place regular files. */
-struct ObjectStoreVisitor : HashingVisitor
+/* Enter a materialised tree. Inode hints skip reads only with a current
+   physical witness; all other eligible files are hashed and placed. */
+struct EnterVisitor : HashingVisitor
 {
-    GitObjectStore & objects;
-    /* The ingestion's hold on what it writes (`08` K16), the caller's, so
-       that it outlives the walk up to the registration. */
+    LocalStore & store;
+    /* The caller retains this hold through traversal and publication. */
     const GitObjectStore::Hold & hold;
+    const std::filesystem::path root;
+    RepairFlag repair;
+    GitObjectStore::BlobInodes * inodes;
+    OptimiseStats * stats;
+    Activity * act;
 
-    ObjectStoreVisitor(GitObjectStore & objects, const GitObjectStore::Hold & hold, size_t workers = 1)
-        : HashingVisitor(workers)
-        , objects(objects)
+    EnterVisitor(
+        LocalStore & store,
+        const GitObjectStore::Hold & hold,
+        std::filesystem::path root,
+        RepairFlag repair,
+        GitObjectStore::BlobInodes * inodes,
+        OptimiseStats * stats,
+        Activity * act)
+        : HashingVisitor(1)
+        , store(store)
         , hold(hold)
+        , root(std::move(root))
+        , repair(repair)
+        , inodes(inodes)
+        , stats(stats)
+        , act(act)
     {
     }
 
@@ -203,36 +224,6 @@ struct ObjectStoreVisitor : HashingVisitor
         hold.addAuxiliary({node.entry, std::move(body)});
         return node;
     }
-};
-
-/* Enter a materialised tree. Inode hints skip reads only with a current
-   physical witness; all other eligible files are hashed and placed. */
-struct EnterVisitor : ObjectStoreVisitor
-{
-    LocalStore & store;
-    const std::filesystem::path root;
-    RepairFlag repair;
-    GitObjectStore::BlobInodes * inodes;
-    OptimiseStats * stats;
-    Activity * act;
-
-    EnterVisitor(
-        LocalStore & store,
-        const GitObjectStore::Hold & hold,
-        std::filesystem::path root,
-        RepairFlag repair,
-        GitObjectStore::BlobInodes * inodes,
-        OptimiseStats * stats,
-        Activity * act)
-        : ObjectStoreVisitor(store.objects, hold)
-        , store(store)
-        , root(std::move(root))
-        , repair(repair)
-        , inodes(inodes)
-        , stats(stats)
-        , act(act)
-    {
-    }
 
     HashedNode node(
         SourceAccessor &,
@@ -249,7 +240,7 @@ struct EnterVisitor : ObjectStoreVisitor
                 /* A preloaded inode can have lost its holder, been replaced, or
                    belong to another device. The map only suggests a hash to query;
                    a current canonical holder of this exact inode is the witness. */
-                auto holder = objects.holderOrForget(i->second, st.isExecutable, NoRepair);
+                auto holder = store.objects.holderOrForget(i->second, st.isExecutable, NoRepair);
                 if (holder && GitObjectStore::validHolderMetadata(*holder, st.isExecutable, file)) {
                     auto node = HashedNode{
                         .entry = {.mode = st.isExecutable ? merkle::Mode::Executable : merkle::Mode::Regular, .hash = i->second},

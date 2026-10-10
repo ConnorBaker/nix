@@ -20,7 +20,7 @@ The [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume
 
 The [full readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/READOUT.md) retains every pair. Cold means fresh application state; host page caches were not flushed. All 1,664 pressure samples are retained: maximum CPU avg10 pressure is 5.95%, I/O some/full 0.20%/0.19%, and memory 0.28%. These observations do not attribute the regressions to host I/O or establish causal time fractions. Earlier PMU, syscall and stack captures below describe f05; they are not profiles of this combined endpoint.
 
-The [complete source census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-38756a-vs-8aad/SUMMARY.json), using the unchanged historical classification, counts +13,283/−4,506 across 187 changed production files: **net +8,777 physical lines**. This remains excessive; the recent 41-line reduction does not achieve substantial implementation shrinkage.
+The [measured endpoint census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-38756a-vs-8aad/SUMMARY.json) counts net +8,777 production lines. The [later committed source census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-810b11598-vs-8aad/SUMMARY.json), using the unchanged historical classification, counts +13,281/−4,521 across 187 changed production files: **net +8,760 physical lines** at 810b11598. Both include comments and blanks. This remains excessive; subsequent correctness and native Git-option changes have not been latency-benchmarked.
 
 ### Hardware profile of the combined endpoint
 
@@ -33,6 +33,10 @@ The [balanced PMU readout](/home/connorbaker/Benchmarks/nix-performance-fixes/re
 | warm 32 git | 1.041506 | 1.768984 | 1.165419 | 1.391194 | 32.780846 |
 
 Both instruction domains regress in all six pairs in every case. Cycles per instruction also increase in both domains. These counters confirm additional work, including substantial kernel work, but do not identify syscall callers or assign causal seconds to SQLite, hashing, libgit2 or scheduling. Instrumented elapsed time is not a latency benchmark. All 650 pressure samples are retained: maximum CPU avg10 some pressure is 2.40%, I/O some/full 0.23%/0.18%, and memory some/full 1.08%/1.08%; no major faults occur. These observations do not establish host I/O as the cause.
+
+The [caller analysis](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/profiling-packet/record-analysis/READOUT.md) retains all 5,007 samples from twelve balanced captures. Warm Git's sampled libgit2 status ancestry stays similar while POSIX directory and SHA256 ancestry increase. Cold path adds SQLite and directory-creation samples. Actual AArch64 call instructions verify eight cold samples at the holder callback's mutex unlock (four enter kernel futex wake), and 86 branch samples at the POSIX helper's `readdir64` call. These immediate edges do not reconstruct missing higher callers or assign causal seconds. In particular, later Copy and earlier DryRun remain distinct routes.
+
+All native leaves and raw kernel prefixes reconcile without loss or throttling. Attribution stops at the first invalid user frame: 1,378 samples contain unknown symbols, 167 contain non-executable mapped frames, 323 user chains reach the depth limit, and 2,041 stack buffers are full; these domains overlap. Root independently checked all 62 analysis artifacts and four helpers against the [analysis seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/profiling-packet/record-analysis/ANALYSIS-SEAL.json). No complete ancestry or pool-cost attribution is claimed.
 
 ### Earlier f05 comparison
 
