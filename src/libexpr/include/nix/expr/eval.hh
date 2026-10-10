@@ -476,6 +476,8 @@ public:
 
     const std::shared_ptr<const StaticEnv> getStaticEnv(const Expr & expr) const
     {
+        if (auto env = expr.getStaticEnv())
+            return env;
         auto i = exprEnvs.find(&expr);
         if (i != exprEnvs.end())
             return i->second;

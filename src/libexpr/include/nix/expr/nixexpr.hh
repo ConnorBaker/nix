@@ -115,6 +115,11 @@ struct Expr
     virtual ~Expr() {};
     virtual void show(const SymbolTable & symbols, std::ostream & str) const;
     virtual void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
+    /** A captured lexical environment, when owned by this expression. */
+    virtual std::shared_ptr<const StaticEnv> getStaticEnv() const
+    {
+        return {};
+    }
 
     /** Normal evaluation, implemented directly by all subclasses. */
     virtual void eval(EvalState & state, Env & env, Value & v);

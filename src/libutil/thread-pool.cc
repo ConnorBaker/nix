@@ -33,7 +33,8 @@ size_t CopyPool::defaultWorkers()
     return std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
 }
 
-bool CopyPool::execute(const Job & job, std::unique_lock<std::mutex> & lock)
+/** Run a removed job unlocked; return locked with its completion state. */
+static bool execute(const auto & job, std::unique_lock<std::mutex> & lock)
 {
     lock.unlock();
     std::exception_ptr failure;

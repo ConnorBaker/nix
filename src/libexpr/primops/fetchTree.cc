@@ -26,45 +26,6 @@
 namespace nix {
 
 /**
- * Adapter for putting libfetchers data into a thunk closure.
- * Used as the argument to prim_forceLazyFetcherAttr in a lazy apply thunk.
- */
-class LazyFetcherAttr : public ExternalValueBase, public gc_cleanup
-{
-private:
-    /* VTable anchor to avoid weak linkage of the vtable - it breaks
-       dynamic_cast across shared libraries on Darwin. */
-    virtual void anchor();
-
-public:
-    fetchers::LazyAttr lazy;
-
-    LazyFetcherAttr(fetchers::LazyAttr lazy)
-        : lazy(std::move(lazy))
-    {
-    }
-
-protected:
-    std::ostream & print(std::ostream & str) const override
-    {
-        unreachable();
-    }
-
-public:
-    std::string showType() const override
-    {
-        unreachable();
-    }
-
-    std::string typeOf() const override
-    {
-        unreachable();
-    }
-};
-
-void LazyFetcherAttr::anchor() {}
-
-/**
  * Initialize a `Value` from a resolved fetcher attribute.
  */
 static void resolvedAttrToValue(EvalState & state, Value & v, const fetchers::ResolvedAttr & resolved)
@@ -78,39 +39,40 @@ static void resolvedAttrToValue(EvalState & state, Value & v, const fetchers::Re
         resolved);
 }
 
-/**
- * internal primop: Force a LazyFetcherAttr external value.
- */
-static void prim_forceLazyFetcherAttr(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+/** A fetched attribute is an evaluator thunk over its host computation. */
+class LazyFetcherAttr : public Expr, public gc_cleanup
 {
-    // We only construct this primop with LazyFetcherAttr preapplied.
-    assert(args[0]->type() == nExternal);
-    auto * ext = dynamic_cast<LazyFetcherAttr *>(args[0]->external());
-    assert(ext);
+    fetchers::LazyAttr lazy;
+    const std::shared_ptr<const StaticEnv> staticEnv;
 
-    resolvedAttrToValue(state, v, (*ext->lazy)());
-}
+public:
+    LazyFetcherAttr(fetchers::LazyAttr lazy, std::shared_ptr<const StaticEnv> staticEnv)
+        : lazy(std::move(lazy))
+        , staticEnv(std::move(staticEnv))
+    {
+    }
 
-/**
- * Emit a lazy thunk for a LazyAttr: mkApp(primop, externalValue).
- */
+    void show(const SymbolTable &, std::ostream & out) const override
+    {
+        out << "<lazy fetcher attribute>";
+    }
+
+    void bindVars(EvalState &, const std::shared_ptr<const StaticEnv> &) override {}
+
+    std::shared_ptr<const StaticEnv> getStaticEnv() const override
+    {
+        return staticEnv;
+    }
+
+    void eval(EvalState & state, Env &, Value & v) override
+    {
+        resolvedAttrToValue(state, v, (*lazy)());
+    }
+};
+
 static void emitLazyAttrThunk(EvalState & state, const fetchers::LazyAttr & lazyAttr, Value & dest)
 {
-    // not user-callable (unregistered, internal)
-    static PrimOp forcePrimOp{
-        .name = "__forceLazyFetcherAttr",
-        .arity = 1,
-        .impl = prim_forceLazyFetcherAttr,
-        .internal = true,
-    };
-
-    auto * vExt = state.allocValue();
-    vExt->mkExternal(new LazyFetcherAttr(lazyAttr));
-
-    auto * vPrimOp = state.allocValue();
-    vPrimOp->mkPrimOp(&forcePrimOp);
-
-    dest.mkApp(vPrimOp, vExt);
+    dest.mkThunk(&state.baseEnv, new LazyFetcherAttr(lazyAttr, state.staticBaseEnv));
 }
 
 void emitTreeAttrs(

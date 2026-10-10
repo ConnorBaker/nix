@@ -114,9 +114,6 @@ class CopyPool
     size_t capacity;
     bool stopping = false;
 
-    /** Runs a removed job with the lock released, returning with it held.
-     * Returns whether the group has no outstanding jobs. */
-    static bool execute(const Job & job, std::unique_lock<std::mutex> & lock);
     bool tryAsync(Group & group, size_t i);
     void wait(Group & group);
 
