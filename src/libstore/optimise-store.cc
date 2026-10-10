@@ -675,7 +675,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
         }
         case merkle::Mode::Directory: {
             std::string body;
-            merkle::Tree tree;
+            std::map<std::string, merkle::TreeEntry> tree;
             try {
                 body = auxiliary(entry);
                 tree = GitObjectStore::parseTreeBody(entry.hash, body);
@@ -686,14 +686,6 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
             if (tree.contains("."))
                 throw Error("synthetic root object cannot be used as a directory");
 
-            /* NAR order and case-hack allocation omit the directory slash.
-               Shortened keys precede the saved next iterator; leaves stay put. */
-            for (auto i = tree.begin(); i != tree.end();)
-                if (auto child = i++; child->second.mode == merkle::Mode::Directory) {
-                    auto directory = tree.extract(child);
-                    directory.key().pop_back();
-                    tree.insert(i, std::move(directory));
-                }
             merkle::nar::Directory size;
             auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
                 assert(rel.isRoot());

@@ -489,9 +489,10 @@ public:
      * The body remains owned by the caller across source callbacks and GC. */
     std::optional<std::string> readAuxiliary(const merkle::TreeEntry & entry) const;
 
-    /** Parse and check canonical tree encoding. The caller has already checked
+    /** Parse to logical-name keys (no directory suffix), checking canonical encoding.
+     * The caller has already checked
      * the framed hash. Throws Error naming the address for a malformed body. */
-    static merkle::Tree parseTreeBody(const Hash & id, std::string_view body);
+    static std::map<std::string, merkle::TreeEntry> parseTreeBody(const Hash & id, std::string_view body);
 
     /**
      * Inode-to-identifier hints from registered holder rows. Before skipping

@@ -745,12 +745,18 @@ protected:
         auto body = store->objects.readAuxiliary({merkle::Mode::Directory, id});
         if (!body)
             throw Error("no tree %s", id.gitRev());
-        return GitObjectStore::parseTreeBody(id, *body);
+        return parseTreeBody(id, *body);
     }
 
     static merkle::Tree parseTreeBody(const Hash & id, std::string_view body)
     {
-        return GitObjectStore::parseTreeBody(id, body);
+        merkle::Tree encoded;
+        for (auto & [name, entry] : GitObjectStore::parseTreeBody(id, body))
+            if (name == ".")
+                encoded.emplace(name, entry);
+            else
+                merkle::insertEntry(encoded, name, entry);
+        return encoded;
     }
 
     void eraseAuxiliary(const merkle::TreeEntry & entry)
@@ -8241,6 +8247,11 @@ TEST_F(LocalStoreObjectsTest, parseTreeBodyRequiresCanonicalGitEntryOrder)
                     if (order == canonical) {
                         const auto tree = parseTreeBody(id, body);
                         EXPECT_EQ(merkle::serialiseTree(tree), body);
+                        const auto logical = GitObjectStore::parseTreeBody(id, body);
+                        ASSERT_EQ(logical.size(), names.size());
+                        for (size_t child = 0; child < names.size(); ++child)
+                            EXPECT_EQ(logical.at(std::string(names[child])), tree.at(
+                                std::string(names[child]) + (selected[child] == 0 ? "/" : "")));
                     } else {
                         EXPECT_THAT(
                             [&] { parseTreeBody(id, body); },

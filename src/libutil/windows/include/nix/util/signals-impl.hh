@@ -5,6 +5,7 @@
 #include "nix/util/fun.hh"
 
 #include <memory>
+#include <optional>
 
 namespace nix {
 
@@ -38,6 +39,9 @@ inline void checkInterrupt()
  */
 struct ReceiveInterrupts
 {
+    ReceiveInterrupts() = default;
+    explicit ReceiveInterrupts(std::nullopt_t) {}
+
     /**
      * Explicit destructor avoids dead code warnings.
      */

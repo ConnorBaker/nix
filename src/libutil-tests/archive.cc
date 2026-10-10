@@ -1,4 +1,5 @@
 #include "nix/util/archive.hh"
+#include "nix/util/merkle-hash.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/tests/characterization.hh"
 #include "nix/util/tests/gmock-matchers.hh"
@@ -156,9 +157,57 @@ TEST_F(NarTest, entryNameWithCaseHackSuffixIsRefusedUnderEitherSetting)
             ASSERT_THAT(
                 [&]() { parseNar(narWithEntry(hacked), mode); },
                 ::testing::ThrowsMessage<SerialisationError>(testing::HasSubstrIgnoreANSIMatcher(
-                    "bad archive: NAR contains file name '" + hacked + "' with the case-hack suffix")));
+                    "bad archive: NAR contains invalid file name '" + hacked + "'")));
             EXPECT_EQ(parseNar(narWithEntry("foo1"), mode), narWithEntry("foo1").size());
         }
+    }
+}
+
+TEST_F(NarTest, ordinaryChildNameAdmissionAgreesAcrossNarAndMerkle)
+{
+    const auto hash = merkle::blobId("");
+    auto check = [&](const std::string & name, bool admitted) {
+        StringSink nar;
+        nar << narVersionMagic1 << "(" << "type" << "directory" << "entry" << "(" << "name" << name << "node" << "("
+            << "type" << "regular" << "contents" << "" << ")" << ")" << ")";
+        for (bool hack : {false, true}) {
+            WithCaseHack scope{hack};
+            for (auto mode : {NarContentMode::Skip, NarContentMode::Drain})
+                if (admitted)
+                    EXPECT_EQ(parseNar(nar.s, mode), nar.s.size());
+                else
+                    EXPECT_THROW(parseNar(nar.s, mode), SerialisationError);
+            for (auto mode : {merkle::Mode::Directory, merkle::Mode::Regular, merkle::Mode::Executable,
+                              merkle::Mode::Symlink}) {
+                merkle::Tree tree;
+                if (admitted)
+                    EXPECT_NO_THROW(merkle::insertEntry(tree, name, {mode, hash}));
+                else {
+                    EXPECT_THROW(merkle::insertEntry(tree, name, {mode, hash}), Error);
+                    EXPECT_TRUE(tree.empty());
+                }
+            }
+        }
+    };
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        SCOPED_TRACE(byte);
+        check(std::string("a") + static_cast<char>(byte) + "z", byte != 0 && byte != '/');
+    }
+    for (auto name : {"", ".", ".."})
+        check(name, false);
+    for (auto name : {"...", ".git", "plain"})
+        check(name, true);
+    const std::string marker(caseHackSuffix);
+    for (const auto & name : {marker, marker + "x", "x" + marker, "x" + marker + "y"})
+        check(name, false);
+    for (size_t size = 1; size < marker.size(); ++size)
+        check("x" + marker.substr(0, size), true);
+    for (unsigned invalid = 0; invalid < 8; ++invalid) {
+        std::string name = "x";
+        if (invalid & 1) name += '/';
+        if (invalid & 2) name += '\0';
+        if (invalid & 4) name += marker;
+        check(name, invalid == 0);
     }
 }
 
@@ -227,7 +276,7 @@ TEST_F(NarTest, caseHackSuffixRefusedAndNeverEmittedOnEveryPlatform)
             ASSERT_THAT(
                 [&]() { parseNar(narWithEntry(hacked), mode); },
                 ::testing::ThrowsMessage<SerialisationError>(testing::HasSubstrIgnoreANSIMatcher(
-                    "bad archive: NAR contains file name '" + hacked + "' with the case-hack suffix")));
+                    "bad archive: NAR contains invalid file name '" + hacked + "'")));
         cells++;
     }
     EXPECT_EQ(cells, 4u) << "`use-case-hack` on and off, dump and parse";

@@ -110,14 +110,18 @@ struct ReceiveInterrupts
     fun<void()> makeCallback() const
     {
         return [target = target]() {
+            if (!target)
+                return;
             auto thread = target->lock();
             if (*thread)
                 pthread_kill(**thread, NIX_SIG_MULTI_INT);
         };
     }
 
-    ReceiveInterrupts()
-        : target(std::make_shared<Sync<std::optional<pthread_t>>>(pthread_self()))
+    ReceiveInterrupts() : ReceiveInterrupts(pthread_self()) {}
+
+    explicit ReceiveInterrupts(std::optional<pthread_t> thread)
+        : target(std::make_shared<Sync<std::optional<pthread_t>>>(thread))
         , callback(createInterruptCallback(makeCallback()))
     {
     }
@@ -126,11 +130,12 @@ struct ReceiveInterrupts
     {
         /* Wait for an in-flight delivery before the target can exit. Drop
            this lock before callback's destructor takes the registry lock. */
-        target->lock()->reset();
+        if (target)
+            target->lock()->reset();
     }
 
     ReceiveInterrupts(const ReceiveInterrupts &) = delete;
-    ReceiveInterrupts(ReceiveInterrupts &&) = delete;
+    ReceiveInterrupts(ReceiveInterrupts &&) noexcept = default;
     ReceiveInterrupts & operator=(const ReceiveInterrupts &) = delete;
     ReceiveInterrupts & operator=(ReceiveInterrupts &&) = delete;
 };

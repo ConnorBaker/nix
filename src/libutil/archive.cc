@@ -358,18 +358,8 @@ static void parse(FileSystemObjectSink & sink, Source & source, const CanonPath 
                 expectTag("name");
 
                 auto name = getString(narMaxName);
-                if (name.empty() || name == "." || name == ".." || name.find('/') != std::string::npos
-                    || name.find((char) 0) != std::string::npos)
+                if (!isValidNarName(name))
                     throw badArchive("NAR contains invalid file name '%1%'", name);
-                /* On every platform, whether or not `use-case-hack` is on:
-                   the suffix is this parser's own marker on a case-colliding
-                   entry (below), removed again by `unhackName` only where
-                   the hack is on, so a name carrying it would be one name
-                   here and another there, and the object hash of the NAR
-                   would differ by platform. */
-                if (name.find(caseHackSuffix) != std::string::npos)
-                    throw badArchive(
-                        "NAR contains file name '%s' with the case-hack suffix '%s'", name, caseHackSuffix);
                 if (name <= prevName)
                     throw badArchive("NAR directory is not sorted");
                 prevName = name;

@@ -113,7 +113,6 @@ class CopyPool
     std::vector<std::thread> threads;
     size_t capacity;
     bool stopping = false;
-    std::atomic<int> startupReady{0};
 
     /** Runs a removed job with the lock released, returning with it held.
      * Returns whether the group has no outstanding jobs. */

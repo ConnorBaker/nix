@@ -63,21 +63,10 @@ bool CopyPool::tryAsync(Group & group, size_t i)
     if (pending.size() == capacity)
         return false;
     if (threads.size() < capacity) {
-        std::exception_ptr failure;
-        startupReady.store(0, std::memory_order_relaxed);
-        threads.emplace_back([this, &failure] {
-            /* Registration allocates. Report failure before accepting any work
-               on this thread, rather than letting it escape the thread entry. */
-            std::optional<ReceiveInterrupts> receiveInterrupts;
-            try {
-                receiveInterrupts.emplace();
-            } catch (...) {
-                failure = std::current_exception();
-            }
-            startupReady.store(1, std::memory_order_release);
-            startupReady.notify_one();
-            if (!receiveInterrupts)
-                return;
+        threads.emplace_back([this, receiveInterrupts = ReceiveInterrupts{std::nullopt}] {
+#ifndef _WIN32
+            *receiveInterrupts.target->lock() = pthread_self();
+#endif
             std::unique_lock lock(mutex);
             while (true) {
                 wake.wait(lock, [&] { return stopping || !pending.empty(); });
@@ -91,12 +80,6 @@ bool CopyPool::tryAsync(Group & group, size_t i)
                     job.group->done.notify_one();
             }
         });
-        startupReady.wait(0, std::memory_order_acquire);
-        if (failure) {
-            threads.back().join();
-            threads.pop_back();
-            std::rethrow_exception(failure);
-        }
     }
     pending.push_back({&group, i});
     ++group.remaining;
@@ -108,15 +91,14 @@ bool CopyPool::tryAsync(Group & group, size_t i)
 void CopyPool::wait(Group & group)
 {
     std::unique_lock lock(mutex);
+    --group.remaining; // Close the admission scope before joining its accepted jobs.
     while (group.remaining) {
         auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == &group; });
-        if (i == pending.end()) {
-            group.done.wait(lock, [&] { return !group.remaining; });
-        } else {
-            auto job = std::exchange(*i, pending.back());
-            pending.pop_back();
-            execute(job, lock);
-        }
+        if (i == pending.end())
+            return group.done.wait(lock, [&] { return !group.remaining; });
+        auto job = std::exchange(*i, pending.back());
+        pending.pop_back();
+        execute(job, lock);
     }
 }
 
@@ -130,7 +112,7 @@ void CopyPool::ordered(size_t count, function_ref<bool(size_t)> canFork, functio
         return;
     }
 
-    Group group{run, count, {}, 0, {}};
+    Group group{run, count, {}, 1, {}};
     std::exception_ptr failure;
     try {
         for (size_t i = 0; i < count; ++i) {

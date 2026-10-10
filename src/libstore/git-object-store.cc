@@ -1,6 +1,7 @@
 #include "nix/store/git-object-store.hh"
 #include "nix/store/pathlocks.hh"
 #include "nix/util/git.hh"
+#include "nix/util/archive.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/file-system-at.hh"
 #include "nix/util/file-descriptor.hh"
@@ -701,33 +702,30 @@ std::optional<std::string> GitObjectStore::readAuxiliary(const merkle::TreeEntry
     return std::nullopt;
 }
 
-merkle::Tree GitObjectStore::parseTreeBody(const Hash & id, std::string_view body)
+std::map<std::string, merkle::TreeEntry> GitObjectStore::parseTreeBody(const Hash & id, std::string_view body)
 {
     struct Into : merkle::DirectorySink
     {
-        merkle::Tree tree;
+        std::map<std::string, merkle::TreeEntry> tree;
 
         void insertChild(std::string_view name, merkle::TreeEntry entry) override
         {
-            /* A bare executable or symlink has a singleton synthetic
-               root. Every other tree is an ordinary directory map. */
-            if (name == "." && tree.empty()
-                && (entry.mode == merkle::Mode::Executable || entry.mode == merkle::Mode::Symlink)) {
-                tree.emplace(".", std::move(entry));
-                return;
-            }
-            if (!tree.empty() && tree.begin()->first == ".")
-                throw Error("synthetic root tree has more than one entry");
-            merkle::insertEntry(tree, std::string(name), entry);
+            if (!isValidNarName(name)
+                && (name != "." || (entry.mode != merkle::Mode::Executable && entry.mode != merkle::Mode::Symlink)))
+                throw Error("invalid tree entry name '%s'", name);
+            if (!tree.try_emplace(std::string(name), std::move(entry)).second)
+                throw Error("duplicate tree entry name '%s'", name);
         }
     } into;
 
     try {
         git::parseTreeBody(into, body, hashAlgo);
+        if (into.tree.size() > 1 && into.tree.contains("."))
+            throw Error("synthetic root tree has more than one entry");
+        return std::move(into.tree);
     } catch (Error & e) {
         throw Error("malformed tree object %s: %s", id.gitRev(), e.msg());
     }
-    return std::move(into.tree);
 }
 
 /* Legacy caches are no longer a readable representation. Descend only the

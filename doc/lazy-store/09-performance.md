@@ -2,23 +2,25 @@
 
 ## Latest matched comparison
 
-The latest measured committed endpoint **05b7398bd80a3df0656ef714221bacebff9b336c** has lower paired wall medians in **seven of nine cases** and CPU medians in **five of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path, cold-Git and both warm-Git CPU regress in all six pairs; both warm-Git wall cases also regress in all six. **The performance goal remains unmet.** These whole-endpoint measurements do not isolate the contribution of ownership, publication or traversal changes.
+The latest measured committed endpoint **eaeb6661191183a96b1f0541432b0517fb2c8cdf** has lower paired wall medians in **eight of nine cases** and CPU medians in **five of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path and both warm-Git CPU regress in all six pairs; cold-Git CPU regresses in five of six. Warm-8 Git wall regresses in five of six; warm-32 Git's wall median is lower, with three wins and three losses. **The performance goal remains unmet.** These whole-endpoint measurements do not isolate individual simplifications. The subsequent net −20-line production batch is outside this measured endpoint and has no performance measurement.
 
 | Case | Wall / base | CPU / base | Wall wins | CPU wins |
 | --- | ---: | ---: | ---: | ---: |
-| cold 32 path | 0.766070 | 1.536124 | 6/6 | 0/6 |
-| cold 32 git | 0.851419 | 1.024697 | 6/6 | 0/6 |
-| cold 32 github | 0.683167 | 0.354781 | 6/6 | 6/6 |
-| warm 8 path | 0.148511 | 0.317713 | 6/6 | 6/6 |
-| warm 8 git | 1.070312 | 1.865672 | 0/6 | 0/6 |
-| warm 8 github | 0.931115 | 0.896552 | 6/6 | 6/6 |
-| warm 32 path | 0.295171 | 0.441967 | 6/6 | 6/6 |
-| warm 32 git | 1.038347 | 1.442720 | 0/6 | 0/6 |
-| warm 32 github | 0.941631 | 0.936447 | 5/6 | 6/6 |
+| cold 32 path | 0.801751 | 1.618778 | 6/6 | 0/6 |
+| cold 32 git | 0.834776 | 1.020253 | 6/6 | 1/6 |
+| cold 32 github | 0.732231 | 0.357741 | 5/6 | 6/6 |
+| warm 8 path | 0.154109 | 0.313563 | 6/6 | 6/6 |
+| warm 8 git | 1.064885 | 1.810959 | 1/6 | 0/6 |
+| warm 8 github | 0.862099 | 0.887500 | 6/6 | 6/6 |
+| warm 32 path | 0.280749 | 0.419985 | 6/6 | 6/6 |
+| warm 32 git | 0.998567 | 1.402420 | 3/6 | 0/6 |
+| warm 32 github | 0.946615 | 0.929058 | 5/6 | 6/6 |
 
-The [c9r5 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/READOUT.md), [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/INDEPENDENT-SEAL.json) and [actual process closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/COHORT-JOB-FINAL-CLOSURE.json) retain all **114 outputs, 54 balanced pairs and 21 complete graphs**. The wrapper closed zero and was reaped; all 527 artifact hashes and 98 runtime providers were read back successfully. Sources, full fixtures and runtime providers remain unchanged. Each case has three AB and three BA pairs, with no exclusions; all 42 states remain present. Graph comparison passes after address rewriting, with nonidentity mappings, rather than proving address formulas. Cold means fresh application state with host page caches intact; warm states reuse their original physical roots.
+The [c9r7 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/post-b898-release-oct10/READOUT.md), [exact paired metrics](/home/connorbaker/Benchmarks/c9r7/paired-metrics.json) and [actual process closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/post-b898-release-oct10/COHORT-JOB-FINAL-CLOSURE.json) retain all **114 outputs, 54 balanced pairs and 21 complete graphs**. The wrapper closed zero and was reaped; the closure retains 731 artifact hashes and 98 selected runtime providers, with unchanged sources, full fixtures and protected providers. Each case has three AB and three BA pairs, with no exclusions or retries; all 42 states remain present. Graph comparison passes after address rewriting, with nonidentity mappings, rather than proving address formulas. Cold means fresh application state with host page caches intact; warm states reuse their original physical roots. CPU is user plus system time at the existing timer resolution; ties are not speedups.
 
-The [pressure readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/PRESSURE-READOUT.json) retains **1,503 samples**, including **951 tagged timed**. Timed CPU some avg10 peaks at **5.56%**, I/O some/full at **1.43%/1.43%**, and memory avg10 remains zero despite nonzero total-counter changes. All-phase CPU peaks at 6.11%. Last-minus-first timed counter differences include intervening guard periods; these rolling host observations establish neither workload causes nor causal time fractions. The earlier bf502 profiles below do not attribute the current endpoint's regressions.
+The [pressure readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/post-b898-release-oct10/PRESSURE-READOUT.json) retains **1,581 samples**, including **1,012 tagged timed**. Timed CPU some avg10 peaks at **6.13%**, I/O some/full at **1.07%/1.07%**, and memory some/full at **1.80%/1.80%**. All-phase I/O peaks at 1.24%. Last-minus-first timed counter differences include intervening guard periods; these rolling host observations establish neither workload causes nor causal time fractions. Earlier endpoint profiles below do not attribute eaeb's regressions.
+
+The separate historical [05b/c9r5 comparison](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/READOUT.md) had seven lower wall medians and five lower CPU medians; both warm-Git wall cases and cold-Git CPU regressed in all six pairs. Its [pressure record](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/PRESSURE-READOUT.json) retains 1,503 samples, 951 timed, with timed CPU/I/O/memory avg10 maxima of 5.56%/1.43%/0%. Those observations are not pooled with c9r7 or an isolated before/after experiment.
 
 ## Historical bf502 matched comparison
 

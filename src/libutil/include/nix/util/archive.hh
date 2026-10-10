@@ -138,6 +138,16 @@ inline constexpr std::string_view narVersionMagic1 = "nix-archive-1";
 
 inline constexpr std::string_view caseHackSuffix = "~nix~case~hack~";
 
+/** Ordinary serialized child names, excluding empty/dot names, slash, NUL and the reserved marker. */
+inline bool isValidNarName(std::string_view name) noexcept
+{
+    /* The marker is NAR's case-collision encoding. Accepting it
+       would give one serialized name and another unhacked name, making
+       the NAR's object hash depend on the platform's case-hack setting. */
+    return !name.empty() && name != "." && name != ".." && name.find('/') == name.npos
+           && name.find('\0') == name.npos && name.find(caseHackSuffix) == name.npos;
+}
+
 /**
  * A tree's name whose case-hacked form is itself a name of the directory
  * (`CaseHackNames::diskName`): `name` as given, `existing` the name it
