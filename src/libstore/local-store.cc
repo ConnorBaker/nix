@@ -512,7 +512,7 @@ LocalStore::LocalStore(ref<const Config> config)
             -> std::optional<GitObjectStore::Holder> {
             return retrySQLite<std::optional<GitObjectStore::Holder>>([&]() -> std::optional<GitObjectStore::Holder> {
                 auto state(_state->lock());
-                auto use(state->stmts->LookupBlob.use());
+                auto use(state->stmts->LookupBlob.use(SQLiteStmt::Bindings::Borrow));
                 /* Bind the identifier bytes directly, without hexadecimal encoding. */
                 use.apply(id.hash, id.hashSize)
                     .apply(int64_t(executable ? 1 : 0))
