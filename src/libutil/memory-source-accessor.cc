@@ -93,32 +93,6 @@ bool MemorySourceAccessor::pathExists(const CanonPath & path)
     return open(path, std::nullopt);
 }
 
-template<>
-SourceAccessor::Stat MemorySourceAccessor::File::lstat() const
-{
-    return std::visit(
-        overloaded{
-            [](const Regular & r) {
-                return SourceAccessor::Stat{
-                    .type = SourceAccessor::tRegular,
-                    .fileSize = r.contents.size(),
-                    .isExecutable = r.executable,
-                };
-            },
-            [](const Directory &) {
-                return SourceAccessor::Stat{
-                    .type = SourceAccessor::tDirectory,
-                };
-            },
-            [](const Symlink &) {
-                return SourceAccessor::Stat{
-                    .type = SourceAccessor::tSymlink,
-                };
-            },
-        },
-        this->raw);
-}
-
 std::optional<MemorySourceAccessor::Stat> MemorySourceAccessor::maybeLstat(const CanonPath & path)
 {
     const auto * f = open(path, std::nullopt);

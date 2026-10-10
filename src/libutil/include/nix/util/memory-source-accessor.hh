@@ -4,6 +4,7 @@
 #include "nix/util/source-path.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/variant-wrapper.hh"
+#include "nix/util/util.hh"
 #include "nix/util/json-impls.hh"
 
 namespace nix {
@@ -100,6 +101,26 @@ VariantT<RegularContents, recur>::operator==(const VariantT<RegularContents, rec
 template<typename RegularContents, bool recur>
 inline std::strong_ordering
 VariantT<RegularContents, recur>::operator<=>(const VariantT<RegularContents, recur> &) const noexcept = default;
+
+template<typename RegularContents, bool recur>
+SourceAccessor::Stat VariantT<RegularContents, recur>::lstat() const
+{
+    return std::visit(
+        overloaded{
+            [](const Regular & r) {
+                SourceAccessor::Stat st{.type = SourceAccessor::tRegular, .isExecutable = r.executable};
+                if constexpr (requires { r.contents.fileSize; r.contents.narOffset; }) {
+                    st.fileSize = r.contents.fileSize;
+                    st.narOffset = r.contents.narOffset;
+                } else
+                    st.fileSize = r.contents.size();
+                return st;
+            },
+            [](const Directory &) { return SourceAccessor::Stat{.type = SourceAccessor::tDirectory}; },
+            [](const Symlink &) { return SourceAccessor::Stat{.type = SourceAccessor::tSymlink}; },
+        },
+        raw);
+}
 
 } // namespace fso
 

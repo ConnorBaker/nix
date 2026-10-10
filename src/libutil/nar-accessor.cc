@@ -75,36 +75,10 @@ public:
         return *result;
     }
 
-    static Stat statOf(const NarListing & listing)
-    {
-        return std::visit(
-            overloaded{
-                [](const NarListing::Regular & r) -> Stat {
-                    return {
-                        .type = Type::tRegular,
-                        .fileSize = r.contents.fileSize,
-                        .isExecutable = r.executable,
-                        .narOffset = r.contents.narOffset,
-                    };
-                },
-                [](const NarListing::Directory &) -> Stat {
-                    return {
-                        .type = Type::tDirectory,
-                    };
-                },
-                [](const NarListing::Symlink &) -> Stat {
-                    return {
-                        .type = Type::tSymlink,
-                    };
-                },
-            },
-            listing.raw);
-    }
-
     std::optional<Stat> maybeLstat(const CanonPath & path) override
     {
         auto i = find(path);
-        return i ? std::optional{statOf(*i)} : std::nullopt;
+        return i ? std::optional{i->lstat()} : std::nullopt;
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -117,7 +91,7 @@ public:
 
         DirEntries res;
         for (const auto & [name, child] : dir->entries)
-            res.emplace_hint(res.end(), name, statOf(child).type);
+            res.emplace_hint(res.end(), name, child.lstat().type);
 
         return res;
     }
