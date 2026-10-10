@@ -1401,8 +1401,8 @@ private:
        object database and carrying an empty in-memory index in place of the
        repository's own.  `attr_decide_sources` (libgit2 `attr.c`) reads,
        per directory of the path, whichever of the working directory's file
-       and the index's entry the low bits of the flags select, and offers no
-       value that selects neither, nor any way to make `has_index` false.
+       and the index's entry the low bits of the flags select, with no documented
+       selector for neither, nor supported way to make `has_index` false.
        An index that names nothing is the supported way to say "no source
        but the commit's tree": with `GIT_ATTR_CHECK_INDEX_ONLY` the only
        per-directory sources are this index, which finds nothing and costs
