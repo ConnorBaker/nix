@@ -21,6 +21,15 @@ struct SourceAccessor;
 
 namespace nix::fetchers {
 
+/** A producer-owned fixed rendered value: every successful read preserves
+ * bytes, modes and children. Ordinary availability errors remain possible.
+ * Construction promises this meaning; a fingerprint does not prove it.
+ */
+struct FixedSource
+{
+    ref<SourceAccessor> accessor;
+};
+
 struct InputScheme;
 
 struct Settings;
@@ -135,8 +144,11 @@ public:
      */
     std::pair<ref<SourceAccessor>, Input> getAccessor(const Settings & settings, Store & store) const;
 
+    std::pair<FixedSource, Input> getFixedAccessor(const Settings & settings, Store & store) const;
+
 private:
 
+    std::pair<ref<SourceAccessor>, Input> getAccessorChecked(const Settings & settings, Store & store, bool requireFixed) const;
     std::pair<ref<SourceAccessor>, Input> getAccessorUnchecked(const Settings & settings, Store & store) const;
 
 public:
@@ -268,6 +280,13 @@ struct InputScheme
         std::string_view contents,
         std::optional<std::string> commitMsg) const;
 
+    /**
+     * For a fixed source, equal Input fingerprints must imply equal rendered
+     * values; metadata may distinguish equal values. If unknown, set
+     * cachedFingerprint to engaged nullopt to suppress scheme fallback. A
+     * lawful accessor fingerprint still takes precedence over this field.
+     * Fixedness does not establish either fingerprint's existing naming law.
+     */
     virtual std::pair<ref<SourceAccessor>, Input>
     getAccessor(const Settings & settings, Store & store, const Input & input) const = 0;
 

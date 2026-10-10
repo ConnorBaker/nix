@@ -12,22 +12,19 @@ InputCache::CachedResult InputCache::getAccessor(
     Input resolvedInput = originalInput;
 
     if (!fetched) {
-        if (originalInput.isDirect()) {
-            auto [accessor, lockedInput] = originalInput.getAccessor(settings, store);
-            fetched.emplace(CachedInput{.lockedInput = std::move(lockedInput), .accessor = accessor});
-        } else {
+        auto fetch = [&](const Input & input, Attrs extraAttrs = {}) {
+            auto [accessor, lockedInput] = input.getFixedAccessor(settings, store);
+            return CachedInput{std::move(lockedInput), std::move(accessor), std::move(extraAttrs)};
+        };
+        if (originalInput.isDirect())
+            fetched.emplace(fetch(originalInput));
+        else {
             if (useRegistries != UseRegistries::No) {
                 auto [res, extraAttrs] = lookupInRegistries(settings, store, originalInput, useRegistries);
                 resolvedInput = std::move(res);
                 fetched = lookup(resolvedInput);
-                if (!fetched) {
-                    auto [accessor, lockedInput] = resolvedInput.getAccessor(settings, store);
-                    fetched.emplace(
-                        CachedInput{
-                            .lockedInput = std::move(lockedInput),
-                            .accessor = accessor,
-                            .extraAttrs = std::move(extraAttrs)});
-                }
+                if (!fetched)
+                    fetched.emplace(fetch(resolvedInput, std::move(extraAttrs)));
                 upsert(resolvedInput, *fetched);
             } else {
                 throw Error(
@@ -38,7 +35,7 @@ InputCache::CachedResult InputCache::getAccessor(
         upsert(originalInput, *fetched);
     }
 
-    debug("got tree '%s' from '%s'", fetched->accessor, fetched->lockedInput.to_string());
+    debug("got tree '%s' from '%s'", fetched->accessor.accessor, fetched->lockedInput.to_string());
 
     return {
         fetched->accessor, std::move(resolvedInput), std::move(fetched->lockedInput), std::move(fetched->extraAttrs)};

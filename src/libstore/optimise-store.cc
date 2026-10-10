@@ -418,11 +418,10 @@ static BufferedRegularFile readBufferedRegular(
 /* Buffer regular files up to restoreBufferLimit, then link or write;
    larger files stream before placement. Linked files fire no write hook.
    Directory scopes retain child sinks and canonicalise before staging the body. */
-struct LinkingVisitor : NodeVisitor<HashedNode>
+struct LinkingVisitor : HashingVisitor
 {
     GitObjectStore & objects;
     const GitObjectStore::Hold & hold;
-    HashingVisitor & hasher;
     RepairFlag repair;
     Sink * rootContents;
 
@@ -445,11 +444,11 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
     LinkingVisitor(
         GitObjectStore & objects,
         const GitObjectStore::Hold & hold,
-        HashingVisitor & hasher,
         RestoreSink & restore,
         RepairFlag repair,
-        Sink * rootContents = nullptr)
-        : objects(objects), hold(hold), hasher(hasher)
+        Sink * rootContents = nullptr,
+        size_t workers = 1)
+        : HashingVisitor(workers), objects(objects), hold(hold)
         , repair(repair)
         , rootContents(rootContents)
         , sink(restore)
@@ -457,7 +456,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
     }
 
     LinkingVisitor(LinkingVisitor & parent, RestoreSink & sink, const std::string * diskName = nullptr)
-        : objects(parent.objects), hold(parent.hold), hasher(parent.hasher)
+        : HashingVisitor(parent), objects(parent.objects), hold(parent.hold)
         , repair(parent.repair), rootContents(parent.rootContents), sink(sink), diskName(diskName)
 #ifndef _WIN32
         , naming(parent.naming)
@@ -504,10 +503,10 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
                         });
                     });
                 };
-                result = hasher.hashDirectory(path, {named, children.canDefer, children.mayFork}, body, child);
+                result = hashDirectory(path, {named, children.canDefer, children.mayFork}, body, child);
             } else
 #endif
-                result = hasher.hashDirectory(path, children, body, child);
+                result = hashDirectory(path, children, body, child);
         };
         target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
@@ -519,7 +518,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
     {
         auto t = at(path);
         t.sink.createSymlink(t.name, target);
-        auto node = hasher.HashingVisitor::symlink(path, target);
+        auto node = HashingVisitor::symlink(path, target);
         hold.addAuxiliary({node.entry, target});
         return node;
     }
@@ -814,8 +813,7 @@ ObjectHashSink::Result LocalStore::restoreThroughObjects(
 {
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = path;
-    HashingVisitor hasher;
-    LinkingVisitor linking{objects, hold, hasher, restore, repair, rootContents};
+    LinkingVisitor linking{objects, hold, restore, repair, rootContents};
     ObjectHashSink adapter{linking};
     beginIngestion(hold, path);
     produce(adapter);
@@ -888,8 +886,7 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     /* Only completed unknown bodies omit discoveries after an EMPTY acquisition. */
     if (!config->readOnly && objects.index == &blobIndex && blobIndex.lookup && !mayHaveValidPaths())
         hold.emptyRegistered = &blobIndex;
-    HashingVisitor hasher{workers};
-    LinkingVisitor visitor{objects, hold, hasher, restore, repair};
+    LinkingVisitor visitor{objects, hold, restore, repair, nullptr, workers};
     visitor.naming = &naming;
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every reused node carries the size of what it made, so the NAR
@@ -990,8 +987,7 @@ StorePath LocalStore::materialise(
             prepare();
             if (!buffered->writer)
                 beginIngestion(*hold, restore.dstPath);
-            HashingVisitor hasher;
-            LinkingVisitor linking{objects, *hold, hasher, restore, repair};
+            LinkingVisitor linking{objects, *hold, restore, repair};
             auto target = linking.at(CanonPath::root);
             linking.placeRegular(target, std::move(*buffered));
             buffered.reset();

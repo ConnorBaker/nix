@@ -233,9 +233,8 @@ private:
     }
 
     /**
-     * Clean legacy auxiliary entries and dead ingestion leases in
-     * `upper-layer/.objects` alone, without reading a merged reachability
-     * graph or inspecting the lower cache. Nonrecursive physical removal
+     * Reap dead ingestion leases in `upper-layer/.objects` alone,
+     * without inspecting lower entries. Nonrecursive physical removal
      * cannot white out the lower layer; an actual removal requests a remount
      * of the merged view.
      *

@@ -1247,7 +1247,13 @@ TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsThe
         });
         EXPECT_FALSE(input.getFingerprint(*store));
         auto [substituted, locked] = input.getAccessor(settings, *store);
-        EXPECT_EQ(substituted->getFingerprint(CanonPath::root), stored->getFingerprint(CanonPath::root));
+        EXPECT_TRUE(substituted->getFingerprint(CanonPath::root));
+        EXPECT_TRUE(substituted->isFixed());
+        EXPECT_EQ(substituted->getKnownEntry(CanonPath::root), std::optional{entry});
+        StringSink expectedNar, acquiredNar;
+        tree->dumpPath(CanonPath::root, expectedNar);
+        substituted->dumpPath(CanonPath::root, acquiredNar);
+        EXPECT_EQ(acquiredNar.s, expectedNar.s);
         EXPECT_EQ(locked.getTreeHash(), named.second);
         EXPECT_FALSE(locked.getNarHash());
         tree->reads = 0;
@@ -2625,6 +2631,120 @@ TEST(FilteringSourceAccessor, admissionCallbacksKeepTheirRequiredPolicyAlive)
         }
     EXPECT_EQ(cases, 244u);
 }
+
+#ifndef _WIN32
+TEST_F(FetchToStoreLocalTest, pathInputsShareTheAcquiredValueWithTheirRegisteredCopy)
+{
+    struct PublicationStore : LocalStore
+    {
+        fun<void(const SourcePath &)> beforeCopy = [](const SourcePath &) {};
+        std::optional<StorePath> published;
+        size_t copies = 0;
+        explicit PublicationStore(ref<const Config> config)
+            : Store{*config}
+            , LocalFSStore{*config}
+            , LocalStore{config}
+        {
+        }
+        StorePath addToStore(
+            std::string_view name, const SourcePath & source, ContentAddressMethod method,
+            HashAlgorithm algorithm, const StorePathSet & references, PathFilter & filter,
+            RepairFlag repair, TreeNamer namer, bool concurrent) override
+        {
+            ++copies;
+            beforeCopy(source);
+            auto path = Store::addToStore(
+                name, source, method, algorithm, references, filter, repair, std::move(namer), concurrent);
+            published = path;
+            return path;
+        }
+    };
+    EnableExperimentalFeature flakes("flakes");
+    unsigned cases = 0;
+    for (auto mode : {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory})
+        for (bool registered : {false, true})
+            for (bool evaluator : {false, true})
+                for (bool suppliedMtime : {false, true}) {
+                    SCOPED_TRACE(fmt("mode=%d registered=%d evaluator=%d supplied-mtime=%d",
+                        int(mode), registered, evaluator, suppliedMtime));
+                    auto root = tempStoreDir.path() / fmt("owned-path-%d", cases);
+                    auto bytes = fmt("AAA-%d", cases);
+                    auto changed = fmt("BBB-%d", cases);
+                    auto file = mode == merkle::Mode::Directory ? root / "payload" : root;
+                    if (mode == merkle::Mode::Directory)
+                        createDirs(root);
+                    if (mode == merkle::Mode::Symlink)
+                        createSymlink(bytes, root);
+                    else {
+                        writeFile(file, bytes);
+                        if (mode == merkle::Mode::Executable)
+                            chmod(file, 0755);
+                    }
+                    setWriteTime(file, 1000, 1000, mode == merkle::Mode::Symlink);
+                    if (mode == merkle::Mode::Directory)
+                        setWriteTime(root, 1000, 1000, false);
+                    auto original = makeFSSourceAccessor(root);
+                    auto entry = objectHashOf(*original, CanonPath::root).root;
+                    StringSink expectedNar;
+                    original->dumpPath(CanonPath::root, expectedNar);
+                    auto inputPath = root.string();
+                    if (registered)
+                        inputPath = store->printStorePath(store->Store::addToStore(
+                            "source", SourcePath{original}, ContentAddressMethod::Raw::Git));
+                    fetchers::Attrs attrs{{"type", "path"}, {"path", inputPath}};
+                    if (suppliedMtime)
+                        attrs.insert_or_assign("lastModified", uint64_t(123));
+                    auto input = fetchers::Input::fromAttrs(std::move(attrs));
+                    auto backend = make_ref<PublicationStore>(ref<const LocalStore::Config>{config});
+                    std::optional<size_t> copiedAccessor;
+                    backend->beforeCopy = [&](const SourcePath & source) {
+                        EXPECT_TRUE(source.accessor->isFixed());
+                        EXPECT_EQ(source.accessor->getKnownEntry(CanonPath::root), std::optional{entry});
+                        copiedAccessor = source.accessor->number;
+                        if (mode == merkle::Mode::Symlink) {
+                            std::filesystem::remove(root);
+                            createSymlink(changed, root);
+                        } else
+                            writeFile(file, changed);
+                        if (mode == merkle::Mode::Directory)
+                            writeFile(root / "late", "new member");
+                        setWriteTime(file, 2000, 2000, mode == merkle::Mode::Symlink);
+                        if (mode == merkle::Mode::Directory)
+                            setWriteTime(root, 2000, 2000, false);
+                    };
+                    fetchers::Settings settings;
+                    auto [accessor, fetched] = [&]() -> std::pair<ref<SourceAccessor>, fetchers::Input> {
+                        if (evaluator) {
+                            auto [fixed, result] = input.getFixedAccessor(settings, *backend);
+                            return {std::move(fixed.accessor), std::move(result)};
+                        }
+                        return input.getAccessor(settings, *backend);
+                    }();
+                    EXPECT_EQ(backend->copies, registered ? 0u : 1u);
+                    EXPECT_EQ(accessor->isFixed(), !registered || evaluator);
+                    EXPECT_EQ(bool(accessor->getPhysicalPath(CanonPath::root)), registered && !evaluator);
+                    EXPECT_EQ(fetched.getLastModified(), std::optional<uint64_t>{suppliedMtime ? 123u : registered ? 0u : 1000u});
+                    if (!registered) {
+                        EXPECT_EQ(copiedAccessor, std::optional<size_t>{accessor->number});
+                        EXPECT_EQ(mode == merkle::Mode::Symlink ? nix::readLink(root).string() : readFile(file), changed);
+                    }
+                    StringSink actualNar;
+                    accessor->dumpPath(CanonPath::root, actualNar);
+                    EXPECT_EQ(actualNar.s, expectedNar.s);
+                    auto named = fetchToStore2(settings, *backend, SourcePath{accessor}, FetchMode::DryRun);
+                    EXPECT_EQ(named.second, merkle::objectHash(entry));
+                    EXPECT_TRUE(backend->isValidPath(named.first));
+                    StringSink registeredNar;
+                    backend->requireStoreObjectAccessor(named.first)->dumpPath(CanonPath::root, registeredNar);
+                    EXPECT_EQ(registeredNar.s, expectedNar.s);
+                    if (!registered)
+                        EXPECT_EQ(backend->published, std::optional{named.first});
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 32u);
+    RecordProperty("finite_cells", cases);
+}
+#endif
 
 TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
 {

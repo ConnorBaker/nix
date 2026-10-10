@@ -636,11 +636,8 @@ protected:
      * stale-projection cleanup in this database (01 §9.10, 08 K13). */
     void sweepObjects();
 
-    /**
-     * Bounded legacy-cache cleanup over the files this store owns, reported by
-     * `reportSweep`.  The local overlay store owns its upper layer alone
-     * and overrides this.
-     */
+    /** Reap dead leases in this store's owned namespace.
+     * The local overlay store owns its upper layer alone and overrides this. */
     virtual void sweepObjectStore();
 
     /** Under the GC lock, remove stale ingestions after dead-lease cleanup;
@@ -649,9 +646,6 @@ public:
     void sweepStaleBlobRows();
 
 protected:
-
-    /** What a sweep did, said once, wherever it swept. */
-    void reportSweep(const GitObjectStore::SweepStats & swept);
 
     /** Reject descriptions under another path before registration effects. */
     static void validatePathInfoKeys(const ValidPathInfos & infos);

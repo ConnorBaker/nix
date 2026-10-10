@@ -15,6 +15,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/git.hh"
 #include "nix/util/merkle-hash.hh"
+#include "nix/util/tree-traversal.hh"
 #include "nix/util/util.hh"
 #include "nix/util/thread-pool.hh"
 #include "nix/util/pool.hh"
@@ -357,6 +358,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
      * interfaces.
      */
     Repository repo;
+    ObjectDb odb;
 
     /* Attribute lookups refresh shared file stamps and macro definitions
        outside libgit2's cache locks. All accessors using this repository
@@ -423,7 +425,6 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             memBackend.release();
         }
 
-        ObjectDb odb;
         if (options.packfilesOnly) {
             /* Create a fresh object database because by default the repo also
                loose object backends. We are not using any of those for the
@@ -573,6 +574,7 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
 
         checkInterrupt();
     }
+
 
     std::unique_ptr<merkle::DirectorySinkWithFinalize> makeDirectorySink() override;
     std::unique_ptr<merkle::RegularFileSinkWithFinalize> makeRegularFileSink() override;
@@ -923,11 +925,15 @@ public:
     {
         ref<GitRepoImpl> repo;
         Object root;
+        merkle::Mode rootMode = git_object_type(root.get()) == GIT_OBJECT_TREE
+            ? merkle::Mode::Directory : merkle::Mode::Regular;
         std::optional<lfs::Fetch> lfsFetch = std::nullopt;
         GitAccessorOptions options;
     };
 
     Sync<State> state_;
+
+    bool isFixed() override { return !state_.lock()->lfsFetch; }
 
     bool allowsConcurrentTraversal() override
     {
@@ -936,13 +942,8 @@ public:
         return !state_.lock()->options.smudgeLfs;
     }
 
-    GitSourceAccessor(ref<GitRepoImpl> repo_, const Hash & rev, const GitAccessorOptions & options)
-        : state_{State{
-              .repo = repo_,
-              .root = peelToTreeOrBlob(lookupObject(*repo_, hashToOID(rev)).get()),
-              .lfsFetch = options.smudgeLfs ? std::make_optional(lfs::Fetch(*repo_, hashToOID(rev))) : std::nullopt,
-              .options = options,
-          }}
+    explicit GitSourceAccessor(State && state)
+        : state_(std::move(state))
     {
     }
 
@@ -1000,7 +1001,7 @@ public:
         auto state(state_.lock());
 
         if (path.isRoot())
-            return Stat{.type = git_object_type(state->root.get()) == GIT_OBJECT_TREE ? tDirectory : tRegular};
+            return statOfMode((RawMode) state->rootMode);
 
         auto entry = lookup(*state, path);
         if (!entry)
@@ -1013,7 +1014,11 @@ public:
        other modes are blobs, with owner-execute preceding symlink mode. */
     static Stat statOfEntry(const git_tree_entry * entry)
     {
-        auto mode = git_tree_entry_filemode_raw(entry);
+        return statOfMode(git_tree_entry_filemode_raw(entry));
+    }
+
+    static Stat statOfMode(RawMode mode)
+    {
         auto type = mode & 0170000; // Git's four type bits.
         if (type == GIT_FILEMODE_TREE || type == GIT_FILEMODE_COMMIT)
             return {.type = tDirectory};
@@ -1059,8 +1064,7 @@ public:
             return std::nullopt;
         if (path.isRoot())
             return merkle::TreeEntry{
-                .mode = git_object_type(state->root.get()) == GIT_OBJECT_TREE ? merkle::Mode::Directory
-                                                                              : merkle::Mode::Regular,
+                .mode = state->rootMode,
                 .hash = toHash(*git_object_id(state->root.get())),
             };
         auto entry = lookup(*state, path);
@@ -1110,7 +1114,9 @@ public:
             return std::pair{
                 CanonPath::root,
                 name(
-                    git_object_type(state->root.get()) == GIT_OBJECT_TREE ? "tree" : "blob",
+                    state->rootMode == merkle::Mode::Directory ? "tree"
+                    : state->rootMode == merkle::Mode::Regular ? "blob"
+                    : state->rootMode == merkle::Mode::Executable ? "blob-executable" : "symlink",
                     *git_object_id(state->root.get()))};
 
         auto entry = lookup(*state, path);
@@ -1228,7 +1234,8 @@ public:
 
     Blob getBlob(State & state, const CanonPath & path, bool expectSymlink)
     {
-        if (path.isRoot() && !expectSymlink && git_object_type(state.root.get()) == GIT_OBJECT_BLOB)
+        if (path.isRoot() && git_object_type(state.root.get()) == GIT_OBJECT_BLOB
+            && expectSymlink == (state.rootMode == merkle::Mode::Symlink))
             return dupObject<Blob>((git_blob *) &*state.root);
 
         auto notExpected = [&]() {
@@ -1437,10 +1444,7 @@ public:
             throw GitError("opening Git repository %s to read its attributes", PathFmt(repo->path));
         /* The repository's object database, so that this handle reads every
            object that one does, the unflushed ones included. */
-        ObjectDb odb;
-        if (git_repository_odb(std::out_ptr(odb), *repo))
-            throw GitError("getting the Git object database");
-        if (git_repository_set_odb(commitAttributesRepo.get(), odb.get()))
+        if (git_repository_set_odb(commitAttributesRepo.get(), repo->odb.get()))
             throw GitError("setting the Git object database for attribute lookups");
         if (git_index_new(std::out_ptr(emptyIndex)))
             throw GitError("creating an empty Git index");
@@ -1603,7 +1607,7 @@ struct GitRegularFileSinkImpl : merkle::RegularFileSinkWithFinalize
         } else {
             /* Small file: get a repo and create blob from buffer. */
             auto handle = getRepo();
-            if (git_blob_create_from_buffer(&oid, *handle, contents.data(), contents.size()))
+            if (git_odb_write(&oid, handle->odb.get(), contents.data(), contents.size(), GIT_OBJECT_BLOB))
                 throw GitError("creating blob from buffer");
         }
 
@@ -1643,11 +1647,8 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
     Hash finalize() && override
     {
         auto body = merkle::serialiseTree(entries);
-        ObjectDb odb;
-        if (git_repository_odb(std::out_ptr(odb), repo))
-            throw GitError("getting Git object database");
         git_oid oid;
-        if (git_odb_write(&oid, odb.get(), body.data(), body.size(), GIT_OBJECT_TREE))
+        if (git_odb_write(&oid, repo.odb.get(), body.data(), body.size(), GIT_OBJECT_TREE))
             throw GitError("writing a tree object");
         return toHash(oid);
     }
@@ -1669,7 +1670,103 @@ std::unique_ptr<merkle::RegularFileSinkWithFinalize> GitRepoImpl::makeRegularFil
 ref<GitSourceAccessor> GitRepoImpl::getRawAccessor(const Hash & rev, const GitAccessorOptions & options)
 {
     auto self = ref<GitRepoImpl>(shared_from_this());
-    return make_ref<GitSourceAccessor>(self, rev, options);
+    return make_ref<GitSourceAccessor>(GitSourceAccessor::State{
+        .repo = self,
+        .root = peelToTreeOrBlob(lookupObject(*self, hashToOID(rev)).get()),
+        .lfsFetch = options.smudgeLfs ? std::make_optional(lfs::Fetch(*self, hashToOID(rev))) : std::nullopt,
+        .options = options,
+    });
+}
+
+static GitRepo::Options tarballCacheOptions()
+{
+    return GitRepo::Options{
+        .create = true,
+        .bare = true,
+        .packfilesOnly = true,
+        /* Tarball unpacking is not expected to benefit from deltas much,
+           compared to how much CPU times it takes to find. */
+        .dontFindDeltas = true,
+        /* A tarball's tree identifier is then the store's name for it. */
+        .oidType = HashAlgorithm::SHA256,
+        .canonicalObjects = true,
+    };
+}
+
+ref<SourceAccessor> GitRepo::acquire(const std::filesystem::path & path, const SourcePath & source)
+{
+    struct Acquire : NodeVisitor<merkle::TreeEntry>
+    {
+        ref<GitRepoImpl> repo;
+        std::exception_ptr failure;
+        explicit Acquire(ref<GitRepoImpl> repo) : repo(std::move(repo)) {}
+        merkle::TreeEntry regular(const CanonPath &, function_ref<void(CreateRegularFileSink &)> read) override
+        {
+            struct File : CreateRegularFileSink
+            {
+                std::string contents;
+                merkle::Mode mode = merkle::Mode::Regular;
+                std::exception_ptr & failure;
+                File(std::exception_ptr & failure) : failure(failure) {}
+                void operator()(std::string_view bytes) override
+                {
+                    if (failure) std::rethrow_exception(failure);
+                    try { contents.append(bytes); }
+                    catch (...) { if (!failure) failure = std::current_exception(); throw; }
+                }
+                void isExecutable() override { mode = merkle::Mode::Executable; }
+            };
+            File file{failure};
+            read(file);
+            if (failure) std::rethrow_exception(failure);
+            git_oid oid;
+            if (git_odb_write(&oid, repo->odb.get(), file.contents.data(), file.contents.size(), GIT_OBJECT_BLOB))
+                throw GitError("creating an acquired regular blob");
+            return {file.mode, toHash(oid)};
+        }
+        merkle::TreeEntry symlink(const CanonPath &, const std::string & target) override
+        {
+            git_oid oid;
+            if (git_odb_write(&oid, repo->odb.get(), target.data(), target.size(), GIT_OBJECT_BLOB))
+                throw GitError("creating an acquired symlink blob");
+            return {merkle::Mode::Symlink, toHash(oid)};
+        }
+        merkle::TreeEntry directory(const CanonPath &, Children children) override
+        {
+            if (failure) std::rethrow_exception(failure);
+            try {
+                GitDirectorySinkImpl sink{*repo};
+                children.each([&](std::string_view name, bool, Visit visit) {
+                    if (failure) std::rethrow_exception(failure);
+                    sink.insertChild(name, visit(*this, false));
+                });
+                if (failure) std::rethrow_exception(failure);
+                return {merkle::Mode::Directory, std::move(sink).finalize()};
+            } catch (...) {
+                if (!failure) failure = std::current_exception();
+                throw;
+            }
+        }
+    } acquire{make_ref<GitRepoImpl>(path, tarballCacheOptions())};
+#if LIBGIT2_VERSION_CHECK(2, 0, 0)
+    if (git_repository_oid_type(*acquire.repo) != GIT_OID_SHA256)
+        throw Error("raw tree acquisition requires a SHA-256 Git repository");
+#else
+    throw Error("raw tree acquisition requires libgit2 2.0");
+#endif
+    acquire.repo->readPackDirOnlyOnce();
+    auto root = traverse(*source.accessor, source.path, defaultPathFilter, acquire);
+    if (acquire.failure)
+        std::rethrow_exception(acquire.failure);
+    auto display = source.to_string();
+    auto accessor = make_ref<GitSourceAccessor>(GitSourceAccessor::State{
+        .repo = acquire.repo,
+        .root = lookupObject(*acquire.repo, hashToOID(root.hash),
+                             root.mode == merkle::Mode::Directory ? GIT_OBJECT_TREE : GIT_OBJECT_BLOB),
+        .rootMode = root.mode,
+    });
+    accessor->setPathDisplay(std::move(display));
+    return accessor;
 }
 
 ref<SourceAccessor> GitRepoImpl::getAccessor(
@@ -1696,9 +1793,8 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
         return mentions;
     };
     if (options.exportIgnore && mentionsExportIgnore())
-        return make_ref<GitExportIgnoreSourceAccessor>(self, rawGitAccessor, rev);
-    else
-        return rawGitAccessor;
+        return ref<SourceAccessor>(make_ref<GitExportIgnoreSourceAccessor>(self, rawGitAccessor, rev));
+    return rawGitAccessor;
 }
 
 ref<SourceAccessor> GitRepoImpl::getAccessor(
@@ -1898,7 +1994,7 @@ struct GitRepoPoolImpl : GitRepoPool
     {
         auto handle = getRepo();
         git_oid oid;
-        if (git_blob_create_from_buffer(&oid, *handle, requireCString(target), target.size()))
+        if (git_odb_write(&oid, handle->odb.get(), requireCString(target), target.size(), GIT_OBJECT_BLOB))
             throw GitError("creating a blob object for symlink");
         return merkle::TreeEntry{.mode = merkle::Mode::Symlink, .hash = toHash(oid)};
     }
@@ -1998,36 +2094,26 @@ static std::filesystem::path tarballCacheDir()
      * v4: Every written directory has canonical logical names. The v3
      * writer admitted the reserved case-hack marker, so its objects cannot
      * establish the canonical provenance required by getKnownEntry. */
-    static auto repoDir = std::filesystem::path(getCacheDir()) / "tarball-cache-v4";
-    return repoDir;
+    return getCacheDir() / "tarball-cache-v4";
 }
 
-static GitRepo::Options tarballCacheOptions(const Settings & settings)
-{
-    return GitRepo::Options{
-        .create = true,
-        .bare = true,
-        .packfilesOnly = true,
-        /* Tarball unpacking is not expected to benefit from deltas much,
-           compared to how much CPU times it takes to find. */
-        .dontFindDeltas = true,
-        /* A tarball's tree identifier is then the store's name for it. */
-        .oidType = HashAlgorithm::SHA256,
-        .canonicalObjects = true,
-    };
-}
 
 ref<GitRepo> Settings::getTarballCache() const
 {
-    return GitRepo::openRepo(tarballCacheDir(), tarballCacheOptions(*this));
+    return GitRepo::openRepo(tarballCacheDir(), tarballCacheOptions());
 }
 
 ref<GitRepoPool> Settings::getTarballWriterPool() const
 {
-    return GitRepoPool::create(tarballCacheDir(), tarballCacheOptions(*this));
+    return GitRepoPool::create(tarballCacheDir(), tarballCacheOptions());
 }
 
 } // namespace fetchers
+
+ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
+{
+    return acquire(fetchers::tarballCacheDir(), source);
+}
 
 static Sync<std::map<std::filesystem::path, std::shared_ptr<const GitRepo::WorkdirInfo>>> workdirInfoCache_;
 

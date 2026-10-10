@@ -1,4 +1,5 @@
 #include "nix/fetchers/fetchers.hh"
+#include "nix/fetchers/git-utils.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/tree-traversal.hh"
@@ -279,29 +280,46 @@ void Input::checkLocks(Input specified, Input & result)
 
 std::pair<ref<SourceAccessor>, Input> Input::getAccessor(const Settings & settings, Store & store) const
 {
+    auto [source, result] = getAccessorChecked(settings, store, false);
+    return {std::move(source), std::move(result)};
+}
+
+std::pair<FixedSource, Input> Input::getFixedAccessor(const Settings & settings, Store & store) const
+{
+    auto [source, result] = getAccessorChecked(settings, store, true);
+    return {FixedSource{std::move(source)}, std::move(result)};
+}
+
+std::pair<ref<SourceAccessor>, Input> Input::getAccessorChecked(const Settings & settings, Store & store, bool requireFixed) const
+{
     try {
-        auto [accessor, result] = getAccessorUnchecked(settings, store);
+        auto [source, result] = getAccessorUnchecked(settings, store);
 
         result.attrs.insert_or_assign("__final", Explicit<bool>(true));
 
         checkLocks(*this, result);
 
-        /* Verify assertions against the rendered tree: `treeHash` by equality,
-           `narHash` through the shim. Named views can reuse this observation
-           at `mountInput`; unnamed worktrees must be observed again. Replace
+        if ((requireFixed || getTreeHash() || getNarHash()) && !source->isFixed()) {
+            source = GitRepo::acquire(SourcePath{source});
+            result.cachedFingerprint.emplace(std::nullopt);
+        }
+
+        /* Both assertions observe the acquired value: `treeHash` by equality,
+           `narHash` through the shim. Later naming and reads use that same
+           value, including when the producer was a live worktree. Replace
            `narHash` with the tree name (`mountInput` refuses `narHash`). */
         if (getTreeHash() || getNarHash()) {
             auto treeHash =
-                fetchToStore2(settings, store, SourcePath(accessor), FetchMode::DryRun, result.getName()).second;
+                fetchToStore2(settings, store, SourcePath(source), FetchMode::DryRun, result.getName()).second;
             if (auto locked = getTreeHash(); locked && *locked != treeHash)
                 throw inputHashMismatch("tree hash", to_string(), *locked, treeHash);
             if (auto asserted = getNarHash())
-                assertNarHash(settings, store, SourcePath(accessor), treeHash, *asserted, to_string());
+                assertNarHash(settings, store, SourcePath(source), treeHash, *asserted, to_string());
             result.attrs.erase("narHash");
             result.attrs.insert_or_assign("treeHash", treeHash.to_string(HashFormat::SRI, true));
         }
 
-        return {accessor, std::move(result)};
+        return {std::move(source), std::move(result)};
     } catch (Error & e) {
         e.addTrace({}, "while fetching the input '%s'", to_string());
         throw;
@@ -398,7 +416,7 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
     else
         result.cachedFingerprint = accessor->fingerprint;
 
-    return {accessor, std::move(result)};
+    return {std::move(accessor), std::move(result)};
 }
 
 Input Input::applyOverrides(std::optional<std::string> ref, std::optional<Hash> rev) const

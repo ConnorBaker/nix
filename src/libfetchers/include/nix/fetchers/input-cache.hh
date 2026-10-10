@@ -11,7 +11,7 @@ struct InputCache
 {
     struct CachedResult
     {
-        ref<SourceAccessor> accessor;
+        FixedSource accessor;
         Input resolvedInput;
         Input lockedInput;
         Attrs extraAttrs;
@@ -23,12 +23,13 @@ struct InputCache
     struct CachedInput
     {
         Input lockedInput;
-        ref<SourceAccessor> accessor;
+        FixedSource accessor;
         Attrs extraAttrs;
     };
 
     virtual std::optional<CachedInput> lookup(const Input & originalInput) const = 0;
 
+    /** The caller supplies the producer-owned fixed value promised by FixedSource. */
     virtual void upsert(Input key, CachedInput cachedInput) = 0;
 
     virtual void clear() = 0;

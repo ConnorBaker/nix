@@ -2287,6 +2287,8 @@ TEST_F(GitUtilsTest, exportIgnoreFilterIsLeftOutWhenNoSourceNamesIt)
     auto notAllowed = [](const CanonPath & path) { return RestrictedPathError("no"); };
     auto workdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {.exportIgnore = true}, notAllowed);
     auto rawWorkdir = repo->getAccessor(make_ref<const GitRepo::WorkdirInfo>(wd), {}, notAllowed);
+    EXPECT_FALSE(workdir->isFixed());
+    EXPECT_FALSE(rawWorkdir->isFixed());
     EXPECT_FALSE(typeid(*workdir) == typeid(*rawWorkdir));
     EXPECT_EQ(workdir->readDirectory(CanonPath::root), rawWorkdir->readDirectory(CanonPath::root));
     EXPECT_EQ(workdir->readFile(CanonPath("sub/a")), rawWorkdir->readFile(CanonPath("sub/a")));
@@ -2359,6 +2361,8 @@ TEST_F(GitUtilsTest, exportFilterConstructionRechecksExternalSourcesAfterAnImmut
     auto repo = openRepo();
     auto raw = repo->getAccessor(rev, {}, "");
     auto first = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_TRUE(raw->isFixed());
+    EXPECT_TRUE(first->isFixed());
     EXPECT_EQ(first->getFingerprint(CanonPath::root), raw->getFingerprint(CanonPath::root));
     Cache::Key key{"treeContainsAttribute", {{"rev", rev.gitRev()}, {"attribute", "export-ignore"}}};
     auto memo = cache->lookup(key);
@@ -2368,11 +2372,13 @@ TEST_F(GitUtilsTest, exportFilterConstructionRechecksExternalSourcesAfterAnImmut
     createDirs(attributes.parent_path());
     writeFile(attributes, "hide export-ignore\n");
     auto filtered = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_FALSE(filtered->isFixed());
     EXPECT_FALSE(filtered->pathExists(CanonPath("hide")));
     EXPECT_EQ(filtered->readFile(CanonPath("keep")), "visible");
     EXPECT_FALSE(filtered->getFingerprint(CanonPath::root));
     std::filesystem::remove(attributes);
     auto again = repo->getAccessor(rev, {.exportIgnore = true}, "", cache);
+    EXPECT_TRUE(again->isFixed());
     EXPECT_EQ(again->readFile(CanonPath("hide")), "conditionally visible");
     EXPECT_EQ(again->getFingerprint(CanonPath::root), raw->getFingerprint(CanonPath::root));
 }
@@ -2867,6 +2873,9 @@ TEST_F(GitUtilsTest, sharedRepositoryAttributeReadersAgreeAfterRefresh)
         views.emplace_back(repo->getAccessor(rev, {.exportIgnore = true, .smudgeLfs = true}, ""), true);
     }
     for (size_t phase = 0; phase < 2; ++phase) {
+        for (const auto & view : views) {
+            EXPECT_FALSE(view.first->isFixed());
+        }
         SCOPED_TRACE(phase);
         if (phase)
             writeFile(attributes, "[attr]hidden export-ignore\n# changed stamp, same rules\n");
@@ -3195,6 +3204,416 @@ TEST_F(GitUtilsTest, immutableBlobCallbacksMayReadTheSameAccessor)
     }
     EXPECT_EQ(cases, 12u);
     RecordProperty("finite_cases", cases);
+}
+
+TEST_F(GitUtilsTest, acquiredTreeRejectsSuppressedDirectoryFailures)
+{
+    enum class History { Escape, Return, Retry, Zero, Once, Twice, SuccessThenReturn };
+    enum class Shape { Root, NestedLast, NestedWithSibling };
+    struct Source : MemorySourceAccessor
+    {
+        History history;
+        CanonPath target;
+        unsigned callbacks = 0, reads = 0, siblingReads = 0;
+        Source(History history, CanonPath target) : history(history), target(std::move(target)) {}
+
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            if (path == CanonPath("/z")) {
+                ++siblingReads;
+                MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+                return;
+            }
+            ++reads;
+            if (reads == 2 && history == History::SuccessThenReturn)
+                throw Error("directory child producer failure");
+            if (reads == 1 && (history == History::Escape || history == History::Return || history == History::Retry))
+                throw Error("directory child producer failure");
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+
+        void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
+        {
+            if (path != target) {
+                MemorySourceAccessor::readDirectoryWithEntries(path, callback);
+                return;
+            }
+            if (history == History::Zero)
+                return;
+            auto invoke = [&] {
+                ++callbacks;
+                callback(*this, path, DirectoryListing(readDirectory(path)));
+            };
+            try { invoke(); }
+            catch (Error &) {
+                if (history == History::Escape)
+                    throw;
+                if (history == History::Return)
+                    return;
+                if (history != History::Retry)
+                    throw;
+            }
+            if (history == History::Twice)
+                addFile(target / "payload", "BBB");
+            if (history == History::Retry || history == History::Twice || history == History::SuccessThenReturn) {
+                try { invoke(); }
+                catch (Error &) {
+                    if (history != History::SuccessThenReturn)
+                        throw;
+                }
+            }
+        }
+    };
+
+    unsigned rejected = 0, completed = 0;
+    for (auto shape : {Shape::Root, Shape::NestedLast, Shape::NestedWithSibling})
+        for (auto history : {History::Escape, History::Return, History::Retry, History::Zero, History::Once, History::Twice, History::SuccessThenReturn}) {
+            SCOPED_TRACE(fmt("shape=%d history=%d", int(shape), int(history)));
+            auto repoPath = tmpDir / fmt("directory-result-%d-%d", int(shape), int(history));
+            auto target = shape == Shape::Root ? CanonPath::root : CanonPath("/nested");
+            auto file = target / "payload";
+            auto source = make_ref<Source>(history, target);
+            source->addFile(file, "AAA");
+            if (shape == Shape::NestedWithSibling)
+                source->addFile(CanonPath("/z"), "late sibling");
+            if (history == History::Once || history == History::Twice) {
+                auto acquired = GitRepo::acquire(repoPath, SourcePath{source});
+                auto expected = history == History::Twice ? "BBB" : "AAA";
+                EXPECT_EQ(acquired->readFile(file), expected);
+                auto reference = make_ref<MemorySourceAccessor>();
+                reference->addFile(file, expected);
+                if (shape == Shape::NestedWithSibling)
+                    reference->addFile(CanonPath("/z"), "late sibling");
+                EXPECT_EQ(acquired->getKnownEntry(CanonPath::root),
+                          std::optional{objectHashOf(*reference, CanonPath::root).root});
+                ++completed;
+            } else {
+                try {
+                    GitRepo::acquire(repoPath, SourcePath{source});
+                    ADD_FAILURE() << "failed or absent directory callback produced a root";
+                } catch (Error & error) {
+                    auto message = filterANSIEscapes(error.what(), true);
+                    EXPECT_THAT(message, ::testing::HasSubstr(
+                        history == History::Return || history == History::Zero
+                            ? "directory accessor did not produce a traversal result"
+                            : "directory child producer failure"));
+                    ++rejected;
+                }
+            }
+            auto count = history == History::Zero ? 0u : history == History::Retry || history == History::Twice || history == History::SuccessThenReturn ? 2u : 1u;
+            EXPECT_EQ(source->callbacks, count);
+            EXPECT_EQ(source->reads, history == History::Retry ? 1u : count);
+            EXPECT_EQ(source->siblingReads, shape == Shape::NestedWithSibling
+                && (history == History::Once || history == History::Twice) ? 1u : 0u);
+        }
+    EXPECT_EQ(rejected, 15u);
+    EXPECT_EQ(completed, 6u);
+    RecordProperty("finite_cells", rejected + completed);
+}
+
+/* Owned acquisition keeps bytes in its private mempack and never needs
+   a temporary blob file, even if the source obstructs objects while writing. */
+#ifndef _WIN32
+TEST_F(GitUtilsTest, acquiredTreeDoesNotSpillToTheObjectsDirectory)
+{
+    struct Source : MemorySourceAccessor
+    {
+        std::filesystem::path objects;
+        bool obstruct = true;
+        explicit Source(std::filesystem::path objects) : objects(std::move(objects)) {}
+        void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            if (!obstruct) {
+                MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+                return;
+            }
+            auto saved = objects;
+            saved += ".saved";
+            std::filesystem::rename(objects, saved);
+            Finally restore{[&] {
+                std::filesystem::remove(objects);
+                std::filesystem::rename(saved, objects);
+            }};
+            writeFile(objects, "a file obstructing the stream directory");
+            MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+        }
+    };
+    for (bool directory : {false, true}) {
+        SCOPED_TRACE(fmt("directory=%d", directory));
+        auto path = tmpDir / fmt("acquire-unspilled-%d", directory);
+        auto source = make_ref<Source>(path / "objects");
+        auto file = directory ? CanonPath("/payload") : CanonPath::root;
+        auto bytes = std::string(1024 * 1024 + 1, 'x');
+        bytes[bytes.size() / 2] = '\0';
+        source->addFile(file, std::string(bytes));
+        auto unspilled = GitRepo::acquire(path, SourcePath{source});
+        EXPECT_TRUE(std::filesystem::is_directory(path / "objects"));
+        EXPECT_FALSE(std::filesystem::exists(path / "objects.saved"));
+        source->obstruct = false;
+        auto expected = objectHashOf(*source, CanonPath::root).root;
+        auto restored = GitRepo::acquire(path, SourcePath{source});
+        source->root.reset();
+        for (auto acquired : {unspilled, restored}) {
+            EXPECT_EQ(acquired->getKnownEntry(CanonPath::root), std::optional{expected});
+            EXPECT_EQ(acquired->readFile(file), bytes);
+            EXPECT_EQ(acquired->lstat(CanonPath::root).type,
+                      directory ? SourceAccessor::tDirectory : SourceAccessor::tRegular);
+            EXPECT_FALSE(acquired->lstat(file).isExecutable);
+        }
+    }
+    RecordProperty("unspilled_shapes", 2u);
+    RecordProperty("restored_shapes", 2u);
+}
+
+TEST_F(GitUtilsTest, publicRegularSinkRetainsRealStreamFailures)
+{
+    auto path = tmpDir / "public-stream-failure";
+    auto repo = GitRepo::openRepo(path, {.create = true, .bare = true, .packfilesOnly = true,
+        .oidType = HashAlgorithm::SHA256, .canonicalObjects = true});
+    auto objects = path / "objects", saved = path / "objects.saved";
+    std::filesystem::rename(objects, saved);
+    Finally restore{[&] { std::filesystem::remove(objects); std::filesystem::rename(saved, objects); }};
+    writeFile(objects, "a file obstructing the stream directory");
+    auto sink = repo->makeRegularFileSink();
+    EXPECT_THAT(
+        [&] { (*sink)(std::string(1024 * 1024 + 1, 'x')); },
+        ::testing::ThrowsMessage<Error>(::testing::AllOf(
+            testing::HasSubstrIgnoreANSIMatcher("creating blob stream"),
+            testing::HasSubstrIgnoreANSIMatcher("Not a directory"),
+            testing::HasSubstrIgnoreANSIMatcher("objects"))));
+}
+#endif
+
+
+/* The writer observes completed raw bytes. ODB setup and owner phase may
+   change placement, never the framed identity or the readable contents. */
+TEST_F(GitUtilsTest, rawBlobBoundariesPreserveIdentityAndPublication)
+{
+    constexpr size_t boundary = 1 << 20;
+    size_t cases = 0, writes = 0, aborts = 0;
+    for (auto options : std::array{
+             GitRepo::Options{.oidType = HashAlgorithm::SHA1},
+             GitRepo::Options{.oidType = HashAlgorithm::SHA256},
+             GitRepo::Options{.oidType = HashAlgorithm::SHA256, .canonicalObjects = true}})
+        for (bool packOnly : {false, true})
+            for (unsigned phase : {0u, 1u, 2u})
+                for (size_t size : {size_t{0}, boundary, boundary + 1})
+                    for (unsigned chunks : {0u, 1u, 2u}) {
+                        SCOPED_TRACE(::testing::Message()
+                                     << printHashAlgo(options.oidType) << " canonical=" << options.canonicalObjects
+                                     << " packOnly=" << packOnly << " phase=" << phase
+                                     << " size=" << size << " chunks=" << chunks);
+                        options.create = options.bare = options.dontFindDeltas = true;
+                        options.packfilesOnly = packOnly;
+                        auto path = tmpDir / fmt("raw-blob-%d", cases++);
+                        AutoDelete cleanup(path, true);
+                        auto repo = GitRepo::openRepo(path, options);
+                        auto existing = options;
+                        existing.create = false;
+                        existing.oidType = options.oidType == HashAlgorithm::SHA1
+                                               ? HashAlgorithm::SHA256 : HashAlgorithm::SHA1;
+                        repo = GitRepo::openRepo(path, existing);
+                        std::optional<ref<GitRepoPool>> pool;
+                        if (phase)
+                            pool.emplace(GitRepoPool::create(path, existing));
+                        auto make = [&] {
+                            if (phase == 2)
+                                std::move(*(*pool)->makeDirectorySink()).finalize();
+                            return pool ? (*pool)->makeRegularFileSink() : repo->makeRegularFileSink();
+                        };
+                        auto flush = [&] {
+                            if (pool)
+                                (*pool)->flush();
+                            else
+                                repo->flush();
+                        };
+                        auto expected = [&](std::string_view bytes) {
+                            HashSink hash(options.oidType);
+                            merkle::feedHeader(hash, "blob", bytes.size());
+                            hash(bytes);
+                            return hash.finish().hash;
+                        };
+                        auto write = [&](std::string_view bytes) {
+                            auto file = make();
+                            if (chunks == 0) {
+                                if (!bytes.empty())
+                                    (*file)(bytes);
+                            } else if (chunks == 1) {
+                                (*file)({});
+                                for (size_t offset = 0; offset < bytes.size(); offset += 65535)
+                                    (*file)(bytes.substr(offset, std::min(size_t{65535}, bytes.size() - offset)));
+                                (*file)({});
+                            } else {
+                                auto split = std::min(boundary, bytes.size());
+                                (*file)(bytes.substr(0, split));
+                                (*file)({});
+                                (*file)(bytes.substr(split));
+                            }
+                            ++writes;
+                            return std::move(*file).finalize();
+                        };
+                        auto read = [&](GitRepo & from, const Hash & id, std::string_view bytes) {
+                            auto accessor = from.getAccessor(id, {}, "raw-blob");
+                            auto st = accessor->lstat(CanonPath::root);
+                            EXPECT_EQ(st.type, SourceAccessor::tRegular);
+                            EXPECT_FALSE(st.isExecutable);
+                            EXPECT_EQ(accessor->readFile(CanonPath::root), bytes);
+                            if (options.canonicalObjects)
+                                EXPECT_EQ(accessor->getKnownEntry(CanonPath::root),
+                                          (merkle::TreeEntry{merkle::Mode::Regular, id}));
+                            else
+                                EXPECT_FALSE(accessor->getKnownEntry(CanonPath::root));
+                        };
+                        std::string bytes(size, 'a');
+                        if (size)
+                            bytes[size / 2] = '\0';
+                        auto id = expected(bytes);
+                        EXPECT_EQ(write(bytes), id);
+                        EXPECT_EQ(id.algo, options.oidType);
+                        if (pool)
+                            EXPECT_FALSE(repo->hasObject(id)) << "a fresh pool blob is not published before flush";
+                        else
+                            read(*repo, id, bytes);
+                        EXPECT_EQ(write(bytes), id); // Existing object in the writer's mempack.
+                        flush();
+                        auto reopened = GitRepo::openRepo(path, existing);
+                        read(*reopened, id, bytes);
+                        EXPECT_EQ(write(bytes), id); // Existing object in the lower pack backend.
+                        flush();
+                        read(*GitRepo::openRepo(path, existing), id, bytes);
+
+                        if (chunks == 0 && size != boundary) {
+                            std::string abandoned(size ? size : 1, '!');
+                            auto abandonedId = expected(abandoned);
+                            EXPECT_THROW(([&] {
+                                auto file = make();
+                                (*file)(abandoned);
+                                throw std::runtime_error("producer failed after delivered bytes");
+                            })(), std::runtime_error);
+                            EXPECT_FALSE(repo->hasObject(abandonedId));
+                            auto healthy = expected("healthy control");
+                            auto control = pool ? (*pool)->makeRegularFileSink() : repo->makeRegularFileSink();
+                            (*control)("healthy control");
+                            ++writes;
+                            EXPECT_EQ(std::move(*control).finalize(), healthy);
+                            control.reset();
+                            flush();
+                            auto afterAbort = GitRepo::openRepo(path, existing);
+                            EXPECT_FALSE(afterAbort->hasObject(abandonedId));
+                            read(*afterAbort, healthy, "healthy control");
+                            ++aborts;
+                        }
+                    }
+    EXPECT_EQ(cases, 162u);
+    EXPECT_EQ(writes, 522u);
+    EXPECT_EQ(aborts, 36u);
+    RecordProperty("finite_inputs", cases);
+    RecordProperty("finalizations", writes);
+    RecordProperty("producer_aborts", aborts);
+}
+
+TEST_F(GitUtilsTest, symlinkBlobBytesPreserveIdentityAndRejectNul)
+{
+    size_t cases = 0, rejected = 0;
+    for (auto options : std::array{
+             GitRepo::Options{.oidType = HashAlgorithm::SHA1},
+             GitRepo::Options{.oidType = HashAlgorithm::SHA256},
+             GitRepo::Options{.oidType = HashAlgorithm::SHA256, .canonicalObjects = true}})
+        for (bool packOnly : {false, true})
+            for (bool dependent : {false, true}) {
+                options.create = options.bare = options.dontFindDeltas = true;
+                options.packfilesOnly = packOnly;
+                auto path = tmpDir / fmt("symlink-blob-%d", rejected);
+                AutoDelete cleanup(path, true);
+                auto repo = GitRepo::openRepo(path, options);
+                auto pool = GitRepoPool::create(path, options);
+                if (dependent)
+                    std::move(*pool->makeDirectorySink()).finalize();
+                EXPECT_THROW(pool->makeSymlink(std::string("a\0b", 3)), Error);
+                ++rejected;
+                std::vector<merkle::TreeEntry> links;
+                for (auto target : {std::string{}, std::string{"target"}, std::string((1 << 20) + 1, 'l')}) {
+                    SCOPED_TRACE(::testing::Message() << printHashAlgo(options.oidType)
+                                 << " packOnly=" << packOnly << " dependent=" << dependent
+                                 << " targetSize=" << target.size());
+                    auto link = pool->makeSymlink(target);
+                    EXPECT_EQ(link.mode, merkle::Mode::Symlink);
+                    EXPECT_EQ(link.hash.algo, options.oidType);
+                    EXPECT_EQ(link.hash, writeString(*pool, target).hash);
+                    links.push_back(link);
+                    ++cases;
+                }
+                auto tree = pool->makeDirectorySink();
+                for (size_t i = 0; i < links.size(); ++i)
+                    tree->insertChild(fmt("link-%d", cases - links.size() + i), links[i]);
+                auto root = std::move(*tree).finalize();
+                pool->flush();
+                auto accessor = GitRepo::openRepo(path, options)->getAccessor(root, {}, "symlink-blob");
+                auto first = cases - 3;
+                for (auto target : {std::string{}, std::string{"target"}, std::string((1 << 20) + 1, 'l')}) {
+                    auto name = CanonPath(fmt("link-%d", first++));
+                    EXPECT_EQ(accessor->lstat(name).type, SourceAccessor::tSymlink);
+                    EXPECT_EQ(accessor->readLink(name), target);
+                }
+            }
+    EXPECT_EQ(cases, 36u);
+    EXPECT_EQ(rejected, 12u);
+    RecordProperty("symlink_cells", cases);
+    RecordProperty("nul_rejections", rejected);
+}
+
+TEST_F(GitUtilsTest, acquiredRootModesRetainTheRenderedValue)
+{
+    using File = MemorySourceAccessor::File;
+    enum class Repository { Missing, SHA1, SHA256 };
+    unsigned cases = 0, rejected = 0;
+    for (auto repository : {Repository::Missing, Repository::SHA1, Repository::SHA256})
+        for (auto mode : {merkle::Mode::Directory, merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink}) {
+            SCOPED_TRACE(fmt("repository=%d mode=%d", int(repository), int(mode)));
+            auto source = make_ref<MemorySourceAccessor>();
+            EXPECT_FALSE(source->isFixed());
+            if (mode == merkle::Mode::Directory)
+                source->addFile(CanonPath("/payload"), "target");
+            else if (mode == merkle::Mode::Symlink)
+                source->root = File{File::Symlink{"target"}};
+            else
+                source->root = File{File::Regular{mode == merkle::Mode::Executable, "target"}};
+            auto expected = objectHashOf(*source, CanonPath::root).root;
+            auto stat = source->lstat(CanonPath::root);
+            StringSink before;
+            source->dumpPath(CanonPath::root, before);
+            auto repoPath = tmpDir / fmt("acquired-mode-%d-%d", int(repository), int(mode));
+            if (repository != Repository::Missing)
+                GitRepo::openRepo(repoPath, {.create = true, .bare = true, .packfilesOnly = true,
+                    .oidType = repository == Repository::SHA1 ? HashAlgorithm::SHA1 : HashAlgorithm::SHA256});
+            if (repository == Repository::SHA1) {
+                EXPECT_THAT(
+                    [&] { GitRepo::acquire(repoPath, SourcePath{source}); },
+                    ::testing::ThrowsMessage<Error>(testing::HasSubstrIgnoreANSIMatcher(
+                        "raw tree acquisition requires a SHA-256 Git repository")));
+                ++rejected;
+                continue;
+            }
+            auto acquired = GitRepo::acquire(repoPath, SourcePath{source});
+            source->root.reset();
+            EXPECT_TRUE(acquired->isFixed());
+            EXPECT_EQ(acquired->getKnownEntry(CanonPath::root), std::optional{expected});
+            auto observed = acquired->lstat(CanonPath::root);
+            EXPECT_EQ(observed.type, stat.type);
+            EXPECT_EQ(observed.isExecutable, stat.isExecutable);
+            if (mode == merkle::Mode::Symlink)
+                EXPECT_EQ(acquired->readLink(CanonPath::root), "target");
+            else
+                EXPECT_EQ(acquired->readFile(mode == merkle::Mode::Directory ? CanonPath("/payload") : CanonPath::root), "target");
+            StringSink after;
+            acquired->dumpPath(CanonPath::root, after);
+            EXPECT_EQ(after.s, before.s);
+            ++cases;
+        }
+    EXPECT_EQ(cases, 8u);
+    EXPECT_EQ(rejected, 4u);
+    RecordProperty("root_modes", cases);
+    RecordProperty("rejected_repository_types", rejected);
 }
 
 } // namespace nix::fetchers

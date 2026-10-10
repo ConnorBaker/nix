@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # The overlay owns its database's auxiliary values and only the upper
-# layer's legacy cache files. Collection drops dead projections without
+# layer's ingestion leases. Collection drops dead projections without
 # touching lower files, hiding them with whiteouts, or changing live bytes.
 
 set -eu -o pipefail
@@ -22,15 +22,12 @@ lowerObjects="$storeA/nix/store/.objects"
 upperObjects="$storeBTop/.objects"
 mergedObjects="$storeBRoot/nix/store/.objects"
 
-# New ingestions no longer create loose auxiliary files. Plant a malformed
-# legacy lower tree explicitly: upper cleanup must neither parse nor remove
-# it, and removing a duplicate upper file must reveal this lower file.
-legacyId=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-upperOnlyId=cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
-duplicateRelative="trees/aa/$legacyId"
-upperOnlyRelative="blobs/cc/$upperOnlyId"
+# Plant dead lease pins in both layers. Upper cleanup must leave the lower
+# pin visible after removing the duplicate upper pin, without a whiteout.
+duplicateRelative="tmp/hold-4242-1/pin"
+upperOnlyRelative="tmp/hold-4242-2/pin"
 mkdir -p "$(dirname "$lowerObjects/$duplicateRelative")" "$storeA/nix/store/.links"
-printf 'malformed legacy tree\n' > "$lowerObjects/$duplicateRelative"
+printf 'lower lease pin\n' > "$lowerObjects/$duplicateRelative"
 printf 'lower legacy link fixture\n' > "$storeA/nix/store/.links/legacy"
 mountOverlayfs
 
@@ -95,13 +92,13 @@ liveInode=$(stat --format=%i "$liveUpper/g")
 
 mkdir -p "$(dirname "$upperObjects/$duplicateRelative")" "$(dirname "$upperObjects/$upperOnlyRelative")"
 cp "$lowerObjects/$duplicateRelative" "$upperObjects/$duplicateRelative"
-printf 'upper-only legacy target\n' > "$upperObjects/$upperOnlyRelative"
+printf 'upper-only lease pin\n' > "$upperObjects/$upperOnlyRelative"
 remountOverlayfs
 cmp "$lowerObjects/$duplicateRelative" "$upperObjects/$duplicateRelative"
 test -e "$mergedObjects/$upperOnlyRelative"
 
-# Snapshot the lower legacy fixture and any retained lease files. The
-# explicit malformed tree makes the preservation checks non-vacuous.
+# Snapshot the lower lease fixture. Its explicit pin makes the
+# preservation checks non-vacuous.
 lowerBefore="$TEST_ROOT/lower-objects-before"
 listObjects "$lowerObjects" > "$lowerBefore"
 test -s "$lowerBefore"
@@ -135,6 +132,9 @@ expect 1 test -e "$upperObjects/$duplicateRelative"
 expect 1 test -e "$upperObjects/$upperOnlyRelative"
 expect 1 test -e "$mergedObjects/$upperOnlyRelative"
 test -e "$mergedObjects/$duplicateRelative"
+cmp "$lowerObjects/$duplicateRelative" "$mergedObjects/$duplicateRelative"
+expect 1 test -e "$(dirname "$upperObjects/$duplicateRelative")"
+expect 1 test -e "$(dirname "$upperObjects/$upperOnlyRelative")"
 
 # No whiteout under `.objects`: a whiteout is a character device in the
 # upper layer, which an unlink through the merged mount of a file the lower

@@ -376,7 +376,7 @@ static Flake getFlake(
     auto lockedRef = FlakeRef(std::move(cachedInput.lockedInput), subdir);
 
     // Parse/eval flake.nix to get at the input.self attributes.
-    auto flake = readFlake(state, originalRef, resolvedRef, lockedRef, {cachedInput.accessor}, lockRootAttrPath);
+    auto flake = readFlake(state, originalRef, resolvedRef, lockedRef, {cachedInput.accessor.accessor}, lockRootAttrPath);
 
     // Re-fetch the tree if necessary.
     auto newLockedRef = applySelfAttrs(lockedRef, flake);

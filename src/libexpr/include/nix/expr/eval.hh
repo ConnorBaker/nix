@@ -46,6 +46,7 @@ enum struct FetchMode;
 namespace fetchers {
 struct Settings;
 struct InputCache;
+struct FixedSource;
 struct Input;
 } // namespace fetchers
 struct EvalSettings;
@@ -647,10 +648,10 @@ public:
     /**
      * Mount an input on the Nix store.
      *
-     * @param input The locked input `Input::getAccessor` returned with
-     * `accessor`: verified, carrying no `narHash`.  Its `treeHash` is set.
+     * @param input The locked input `Input::getFixedAccessor` returned with
+     * `source`: verified, carrying no `narHash`. Its `treeHash` is set here.
      */
-    StorePath mountInput(fetchers::Input & input, ref<SourceAccessor> accessor);
+    StorePath mountInput(fetchers::Input & input, fetchers::FixedSource source);
 
     /**
      * Parse a Nix expression from the specified file.

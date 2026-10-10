@@ -925,16 +925,7 @@ void LocalStore::sweepObjects()
 
 void LocalStore::sweepObjectStore()
 {
-    reportSweep(objects.sweep());
-}
-
-void LocalStore::reportSweep(const GitObjectStore::SweepStats & swept)
-{
-    if (swept.treesRemoved || swept.blobsRemoved)
-        printInfo(
-            "removed %d legacy auxiliary files (%d trees)",
-            swept.treesRemoved + swept.blobsRemoved,
-            swept.treesRemoved);
+    objects.sweep();
 }
 
 void LocalStore::autoGC(bool sync)

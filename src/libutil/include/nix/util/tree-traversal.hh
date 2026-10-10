@@ -203,7 +203,8 @@ Result traverse(
                         };
                         result = visitor.directory(to, {children, true, mayFork});
                     });
-                assert(result);
+                if (!result)
+                    throw Error("directory accessor did not produce a traversal result");
                 return std::move(*result);
             }
 

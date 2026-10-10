@@ -27,11 +27,6 @@
 
 namespace nix {
 
-GitObjectStore::GitObjectStore(std::filesystem::path dir)
-    : dir(std::move(dir))
-{
-}
-
 Hash GitObjectStore::blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize)
 {
     merkle::ObjectHasher hasher{"blob", observedSize};
@@ -45,17 +40,6 @@ std::filesystem::path GitObjectStore::Hold::tempPath(std::string_view kind) cons
     static std::atomic<uint32_t> counter(0);
     return directory()
            / fmt("%s-%d-%d-%d", kind, static_cast<long long>(time(nullptr)), getpid(), counter.fetch_add(1));
-}
-
-/* The creation second carried by a retired flat temporary name, if present. */
-static std::optional<time_t> tempTime(std::string_view name)
-{
-    auto parts = tokenizeString<std::vector<std::string>>(name, "-");
-    if (parts.size() != 4)
-        return std::nullopt;
-    if (auto t = string2Int<long long>(parts[1]))
-        return static_cast<time_t>(*t);
-    return std::nullopt;
 }
 
 static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
@@ -632,10 +616,6 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
 
     /* Keep our own witness on both miss and reuse: GC may remove the donor
        before registration. The row remains private until publication. */
-    if (entered && failPlaceWithNoSpace && failPlaceWithNoSpace(where)) {
-        printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
-        return std::nullopt;
-    }
     auto row = rowOf(id, executable, after, where, hold);
     auto other = hold.addRow(std::move(row));
     if (other) {
@@ -723,13 +703,6 @@ std::map<std::string, merkle::TreeEntry> GitObjectStore::parseTreeBody(const Has
     }
 }
 
-/* Legacy caches are no longer a readable representation. Descend only the
-   fixed kind/shard shape; an unexpected directory is an opaque occupant. */
-static bool isShardName(std::string_view name)
-{
-    return name.size() == 2 && name.find_first_not_of("0123456789abcdef") == name.npos;
-}
-
 static bool isHoldName(std::string_view name)
 {
     if (!name.starts_with("hold-"))
@@ -741,11 +714,10 @@ static bool isHoldName(std::string_view name)
            && name.substr(split + 1).find_first_not_of("0123456789") == name.npos;
 }
 
-GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
+uint64_t GitObjectStore::sweep(const Owned * owned)
 {
-    SweepStats stats;
+    uint64_t holds = 0;
     const auto & sweptDir = owned ? owned->dir : dir;
-    constexpr std::array<std::string_view, 3> kinds{"blobs", "blobs-x", "trees"};
     auto removed = [&] {
         if (owned)
             owned->removed();
@@ -754,13 +726,13 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
     auto root = openDirectory(sweptDir, FinalSymlink::DontFollow);
     if (!root) {
         if (errno == ENOENT || errno == ENOTDIR || errno == ELOOP)
-            return stats;
-        throw SysError("opening legacy object namespace %s", PathFmt(sweptDir));
+            return holds;
+        throw SysError("opening ingestion namespace %s", PathFmt(sweptDir));
     }
     auto openChild = [&](Descriptor parent, const char * name) {
         AutoCloseFD fd{openat(parent, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
         if (!fd && errno != ENOENT && errno != ENOTDIR && errno != ELOOP)
-            throw SysError("opening legacy object directory '%s'", name);
+            throw SysError("opening ingestion directory '%s'", name);
         return fd;
     };
     auto remove = [&](Descriptor parent, const char * name, bool directory) {
@@ -772,38 +744,13 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
             return false;
         if (directory && (errno == ENOTEMPTY || errno == EEXIST))
             return false;
-        throw SysError("removing legacy object '%s'", name);
+        throw SysError("removing ingestion entry '%s'", name);
     };
     auto scan = [&](AutoCloseFD fd, auto && visit) {
-        scanObjectDirectory(std::move(fd), "legacy object directory", [&](Descriptor parent, const char * name) {
+        scanObjectDirectory(std::move(fd), "ingestion directory", [&](Descriptor parent, const char * name) {
             checkInterrupt();
             visit(parent, name);
         });
-    };
-    auto cleanKind = [&](Descriptor parent, const char * kind, uint64_t * count) {
-        auto fd = openChild(parent, kind);
-        if (!fd)
-            return;
-        scan(std::move(fd), [&](Descriptor kindFd, const char * name) {
-            auto st = maybeLstat(name, kindFd);
-            if (!st)
-                return;
-            if (S_ISDIR(st->st_mode)) {
-                if (!isShardName(name))
-                    return;
-                auto shard = openChild(kindFd, name);
-                if (!shard)
-                    return;
-                scan(std::move(shard), [&](Descriptor shardFd, const char * leaf) {
-                    auto leafSt = maybeLstat(leaf, shardFd);
-                    if (leafSt && !S_ISDIR(leafSt->st_mode) && remove(shardFd, leaf, false) && count)
-                        ++*count;
-                });
-                remove(kindFd, name, true);
-            } else if (remove(kindFd, name, false) && count)
-                ++*count;
-        });
-        remove(parent, kind, true);
     };
     auto tmp = openChild(root.get(), "tmp");
     if (tmp) {
@@ -813,18 +760,11 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
             if (mergedRoot)
                 mergedTmp = openChild(mergedRoot.get(), "tmp");
         }
-        auto now = time(nullptr);
         scan(std::move(tmp), [&](Descriptor tmpFd, const char * name) {
             auto st = maybeLstat(name, tmpFd);
             if (!st)
                 return;
-            if (!S_ISDIR(st->st_mode)) {
-                auto made = tempTime(name).value_or(st->st_ctime);
-                if (now - made > 3600)
-                    remove(tmpFd, name, false);
-                return;
-            }
-            if (!isHoldName(name))
+            if (!S_ISDIR(st->st_mode) || !isHoldName(name))
                 return;
             auto held = openChild(tmpFd, name);
             if (!held)
@@ -836,7 +776,7 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
                 merged = openChild(mergedTmp.get(), name);
             auto lockFd = owned ? (merged ? merged.get() : -1) : held.get();
             if (lockFd == -1 || !lockFile(lockFd, ltWrite, false)) {
-                ++stats.holds;
+                ++holds;
                 return;
             }
             auto heldStat = nix::fstat(held.get());
@@ -844,66 +784,34 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
             if (!current || current->st_ino != heldStat.st_ino || current->st_dev != heldStat.st_dev)
                 return;
             try {
-                if (failHoldRemoval && failHoldRemoval(dir / "tmp" / name))
-                    throw SysError(ENOTEMPTY, "cannot remove ingestion lease '%s'", name);
-                for (auto kind : kinds)
-                    cleanKind(held.get(), kind.data(), nullptr);
-                /* Regular coalescing pins and old flat temporary links are
-                   leaves. Unknown directories are retained, not recursed. */
+                /* Pins are leaves. Unknown directories are retained, not recursed. */
                 scan(dupDescriptor(held.get()), [&](Descriptor holdFd, const char * leaf) {
                     auto leafSt = maybeLstat(leaf, holdFd);
                     if (leafSt && !S_ISDIR(leafSt->st_mode))
                         remove(holdFd, leaf, false);
                 });
                 if (!remove(tmpFd, name, true) && maybeLstat(name, tmpFd))
-                    ++stats.holds;
+                    ++holds;
             } catch (SystemError & e) {
                 printInfo("cannot remove the ingestion lease '%s': %s", name, e.msg());
-                ++stats.holds;
+                ++holds;
             }
         });
     }
-    for (auto kind : kinds)
-        cleanKind(root.get(), kind.data(), kind == "trees" ? &stats.treesRemoved : &stats.blobsRemoved);
 #else
-    /* Keep the existing portable no-follow metadata/directory operations on
-       Windows. No publisher uses these legacy names after the transition. */
+    /* Windows retains its existing portable namespace operations. */
     auto root = maybeLstat(sweptDir);
     if (!root || !S_ISDIR(root->st_mode))
-        return stats;
+        return holds;
     auto remove = [&](const std::filesystem::path & path) {
         std::error_code ec;
         bool didRemove = std::filesystem::remove(path, ec);
         if (ec && ec != std::errc::no_such_file_or_directory && ec != std::errc::not_a_directory
             && ec != std::errc::directory_not_empty)
-            throw SystemError(ec, "removing legacy object %s", PathFmt(path));
+            throw SystemError(ec, "removing ingestion entry %s", PathFmt(path));
         if (didRemove)
             removed();
         return didRemove;
-    };
-    auto cleanKind = [&](const std::filesystem::path & path, uint64_t * count) {
-        auto st = maybeLstat(path);
-        if (!st || !S_ISDIR(st->st_mode))
-            return;
-        for (auto & entry : DirectoryIterator{path}) {
-            checkInterrupt();
-            auto observed = maybeLstat(entry.path());
-            if (!observed)
-                continue;
-            if (S_ISDIR(observed->st_mode)) {
-                if (!isShardName(entry.path().filename().string()))
-                    continue;
-                for (auto & leaf : DirectoryIterator{entry.path()}) {
-                    checkInterrupt();
-                    auto leafSt = maybeLstat(leaf.path());
-                    if (leafSt && !S_ISDIR(leafSt->st_mode) && remove(leaf.path()) && count)
-                        ++*count;
-                }
-                remove(entry.path());
-            } else if (remove(entry.path()) && count)
-                ++*count;
-        }
-        remove(path);
     };
     auto tmp = sweptDir / "tmp";
     if (auto st = maybeLstat(tmp); st && S_ISDIR(st->st_mode))
@@ -913,23 +821,14 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
             if (!st)
                 continue;
             auto name = entry.path().filename().string();
-            if (!S_ISDIR(st->st_mode)) {
-                if (time(nullptr) - tempTime(name).value_or(st->st_ctime) > 3600)
-                    remove(entry.path());
-                continue;
-            }
-            if (!isHoldName(name))
+            if (!S_ISDIR(st->st_mode) || !isHoldName(name))
                 continue;
             auto held = openDirectory(dir / "tmp" / name, FinalSymlink::DontFollow);
             if (!held || !lockFile(held.get(), ltWrite, false)) {
-                ++stats.holds;
+                ++holds;
                 continue;
             }
             try {
-                if (failHoldRemoval && failHoldRemoval(dir / "tmp" / name))
-                    throw SysError(ENOTEMPTY, "cannot remove ingestion lease '%s'", name);
-                for (auto kind : kinds)
-                    cleanKind(entry.path() / kind, nullptr);
                 for (auto & leaf : DirectoryIterator{entry.path()}) {
                     checkInterrupt();
                     auto leafSt = maybeLstat(leaf.path());
@@ -937,16 +836,14 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
                         remove(leaf.path());
                 }
                 if (!remove(entry.path()) && maybeLstat(entry.path()))
-                    ++stats.holds;
+                    ++holds;
             } catch (SystemError & e) {
                 printInfo("cannot remove the ingestion lease '%s': %s", name, e.msg());
-                ++stats.holds;
+                ++holds;
             }
         }
-    for (auto kind : kinds)
-        cleanKind(sweptDir / kind, kind == "trees" ? &stats.treesRemoved : &stats.blobsRemoved);
 #endif
-    return stats;
+    return holds;
 }
 
 } // namespace nix

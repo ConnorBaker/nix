@@ -64,6 +64,13 @@ public:
 
     virtual ~SourceAccessor() {}
 
+    /** True promises a producer-owned fixed rendered value: successful
+     * observations preserve bytes, modes, children and link targets for this
+     * owner's lifetime. Availability errors remain possible. False declines
+     * this promise; fingerprints and concurrent traversal do not imply it.
+     * The classification is stable and observes no external source or callback. */
+    virtual bool isFixed() { return false; }
+
     /** Whether sibling traversal reads and naming observations may run
      * concurrently and out of order. This permits neither retaining a
      * scoped accessor nor assuming an immutable filesystem snapshot.

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nix/fetchers/filtering-source-accessor.hh"
+#include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/merkle-tar-adapter.hh"
 
 #include <memory>
@@ -111,6 +112,10 @@ struct GitRepo
         const GitAccessorOptions & options,
         std::string displayPrefix,
         std::shared_ptr<fetchers::Cache> cache = nullptr) = 0;
+
+    /** Acquire the rendered value into a fresh, private canonical SHA-256 ODB. */
+    static ref<SourceAccessor> acquire(const std::filesystem::path & path, const SourcePath & source);
+    static ref<SourceAccessor> acquire(const SourcePath & source);
 
     /** Retains a fixed workdir observation; callers must not mutate it through another alias. */
     virtual ref<SourceAccessor> getAccessor(

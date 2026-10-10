@@ -2238,17 +2238,17 @@ StorePath LocalStore::addToStoreFromDump(
 
     bool methodsMatch = static_cast<FileIngestionMethod>(dumpMethod) == ingestionMethod;
 
-    /* The dump's hash is the content address only when the methods match;
-       under the git method the sink's root is, and the dump is not hashed. */
+    /* Matching methods hash the transport; NAR under Flat/Text hashes only
+       its regular root contents. Git uses the restore's typed root. */
     std::optional<HashSink> hashSink;
-    if (methodsMatch)
+    if (methodsMatch || ingestionMethod == FileIngestionMethod::Flat)
         hashSink.emplace(hashAlgo);
     std::optional<PathRefScanSink> refSink;
     if (filterReferences)
         // Only scan if we really need to, since it's slower.
         refSink = PathRefScanSink::fromPaths(originalReferences);
     LambdaSink tap{[&](std::string_view data) {
-        if (hashSink)
+        if (methodsMatch)
             (*hashSink)(data);
         if (refSink)
             (*refSink)(data);
@@ -2300,7 +2300,8 @@ StorePath LocalStore::addToStoreFromDump(
                 });
         };
         return restoreThroughObjects(
-            path, std::ref(produce), localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get(), *hold, repair);
+            path, std::ref(produce), localSettings.fsyncStorePaths, canonicalisingRestoreHooks.get(), *hold, repair,
+            !methodsMatch && hashSink ? &*hashSink : nullptr);
     };
 
     if (!inMemoryAndDontNeedRestore) {
@@ -2330,7 +2331,9 @@ StorePath LocalStore::addToStoreFromDump(
        regular root has the blob ID as its object hash, without a projection. */
     auto desc = ContentAddressWithReferences::fromParts(
         hashMethod,
-        methodsMatch                 ? hashSink->finish().hash
+        hashSink && (methodsMatch || restored->root.mode == merkle::Mode::Regular
+                     || restored->root.mode == merkle::Mode::Executable)
+            ? hashSink->finish().hash
         : inMemoryAndDontNeedRestore ? merkle::blobId(dump)
         : (restored && ingestionMethod == FileIngestionMethod::Git)
             ? merkle::objectHash(restored->root)

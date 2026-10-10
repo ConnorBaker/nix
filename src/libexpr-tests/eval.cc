@@ -7,12 +7,18 @@
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetchers.hh"
+#include "nix/fetchers/git-utils.hh"
+#include "nix/fetchers/fetch-settings.hh"
 #include "nix/store/local-store.hh"
 #include "nix/util/archive.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
 #include "nix/util/environment-variables.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/util/object-hash-sink.hh"
+#include "nix/util/tests/setting-scopes.hh"
+#include "nix/util/tests/gmock-matchers.hh"
+#include "nix/util/url.hh"
 
 namespace nix {
 
@@ -179,7 +185,7 @@ TEST(nix_isAllowedURI, non_scheme_colon)
     ASSERT_FALSE(isAllowedURI("https://foo/bar:baz", allowed));
 }
 
-class EvalStateTest : public LibExprTest
+class EvalStateTest : private FreshCacheHome, public LibExprTest
 {};
 
 TEST_F(EvalStateTest, parserContainersReleaseAllStorageWithTheEvaluator)
@@ -355,8 +361,13 @@ TEST_F(EvalStateTest, mountInputInvalidatesPreviouslyObservedStoreNodes)
                         EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
                         EXPECT_FALSE(nested.rootFS->getFingerprint(logical));
                     }
-                    EXPECT_EQ(nested.mountInput(input, mounted), storePath);
-                    EXPECT_EQ(nested.rootFS->getFingerprint(logical), mounted->getFingerprint(CanonPath::root));
+                    auto fixedMounted = fetchers::FixedSource{GitRepo::acquire(SourcePath{mounted})};
+                    EXPECT_FALSE(mounted->isFixed());
+                    EXPECT_TRUE(fixedMounted.accessor->isFixed());
+                    EXPECT_EQ(nested.mountInput(input, fixedMounted), storePath);
+                    EXPECT_FALSE(nested.storeFS->isFixed());
+                    EXPECT_FALSE(nested.rootFS->isFixed());
+                    EXPECT_EQ(nested.rootFS->getFingerprint(logical), fixedMounted.accessor->getFingerprint(CanonPath::root));
                     auto expectedStat = mounted->lstat(CanonPath::root);
                     auto actualStat = nested.rootFS->lstat(logical);
                     EXPECT_EQ(actualStat.type, expectedStat.type);
@@ -372,8 +383,9 @@ TEST_F(EvalStateTest, mountInputInvalidatesPreviouslyObservedStoreNodes)
                     /* The public fetch route also preserves the first mount. */
                     auto repeated = make_ref<MemorySourceAccessor>();
                     repeated->root = mounted->root;
-                    EXPECT_EQ(nested.mountInput(input, repeated), storePath);
-                    EXPECT_EQ(nested.storeFS->getMount(logical).get(), mounted.get_ptr().get());
+                    auto fixedRepeated = fetchers::FixedSource{GitRepo::acquire(SourcePath{repeated})};
+                    EXPECT_EQ(nested.mountInput(input, fixedRepeated), storePath);
+                    EXPECT_EQ(nested.storeFS->getMount(logical).get(), fixedMounted.accessor.get_ptr().get());
                 }
     }
 }
@@ -430,7 +442,8 @@ TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupan
                 if (relocated)
                     writeTree(other, std::filesystem::path(logical.abs()));
 
-                EXPECT_EQ(nested.mountInput(input, tree), path);
+                auto fixedTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{tree})};
+                EXPECT_EQ(nested.mountInput(input, fixedTree), path);
                 Value value;
                 nested.evalFile(nested.storePath(path) / "default.nix", value);
                 nested.forceValue(value, noPos);
@@ -465,10 +478,10 @@ TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupan
                 setEnv("_NIX_TEST_FREE_SPACE_FILE", (root.path() / "missing-free-space").string().c_str());
                 EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
 
-                /* Fresh evaluation reads remain live. The opaque context denotes
-                   the already-present object, whose validity needs no new hash. */
+                /* Evaluation retains the acquired value. Later witness mutation
+                   changes neither its reads nor its opaque named context. */
                 tree->addFile(CanonPath("default.nix"), "99");
-                EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "99");
+                EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "42");
                 EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
                 EXPECT_TRUE(local->isValidPath(path));
             }
@@ -521,7 +534,8 @@ TEST_F(EvalStateTest, mountedInputsPreserveFallbackBoundariesAndSymlinkEscapes)
         auto logical = CanonPath(local->printStorePath(path));
         createDirs(std::filesystem::path(logical.abs()) / "blocked");
         writeFile(std::filesystem::path(logical.abs()) / "blocked/hidden", "host-only");
-        EXPECT_EQ(nested.mountInput(input, tree), path);
+        auto fixedTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{tree})};
+        EXPECT_EQ(nested.mountInput(input, fixedTree), path);
         EXPECT_FALSE(nested.rootFS->pathExists(logical / CanonPath("blocked/hidden")));
         fallback();
 
@@ -552,7 +566,7 @@ TEST_F(EvalStateTest, mountedInputsPromoteEveryLogicalAncestorKind)
 {
     using File = MemorySourceAccessor::File;
     enum class Mode { Impure, Restricted, Pure };
-    size_t serial = 0;
+    size_t serial = 0, namedAncestors = 0;
     for (bool atStoreDir : {false, true})
         for (unsigned kind = 0; kind != 5; ++kind) {
             SCOPED_TRACE(fmt("storeDir=%d kind=%d", atStoreDir, kind));
@@ -592,7 +606,8 @@ TEST_F(EvalStateTest, mountedInputsPromoteEveryLogicalAncestorKind)
                 tree->addFile(CanonPath("default.nix"), "42");
                 fetchers::Input input;
                 input.attrs.insert_or_assign("name", fmt("mount-ancestor-%d", serial++));
-                auto path = nested.mountInput(input, tree);
+                auto fixedTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{tree})};
+                auto path = nested.mountInput(input, fixedTree);
                 auto logical = CanonPath(local->printStorePath(path));
                 auto ancestor = CanonPath(blocker.string());
                 EXPECT_EQ(nested.rootFS->lstat(ancestor).type, SourceAccessor::tDirectory);
@@ -610,7 +625,17 @@ TEST_F(EvalStateTest, mountedInputsPromoteEveryLogicalAncestorKind)
                 EXPECT_THROW(nested.rootFS->readLink(ancestor), Error);
                 EXPECT_FALSE(nested.rootFS->getPhysicalPath(ancestor));
                 EXPECT_FALSE(nested.rootFS->getKnownEntry(ancestor));
-                EXPECT_FALSE(nested.rootFS->getFingerprint(ancestor));
+                auto identity = nested.rootFS->getFingerprint(ancestor);
+                EXPECT_EQ(bool(identity), mode != Mode::Pure && kind >= 1 && kind <= 3);
+                namedAncestors += bool(identity);
+                auto expected = make_ref<MemorySourceAccessor>();
+                expected->addFile(CanonPath(atStoreDir ? path.to_string() : "store/" + path.to_string()) / "default.nix", "42");
+                if (keepsSibling)
+                    expected->addFile(CanonPath("/outside"), "surviving directory sibling");
+                StringSink rendered, expectedNar;
+                nested.rootFS->dumpPath(ancestor, rendered);
+                expected->dumpPath(CanonPath::root, expectedNar);
+                EXPECT_EQ(rendered.s, expectedNar.s);
                 auto expression = nested.storePath(path) / "default.nix";
                 EXPECT_EQ(expression.resolveSymlinks().path, logical / "default.nix");
                 EXPECT_EQ(expression.resolveSymlinks().readFile(), "42");
@@ -620,6 +645,11 @@ TEST_F(EvalStateTest, mountedInputsPromoteEveryLogicalAncestorKind)
                 EXPECT_THAT(value, IsIntEq(42));
             }
         }
+    EXPECT_EQ(serial, 30u);
+    EXPECT_EQ(namedAncestors, 12u);
+    EXPECT_EQ(serial - namedAncestors, 18u);
+    RecordProperty("named_ancestors", namedAncestors);
+    RecordProperty("unnamed_ancestors", serial - namedAncestors);
 }
 
 TEST_F(EvalStateTest, parsedFilesReleaseTheirSourceWithTheEvaluator)
@@ -810,7 +840,8 @@ TEST_F(EvalStateTest, mountingPreservesEvaluationMemoizationUntilExplicitReset)
             EXPECT_THAT(earlier, IsIntEq(7));
         }
 
-        EXPECT_EQ(nested.mountInput(input, tree), path);
+        auto fixedTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{tree})};
+        EXPECT_EQ(nested.mountInput(input, fixedTree), path);
         EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "42");
         if (lookup)
             EXPECT_THROW(nested.findFile("mounted/default.nix"), ThrownError);
@@ -860,6 +891,41 @@ struct CopyRequestSource : MemorySourceAccessor
     }
 };
 
+struct ObservedInputScheme : fetchers::InputScheme
+{
+    std::shared_ptr<CopyRequestSource> source;
+    std::optional<fetchers::Input> inputFromURL(const ParsedURL &, bool) const override { return {}; }
+    std::optional<fetchers::Input> inputFromAttrs(const fetchers::Attrs & attrs) const override
+    {
+        fetchers::Input input;
+        input.attrs = attrs;
+        return input;
+    }
+    std::string_view schemeName() const override { return "observed-test"; }
+    std::string schemeDescription() const override { return "mutable test input"; }
+    const std::map<std::string, AttributeInfo> & schemeAttrs() const override
+    {
+        static const std::map<std::string, AttributeInfo> attrs;
+        return attrs;
+    }
+    ParsedURL toURL(const fetchers::Input &) const override { return parseURL("observed-test://source"); }
+    std::pair<ref<SourceAccessor>, fetchers::Input>
+    getAccessor(const fetchers::Settings &, Store &, const fetchers::Input & input) const override
+    {
+        return {ref<SourceAccessor>{source}, input};
+    }
+};
+
+static std::shared_ptr<ObservedInputScheme> observedInputScheme()
+{
+    static auto scheme = [] {
+        auto scheme = std::make_shared<ObservedInputScheme>();
+        fetchers::registerInputScheme(std::shared_ptr<fetchers::InputScheme>(scheme));
+        return scheme;
+    }();
+    return scheme;
+}
+
 static StorePath evalCopiedPath(EvalState & state, std::string expression)
 {
     Value value;
@@ -869,6 +935,103 @@ static StorePath evalCopiedPath(EvalState & state, std::string expression)
 }
 
 } // namespace
+
+TEST_F(EvalStateTest, fetchedAssertionsReadsAndCopiesDenoteOneObservedValue)
+{
+    EnableExperimentalFeature fetchTree{"fetch-tree"};
+    auto scheme = observedInputScheme();
+    Finally clearSource{[&] { scheme->source.reset(); }};
+    auto oracle = make_ref<MemorySourceAccessor>();
+    oracle->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+    auto treeA = objectHashOf(*oracle, CanonPath::root).root.hash.to_string(HashFormat::SRI, true);
+    auto narOf = [&] {
+        HashSink sink{HashAlgorithm::SHA256};
+        oracle->dumpPath(CanonPath::root, sink);
+        return sink.finish().hash.to_string(HashFormat::SRI, true);
+    };
+    auto narA = narOf();
+    oracle->root = MemorySourceAccessor::File::Regular{false, "BBB"};
+    auto treeB = objectHashOf(*oracle, CanonPath::root).root.hash.to_string(HashFormat::SRI, true);
+    auto narB = narOf();
+    size_t cases = 0, rejected = 0, accepted = 0;
+    for (const auto & treeAssertion : {std::string{}, treeA, treeB})
+        for (const auto & narAssertion : {std::string{}, narA, narB}) {
+            SCOPED_TRACE(::testing::Message() << treeAssertion << " / " << narAssertion);
+            ++cases;
+            nix::FreshCacheHome cacheHome;
+            fetchers::Settings fetchSettings;
+            AutoDelete root{createTempDir()};
+            auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+            bool readOnly = false;
+            EvalSettings settings{readOnly};
+            settings.nixPath = {};
+            settings.pureEval = false;
+            EvalState nested({}, local, fetchSettings, settings);
+            auto source = make_ref<CopyRequestSource>();
+            source->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+            source->afterRead = [source] { source->root = MemorySourceAccessor::File::Regular{false, "BBB"}; };
+            Finally clearCallback{[&] { source->afterRead = {}; }};
+            scheme->source = source.get_ptr();
+            std::string attrs;
+            if (!treeAssertion.empty())
+                attrs += fmt("treeHash = \"%s\";", treeAssertion);
+            if (!narAssertion.empty())
+                attrs += fmt("narHash = \"%s\";", narAssertion);
+            Value value;
+            auto fetch = [&] {
+                nested.eval(nested.parseExprFromString(
+                    "builtins.fetchTree { type = \"observed-test\"; " + attrs + " }",
+                    nested.rootPath(CanonPath::root)), value);
+            };
+            if (treeAssertion == treeB || narAssertion == narB) {
+                try {
+                    fetch();
+                    ADD_FAILURE() << "a different-value assertion was accepted";
+                } catch (const Error & error) {
+                    EXPECT_EQ(error.info().status, 102u);
+                    EXPECT_THAT(error.message(), testing::HasSubstrIgnoreANSIMatcher(
+                        treeAssertion == treeB ? "tree hash mismatch" : "NAR hash mismatch"));
+                }
+                ++rejected;
+                continue;
+            }
+            ASSERT_NO_THROW(fetch());
+            ++accepted;
+            auto stringAttr = [&](const char * name) {
+                return nested.forceStringNoCtx(*value.attrs()->get(nested.symbols.create(name))->value,
+                    noPos, "owned fetched input test");
+            };
+            EXPECT_EQ(stringAttr("treeHash"), treeA);
+            EXPECT_EQ(stringAttr("narHash"), narA);
+            source->root = MemorySourceAccessor::File::Regular{false, "CCC"};
+            NixStringContext context;
+            auto path = local->parseStorePath(nested.forceString(
+                *value.attrs()->get(nested.s.outPath)->value, context, noPos, "owned fetched input test"));
+            EXPECT_EQ(nested.storePath(path).readFile(), "AAA");
+            ASSERT_NO_THROW(nested.ensureLazyPathCopied(path));
+            EXPECT_EQ(readFile(local->toRealPath(path)), "AAA");
+            EXPECT_EQ(SourcePath{source}.readFile(), "CCC");
+        }
+    EXPECT_EQ(cases, 9u);
+    EXPECT_EQ(rejected, 5u);
+    EXPECT_EQ(accepted, 4u);
+    RecordProperty("finite_cells", cases);
+}
+
+TEST_F(EvalStateTest, publicFetchedAccessorRetainsLiveSourceMeaning)
+{
+    auto scheme = observedInputScheme();
+    Finally clearSource{[&] { scheme->source.reset(); }};
+    auto source = make_ref<CopyRequestSource>();
+    source->root = MemorySourceAccessor::File::Regular{false, "AAA"};
+    source->afterRead = [source] { source->root = MemorySourceAccessor::File::Regular{false, "BBB"}; };
+    Finally clearCallback{[&] { source->afterRead = {}; }};
+    scheme->source = source.get_ptr();
+    auto input = fetchers::Input::fromAttrs({{"type", std::string("observed-test")}});
+    auto [live, result] = input.getAccessor(fetchSettings, *store);
+    EXPECT_EQ(live->readFile(CanonPath::root), "AAA");
+    EXPECT_EQ(live->readFile(CanonPath::root), "BBB");
+}
 
 TEST_F(EvalStateTest, presentMountedContextsNeedNoBorrowedFileRead)
 {
@@ -1087,7 +1250,8 @@ TEST_F(EvalStateTest, sourceCopyRequestsRetireOnMountAndResetCompletion)
                     tree->addFile(CanonPath("value"), "input");
                     fetchers::Input input;
                     input.attrs.insert_or_assign("name", "copy-request-mount");
-                    nested.mountInput(input, tree);
+                    auto fixedTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{tree})};
+                    nested.mountInput(input, fixedTree);
                 };
                 source->afterRead = [&] {
                     source->afterRead = {};
@@ -1225,7 +1389,8 @@ TEST_F(EvalStateTest, resolutionCallbacksPrecedeTheResolvedCopyRequest)
                 inputTree->addFile(CanonPath("value"), "input");
                 fetchers::Input input;
                 input.attrs.insert_or_assign("name", "resolution-mount");
-                nested.mountInput(input, inputTree);
+                auto fixedInputTree = fetchers::FixedSource{GitRepo::acquire(SourcePath{inputTree})};
+                nested.mountInput(input, fixedInputTree);
             }
         };
         NixStringContext context;

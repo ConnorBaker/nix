@@ -65,15 +65,15 @@ void EvalState::ensureLazyPathsCopied(const NixStringContext & context)
             ensureLazyPathCopied(o->path);
 }
 
-StorePath EvalState::mountInput(fetchers::Input & input, ref<SourceAccessor> accessor)
+StorePath EvalState::mountInput(fetchers::Input & input, fetchers::FixedSource source)
 {
     /* A dry run names the tree: the store path, to know where to mount it,
        and the tree hash (doc/lazy-store/04-derivation.md, section 1.9). */
-    auto [storePath, hash] = fetchToStore2(fetchSettings, *store, accessor, FetchMode::DryRun, input.getName());
+    auto [storePath, hash] = fetchToStore2(fetchSettings, *store, source.accessor, FetchMode::DryRun, input.getName());
 
     allowPath(storePath); // FIXME: should just whitelist the entire virtual store
 
-    storeFS->mount(CanonPath(store->printStorePath(storePath)), accessor);
+    storeFS->mount(CanonPath(store->printStorePath(storePath)), source.accessor);
 
     /* The fetched tree owns this prefix, including over an ambient host
        occupant. Discard facts observed before the graft, including cached

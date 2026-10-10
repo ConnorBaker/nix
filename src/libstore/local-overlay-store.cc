@@ -256,9 +256,8 @@ void LocalOverlayStore::collectGarbage(const GCOptions & options, GCResults & re
 
 void LocalOverlayStore::sweepObjectStore()
 {
-    /* Auxiliary values belong to this store's database. Only legacy cache
-       entries and ingestion temporaries remain under `.objects`; the merged
-       mount also shows the lower store's, which this cleanup does not own. */
+    /* Reap only upper-layer leases; the merged mount also shows the lower
+       store's namespace, which this cleanup does not own. */
     GitObjectStore::Owned owned{
         .dir = config->upperLayer.get() / ".objects",
         /* The cleaner removes through descriptors opened in the upper
@@ -266,7 +265,7 @@ void LocalOverlayStore::sweepObjectStore()
         .removed = [&] { _remountRequired = true; },
     };
 
-    reportSweep(objects.sweep(&owned));
+    objects.sweep(&owned);
 }
 
 void LocalOverlayStore::deleteStorePath(const std::filesystem::path & path, uint64_t & bytesFreed, bool isKnownPath)

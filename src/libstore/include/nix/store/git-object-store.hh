@@ -132,11 +132,9 @@ public:
         std::function<std::optional<std::string>(const merkle::TreeEntry &)> readAuxiliary;
     };
 
-    const Index * index = nullptr;
-
     const std::filesystem::path dir;
 
-    explicit GitObjectStore(std::filesystem::path dir);
+    const Index * index = nullptr;
 
     /**
      * Object-store work, counted only while a test asks for it
@@ -161,14 +159,11 @@ public:
     Counters * counters = nullptr;
 
     /**
-     * When set and true for the file at `where`, `place` declines a new
-     * holder claim with `ENOSPC`, leaving the file as written and without a
-     * row (`05-validation.md` section 7; law 3's fourth exception, 01 §9.10).
-     * This preserves the old full-directory failure seam; an ordinary
-     * holder miss now records a row and creates no auxiliary directory entry.
-     * Empty in every build but a test's.
+     * Test-only refusal of a physical coalescing pin or alias replacement.
+     * Ordinary first claims stage memory and allocate no auxiliary file;
+     * they do not invoke this filesystem-failure seam.
      */
-    std::function<bool(const std::filesystem::path &)> failPlaceWithNoSpace;
+    std::function<bool(const std::filesystem::path &)> failPlaceWithNoSpace{};
 
     /**
      * Called while constructing the physical lease at the one instant it is
@@ -180,18 +175,7 @@ public:
      * not disarm existing holds; captured references must outlive first use.
      * Empty outside tests.
      */
-    std::function<void()> atHoldMade;
-
-    /**
-     * When set and true for a hold the sweep has locked, its removal
-     * fails with `ENOTEMPTY`, as it did against a maker that filled the
-     * directory before locking it: the sweep counts the hold and goes on
-     * (01 section 9.10 law 5).  A maker of this Nix leaves the window
-     * empty, so the condition cannot be made in one process; this is it,
-     * injected at the one call it reaches, as `failPlaceWithNoSpace` is.
-     * Empty in every build but a test's.
-     */
-    std::function<bool(const std::filesystem::path &)> failHoldRemoval;
+    std::function<void()> atHoldMade{};
 
     /** Hash file bytes using their previously observed size.
      * The caller must ensure that size is still correct or compare the result
@@ -501,11 +485,6 @@ public:
      */
     using BlobInodes = boost::unordered_flat_map<ino_t, Hash>;
 
-    struct SweepStats
-    {
-        uint64_t treesRemoved = 0, blobsRemoved = 0, holds = 0;
-    };
-
     /** The physical namespace this store owns, e.g. an overlay's upper layer.
      * `removed` is notified after an actual removal so an overlay can
      * request a remount. Deletion stays inside the opened owned namespace. */
@@ -515,11 +494,10 @@ public:
         fun<void()> removed;
     };
 
-    /** Reap dead leases and obsolete auxiliary cache files. Only fixed kinds
-     * and two-digit shard directories are descended, never symbolic links.
-     * The live representation and its GC are the indexed projections, so
-     * this cleanup reads no body and computes no graph reachability. */
-    SweepStats sweep(const Owned * owned = nullptr);
+    /** Reap dead ingestion leases, retaining busy or unremovable leases.
+     * Return their count. Pins are unlinked without following symlinks;
+     * unexpected directories and entries outside lease names are untouched. */
+    uint64_t sweep(const Owned * owned = nullptr);
 
 private:
     friend class LocalStoreObjectsTest;

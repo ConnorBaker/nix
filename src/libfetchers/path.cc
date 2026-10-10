@@ -4,6 +4,7 @@
 #include "nix/fetchers/cache.hh"
 #include "nix/fetchers/fetch-to-store.hh"
 #include "nix/fetchers/fetch-settings.hh"
+#include "nix/fetchers/git-utils.hh"
 #include "nix/util/object-hash-sink.hh"
 #include "nix/util/merkle-hash.hh"
 
@@ -151,53 +152,26 @@ struct PathInputScheme : InputScheme
             store.addTempRoot(*storePath);
 
         time_t mtime = 0;
-        if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
-            storePath = [&]() -> StorePath {
-                auto accessor = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
-                /* A store known to be empty cannot contain the destination.
-                   Otherwise name the source first to avoid copying
-                   a tree the store already holds. Absence is not cached. */
-                if (store.mayHaveValidPaths()) {
-                    auto named =
-                        gitTreePath(store, "source", merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root));
-                    store.addTempRoot(named);
-                    if (store.isValidPath(named)) {
-                        mtime = accessor->getLastModified().value();
-                        return named;
-                    }
-                    /* The source is mutable. Ingestion names the bytes it
-                       actually copies; the preflight name does not constrain
-                       a later observation. Track that observation's mtime. */
-                    accessor = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
-                }
-                Activity act(*logger, lvlTalkative, actUnknown, fmt("copying %s to the store", PathFmt(absPath)));
-                auto copied = store.addToStore(
-                    "source",
-                    SourcePath(accessor),
-                    ContentAddressMethod::Raw::Git,
-                    HashAlgorithm::SHA256,
-                    {},
-                    defaultPathFilter,
-                    NoRepair,
-                    [](const CanonPath &, const SourceAccessor::Stat &) { return std::nullopt; },
-                    /*callbacksPermitParallelism=*/true);
-                mtime = accessor->getLastModified().value();
-                return copied;
-            }();
-        }
+        auto accessor = [&]() -> ref<SourceAccessor> {
+            if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
+                auto source = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
+                auto acquired = GitRepo::acquire(SourcePath{source});
+                auto objectHash = merkle::objectHash(*acquired->getKnownEntry(CanonPath::root));
+                acquired->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
+                auto copied = fetchToStore2(settings, store, SourcePath{acquired}, FetchMode::Copy, "source");
+                acquired->setPathDisplay(store.printStorePath(copied.first));
+                mtime = source->getLastModified().value();
+                return acquired;
+            }
 
-        auto accessor = store.requireStoreObjectAccessor(*storePath);
-
-        // To prevent `fetchToStore()` copying the path again to Nix
-        // store, pre-create an entry in the fetcher cache: the tree's
-        // name, from the object hash the store holds for the path (the
-        // path may have been valid before this call). For an old peer,
-        // hash the already acquired object instead of acquiring it again.
-        auto info = store.queryPathInfo(*storePath);
-        auto objectHash = info->objectHash ? info->objectHash->hash
-                                           : merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root);
-        accessor->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
-        recordRootEntry(settings, SourcePath(accessor), objectHash);
+            auto accessor = store.requireStoreObjectAccessor(*storePath);
+            auto info = store.queryPathInfo(*storePath);
+            auto objectHash = info->objectHash ? info->objectHash->hash
+                                               : merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root);
+            accessor->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
+            recordRootEntry(settings, SourcePath(accessor), objectHash);
+            return accessor;
+        }();
 
         /* Trust the lastModified value supplied by the user, if
            any. It's not a "secure" attribute so we don't care. */
