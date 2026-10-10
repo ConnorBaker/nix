@@ -22,6 +22,18 @@ The [full readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-600
 
 The [complete source census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-38756a-vs-8aad/SUMMARY.json), using the unchanged historical classification, counts +13,283/−4,506 across 187 changed production files: **net +8,777 physical lines**. This remains excessive; the recent 41-line reduction does not achieve substantial implementation shrinkage.
 
+### Hardware profile of the combined endpoint
+
+The [balanced PMU readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/profiling-packet/PMU-READOUT.json) profiles the same **38756a** endpoint against **8aad**, with six pairs per regressing case and disjoint user/kernel instruction and cycle counters. All 36 captures have full counter coverage; seven complete graph comparisons and source/runtime/fixture guards pass. The [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/profiling-packet/INDEPENDENT-SEAL.json) retains every capture, including zero baselines whose ratios remain undefined. Root independently checked all 269 recorded artifact hashes.
+
+| Case | User instructions / base | Kernel instructions / base | Total instructions / base | Task clock / base | Context switches / base |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold 32 path | 1.092147 | 1.173081 | 1.130153 | 1.281469 | 25.424627 |
+| warm 8 git | 1.109412 | 1.949482 | 1.336965 | 1.694859 | 53.971429 |
+| warm 32 git | 1.041506 | 1.768984 | 1.165419 | 1.391194 | 32.780846 |
+
+Both instruction domains regress in all six pairs in every case. Cycles per instruction also increase in both domains. These counters confirm additional work, including substantial kernel work, but do not identify syscall callers or assign causal seconds to SQLite, hashing, libgit2 or scheduling. Instrumented elapsed time is not a latency benchmark. All 650 pressure samples are retained: maximum CPU avg10 some pressure is 2.40%, I/O some/full 0.23%/0.18%, and memory some/full 1.08%/1.08%; no major faults occur. These observations do not establish host I/O as the cause.
+
 ### Earlier f05 comparison
 
 Measured **f05adeff82965dc67d91ee00110e61d811e40578** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, using matching release builds and dependencies. It wins **40/54 wall**, **33/54 CPU** and **18/54 RSS** pairs. Both warm-Git cases regress in wall and CPU; cold path regresses in CPU. Cold Git's CPU median is only marginally lower, with three wins and three losses. Uniform performance and substantial source reduction remain unfinished.
