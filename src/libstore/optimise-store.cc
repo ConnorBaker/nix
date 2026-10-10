@@ -1207,22 +1207,9 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
            Modified paths remain unentered. Legacy paths need this second walk;
            current rows already carry the object hash. */
         if (!row->objectHash) {
-            std::optional<std::pair<Hash, Hash>> narHashes;
             try {
-                switch (walkOldRow(*row, &narHashes)) {
-                case OldRowWalk::Migrated:
-                    break;
-                case OldRowWalk::Modified:
-                    printError(
-                        "path '%s' was modified! expected hash '%s', got '%s'; not entered -- run `nix-store --verify --check-contents --repair`",
-                        printStorePath(i),
-                        narHashes->first.to_string(HashFormat::Nix32, true),
-                        narHashes->second.to_string(HashFormat::Nix32, true));
-                    continue;
-                case OldRowWalk::FilesMissing:
-                    printError(
-                        "path '%s' is registered but its files are missing; run `nix-store --verify` to remove the row",
-                        printStorePath(i));
+                if (auto failure = walkOldRow(*row)) {
+                    printError("%s", failure->str());
                     continue;
                 }
             } catch (InvalidPath &) {

@@ -2627,4 +2627,75 @@ TEST(HashingVisitor, movingARootPreservesItsResultsAndFirstFailure)
     EXPECT_EQ(cases, 288u);
 }
 
+/* Permission observations may invoke callbacks before traversal starts.
+   Configuration and the selected filter remain stable during every walk. */
+TEST(HashingVisitor, permissionCallbackCannotLendAReplacedFilterParallelism)
+{
+    enum class Answer { No, Yes, Throw };
+    enum class Replacement { Keep, All, Custom };
+    struct Source final : MemorySourceAccessor
+    {
+        std::function<bool()> permission;
+        bool allowsConcurrentTraversal() override { return permission(); }
+    };
+    Finally restoreWorkers{
+        [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
+    const auto defaultWorkers = CopyPool::defaultWorkers();
+    size_t cases = 0, customWalks = 0;
+    for (size_t configured = 0; configured <= 8; ++configured)
+        for (bool initiallyAll : {false, true})
+            for (auto answer : {Answer::No, Answer::Yes, Answer::Throw})
+                for (auto replacement : {Replacement::Keep, Replacement::All, Replacement::Custom}) {
+                    SCOPED_TRACE(fmt("width=%d all=%d answer=%d replacement=%d",
+                        configured, initiallyAll, int(answer), int(replacement)));
+                    auto source = make_ref<Source>();
+                    source->addFile(CanonPath("a/keep"), "kept");
+                    source->addFile(CanonPath("b/drop"), "rejected");
+                    const auto caller = std::this_thread::get_id();
+                    std::mutex mutex;
+                    std::vector<std::string> filterCalls;
+                    bool wrongThread = false;
+                    auto custom = [&](const std::string & path) {
+                        std::lock_guard lock(mutex);
+                        filterCalls.push_back(path);
+                        wrongThread |= std::this_thread::get_id() != caller;
+                        return path != "/b/drop";
+                    };
+                    PathFilter filter = AllPaths{};
+                    if (!initiallyAll) filter = custom;
+                    size_t permissionCalls = 0;
+                    source->permission = [&] {
+                        ++permissionCalls;
+                        EXPECT_EQ(std::this_thread::get_id(), caller);
+                        if (replacement == Replacement::All) filter = AllPaths{};
+                        if (replacement == Replacement::Custom) filter = custom;
+                        if (answer == Answer::Throw) throw Error("permission callback");
+                        return answer == Answer::Yes;
+                    };
+                    HashingVisitor::workersForTest.store(configured);
+                    const bool finallyAll = initiallyAll && replacement != Replacement::Custom;
+                    if (initiallyAll && answer == Answer::Throw) {
+                        EXPECT_THROW(HashingVisitor::workerCountFor(*source, filter), Error);
+                    } else {
+                        const auto expected = initiallyAll && answer == Answer::Yes && finallyAll
+                            ? (configured ? configured : defaultWorkers) : 1;
+                        const auto selected = HashingVisitor::workerCountFor(*source, filter);
+                        EXPECT_EQ(selected, expected);
+                        if (!finallyAll) {
+                            HashingVisitor visitor{selected};
+                            EXPECT_NO_THROW(objectHashOf(*source, CanonPath::root, filter, visitor));
+                            EXPECT_FALSE(wrongThread);
+                            EXPECT_EQ(filterCalls, (std::vector<std::string>{"/a", "/a/keep", "/b", "/b/drop"}));
+                            ++customWalks;
+                        }
+                    }
+                    EXPECT_EQ(bool(filter.get_fn().target<AllPaths>()), finallyAll);
+                    EXPECT_EQ(permissionCalls, initiallyAll ? 1u : 0u);
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 162u);
+    EXPECT_EQ(customWalks, 99u);
+    RecordProperty("finite_cells", cases);
+}
+
 } // namespace nix

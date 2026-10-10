@@ -841,29 +841,15 @@ public:
     std::shared_ptr<const ValidPathInfo> queryPathInfoUnmigrated(const StorePath & path);
 
     /**
-     * What the walk of a schema-10 row's path found (01 §10, *a schema-10
-     * row's migration checks the NAR hash the row asserts*):
-     * `Migrated` -- the walk's NAR hash is the one the row asserts, the
-     * object hash written; `Modified` -- it is not, nothing written;
-     * `FilesMissing` -- the path's directory, or a file under it, is gone
-     * while the row is valid (what `nix-store --verify` finds and
-     * removes), nothing written.
-     */
-    enum struct OldRowWalk { Migrated, Modified, FilesMissing };
-
-    /**
-     * One walk of the path of a schema-10 row: the object hash and the NAR
-     * size, and on a tee of the same bytes the NAR hash, compared with the
-     * one the row asserts -- as `--load-db` checks a registration
-     * (`nix-store.cc`).  On `Migrated`, `info` carries the object hash (and
-     * the size when the row lacked it) and the column is written
-     * (`walkOldRow`); on `Modified` the two NAR hashes -- asserted,
-     * walked -- are stored in `narHashes` when given. Read-only stores do not write.
-     * No root is taken (see `migratedPathInfo`).
+     * One walk computes the object hash, NAR size and asserted NAR hash on
+     * the same bytes. A modified or missing valid path returns a diagnostic
+     * and leaves `info` and its row unchanged. Otherwise `info` receives the
+     * object hash and any missing size, and writable stores update the row.
+     * Read-only stores do not write. No root is taken (see `migratedPathInfo`).
      *
      * @throws InvalidPath if the row was deleted before or during the walk.
      */
-    OldRowWalk walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes = nullptr);
+    std::optional<HintFmt> walkOldRow(ValidPathInfo & info);
 
     /**
      * Write the row from `info`.

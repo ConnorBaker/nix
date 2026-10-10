@@ -118,12 +118,10 @@ public:
 
     static size_t workerCountFor(SourceAccessor & accessor, PathFilter & filter)
     {
-        if (!filter.get_fn().target<AllPaths>() || !accessor.allowsConcurrentTraversal())
-            return 1;
-        auto workers = workersForTest.load(std::memory_order_relaxed);
-        if (!workers)
-            workers = CopyPool::defaultWorkers();
-        return workers;
+        auto workers = filter.get_fn().target<AllPaths>() && accessor.allowsConcurrentTraversal()
+            && filter.get_fn().target<AllPaths>()
+            ? workersForTest.load(std::memory_order_relaxed) : 1;
+        return workers ? workers : CopyPool::defaultWorkers();
     }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override;

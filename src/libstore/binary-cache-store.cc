@@ -323,7 +323,7 @@ BinaryCacheStore::uploadData(Source & narSource, RepairFlag repair, fun<ValidPat
     return narInfo;
 }
 
-void BinaryCacheStore::uploadNarInfo(ref<NarInfo> narInfo)
+ref<NarInfo> BinaryCacheStore::uploadNarInfo(ref<NarInfo> narInfo)
 {
     /* Verify that all references are valid. This may do some .narinfo
        reads, but typically they'll already be cached. */
@@ -348,13 +348,6 @@ void BinaryCacheStore::uploadNarInfo(ref<NarInfo> narInfo)
 
     /* Atomically write the NAR info file.*/
     writeNarInfo(narInfo);
-}
-
-ref<const ValidPathInfo> BinaryCacheStore::addToStoreCommon(
-    Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(const UploadedNar &)> mkInfo)
-{
-    auto narInfo = uploadData(narSource, repair, std::move(mkInfo));
-    uploadNarInfo(narInfo);
     return narInfo;
 }
 
@@ -370,7 +363,7 @@ void BinaryCacheStore::addToStore(
 
     /* `uploadData` checks the info's object hash, asserted NAR hash and
        size against the stream and throws on a mismatch. */
-    addToStoreCommon(narSource, repair, checkSigs, {[&](const UploadedNar &) { return info; }});
+    uploadNarInfo(uploadData(narSource, repair, {[&](const UploadedNar &) { return info; }}));
 }
 
 void BinaryCacheStore::addMultipleToStore(
@@ -506,10 +499,9 @@ StorePath BinaryCacheStore::addToStoreFromDump(
     // Use `narDump` if we wrote to `nar`.
     Source & narDump2 = nar.size() > 0 ? static_cast<Source &>(narDump) : dump;
 
-    return addToStoreCommon(
+    return uploadNarInfo(uploadData(
                narDump2,
                repair,
-               CheckSigs,
                [&](const UploadedNar & uploaded) {
                    auto info = ValidPathInfo::makeFromCA(
                        *this,
@@ -528,7 +520,7 @@ StorePath BinaryCacheStore::addToStoreFromDump(
                        uploaded.objectHash);
                    info.narSize = uploaded.nar.numBytesDigested;
                    return info;
-               })
+               }))
         ->path;
 }
 
@@ -618,17 +610,16 @@ StorePath BinaryCacheStore::addToStore(
     TreeNamer namer,
     bool callbacksPermitParallelism)
 {
-    /* FIXME: Make BinaryCacheStore::addToStoreCommon support
+    /* FIXME: Make BinaryCacheStore::addToStoreFromDump support
        non-recursive+sha256 so we can just use the default
        implementation of this method in terms of addToStoreFromDump. */
 
     auto h = hashPath(path, method.getFileIngestionMethod(), hashAlgo, filter).first;
 
     auto source = sinkToSource([&](Sink & sink) { path.dumpPath(sink, filter); });
-    return addToStoreCommon(
+    return uploadNarInfo(uploadData(
                *source,
                repair,
-               CheckSigs,
                [&](const UploadedNar & uploaded) {
                    auto info = ValidPathInfo::makeFromCA(
                        *this,
@@ -645,7 +636,7 @@ StorePath BinaryCacheStore::addToStore(
                        uploaded.objectHash);
                    info.narSize = uploaded.nar.numBytesDigested;
                    return info;
-               })
+               }))
         ->path;
 }
 

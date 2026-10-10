@@ -4942,6 +4942,115 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
             }
 }
 
+TEST_F(LocalStoreObjectsTest, regularOwnerIdentityDomainKeepsLookupHintsAndPublicationAligned)
+{
+    unsigned cases = 0;
+    for (bool executable : {false, true})
+        for (int64_t badOwner : {std::numeric_limits<int64_t>::min(), int64_t(-1), int64_t(0)})
+            for (unsigned shape = 0; shape < 3; ++shape) {
+                SCOPED_TRACE(fmt("executable=%d owner=%d shape=%d", executable, badOwner, shape));
+                auto contents = fmt("regular-owner-domain-%d", cases++);
+                auto nar = treeNar({{"a", contents, executable ? 'x' : 'f'}});
+                auto id = merkle::blobId(contents);
+                std::array holds{store->objects.hold(), store->objects.hold(), store->objects.hold()};
+                std::vector<ValidPathInfo> infos;
+                infos.push_back(restoreOutput("owner-donor", nar, holds[1]));
+                size_t bad = 0;
+                if (shape == 0) {
+                    store->registerValidPath(infos[0], holds[1]);
+                    infos.push_back(restoreOutput("owner-receiver", nar, holds[0]));
+                } else {
+                    infos.push_back(restoreOutput("owner-other", nar, holds[shape == 1 ? 0 : 2]));
+                    ASSERT_NE(st(store->toRealPath(infos[0].path) / "a").st_ino,
+                              st(store->toRealPath(infos[1].path) / "a").st_ino);
+                    if (shape == 1)
+                        store->registerValidPath(infos[0], holds[1]);
+                    else {
+                        auto physical = [&](size_t n) {
+                            auto stat = st(store->toRealPath(infos[n].path) / "a");
+                            return std::pair{int64_t(stat.st_dev), int64_t(stat.st_ino)};
+                        };
+                        // The corrupt class precedes the usable one in the actual signed order.
+                        bad = physical(0) < physical(1) ? 0 : 1;
+                        auto good = 1 - bad;
+                        store->registerValidPath(infos[good], holds[good + 1]);
+                        store->registerValidPath(infos[bad]);
+                        infos.push_back(restoreOutput("owner-receiver", nar, holds[0]));
+                    }
+                }
+                auto & receiver = infos.back();
+                auto badRoot = store->toRealPath(infos[bad].path);
+                auto target = store->toRealPath(receiver.path) / "a";
+                auto before = st(target);
+                auto donor = st(badRoot / "a");
+                SQLite db{store->dbDir / "db.sqlite",
+                          {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                {
+                    SQLiteTxn txn{db};
+                    SQLiteStmt{db, "delete from Ingestions where path = ?;"}.use()
+                        .apply(store->printStorePath(infos[bad].path)).exec();
+                    SQLiteStmt{db, "insert into Ingestions(id, path) values (?, ?);"}.use()
+                        .apply(badOwner).apply(store->printStorePath(infos[bad].path)).exec();
+                    SQLiteStmt{db, "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, ?, ?, ?, ?, ?);"}.use()
+                        .apply(id.hash, id.hashSize).apply(int64_t(executable))
+                        .apply(int64_t(donor.st_ino)).apply(int64_t(donor.st_dev)).apply(badOwner)
+                        .apply("a").apply(int64_t(donor.st_size)).exec();
+                    txn.commit();
+                }
+                auto holder = store->objects.holderOrForget(id, executable, NoRepair);
+                EXPECT_EQ(bool(holder), shape == 2);
+                if (holder) {
+                    EXPECT_GT(holder->ingestion, 0u);
+                    EXPECT_LE(holder->ingestion, uint64_t(std::numeric_limits<int64_t>::max()));
+                    if (shape == 2)
+                        EXPECT_EQ(holder->ino, before.st_ino);
+                }
+                size_t hints = 0;
+                for (const auto & [ino, hash] : blobInodes())
+                    if (hash == id) {
+                        ++hints;
+                        EXPECT_EQ(ino, before.st_ino);
+                    }
+                EXPECT_EQ(hints, shape == 2 ? 1u : 0u);
+                auto missing = store->verifyObjects(badRoot).second;
+                EXPECT_EQ(std::find(missing.begin(), missing.end(), badRoot / "a") != missing.end(), shape != 2);
+                unsigned collisionRows = 0;
+                {
+                    auto state = lockStoreState();
+                    ASSERT_EQ(sqlite3_trace_v2(state->db, SQLITE_TRACE_ROW,
+                        [](unsigned, void * context, void * statement, void *) -> int {
+                            auto sql = sqlite3_sql(static_cast<sqlite3_stmt *>(statement));
+                            if (sql && std::string_view(sql).find("from Blobs own join Blobs donor") != std::string_view::npos)
+                                ++*static_cast<unsigned *>(context);
+                            return 0;
+                        }, &collisionRows), SQLITE_OK);
+                }
+                Finally clearTrace{[&] {
+                    auto state = lockStoreState();
+                    sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+                }};
+                store->registerValidPath(receiver, holds[0]);
+                EXPECT_EQ(collisionRows, 0u);
+                EXPECT_EQ(st(target).st_ino, before.st_ino);
+                EXPECT_EQ(st(target).st_mode, before.st_mode);
+                EXPECT_EQ(readFile(target), contents);
+                holder = store->objects.holderOrForget(id, executable, NoRepair);
+                ASSERT_TRUE(holder);
+                EXPECT_GT(holder->ingestion, 0u);
+                EXPECT_LE(holder->ingestion, uint64_t(std::numeric_limits<int64_t>::max()));
+                auto repairHold = store->objects.hold();
+                store->enterPath(badRoot, Repair, repairHold);
+                store->endIngestion(repairHold, infos[bad].path);
+                EXPECT_TRUE(store->verifyObjects(badRoot).second.empty());
+                SQLiteStmt countStmt{db, "select count(*) from Ingestions where id = ?;"};
+                auto count = countStmt.use();
+                count.apply(badOwner);
+                ASSERT_TRUE(count.next());
+                EXPECT_EQ(count.getInt(0), 0);
+            }
+    EXPECT_EQ(cases, 18u);
+}
+
 TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysicalCursor)
 {
     using Cursor = GitObjectStore::Holder::Cursor;
@@ -6908,8 +7017,10 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                         EXPECT_EQ(store->objects.readAuxiliary(entry), body);
                     else
                         EXPECT_FALSE(store->objects.readAuxiliary(entry));
-                    if (integer && ownerId == 0 && !corrupt) {
-                        /* Outer numeric equality selects both chunk-zero rows. */
+                    if (integer && !corrupt) {
+                        /* An INTEGER incarnation stays usable beside a REAL copy.
+                           MIN, -1 and zero are numerically equal; MAX's REAL
+                           conversion rounds above it and must also stay separate. */
                         SQLiteStmt duplicate{
                             db,
                             "insert into AuxValues select kind, id, cast(ingestion as real), chunk, body"
@@ -6918,7 +7029,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                             .apply(static_cast<int64_t>(mode))
                             .apply(entry.hash.hash, entry.hash.hashSize)
                             .exec();
-                        EXPECT_FALSE(store->objects.readAuxiliary(entry));
+                        EXPECT_EQ(store->objects.readAuxiliary(entry), body);
                         ++duplicates;
                     }
                     /* MAX is terminal within one lookup. A later publication below
@@ -6931,11 +7042,9 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                     if (integer && ownerId != std::numeric_limits<int64_t>::max())
                         EXPECT_GT(static_cast<int64_t>(sound), ownerId);
                     EXPECT_EQ(store->objects.readAuxiliary(entry), body);
-                    /* A sound copy survives repair, including integer zero
-                       beside the numerically equal REAL-zero duplicate. */
-                    EXPECT_EQ(
-                        verifyAuxiliaryForTest(NoRepair),
-                        !integer || corrupt || (ownerId == 0 && !corrupt));
+                    /* Every case now has a corrupt body or a non-INTEGER
+                       incarnation. Repair preserves every sound INTEGER copy. */
+                    EXPECT_TRUE(verifyAuxiliaryForTest(NoRepair));
                     EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
                     EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));
                     {
@@ -6955,7 +7064,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                     ++cases;
                 }
     EXPECT_EQ(cases, 128u);
-    EXPECT_EQ(duplicates, 4u);
+    EXPECT_EQ(duplicates, 16u);
 
     /* Invalid projected keys must not erase the sound integer-zero
        incarnation with the original typed address and exact bytes. */
@@ -6984,10 +7093,12 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                     fmt("update AuxValues set %s = %s, ingestion = 0 where ingestion = ?;",
                         changeKind ? "kind" : "id", changeKind ? kindFaults[fault] : idFaults[fault])};
                 change.use().apply(static_cast<int64_t>(bad)).exec();
+                EXPECT_FALSE(store->objects.readAuxiliary(entry));
                 auto good = publishAuxiliary(
                     config->realStoreDir.get() / fmt("good-projection-%u", unsigned(projections)), {{entry, body}});
                 SQLiteStmt zero{db, "update AuxValues set ingestion = 0 where ingestion = ?;"};
                 zero.use().apply(static_cast<int64_t>(good)).exec();
+                EXPECT_EQ(store->objects.readAuxiliary(entry), body);
                 EXPECT_TRUE(verifyAuxiliaryForTest(NoRepair));
                 EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
                 EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));

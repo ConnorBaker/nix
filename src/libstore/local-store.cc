@@ -182,7 +182,7 @@ struct LocalStore::State::Stmts
 static constexpr auto lookupBlobSql =
     "select b.ino, b.dev, b.size, i.path, b.name, b.ingestion from Blobs b"
     " join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path"
-    " where b.id = ? and b.exec = ? and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
+    " where b.id = ? and b.exec = ? and i.id > 0 and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
 
 /* Storage class is part of an incarnation key; unary + removes column affinity. */
 static constexpr auto auxiliaryExactKeySql =
@@ -455,8 +455,9 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->ReadAuxiliary.create(
             state->db,
             "select a.ingestion, a.chunk, a.body from AuxValues a"
-            " where a.kind = ?1 and a.id = ?2 and a.ingestion = ("
-            " select min(ingestion) from AuxValues where typeof(ingestion) = 'integer'"
+            " where a.kind = ?1 and a.id = ?2 and typeof(a.kind) = 'integer'"
+            " and typeof(a.ingestion) = 'integer' and a.ingestion = ("
+            " select min(ingestion) from AuxValues where typeof(kind) = 'integer' and typeof(ingestion) = 'integer'"
             " and kind = ?1 and id = ?2 and (?3 is null or ingestion > ?3)) order by a.chunk;");
         state->stmts->InsertAuxiliary.create(
             state->db, "insert into AuxValues (kind, id, ingestion, chunk, body) values (?, ?, ?, ?, ?);");
@@ -478,9 +479,9 @@ LocalStore::LocalStore(ref<const Config> config)
             " donor.ino, donor.dev, donor.size, i.path, donor.name, donor.ingestion"
             " from Blobs own join Blobs donor on donor.id = own.id and donor.exec = own.exec"
             " join Ingestions i on i.id = donor.ingestion join ValidPaths v on v.path = i.path"
-            " where own.ingestion = ? and donor.ingestion != own.ingestion"
+            " where own.ingestion = ? and i.id > 0"
             " and exists (select 1 from Blobs other join Ingestions oi on oi.id = other.ingestion"
-            " join ValidPaths ov on ov.path = oi.path where other.id = own.id and other.exec = own.exec"
+            " join ValidPaths ov on ov.path = oi.path where other.id = own.id and other.exec = own.exec and oi.id > 0"
             " and (other.ino != own.ino or other.dev != own.dev))"
             " order by own.id, own.exec, donor.dev, donor.ino, donor.ingestion;");
         state->stmts->DeletePathIngestions.create(state->db, "delete from Ingestions where path = ?;");
@@ -589,10 +590,10 @@ GitObjectStore::BlobInodes LocalStore::blobInodes()
         SQLiteStmt queryBlobInodes(
             state->db,
             "select b.ino, b.id from Blobs b join Ingestions i on i.id = b.ingestion "
-            "join ValidPaths v on v.path = i.path where not exists ("
+            "join ValidPaths v on v.path = i.path where i.id > 0 and not exists ("
             "select 1 from Blobs earlier join Ingestions ei on ei.id = earlier.ingestion "
             "join ValidPaths ev on ev.path = ei.path "
-            "where earlier.id = b.id and earlier.exec = b.exec"
+            "where earlier.id = b.id and earlier.exec = b.exec and ei.id > 0"
             " and (earlier.dev, earlier.ino, earlier.ingestion) < (b.dev, b.ino, b.ingestion));");
         auto use(queryBlobInodes.use());
         while (use.next())
@@ -1432,27 +1433,18 @@ void LocalStore::migratePathInfo(const StorePath & path)
     if (info->objectHash)
         return;
 
-    std::optional<std::pair<Hash, Hash>> narHashes;
-    switch (walkOldRow(*info, &narHashes)) {
-    case OldRowWalk::Migrated:
-        return;
-    case OldRowWalk::Modified:
-        throw Error(
-            "path '%s' was modified! expected hash '%s', got '%s'; its row is left as it is -- run `nix-store --verify --check-contents --repair`",
-            printStorePath(path),
-            narHashes->first.to_string(HashFormat::Nix32, true),
-            narHashes->second.to_string(HashFormat::Nix32, true));
-    case OldRowWalk::FilesMissing:
-        throw Error(
-            "path '%s' is registered but its files are missing; run `nix-store --verify` to remove the row",
-            printStorePath(path));
-    }
-    unreachable();
+    if (auto failure = walkOldRow(*info))
+        throw Error(*failure);
 }
 
-LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optional<std::pair<Hash, Hash>> * narHashes)
+std::optional<HintFmt> LocalStore::walkOldRow(ValidPathInfo & info)
 {
     auto & path = info.path;
+    auto missing = [&] {
+        return HintFmt(
+            "path '%s' is registered but its files are missing; run `nix-store --verify` to remove the row",
+            printStorePath(path));
+    };
 
     /* Hash the same NAR stream for both identities before updating the row. */
     HashSink narSink{info.assertedNarHash ? info.assertedNarHash->algo : HashAlgorithm::SHA256};
@@ -1467,12 +1459,12 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
     } catch (InvalidPath &) {
         if (!rowValid())
             throw;
-        return OldRowWalk::FilesMissing;
+        return missing();
     } catch (SysError & e) {
         if (!rowValid())
             throw InvalidPath("path '%s' is not valid", printStorePath(path));
         if (e.errNo == ENOENT)
-            return OldRowWalk::FilesMissing;
+            return missing();
         throw;
     }
     auto narHash = narSink.finish().hash;
@@ -1480,11 +1472,12 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
     /* The row's assertion checked before anything is written, as master's
        verifier checked it and `--load-db` still does.  (The NAR size need
        not be compared: the hash is over the whole serialisation.) */
-    if (info.assertedNarHash && *info.assertedNarHash != narHash) {
-        if (narHashes)
-            *narHashes = {*info.assertedNarHash, narHash};
-        return OldRowWalk::Modified;
-    }
+    if (info.assertedNarHash && *info.assertedNarHash != narHash)
+        return HintFmt(
+            "path '%s' was modified! expected hash '%s', got '%s'; its row is left as it is -- run `nix-store --verify --check-contents --repair`",
+            printStorePath(path),
+            info.assertedNarHash->to_string(HashFormat::Nix32, true),
+            narHash.to_string(HashFormat::Nix32, true));
 
     info.objectHash = ObjectHash::of(object->root);
     if (info.narSize == 0)
@@ -1506,7 +1499,7 @@ LocalStore::OldRowWalk LocalStore::walkOldRow(ValidPathInfo & info, std::optiona
             }
             txn.commit();
         });
-    return OldRowWalk::Migrated;
+    return std::nullopt;
 }
 
 std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_ptr<ValidPathInfo> info)
@@ -1517,22 +1510,9 @@ std::shared_ptr<const ValidPathInfo> LocalStore::migratedPathInfo(std::shared_pt
     /* Preserve assertedNarHash until migration checks the bytes. Do not add
        a temp root here: GC calls this while holding its exclusive lock;
        other callers already hold a root or shared lock. */
-    switch (walkOldRow(*info)) {
-    case OldRowWalk::Migrated:
-        return info;
-    case OldRowWalk::Modified:
-        /* Return the unchanged row so verification can report corruption.
-           Recording the observed hash would bless the modified bytes. */
-        debug(
-            "path '%s' does not hash to the NAR hash its row asserts; row left unmigrated", printStorePath(info->path));
-        return info;
-    case OldRowWalk::FilesMissing:
-        /* Likewise: master answered a query of such a row from the
-           database, and `nix-store --verify` is what removes the row. */
-        debug("path '%s' is registered but its files are missing; row left unmigrated", printStorePath(info->path));
-        return info;
-    }
-    unreachable();
+    if (auto failure = walkOldRow(*info))
+        debug("%s; row left unmigrated", failure->str());
+    return info;
 }
 
 std::shared_ptr<ValidPathInfo> LocalStore::queryPathInfoInternal(State & state, const StorePath & path)

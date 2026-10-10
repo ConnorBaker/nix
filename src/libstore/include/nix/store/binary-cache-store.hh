@@ -212,15 +212,12 @@ private:
     ref<NarInfo> uploadData(Source & narSource, RepairFlag repair, fun<ValidPathInfo(const UploadedNar &)> mkInfo);
 
     /**
-     * Sign and publish the `.narinfo` file for a path whose NAR has
+     * Sign, publish and return the `.narinfo` for a path whose NAR has
      * already been uploaded by `uploadData()`. This is what establishes
      * the closure invariant, so all of the path's references must
      * already be valid in the store.
      */
-    void uploadNarInfo(ref<NarInfo> narInfo);
-
-    ref<const ValidPathInfo> addToStoreCommon(
-        Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs, fun<ValidPathInfo(const UploadedNar &)> mkInfo);
+    ref<NarInfo> uploadNarInfo(ref<NarInfo> narInfo);
 
     /**
      * Same as `getFSAccessor`, but with a more preceise return type.
