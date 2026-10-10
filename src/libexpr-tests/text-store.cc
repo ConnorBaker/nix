@@ -21,6 +21,7 @@
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/mounted-source-accessor.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/util/tests/setting-scopes.hh"
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -34,6 +35,8 @@ namespace nix {
 // before the backend is allowed to collect garbage or reject an upload.
 struct TextPublicationStore : LocalStore
 {
+    using Store::invalidatePathInfoCacheFor;
+
     explicit TextPublicationStore(ref<const LocalStore::Config> config)
         : Store{*config}
         , LocalFSStore{*config}
@@ -45,6 +48,21 @@ struct TextPublicationStore : LocalStore
     bool collectBeforeWrite = false;
     size_t uploads = 0;
     size_t rootCalls = 0;
+    std::optional<StorePath> collectBeforeValidity;
+    size_t validityCollections = 0;
+
+    bool isValidPathUncached(const StorePath & path) override
+    {
+        if (collectBeforeValidity == path) {
+            collectBeforeValidity.reset();
+            ++validityCollections;
+            GCOptions options;
+            options.pathsToDelete = GCOptions::SpecificPaths{.paths = {path}};
+            GCResults results;
+            collectGarbage(options, results);
+        }
+        return LocalStore::isValidPathUncached(path);
+    }
 
     void addTempRoot(const StorePath & path) override
     {
@@ -113,7 +131,11 @@ protected:
         return std::string(eval(expr).string_view());
     }
 
-    StorePath addUnrooted(std::string_view name, std::string contents)
+    StorePath addUnrooted(
+        std::string_view name,
+        std::string contents,
+        ContentAddressMethod method = ContentAddressMethod::Raw::Text,
+        const StorePathSet & references = {})
     {
         HashSink narSink(HashAlgorithm::SHA256);
         dumpString(contents, narSink);
@@ -121,7 +143,12 @@ protected:
         auto info = ValidPathInfo::makeFromCA(
             *local,
             name,
-            TextInfo{.hash = hashString(HashAlgorithm::SHA256, contents), .references = {}},
+            ContentAddressWithReferences::fromParts(
+                method,
+                method == ContentAddressMethod::Raw::Git ? merkle::blobId(contents)
+                : method == ContentAddressMethod::Raw::NixArchive ? narHash
+                                                                  : hashString(HashAlgorithm::SHA256, contents),
+                {.others = references}),
             ObjectHash::of(merkle::TreeEntry{.mode = merkle::Mode::Regular, .hash = merkle::blobId(contents)}));
         info.narSize = narSize;
         auto path = info.path;
@@ -716,6 +743,184 @@ TEST_F(TextStoreTest, validatedContextKeysSurviveArbitraryFlagEvaluation)
         EXPECT_TRUE(local->isValidPath(reference));
         EXPECT_FALSE(local->isValidPath(dead));
     }
+}
+
+namespace {
+
+struct AssertedPathSource : MemorySourceAccessor
+{
+    size_t reads = 0;
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        ++reads;
+        MemorySourceAccessor::readFile(path, sink, std::move(sizeCallback));
+    }
+};
+
+} // namespace
+
+/* A valid database row does not keep its file alive. The collector runs
+   at a real validity observation, or after a warm-cache return, rather
+   than checking the implementation's call sequence in a mock. */
+TEST_F(TextStoreTest, assertedPathAddressesProtectWritableUseAndRespectRepairAndReadonly)
+{
+    auto savedMode = settings.readOnlyMode;
+    auto savedCache = getEnv("NIX_CACHE_HOME");
+    auto savedLsof = getEnv("_NIX_TEST_NO_LSOF");
+    Finally restore{[&] {
+        settings.readOnlyMode = savedMode;
+        if (savedCache) setEnv("NIX_CACHE_HOME", savedCache->c_str()); else unsetenv("NIX_CACHE_HOME");
+        if (savedLsof) setEnv("_NIX_TEST_NO_LSOF", savedLsof->c_str()); else unsetenv("_NIX_TEST_NO_LSOF");
+    }};
+    FreshCacheHome cache;
+    setEnv("_NIX_TEST_NO_LSOF", "1");
+    unsigned serial = 0;
+    // Direct tree; NAR correspondence hit/miss; both assertions with
+    // correspondence hit/miss; flat SHA256; NAR with references.
+    for (unsigned route = 0; route < 7; ++route)
+        for (unsigned contentsState = 0; contentsState < 3; ++contentsState)
+            for (bool readonly : {false, true})
+                for (bool repair : {false, true})
+                    for (bool warm : {false, true}) {
+                        SCOPED_TRACE(fmt("route=%d state=%d readonly=%d repair=%d warm=%d",
+                                         route, contentsState, readonly, repair, warm));
+                        settings.readOnlyMode = false;
+                        auto name = fmt("asserted-%d", serial++);
+                        auto contents = "good-" + name;
+                        auto source = make_ref<AssertedPathSource>();
+                        source->root = MemorySourceAccessor::File::Regular{false, contents};
+                        auto treeHash = merkle::blobId(contents);
+                        auto narHash = source->hashPath(CanonPath::root);
+                        source->reads = 0;
+                        bool flat = route == 5, referenced = route == 6;
+                        StorePathSet refs;
+                        std::string sourcePath = "/asserted-source-" + name;
+                        if (referenced) {
+                            refs.insert(addUnrooted(name + "-reference", "reference"));
+                            sourcePath = local->printStorePath(addUnrooted(
+                                name + "-source", contents, ContentAddressMethod::Raw::NixArchive, refs));
+                        }
+                        auto method = flat ? ContentAddressMethod::Raw::Flat
+                                           : referenced ? ContentAddressMethod::Raw::NixArchive
+                                                        : ContentAddressMethod::Raw::Git;
+                        auto addressHash = flat ? hashString(HashAlgorithm::SHA256, contents)
+                                                : referenced ? narHash : treeHash;
+                        auto expected = local->makeFixedOutputPathFromCA(
+                            name, ContentAddressWithReferences::fromParts(method, addressHash, {.others = refs}));
+                        if (contentsState) {
+                            ASSERT_EQ(addUnrooted(name, contents, method, refs), expected);
+                            if (contentsState == 2)
+                                writeFile(local->toRealPath(expected), "bad-" + name);
+                        }
+                        if (!warm) local->invalidatePathInfoCacheFor(expected);
+                        else {
+                            try { local->queryPathInfo(expected); }
+                            catch (InvalidPath &) { }
+                        }
+                        fetchers::Settings localFetch;
+                        if (route == 1 || route == 3)
+                            recordTreeAddress(localFetch, narHash, treeHash);
+                        readOnlyMode = settings.readOnlyMode = readonly;
+                        EvalState nested({}, local, localFetch, evalSettings);
+                        nested.repair = repair ? Repair : NoRepair;
+                        if (!referenced)
+                            nested.storeFS->mount(CanonPath(sourcePath), source);
+                        std::string assertions;
+                        if (route == 0 || route == 3 || route == 4)
+                            assertions += fmt("treeHash = \"%s\";", treeHash.to_string(HashFormat::SRI, true));
+                        if (route != 0)
+                            assertions += fmt("sha256 = \"%s\";", (flat ? addressHash : narHash).to_string(HashFormat::SRI, true));
+                        auto pathExpr = referenced ? fmt("builtins.storePath \"%s\"", sourcePath) : sourcePath;
+                        auto expression = fmt("builtins.path { name = \"%s\"; path = %s; recursive = %s; %s }",
+                                              name, pathExpr, flat ? "false" : "true", assertions);
+                        auto rootCalls = local->rootCalls;
+                        auto collections = local->validityCollections;
+                        if (!readonly && !repair && !warm && route != 2)
+                            local->collectBeforeValidity = expected;
+                        Value result;
+                        bool rejectsCorruptNAR = contentsState == 2 && !repair && route == 4;
+                        try {
+                            nested.eval(nested.parseExprFromString(expression, nested.rootPath(CanonPath::root)), result);
+                            if (rejectsCorruptNAR) {
+                                ADD_FAILURE() << "corrupt stored NAR satisfied both assertions";
+                            } else {
+                                EXPECT_EQ(result.string_view(), local->printStorePath(expected));
+                            }
+                        } catch (Error & error) {
+                            if (rejectsCorruptNAR) {
+                                EXPECT_EQ(error.info().status, 102u);
+                            } else {
+                                throw;
+                            }
+                        }
+                        local->collectBeforeValidity.reset();
+                        if (!readonly && !repair && !warm && route != 2) {
+                            EXPECT_EQ(local->validityCollections, collections + 1);
+                        }
+                        if (readonly) {
+                            EXPECT_EQ(local->rootCalls, rootCalls);
+                        } else {
+                            EXPECT_GT(local->rootCalls, rootCalls);
+                        }
+                        bool stored = contentsState || !readonly;
+                        EXPECT_EQ(pathExists(local->toRealPath(expected)), stored);
+                        if (stored) {
+                            auto expectedBytes = contentsState == 2 && (readonly || !repair) ? "bad-" + name : contents;
+                            EXPECT_EQ(readFile(local->toRealPath(expected)), expectedBytes);
+                        }
+                        if (!referenced) {
+                            bool reobservesSource = repair || !contentsState || route == 2;
+                            EXPECT_EQ(source->reads != 0, reobservesSource);
+                        }
+                        GCOptions options;
+                        options.pathsToDelete = GCOptions::SpecificPaths{.paths = {expected}};
+                        GCResults gc;
+                        local->collectGarbage(options, gc);
+                        EXPECT_EQ(pathExists(local->toRealPath(expected)), !readonly && stored);
+                    }
+}
+
+TEST_F(TextStoreTest, assertedPathRepairAndReadonlyStillRejectBothHashMismatches)
+{
+    auto savedMode = settings.readOnlyMode;
+    auto savedCache = getEnv("NIX_CACHE_HOME");
+    Finally restore{[&] {
+        settings.readOnlyMode = savedMode;
+        if (savedCache) setEnv("NIX_CACHE_HOME", savedCache->c_str()); else unsetenv("NIX_CACHE_HOME");
+    }};
+    FreshCacheHome cache;
+    fetchers::Settings localFetch;
+    auto source = make_ref<AssertedPathSource>();
+    source->root = MemorySourceAccessor::File::Regular{false, "good"};
+    auto treeHash = merkle::blobId("good");
+    auto narHash = source->hashPath(CanonPath::root);
+    auto wrongTree = merkle::blobId("wrong");
+    auto wrongNar = hashString(HashAlgorithm::SHA256, "wrong");
+    for (bool readonly : {false, true})
+        for (bool repair : {false, true})
+            for (bool wrongTreeAssertion : {false, true}) {
+                SCOPED_TRACE(fmt("readonly=%d repair=%d wrongTree=%d", readonly, repair, wrongTreeAssertion));
+                settings.readOnlyMode = false;
+                auto name = fmt("mismatch-%d-%d-%d", readonly, repair, wrongTreeAssertion);
+                addUnrooted(name, "good", ContentAddressMethod::Raw::Git);
+                readOnlyMode = settings.readOnlyMode = readonly;
+                EvalState nested({}, local, localFetch, evalSettings);
+                nested.repair = repair ? Repair : NoRepair;
+                nested.storeFS->mount(CanonPath("/asserted-mismatch-source"), source);
+                auto expression = fmt(
+                    "builtins.path { name = \"%s\"; path = /asserted-mismatch-source; treeHash = \"%s\"; sha256 = \"%s\"; }",
+                    name,
+                    (wrongTreeAssertion ? wrongTree : treeHash).to_string(HashFormat::SRI, true),
+                    (wrongTreeAssertion ? narHash : wrongNar).to_string(HashFormat::SRI, true));
+                Value result;
+                try {
+                    nested.eval(nested.parseExprFromString(expression, nested.rootPath(CanonPath::root)), result);
+                    ADD_FAILURE() << "invalid assertion was accepted";
+                } catch (Error & error) {
+                    EXPECT_EQ(error.info().status, 102u);
+                }
+            }
 }
 
 } // namespace nix

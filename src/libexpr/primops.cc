@@ -753,7 +753,7 @@ struct CompareValues
             case nFloat:
                 return v1->fpoint() < v2->fpoint();
             case nString:
-                return state.forceString(*v1, pos, errorCtx) < state.forceString(*v2, pos, errorCtx);
+                return v1->string_view() < v2->string_view();
             case nPath:
                 // Note: we don't take the accessor into account
                 // since it's not obvious how to compare them in a
@@ -2978,39 +2978,33 @@ static void addPath(
            memo once verified; a `sha256` under another method names the path
            as it always did (doc/lazy-store/04-derivation.md, section 1.9). */
         std::optional<StorePath> expectedStorePath;
-        if (expectedTreeHash) {
-            auto treePath = gitTreePath(*state.store, name, *expectedTreeHash);
-            if (state.store->isValidPath(treePath)) {
+        if (expectedTreeHash)
+            expectedStorePath = gitTreePath(*state.store, name, *expectedTreeHash);
+        else if (expectedHash) {
+            if (method == ContentAddressMethod::Raw::Git) {
+                if (auto hash = lookupTreeAddress(state.fetchSettings, *expectedHash))
+                    expectedStorePath = gitTreePath(*state.store, name, *hash);
+            } else
+                expectedStorePath = state.store->makeFixedOutputPathFromCA(
+                    name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
+        }
+        if (expectedStorePath) {
+            if (!settings.readOnlyMode)
+                state.store->addTempRoot(*expectedStorePath);
+            if (!state.repair && state.store->isValidPath(*expectedStorePath)) {
                 /* Both assertions given: the tree is named by `treeHash`; the
                    `sha256` is verified too, by the shim (the memo answers
                    first, else a walk of the store object). */
-                if (expectedHash)
+                if (expectedTreeHash && expectedHash)
                     assertNarHash(
                         state.fetchSettings,
                         *state.store,
-                        SourcePath{state.store->requireStoreObjectAccessor(treePath)},
+                        SourcePath{state.store->requireStoreObjectAccessor(*expectedStorePath)},
                         *expectedTreeHash,
                         *expectedHash,
                         path.to_string());
-                state.allowAndSetStorePathString(treePath, v);
+                state.allowAndSetStorePathString(*expectedStorePath, v);
                 return;
-            }
-        } else if (expectedHash) {
-            if (method == ContentAddressMethod::Raw::Git) {
-                if (auto hash = lookupTreeAddress(state.fetchSettings, *expectedHash)) {
-                    auto treePath = gitTreePath(*state.store, name, *hash);
-                    if (state.store->isValidPath(treePath)) {
-                        state.allowAndSetStorePathString(treePath, v);
-                        return;
-                    }
-                }
-            } else {
-                expectedStorePath = state.store->makeFixedOutputPathFromCA(
-                    name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
-                if (state.store->isValidPath(*expectedStorePath)) {
-                    state.allowAndSetStorePathString(*expectedStorePath, v);
-                    return;
-                }
             }
         }
 
@@ -3049,6 +3043,14 @@ static void addPath(
                 return {p, h};
             }
             // FIXME: support refs in fetchToStore()?
+            if (settings.readOnlyMode)
+                return state.store->computeStorePath(
+                    name,
+                    srcPath,
+                    method,
+                    HashAlgorithm::SHA256,
+                    refs,
+                    filter ? *filter.get() : defaultPathFilter);
             return {
                 state.store->addToStore(
                     name,

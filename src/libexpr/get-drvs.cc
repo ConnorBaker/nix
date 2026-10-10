@@ -167,7 +167,7 @@ PackageInfo::Outputs PackageInfo::queryOutputs(bool withPaths, bool onlyOutputsT
         for (auto elem : outTI->listView()) {
             if (elem->type() != nString)
                 throw std::move(errMsg);
-            auto out = outputs.find(state->forceString(*elem, noPos, "while evaluating an output name"));
+            auto out = outputs.find(elem->string_view());
             if (out == outputs.end())
                 throw std::move(errMsg);
             result.insert(*out);
@@ -260,7 +260,7 @@ NixInt PackageInfo::queryMetaInt(const std::string & name, NixInt def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            integer meta fields. */
-        if (auto n = string2Int<NixInt::Inner>(state->forceString(*v, noPos, "while evaluating a meta attribute")))
+        if (auto n = string2Int<NixInt::Inner>(v->string_view()))
             return NixInt{*n};
     }
     return def;
@@ -276,7 +276,7 @@ NixFloat PackageInfo::queryMetaFloat(const std::string & name, NixFloat def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            float meta fields. */
-        if (auto n = string2Float<NixFloat>(state->forceString(*v, noPos, "while evaluating a meta attribute")))
+        if (auto n = string2Float<NixFloat>(v->string_view()))
             return *n;
     }
     return def;
@@ -292,7 +292,7 @@ bool PackageInfo::queryMetaBool(const std::string & name, bool def)
     if (v->type() == nString) {
         /* Backwards compatibility with before we had support for
            Boolean meta fields. */
-        auto text = state->forceString(*v, noPos, "while evaluating a meta attribute");
+        auto text = v->string_view();
         if (text == "true")
             return true;
         if (text == "false")

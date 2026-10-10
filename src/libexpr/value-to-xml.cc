@@ -108,15 +108,14 @@ static void printValueAsXML(
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
-                    xmlAttrs["drvPath"] = drvPath =
-                        state.forceString(*a->value, a->pos, "while serialising a derivation to XML");
+                    xmlAttrs["drvPath"] = drvPath = a->value->string_view();
             }
 
             if (auto a = v.attrs()->get(state.s.outPath)) {
                 if (strict)
                     state.forceValue(*a->value, a->pos);
                 if (a->value->type() == nString)
-                    xmlAttrs["outPath"] = state.forceString(*a->value, a->pos, "while serialising a derivation to XML");
+                    xmlAttrs["outPath"] = a->value->string_view();
             }
 
             XMLOpenElement _(doc, "derivation", xmlAttrs);

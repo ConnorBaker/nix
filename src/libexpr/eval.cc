@@ -2384,57 +2384,51 @@ void EvalState::forceValueDeep(Value & v)
     }(v);
 }
 
-NixInt EvalState::forceInt(Value & v, const PosIdx pos, std::string_view errorCtx)
+[[gnu::noinline, noreturn]]
+static void throwExpectedType(EvalState & state, Value & v, PosIdx pos, const char * message)
+{
+    state.error<TypeError>(message, showType(v), ValuePrinter(state, v, errorPrintOptions))
+        .atPos(pos)
+        .debugThrow();
+}
+
+template<typename Accept>
+static inline ValueType forceValueAndRequire(
+    EvalState & state, Value & v, PosIdx pos, std::string_view errorCtx, const char * message, Accept accept)
 {
     try {
-        forceValue(v, pos);
-        if (v.type() != nInt)
-            error<TypeError>(
-                "expected an integer but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
-        return v.integer();
+        state.forceValue(v, pos);
+        auto type = v.type();
+        if (!accept(type))
+            throwExpectedType(state, v, pos, message);
+        return type;
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        e.addTrace(state.positions[pos], errorCtx);
         throw;
     }
+}
 
+NixInt EvalState::forceInt(Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    forceValueAndRequire(*this, v, pos, errorCtx, "expected an integer but found %1%: %2%", [](ValueType type) {
+        return type == nInt;
+    });
     return v.integer();
 }
 
 NixFloat EvalState::forceFloat(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    try {
-        forceValue(v, pos);
-        if (v.type() == nInt)
-            return v.integer().value;
-        else if (v.type() != nFloat)
-            error<TypeError>(
-                "expected a float but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
-        return v.fpoint();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
+    auto type = forceValueAndRequire(*this, v, pos, errorCtx, "expected a float but found %1%: %2%", [](ValueType type) {
+        return type == nInt || type == nFloat;
+    });
+    return type == nInt ? v.integer().value : v.fpoint();
 }
 
 bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    try {
-        forceValue(v, pos);
-        if (v.type() != nBool)
-            error<TypeError>(
-                "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
-        return v.boolean();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
-
+    forceValueAndRequire(*this, v, pos, errorCtx, "expected a Boolean but found %1%: %2%", [](ValueType type) {
+        return type == nBool;
+    });
     return v.boolean();
 }
 
@@ -2454,33 +2448,17 @@ bool EvalState::isFunctor(const Value & fun) const
 
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    try {
-        forceValue(v, pos);
-        if (v.type() != nFunction && !isFunctor(v))
-            error<TypeError>(
-                "expected a function but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
+    forceValueAndRequire(*this, v, pos, errorCtx, "expected a function but found %1%: %2%", [this, &v](ValueType type) {
+        return type == nFunction || isFunctor(v);
+    });
 }
 
 std::string_view EvalState::forceString(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    try {
-        forceValue(v, pos);
-        if (v.type() != nString)
-            error<TypeError>(
-                "expected a string but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
-        return v.string_view();
-    } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
-        throw;
-    }
+    forceValueAndRequire(*this, v, pos, errorCtx, "expected a string but found %1%: %2%", [](ValueType type) {
+        return type == nString;
+    });
+    return v.string_view();
 }
 
 void copyContext(const Value & v, NixStringContext & context, const ExperimentalFeatureSettings & xpSettings)
