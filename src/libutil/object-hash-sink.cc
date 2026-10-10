@@ -42,7 +42,7 @@ HashedNode HashingVisitor::hashDirectory(
         if (child.entry.hash.algo != merkle::hashAlgo)
             throw Error(
                 "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
-                path / name,
+                std::string(path.abs()) + (path.isRoot() ? "" : "/") + name,
                 printHashAlgo(child.entry.hash.algo),
                 printHashAlgo(merkle::hashAlgo));
         auto nameSize = name.size();

@@ -4,6 +4,7 @@ The lazy-store work kept a ledger of every defect the branch introduced and foun
 
 | defect | pinned by |
 |---|---|
+| a wrong-algorithm child result constructed its diagnostic through `CanonPath`, aborting on dot names or throwing `BadCanonPath` for NUL before reporting the identifier error | `ObjectHashSink.identifierDiagnosticsPreserveEveryNameClassAndDirectoryPath`; the isolated baseline reproduces both failure classes before the one-expression fix |
 | `builtins.storePath` and `fetchTree` of a pending object dereferenced a name that was not written | `WriteBufferTest.everyBuiltinAgreesWithEagerEvaluationOnPendingInputs`, `dereferencingBuiltinsWriteFirst`, `tests/functional/lazy-store-doors.sh` |
 | a pending path printed through `match`, `split`, `getContext` or `trace` before its object existed | the (C2) observer's `match`, `split`, `getctx`, `trace` modes; `WriteBufferTest.valuePrinterRealisesBeforeEmitting`, `ambiguousPrinterRealisesBeforeEmitting` |
 | a context-free literal naming a pending path escaped, or could not be read | `WriteBufferTest.aContextFreeLiteralNamingAPendingPathCannotEscape`, `aContextFreeLiteralNamingAPendingPathCanBeRead` |

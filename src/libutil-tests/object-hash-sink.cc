@@ -239,6 +239,51 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
     EXPECT_EQ(visitor.completed, 10u);
 }
 
+TEST(ObjectHashSink, identifierDiagnosticsPreserveEveryNameClassAndDirectoryPath)
+{
+    ExperimentalFeatureSettings xpSettings;
+    xpSettings.set("experimental-features", "blake3-hashes");
+    const std::array algorithms{
+        HashAlgorithm::MD5, HashAlgorithm::SHA1, HashAlgorithm::SHA512, HashAlgorithm::BLAKE3};
+    const std::array modes{
+        merkle::Mode::Directory, merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink};
+    const std::string marker(caseHackSuffix);
+    const std::array<std::string, 13> names{
+        "x", "x!", "x.", "y", "", ".", "..", "bad/name", std::string("a\0b", 3),
+        marker, marker + "x", "x" + marker + "y", "x" + marker};
+    const std::array paths{CanonPath::root, CanonPath("/parent")};
+    size_t cases = 0;
+    for (const auto & path : paths)
+        for (auto algorithm : algorithms)
+            for (auto mode : modes)
+                for (size_t nameIndex = 0; nameIndex != names.size(); ++nameIndex) {
+                    const auto & name = names[nameIndex];
+                    SCOPED_TRACE(fmt("path=%s algorithm=%s mode=%o name=%s", path, printHashAlgo(algorithm), static_cast<RawMode>(mode), name));
+                    Hash hash{algorithm, xpSettings};
+                    HashingVisitor visitor;
+                    try {
+                        visitor.directory(path, {[&](auto each) {
+                            each(name, false, [&](auto &) -> HashedNode { return {{mode, hash}, std::nullopt}; });
+                        }});
+                        ADD_FAILURE() << "wrong identifier algorithm was accepted";
+                    } catch (const BadCanonPath &) {
+                        ADD_FAILURE() << "name interpretation preempted the identifier diagnostic";
+                    } catch (const Error & error) {
+                        EXPECT_EQ(error.msg(), Error(
+                            "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
+                            std::string(path.abs()) + (path.isRoot() ? "" : "/") + name,
+                            printHashAlgo(algorithm), printHashAlgo(merkle::hashAlgo)).msg());
+                        if (nameIndex < 4) {
+                            EXPECT_EQ(error.msg(), Error(
+                                "object hash: '%s' was answered with a %s identifier, but the tree is hashed with %s",
+                                path / name, printHashAlgo(algorithm), printHashAlgo(merkle::hashAlgo)).msg());
+                        }
+                    }
+                    ++cases;
+                }
+    EXPECT_EQ(cases, 416u);
+}
+
 TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
 {
     const merkle::TreeEntry keep{merkle::Mode::Regular, merkle::blobId("first")};
