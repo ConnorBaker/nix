@@ -66,33 +66,26 @@ std::string NixStringContextElem::to_string() const
 {
     std::string res;
 
-    std::function<void(const SingleDerivedPath &)> toStringRest;
-    toStringRest = [&](auto & p) {
+    auto toStringRest = [&](this auto & toStringRest, const auto & path) -> void {
         std::visit(
             overloaded{
-                [&](const SingleDerivedPath::Opaque & o) { res += o.path.to_string(); },
-                [&](const SingleDerivedPath::Built & o) {
-                    res += o.output;
+                [&](const Opaque & o) { res += o.path.to_string(); },
+                [&](const Built & b) {
+                    res += b.output;
                     res += '!';
-                    toStringRest(*o.drvPath);
+                    toStringRest(b.drvPath->raw());
+                },
+                [&](const DrvDeep & d) {
+                    res += '=';
+                    res += d.drvPath.to_string();
                 },
             },
-            p.raw());
+            path);
     };
 
-    std::visit(
-        overloaded{
-            [&](const NixStringContextElem::Built & b) {
-                res += '!';
-                toStringRest(b);
-            },
-            [&](const NixStringContextElem::Opaque & o) { toStringRest(o); },
-            [&](const NixStringContextElem::DrvDeep & d) {
-                res += '=';
-                res += d.drvPath.to_string();
-            },
-        },
-        raw);
+    if (std::holds_alternative<Built>(raw))
+        res += '!';
+    toStringRest(raw);
 
     return res;
 }
@@ -101,13 +94,10 @@ std::string NixStringContextElem::display(const StoreDirConfig & store) const
 {
     return std::visit(
         overloaded{
-            [&](const NixStringContextElem::Opaque & o) -> std::string {
-                return SingleDerivedPath{o}.to_string(store);
-            },
+            [&](const auto & path) -> std::string { return path.to_string(store); },
             [&](const NixStringContextElem::DrvDeep & d) -> std::string {
                 return store.printStorePath(d.drvPath) + " (deep)";
             },
-            [&](const NixStringContextElem::Built & b) -> std::string { return SingleDerivedPath{b}.to_string(store); },
         },
         raw);
 }

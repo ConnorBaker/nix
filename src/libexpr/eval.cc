@@ -2650,12 +2650,11 @@ StorePath EvalState::copySourceToStore(
             cached = i->second;
     }
     if (cached && (mode == FetchMode::DryRun || cached->second == FetchMode::Copy)) {
-        auto & dst = cached->first;
         if (mode == FetchMode::DryRun)
-            return dst;
-        store->addTempRoot(dst);
-        if (store->isValidPath(dst))
-            return dst;
+            return std::move(cached->first);
+        store->addTempRoot(cached->first);
+        if (store->isValidPath(cached->first))
+            return std::move(cached->first);
     }
 
     auto result = fetchToStore(fetchSettings, *store, path, mode, name, method);

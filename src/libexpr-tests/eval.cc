@@ -450,7 +450,7 @@ TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupan
                         readFile(real / "default.nix"), registered && physical == Physical::Different ? "7" : "42");
 
                 /* A valid destination needs no restore or free-space probe.
-                   Keep that probe unavailable through the changed-source check. */
+                   Keep that probe unavailable through the repeated-context demand. */
                 auto previousFreeSpaceFile = getEnv("_NIX_TEST_FREE_SPACE_FILE");
                 auto & gc = nix::settings.getLocalSettings().getGCSettings();
                 auto previousInterval = gc.minFreeCheckInterval.get();
@@ -465,17 +465,12 @@ TEST_F(EvalStateTest, mountedReadsAndCopiesUseTheSameInputDespitePhysicalOccupan
                 setEnv("_NIX_TEST_FREE_SPACE_FILE", (root.path() / "missing-free-space").string().c_str());
                 EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
 
-                /* Mounting fixes an expected address, not mutable source bytes.
-                   A valid old destination must not suppress the later check. */
+                /* Fresh evaluation reads remain live. The opaque context denotes
+                   the already-present object, whose validity needs no new hash. */
                 tree->addFile(CanonPath("default.nix"), "99");
                 EXPECT_EQ(nested.rootFS->readFile(logical / "default.nix"), "99");
-                try {
-                    nested.ensureLazyPathCopied(path);
-                    ADD_FAILURE() << "a mounted input changed without the address check failing";
-                } catch (Error & error) {
-                    EXPECT_EQ(error.info().status, 102u);
-                    EXPECT_NE(error.message().find("contents have changed"), std::string::npos);
-                }
+                EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
+                EXPECT_TRUE(local->isValidPath(path));
             }
     }
 }
@@ -874,6 +869,28 @@ static StorePath evalCopiedPath(EvalState & state, std::string expression)
 }
 
 } // namespace
+
+TEST_F(EvalStateTest, presentMountedContextsNeedNoBorrowedFileRead)
+{
+    AutoDelete root{createTempDir()};
+    auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+    bool readOnly = false;
+    EvalSettings settings{readOnly};
+    settings.nixPath = {};
+    EvalState nested({}, local, fetchSettings, settings);
+    auto source = make_ref<CopyRequestSource>();
+    source->root = MemorySourceAccessor::File::Regular{false, "before"};
+    auto path = nested.store->addToStore("present-mounted", SourcePath{source}, ContentAddressMethod::Raw::Git);
+    nested.storeFS->mount(CanonPath(local->printStorePath(path)), source);
+    source->root = MemorySourceAccessor::File::Regular{false, "after"};
+    source->afterRead = [] { throw Error("borrowed source unavailable"); };
+    source->reads = 0;
+    EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
+    EXPECT_NO_THROW(nested.ensureLazyPathCopied(path));
+    EXPECT_EQ(source->reads, 0u);
+    EXPECT_TRUE(local->isValidPath(path));
+    EXPECT_EQ(readFile(local->toRealPath(path)), "before");
+}
 
 TEST_F(EvalStateTest, sourceCopyRequestsRespectModesRepairAndDestinationPresence)
 {

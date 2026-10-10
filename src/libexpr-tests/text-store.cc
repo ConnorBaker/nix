@@ -436,41 +436,51 @@ TEST_F(TextStoreTest, mountedReferencesPrecedeBothTextWriters)
         }
 }
 
-TEST_F(TextStoreTest, validReferrersStillCheckTheirMountedSources)
+TEST_F(TextStoreTest, mountedReferencesReusePresentObjectsAndRejectChangedMissingWitnesses)
 {
-    for (bool derivation : {false, true}) {
-        SCOPED_TRACE(derivation);
-        AutoDelete root{canonPath(createTempDir(), true)};
-        auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
-        EvalState nested({}, local, fetchSettings, evalSettings);
-        auto tree = make_ref<MemorySourceAccessor>();
-        tree->addFile(CanonPath("file"), "before");
-        auto source = gitTreePath(*local, "mounted", merkle::objectHash(objectHashOf(*tree, CanonPath::root).root));
-        nested.storeFS->mount(CanonPath(local->printStorePath(source)), tree);
-        auto expr = derivation ? "input: (derivation { name = \"valid-drv\"; system = \"x86_64-linux\"; "
-                                 "builder = \"/bin/sh\"; inherit input; }).drvPath"
-                               : "input: builtins.toFile \"valid-text\" input";
-        Value function, argument;
-        nested.eval(nested.parseExprFromString(expr, nested.rootPath(CanonPath::root)), function);
-        argument.mkString("same text", NixStringContext{NixStringContextElem::Opaque{.path = source}}, nested.mem);
-        auto evaluate = [&] {
-            Value value;
-            nested.callFunction(function, argument, value, noPos);
-            nested.forceValue(value, noPos);
-            return local->parseStorePath((value).string_view());
-        };
-        auto path = evaluate();
-        ASSERT_TRUE(local->isValidPath(path));
-        tree->addFile(CanonPath("file"), "after");
-        try {
-            evaluate();
-            ADD_FAILURE() << "a valid referrer suppressed the changed mounted-source error";
-        } catch (Error & error) {
-            EXPECT_EQ(error.info().status, 102u);
-            EXPECT_NE(error.message().find("contents have changed"), std::string::npos);
+    for (bool derivation : {false, true})
+        for (bool present : {false, true}) {
+            SCOPED_TRACE(fmt("derivation=%d present=%d", derivation, present));
+            AutoDelete root{canonPath(createTempDir(), true)};
+            auto local = make_ref<LocalStore>(make_ref<LocalStoreConfig>(root.path(), StoreConfig::Params{}));
+            EvalState nested({}, local, fetchSettings, evalSettings);
+            auto tree = make_ref<MemorySourceAccessor>();
+            tree->addFile(CanonPath("file"), "before");
+            auto source = gitTreePath(*local, "mounted", merkle::objectHash(objectHashOf(*tree, CanonPath::root).root));
+            nested.storeFS->mount(CanonPath(local->printStorePath(source)), tree);
+            auto expr = derivation ? "input: (derivation { name = \"valid-drv\"; system = \"x86_64-linux\"; "
+                                     "builder = \"/bin/sh\"; inherit input; }).drvPath"
+                                   : "input: builtins.toFile \"valid-text\" input";
+            Value function, argument;
+            nested.eval(nested.parseExprFromString(expr, nested.rootPath(CanonPath::root)), function);
+            argument.mkString("same text", NixStringContext{NixStringContextElem::Opaque{.path = source}}, nested.mem);
+            auto evaluate = [&] {
+                Value value;
+                nested.callFunction(function, argument, value, noPos);
+                nested.forceValue(value, noPos);
+                return local->parseStorePath((value).string_view());
+            };
+            std::optional<StorePath> path;
+            if (present) {
+                path = evaluate();
+                ASSERT_TRUE(local->isValidPath(*path));
+            }
+            tree->addFile(CanonPath("file"), "after");
+            if (present) {
+                EXPECT_EQ(evaluate(), *path);
+                EXPECT_EQ(readFile(local->toRealPath(source) / "file"), "before");
+                EXPECT_TRUE(local->isValidPath(*path));
+            } else {
+                try {
+                    evaluate();
+                    ADD_FAILURE() << "a changed absent source satisfied its original opaque context";
+                } catch (Error & error) {
+                    EXPECT_EQ(error.info().status, 102u);
+                    EXPECT_NE(error.message().find("contents have changed"), std::string::npos);
+                }
+            }
+            EXPECT_EQ(local->isValidPath(source), present);
         }
-        EXPECT_TRUE(local->isValidPath(path));
-    }
 }
 
 TEST_F(TextStoreTest, unobservedObjectsRemainAndFailuresLeaveAReferenceClosedPrefix)

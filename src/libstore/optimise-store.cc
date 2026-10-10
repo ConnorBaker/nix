@@ -573,7 +573,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
 
         /* The whole file is in memory and its blob known.  A hit: the
            store's valid file linked under the name, nothing written. */
-        if (linkable && objects.link(entry.hash, executable, dirFd, name, where, buffer.size(), repair, hold))
+        if (linkable && objects.link(entry.hash, executable, dirFd, name, where, buffer.size(), repair, hold, hold.emptyRegistered))
             return std::move(file.node);
 
         /* A miss: written from memory, canonicalised by the restore sink's
@@ -892,10 +892,13 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
             hold.addAuxiliary(std::move(auxiliary));
     };
     LinkingVisitor::Naming naming{std::move(namer), commitAttempt};
+    beginIngestion(hold, dst);
+    /* Only completed unknown bodies omit discoveries after an EMPTY acquisition. */
+    if (!config->readOnly && objects.index == &blobIndex && blobIndex.lookup && !mayHaveValidPaths())
+        hold.emptyRegistered = &blobIndex;
     HashingVisitor hasher{workers};
     LinkingVisitor visitor{objects, hold, hasher, restore, repair};
     visitor.naming = &naming;
-    beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
     /* Every reused node carries the size of what it made, so the NAR
        size is exact, as the one route's is. */

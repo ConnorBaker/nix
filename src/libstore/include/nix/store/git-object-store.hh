@@ -234,7 +234,8 @@ public:
         const std::filesystem::path & where,
         std::optional<uint64_t> size,
         RepairFlag repair,
-        const Hold & hold);
+        const Hold & hold,
+        const Index * emptyRegistered = nullptr);
 
     struct Placed
     {
@@ -386,6 +387,8 @@ public:
 
         /** A fresh source operation whose physical projection has not completed. */
         mutable bool ingesting = false;
+        /** EMPTY applies only to this provider; known-source availability remains live. */
+        mutable const Index * emptyRegistered = nullptr;
         /** Completed outputs retain their database identity across the next beginIngestion. */
         mutable boost::container::flat_map<std::string, std::pair<uint64_t, std::vector<Row>>> completedIngestions;
 

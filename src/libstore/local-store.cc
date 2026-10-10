@@ -605,6 +605,7 @@ GitObjectStore::BlobInodes LocalStore::blobInodes()
 
 void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
 {
+    hold.emptyRegistered = nullptr;
     if (config->readOnly)
         return;
     hold.setRoot(root);
@@ -879,7 +880,9 @@ void LocalStore::coalesceBlobRows(
             sync();
     }
     for (auto & collision : collisions)
-        if (!collision.eligible)
+        if (collision.eligible)
+            writeBlobRow(state.stmts->InsertBlob.use(), ingestion, collision.row);
+        else
             deleteOwn(collision.row.id, collision.row.executable);
     for (auto & [row, holder] : rejected) {
         auto name = (++std::get<GitObjectStore::Holder::Registered>(holder.address).second.begin()).remaining;
@@ -889,9 +892,6 @@ void LocalStore::coalesceBlobRows(
             {row.id, row.executable, holder.ino, holder.dev, holder.size,
              std::string(name)});
     }
-    for (auto & collision : collisions)
-        if (collision.eligible)
-            writeBlobRow(state.stmts->InsertBlob.use(), ingestion, collision.row);
 }
 
 /* Order each initial publication by its SQLite primary key. Ingestion is

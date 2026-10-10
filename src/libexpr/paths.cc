@@ -35,11 +35,14 @@ void EvalState::ensureLazyPathCopied(const StorePath & path)
 
     /* Protect the demanded destination before deciding whether it needs a write. */
     store->addTempRoot(path);
+    if (store->isValidPath(path))
+        return;
+
     auto storePath = fetchToStore(
         fetchSettings,
         *store,
         SourcePath{ref(mount)},
-        store->isValidPath(path) ? FetchMode::DryRun : FetchMode::Copy,
+        FetchMode::Copy,
         path.name());
 
     /* This can happen if the source gets modified by another process while we are evaluaing

@@ -476,7 +476,8 @@ std::optional<uint64_t> GitObjectStore::link(
     const std::filesystem::path & where,
     std::optional<uint64_t> size,
     RepairFlag repair,
-    const Hold & hold)
+    const Hold & hold,
+    const Index * emptyRegistered)
 {
 #ifdef _WIN32
     return std::nullopt;
@@ -504,7 +505,7 @@ std::optional<uint64_t> GitObjectStore::link(
                 PathFmt(where),
                 ec.message());
         }
-    } else if (index && index->lookup) {
+    } else if (index && index != emptyRegistered && index->lookup) {
         auto cursor = Holder::initialCursor;
         while (auto holder = index->lookup(id, executable, cursor)) {
             assert(holder->cursor() > cursor);
@@ -598,7 +599,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
     if (auto mine = hold.pendingHolder(id, executable)) {
         hold.appendNames(rowOf(id, executable, before, where, hold));
         return placePending(hold, *mine, dirFd, name, where, before);
-    } else if (index && index->lookup) {
+    } else if (index && index != hold.emptyRegistered && index->lookup) {
         auto cursor = Holder::initialCursor;
         while (auto holder = index->lookup(id, executable, cursor)) {
             assert(holder->cursor() > cursor);

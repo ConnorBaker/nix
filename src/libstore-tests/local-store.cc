@@ -1088,11 +1088,110 @@ TEST_F(LocalStoreObjectsTest, materialisationUsesImmutableBlobIdentityButRepairR
     }
 }
 
+TEST_F(LocalStoreObjectsTest, acquiredRegularRelationPreservesPendingAndPublishedSharing)
+{
+    size_t cases = 0;
+    /* EMPTY, preexisting LIVE, initial custom, switched custom, no provider, valid path without blobs. */
+    for (unsigned provider = 0; provider < 6; ++provider)
+        for (size_t size : {size_t{4}, size_t{(1 << 20) + 1}})
+            for (bool executable : {false, true})
+                for (auto repair : {NoRepair, Repair}) {
+                    auto label = fmt("acquisition-%d", cases++);
+                    SCOPED_TRACE(fmt("%s provider=%d size=%d exec=%d repair=%d",
+                        label, provider, size, executable, repair));
+                    store.reset();
+                    config = std::make_shared<LocalStoreConfig>(tempStoreDir.path() / label, StoreConfig::Params{});
+                    store = std::make_shared<LocalStore>(ref{config});
+                    auto bytes = std::string(size, 'v');
+                    Nodes nodes{{"a", bytes, executable ? 'x' : 'f'}, {"b", bytes, executable ? 'x' : 'f'}};
+                    auto tree = treeAccessor(nodes);
+                    auto source = make_ref<CountingAccessor>(tree);
+                    auto seed = config->realStoreDir.get() / "seed";
+                    auto original = store->objects.index;
+                    auto index = *original;
+                    size_t lookups = 0;
+                    index.lookup = [&](const Hash & id, bool mode, GitObjectStore::Holder::Cursor cursor) {
+                        ++lookups;
+                        return original->lookup(id, mode, cursor);
+                    };
+                    Finally restoreProvider{[&] { store->objects.index = original; }};
+                    if (provider == 1)
+                        restore(seed, treeNar(nodes));
+                    if (provider == 5) {
+                        restore(config->realStoreDir.get() / "empty-directory", treeNar({}));
+                        EXPECT_TRUE(store->mayHaveValidPaths());
+                        EXPECT_EQ(blobRowCount(*store, executable), 0u);
+                    }
+                    if (provider == 2)
+                        store->objects.index = &index;
+                    if (provider == 4)
+                        store->objects.index = nullptr;
+                    auto hold = store->objects.hold();
+                    bool acquired = false;
+                    auto namer = [&](const CanonPath & path, const SourceAccessor::Stat &)
+                        -> std::optional<merkle::TreeEntry> {
+                        if (path.isRoot()) {
+                            EXPECT_FALSE(acquired);
+                            acquired = true;
+                            EXPECT_EQ(hold.emptyRegistered, provider == 0 || provider == 3 ? original : nullptr);
+                            EXPECT_EQ(hold.ownRows().emptyRegistered, nullptr);
+                            if (provider != 1)
+                                restore(seed, treeNar(nodes));
+                            if (provider == 3)
+                                store->objects.index = &index;
+                            lookups = 0;
+                        }
+                        return std::nullopt;
+                    };
+                    auto copy = [&](std::string name, LocalStore::TreeNamer naming, bool warm = false) {
+                        ValidPathInfo info{StorePath::random(name), UnkeyedValidPathInfo{*store, std::nullopt}};
+                        auto real = store->toRealPath(info.path);
+                        CountingRestoreHooks hooks{makeCanonicalisingRestoreHooks(
+                            NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls))};
+                        auto result = store->materialiseThroughObjects(real, SourcePath(source), defaultPathFilter,
+                            false, &hooks, repair, std::move(naming), hold);
+                        EXPECT_EQ(result.root, referenceObjectEntry(*tree, CanonPath::root));
+                        StringSink nar;
+                        dumpPath(real, nar);
+                        EXPECT_EQ(nar.s, treeNar(nodes));
+                        EXPECT_EQ(result.narSize, nar.s.size());
+                        EXPECT_EQ(hooks.regularFilesCreated.load(), size > (1 << 20) ? 2u
+                            : !warm && (provider == 0 || provider == 4) ? 1u : 0u);
+                        if (!warm && (provider == 2 || provider == 3))
+                            EXPECT_EQ(lookups, 1u) << "pending duplicates bypass the foreign provider";
+                        info.objectHash = ObjectHash::of(result.root);
+                        info.narSize = result.narSize.value();
+                        store->registerValidPath(info, hold);
+                        for (auto name : {"a", "b"}) {
+                            EXPECT_EQ(st(real / name).st_ino, st(seed / "a").st_ino);
+                            EXPECT_EQ(st(real / name).st_dev, st(seed / "a").st_dev);
+                            EXPECT_EQ(readFile(real / name), bytes);
+                        }
+                    };
+                    copy(label, namer);
+                    EXPECT_TRUE(acquired);
+                    EXPECT_EQ(source->reads.load(), 2u);
+                    store->objects.index = original;
+                    store->beginIngestion(hold, config->realStoreDir.get() / "reset");
+                    EXPECT_EQ(hold.emptyRegistered, nullptr);
+                    source->reads = 0;
+                    copy(label + "-reuse", [&](const CanonPath &, const SourceAccessor::Stat &)
+                        -> std::optional<merkle::TreeEntry> {
+                        EXPECT_EQ(hold.emptyRegistered, nullptr);
+                        return std::nullopt;
+                    }, true);
+                    EXPECT_EQ(source->reads.load(), 2u);
+                }
+    EXPECT_EQ(cases, 48u);
+}
+
 TEST_F(LocalStoreObjectsTest, canonicalBlobCopyDoesNotRequireSizeMetadata)
 {
     struct Source : MemorySourceAccessor
     {
         bool sizeKnown;
+        bool fail = false;
+        std::function<void()> beforeStat;
         size_t reads = 0;
 
         Source(std::string bytes, bool executable, bool sizeKnown)
@@ -1105,6 +1204,8 @@ TEST_F(LocalStoreObjectsTest, canonicalBlobCopyDoesNotRequireSizeMetadata)
 
         std::optional<Stat> maybeLstat(const CanonPath & path) override
         {
+            if (beforeStat)
+                std::exchange(beforeStat, nullptr)();
             auto st = MemorySourceAccessor::maybeLstat(path);
             if (st && !sizeKnown)
                 st->fileSize.reset();
@@ -1114,39 +1215,72 @@ TEST_F(LocalStoreObjectsTest, canonicalBlobCopyDoesNotRequireSizeMetadata)
         void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
         {
             reads++;
+            if (fail)
+                throw Error("known source read failed");
             MemorySourceAccessor::readFile(path, sink, sizeCallback);
         }
     };
 
     unsigned int serial = 0;
-    for (bool sizeKnown : {false, true})
-        for (bool held : {false, true})
-            for (bool executable : {false, true})
-                for (auto repair : {NoRepair, Repair}) {
-                    SCOPED_TRACE(sizeKnown);
-                    SCOPED_TRACE(held);
-                    SCOPED_TRACE(executable);
-                    SCOPED_TRACE(repair);
-                    auto bytes = fmt("canonical blob %d", serial++);
-                    auto source = make_ref<Source>(bytes, executable, sizeKnown);
-                    auto dst = config->realStoreDir.get() / fmt("canonical-%d", serial);
-                    auto seed = dst.string() + "-seed";
-                    if (held)
-                        materialise(seed, SourcePath(source), noNode());
-                    source->reads = 0;
+    for (bool producer : {false, true})
+        for (bool sizeKnown : {false, true})
+            for (unsigned availability : {0u, 1u, 2u})
+                for (bool executable : {false, true})
+                    for (auto repair : {NoRepair, Repair})
+                        for (bool fail : {false, true}) {
+                            bool held = availability != 0;
+                            SCOPED_TRACE(sizeKnown);
+                            SCOPED_TRACE(producer);
+                            SCOPED_TRACE(availability);
+                            SCOPED_TRACE(fail);
+                            SCOPED_TRACE(executable);
+                            SCOPED_TRACE(repair);
+                            auto bytes = fmt("canonical blob %d", serial++);
+                            store.reset();
+                            config = std::make_shared<LocalStoreConfig>(
+                                tempStoreDir.path() / fmt("known-domain-%d", serial), StoreConfig::Params{});
+                            store = std::make_shared<LocalStore>(ref{config});
+                            auto source = make_ref<Source>(bytes, executable, sizeKnown);
+                            auto dst = config->realStoreDir.get() / fmt("canonical-%d", serial);
+                            auto seed = dst.string() + "-seed";
+                            if (availability == 1)
+                                materialise(seed, SourcePath(source), noNode());
+                            if (availability == 2)
+                                source->beforeStat = [&] {
+                                    auto plain = make_ref<MemorySourceAccessor>();
+                                    plain->root = source->root;
+                                    materialise(seed, SourcePath(plain), noNode());
+                                };
+                            auto entry = *source->knownRoot;
+                            if (!producer)
+                                source->knownRoot.reset();
+                            auto namer = producer ? noNode() : LocalStore::TreeNamer{
+                                [entry](const CanonPath &, const SourceAccessor::Stat &) { return std::optional(entry); }};
+                            source->fail = fail;
+                            source->reads = 0;
 
-                    auto copied = materialise(dst, SourcePath(source), noNode(), repair);
-                    EXPECT_EQ(copied.root, *source->knownRoot);
-                    EXPECT_EQ(source->reads, held && !repair ? 0u : 1u);
-                    EXPECT_EQ(filesCreated, held ? 0u : 1u);
-                    EXPECT_EQ(readFile(dst), bytes);
-                    EXPECT_EQ(bool(st(dst).st_mode & S_IXUSR), executable);
-                    StringSink nar;
-                    dumpPath(dst, nar);
-                    EXPECT_EQ(copied.narSize, nar.s.size());
-                    if (held)
-                        EXPECT_EQ(st(dst).st_ino, st(seed).st_ino);
-                }
+                            if (fail && (!held || (repair && producer))) {
+                                EXPECT_THROW(materialise(dst, SourcePath(source), namer, repair), Error);
+                                EXPECT_EQ(source->reads, 1u);
+                                EXPECT_EQ(blobRowCount(*store, executable), held ? 1u : 0u);
+                                EXPECT_EQ(auxiliaryRowCount(), held && executable ? 1u : 0u);
+                                continue;
+                            }
+                            auto copied = materialise(dst, SourcePath(source), namer, repair);
+                            EXPECT_EQ(copied.root, entry);
+                            EXPECT_EQ(source->reads, held && (!repair || !producer) ? 0u : 1u);
+                            EXPECT_EQ(filesCreated, held && !(availability == 2 && repair && producer) ? 0u : 1u);
+                            EXPECT_EQ(readFile(dst), bytes);
+                            EXPECT_EQ(bool(st(dst).st_mode & S_IXUSR), executable);
+                            StringSink nar;
+                            dumpPath(dst, nar);
+                            EXPECT_EQ(copied.narSize, nar.s.size());
+                            /* Late producer repair reads the source and uses EMPTY for that completed body.
+                               This legacy fixture publishes rows without production coalescence;
+                               the real registration test above checks final sharing. */
+                            if (held && !(availability == 2 && repair && producer))
+                                EXPECT_EQ(st(dst).st_ino, st(seed).st_ino);
+                        }
 }
 
 TEST_F(LocalStoreObjectsTest, knownBlobChecksAnnouncedAndDeliveredSizes)
@@ -7176,6 +7310,10 @@ TEST_F(LocalStoreObjectsTest, readOnlyOldStoresVerifyPhysicalValuesWithoutAuxili
             }
             config = std::make_shared<LocalStoreConfig>(root, StoreConfig::Params{{"read-only", "true"}});
             store = std::make_shared<LocalStore>(ref{config});
+            auto hold = store->objects.hold();
+            hold.emptyRegistered = store->objects.index;
+            store->beginIngestion(hold, real);
+            EXPECT_EQ(hold.emptyRegistered, nullptr);
             EXPECT_EQ(store->objects.readAuxiliary(entry).has_value(), hasTable);
             EXPECT_EQ(store->verifyStore(true, NoRepair), corrupt)
                 << "missing optional cache storage cannot suppress physical hash verification";
@@ -11048,6 +11186,10 @@ TEST_F(LocalStoreObjectsTest, freshParallelCopySharesDuplicatesAtEveryWidth)
     Finally restoreWorkers{
         [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
     for (size_t workers = 1; workers <= 8; ++workers) {
+        store.reset();
+        config = std::make_shared<LocalStoreConfig>(
+            tempStoreDir.path() / fmt("fresh-empty-w%d", workers), StoreConfig::Params{});
+        store = std::make_shared<LocalStore>(ref{config});
         HashingVisitor::workersForTest.store(workers);
         Nodes nodes;
         auto bytes = fmt("width %d ", workers) + std::string(65536, 'x');
