@@ -1414,7 +1414,7 @@ private:
 
 public:
     ref<GitRepoImpl> repo;
-    std::optional<Hash> rev;
+    git_attr_options attributes = GIT_ATTR_OPTIONS_INIT;
 
     GitExportIgnoreSourceAccessor(ref<GitRepoImpl> repo, ref<SourceAccessor> next, std::optional<Hash> rev)
         : CachingFilteringSourceAccessor(
@@ -1424,10 +1424,12 @@ public:
                       fmt("'%s' does not exist because it was fetched with exportIgnore enabled", path));
               })
         , repo(repo)
-        , rev(rev)
     {
+        attributes.flags = GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_NO_SYSTEM;
         if (!rev)
             return;
+        attributes.flags |= GIT_ATTR_CHECK_INCLUDE_COMMIT;
+        attributes.attr_commit_id = hashToOID(*rev);
         if (git_repository_open(std::out_ptr(commitAttributesRepo), repo->path.string().c_str()))
             throw GitError("opening Git repository %s to read its attributes", PathFmt(repo->path));
         /* The repository's object database, so that this handle reads every
@@ -1443,31 +1445,6 @@ public:
             throw GitError("setting the empty Git index for attribute lookups");
     }
 
-    bool gitAttrGet(const CanonPath & path, const char * attrName, const char *& valueOut)
-    {
-        const char * pathCStr = path.rel_c_str();
-
-        if (rev) {
-            /* The tree named is the commit's, so its attributes are the
-               commit's own `.gitattributes`, `info/attributes` and
-               `core.attributesFile` -- `git archive <rev>` without
-               `--worktree-attributes`, which unpacks the tree being
-               archived into its in-core index and reads attributes from
-               that index alone.  `GIT_ATTR_CHECK_INDEX_ONLY` against the
-               empty index above withholds the working directory's files and
-               the repository's index; `GIT_ATTR_CHECK_NO_SYSTEM` withholds
-               the system file's rules, though not its macros, as before. */
-            git_attr_options opts = GIT_ATTR_OPTIONS_INIT;
-            opts.attr_commit_id = hashToOID(*rev);
-            opts.flags = GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_INCLUDE_COMMIT | GIT_ATTR_CHECK_NO_SYSTEM;
-            return git_attr_get_ext(&valueOut, commitAttributesRepo.get(), &opts, pathCStr, attrName);
-        } else {
-            /* The tree named is the working directory's. */
-            return git_attr_get(
-                &valueOut, *repo, GIT_ATTR_CHECK_INDEX_ONLY | GIT_ATTR_CHECK_NO_SYSTEM, pathCStr, attrName);
-        }
-    }
-
     bool isExportIgnored(const CanonPath & path)
     {
         /* The workdir handle can also belong to another export-ignore or
@@ -1479,7 +1456,12 @@ public:
         // > It will use index only for creating archives or for a bare repo
         // > (if an index has been specified for the bare repo).
         // -- https://github.com/libgit2/libgit2/blob/HEAD/include/git2/attr.h#L113C62-L115C48
-        if (gitAttrGet(path, "export-ignore", exportIgnoreEntry)) {
+        if (git_attr_get_ext(
+                &exportIgnoreEntry,
+                commitAttributesRepo ? commitAttributesRepo.get() : repo->repo.get(),
+                &attributes,
+                path.rel_c_str(),
+                "export-ignore")) {
             if (git_error_last()->klass == GIT_ENOTFOUND)
                 return false;
             else
