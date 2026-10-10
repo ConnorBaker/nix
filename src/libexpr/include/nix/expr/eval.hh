@@ -735,14 +735,7 @@ private:
      *
      * This code is factored out so that it's not in the heavily inlined hot path.
      */
-    void handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, const PosIdx pos);
-
-    /**
-     * Internal support function for forceValue
-     *
-     * This code is factored out so that it's not in the heavily inlined hot path.
-     */
-    void handleEvalExceptionForApp(Value & v, const Value & savedApp);
+    void handleEvalException(Value & v, const Value & saved, const PosIdx pos);
 
     void handleEvalFailed(Value & v, PosIdx pos);
 

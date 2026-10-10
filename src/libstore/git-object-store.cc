@@ -761,10 +761,7 @@ uint64_t GitObjectStore::sweep(const Owned * owned)
                 mergedTmp = openChild(mergedRoot.get(), "tmp");
         }
         scan(std::move(tmp), [&](Descriptor tmpFd, const char * name) {
-            auto st = maybeLstat(name, tmpFd);
-            if (!st)
-                return;
-            if (!S_ISDIR(st->st_mode) || !isHoldName(name))
+            if (!isHoldName(name))
                 return;
             auto held = openChild(tmpFd, name);
             if (!held)

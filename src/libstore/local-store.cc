@@ -1243,41 +1243,25 @@ bool LocalStore::upgradeDBSchema(State & state, bool dryRun)
 
     maybeUpgrade("20260309-drop-redundant-indexreferrer", "drop index if exists IndexReferrer");
 
-    /* Install ownership and auxiliary tables in one transaction, retaining
-       non-orphan candidates. ValidPaths is not rebuilt. */
+    /* Install the current owned projections atomically. Existing unmarked
+       branch layouts are unsupported; never replace their tables. */
     maybeUpgrade(
         "20260928-ingestion-owned-projections",
-        "create table if not exists Ingestions ("
+        "create table Ingestions ("
         " id integer primary key autoincrement not null, path text, hold text);"
-        "\ncreate table if not exists Blobs ("
-        " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
-        " ingestion integer not null, name text not null, size integer not null,"
-        " primary key (id, exec, ingestion)) without rowid;"
-        "\ncreate table OwnedBlobs ("
+        "\ncreate table Blobs ("
         " id blob not null, exec integer not null, ino integer not null, dev integer not null,"
         " ingestion integer not null references Ingestions(id) on delete cascade,"
         " name text not null, size integer not null, primary key (id, exec, ingestion)) without rowid;"
-        "\ninsert into OwnedBlobs select b.id, b.exec, b.ino, b.dev, b.ingestion, b.name, b.size"
-        " from Blobs b join Ingestions i on i.id = b.ingestion;"
-        "\ndrop table Blobs; alter table OwnedBlobs rename to Blobs;"
         "\ncreate index IndexBlobsIngestion on Blobs(ingestion);"
-        "\ncreate index if not exists IndexIngestionsPath on Ingestions(path, hold);"
-        "\ncreate table if not exists AuxValues ("
+        "\ncreate index IndexIngestionsPath on Ingestions(path, hold);"
+        "\ncreate table AuxValues ("
         " kind integer not null check(kind in (16384, 40960)),"
         " id blob not null check(typeof(id) = 'blob' and length(id) = 32),"
         " ingestion integer not null references Ingestions(id) on delete cascade,"
         " chunk integer not null check(chunk >= 0), body blob not null,"
         " primary key(kind, id, ingestion, chunk)) without rowid;"
-        "\ncreate index if not exists IndexAuxValuesIngestion on AuxValues(ingestion);"
-        /* Older schema-11 writers must see their layouts as already installed.
-           Replaying their rebuilds would remove the ownership FK while leaving
-           this migration's marker present on the subsequent upgrade. */
-        "\ninsert or ignore into SchemaMigrations(migration) values"
-        " ('20260919-blob-index-holders'),"
-        " ('20260921-blob-holder-candidates'),"
-        " ('20260921-ingestion-paths'),"
-        " ('20260924-blob-holder-without-rowid'),"
-        " ('20260927-auxiliary-ingestion-values')");
+        "\ncreate index IndexAuxValuesIngestion on AuxValues(ingestion);");
 
     return ret;
 }

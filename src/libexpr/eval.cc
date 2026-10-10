@@ -2261,9 +2261,10 @@ void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & 
 // always force this to be separate, otherwise forceValue may inline it and take
 // a massive perf hit
 [[gnu::noinline]]
-void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, const PosIdx pos)
+void EvalState::handleEvalException(Value & v, const Value & saved, const PosIdx pos)
 {
-    if (!env)
+    auto env = saved.isThunk() ? saved.thunk().env : nullptr;
+    if (saved.isThunk() && !env)
         tryFixupBlackHolePos(v, pos);
 
     auto e = std::current_exception();
@@ -2288,26 +2289,7 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
     } catch (...) {
     }
     if (recovery) {
-        recovery->mkThunk(env, expr);
-    }
-    v.mkFailed(e, recovery, mem);
-}
-
-[[gnu::noinline]]
-void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
-{
-    auto e = std::current_exception();
-    Value * recovery = nullptr;
-    try {
-        std::rethrow_exception(e);
-    } catch (const Interrupted & e) {
-        recovery = allocValue();
-    } catch (const RecoverableEvalError & e) {
-        recovery = allocValue();
-    } catch (...) {
-    }
-    if (recovery) {
-        *recovery = savedApp;
+        *recovery = saved;
     }
     v.mkFailed(e, recovery, mem);
 }
@@ -2795,12 +2777,6 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
     }
 
     switch (v1.type()) {
-    case nInt:
-        if (v1.integer() != v2.integer()) {
-            error<AssertionError>("integer '%d' is not equal to integer '%d'", v1.integer(), v2.integer()).debugThrow();
-        }
-        return;
-
     case nBool:
         if (v1.boolean() != v2.boolean()) {
             error<AssertionError>(
@@ -2946,13 +2922,9 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
         }
         return;
 
+    // Numeric pairs were handled before the switch.
+    case nInt:
     case nFloat:
-        // !!!
-        if (!(v1.fpoint() == v2.fpoint())) {
-            error<AssertionError>("float '%f' is not equal to float '%f'", v1.fpoint(), v2.fpoint()).debugThrow();
-        }
-        return;
-
     // Cannot be returned by forceValue().
     case nThunk:
     case nFailed:

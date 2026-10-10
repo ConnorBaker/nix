@@ -612,17 +612,9 @@ struct LinkingVisitor : HashingVisitor
         return descend();
     }
 
-    std::string auxiliary(const merkle::TreeEntry & entry)
-    {
-        auto body = objects.readAuxiliary(entry);
-        if (!body)
-            throw ObjectUnavailable{};
-        return std::move(*body);
-    }
-
     /* Materialise validated Merkle values directly. Directory scopes own their
        parsed children and original bodies until all child visits complete. */
-    uint64_t materialise(
+    std::optional<uint64_t> materialise(
         const merkle::TreeEntry & entry, const CanonPath & path, size_t depth,
         const GitObjectStore::Hold & attemptHold, const Target & target)
     {
@@ -639,17 +631,17 @@ struct LinkingVisitor : HashingVisitor
                 auto linked = objects.link(
                     entry.hash, executable, dirFd, name, where, std::nullopt, repair, attemptHold);
                 if (!linked)
-                    throw ObjectUnavailable{};
+                    return std::nullopt;
                 return merkle::nar::regular(*linked, executable);
             }
             auto holder = objects.holderOrForget(entry.hash, executable, repair);
             if (!holder)
                 holder = objects.holderOrForget(entry.hash, !executable, repair);
             if (!holder)
-                throw ObjectUnavailable{};
+                return std::nullopt;
             auto source = holder->parentOf();
             if (!source)
-                throw ObjectUnavailable{};
+                return std::nullopt;
             auto & [owned, parent, name] = *source;
             AutoCloseFD fd{openat(parent, name.c_str(), O_RDONLY | O_CLOEXEC | (parent == AT_FDCWD ? 0 : O_NOFOLLOW))};
             if (!fd)
@@ -666,21 +658,25 @@ struct LinkingVisitor : HashingVisitor
             return merkle::nar::regular(bytes.size(), executable);
         }
         case merkle::Mode::Symlink: {
-            auto body = auxiliary(entry);
-            target.sink.createSymlink(target.name, body);
-            auto size = merkle::nar::symlink(body.size());
-            attemptHold.addAuxiliary({entry, std::move(body)});
+            auto body = objects.readAuxiliary(entry);
+            if (!body)
+                return std::nullopt;
+            target.sink.createSymlink(target.name, *body);
+            auto size = merkle::nar::symlink(body->size());
+            attemptHold.addAuxiliary({entry, std::move(*body)});
             return size;
         }
         case merkle::Mode::Directory: {
-            std::string body;
+            std::optional<std::string> body;
             std::map<std::string, merkle::TreeEntry> tree;
             try {
-                body = auxiliary(entry);
-                tree = GitObjectStore::parseTreeBody(entry.hash, body);
+                body = objects.readAuxiliary(entry);
+                if (!body)
+                    return std::nullopt;
+                tree = GitObjectStore::parseTreeBody(entry.hash, *body);
             } catch (Error & e) {
                 warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
-                throw ObjectUnavailable{};
+                return std::nullopt;
             }
             if (tree.contains("."))
                 throw Error("synthetic root object cannot be used as a directory");
@@ -691,14 +687,17 @@ struct LinkingVisitor : HashingVisitor
                 CaseHackNames hack;
                 for (auto & [name, child] : tree) {
                     auto diskName = hack.diskName(name);
-                    size.add(name.size(), materialise(
-                        child, path / name, depth + 1, attemptHold, {sub, CanonPath::root / diskName}));
+                    auto childSize = materialise(
+                        child, path / name, depth + 1, attemptHold, {sub, CanonPath::root / diskName});
+                    if (!childSize)
+                        throw ObjectUnavailable{};
+                    size.add(name.size(), *childSize);
                 }
             };
             target.sink.createSubdirectory(target.name, std::ref(populate));
             /* Acquisition checked the hash; parsing checked canonical encoding.
                Every successful child preserves its typed entry. */
-            attemptHold.addAuxiliary({entry, std::move(body)});
+            attemptHold.addAuxiliary({entry, std::move(*body)});
             return size.finish();
         }
         }
