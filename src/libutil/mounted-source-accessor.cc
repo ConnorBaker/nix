@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <ranges>
 #include <tuple>
 
 #include "nix/util/sync.hh"
@@ -149,7 +150,8 @@ public:
             auto before = std::prev(next); // The required root mount is at or before every query.
             if (before->first == mountPoint && (next == state->end() || !next->first.isWithin(mountPoint)))
                 return result;
-            for (auto i = next; i != state->end() && i->first.isWithin(path); ++i)
+            for (auto i = next; i != state->end() && i->first.isWithin(path)
+                                 && (needDirectoryContents || result.below.empty()); ++i)
                 result.below.emplace_back(*i);
             /* Shape needs no fallback observation; listing and naming need its contents. */
             if (!result.below.empty() && !needDirectoryContents)
@@ -176,9 +178,7 @@ public:
     {
         /* This call invalidates the observed mounts. A reentrant mount is
            for the next call; no child callback runs under the map's lock. */
-        std::vector<ref<SourceAccessor>> children;
-        for (auto state = mounts.readLock(); const auto & [path, child] : *state)
-            children.push_back(child);
+        auto children = *mounts.readLock() | std::views::values | std::ranges::to<std::vector<ref<SourceAccessor>>>();
         for (auto & child : children)
             child->invalidateCache();
     }

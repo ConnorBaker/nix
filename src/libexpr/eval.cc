@@ -652,9 +652,9 @@ std::optional<EvalState::Doc> EvalState::getDoc(Value & v)
             .doc = makeImmutableString(s.view()),
         };
     }
-    if (isFunctor(v)) {
+    if (const auto functorAttr = v.type() == nAttrs ? v.attrs()->get(s.functor) : nullptr) {
         try {
-            Value & functor = *v.attrs()->get(s.functor)->value;
+            Value & functor = *functorAttr->value;
             Value partiallyApplied;
             // The first parameter is not user-provided, and may be
             // handled by code that is opaque to the user, like lib.const = x: y: y;
@@ -2441,15 +2441,10 @@ const Attr * EvalState::getAttr(Symbol attrSym, const Bindings * attrSet, std::s
     return value;
 }
 
-bool EvalState::isFunctor(const Value & fun) const
-{
-    return fun.type() == nAttrs && fun.attrs()->get(s.functor);
-}
-
 void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     forceValueAndRequire(*this, v, pos, errorCtx, "expected a function but found %1%: %2%", [this, &v](ValueType type) {
-        return type == nFunction || isFunctor(v);
+        return type == nFunction || (type == nAttrs && v.attrs()->get(s.functor));
     });
 }
 

@@ -220,8 +220,7 @@ FrameInfo SampleStack::getFrameInfoFromValueAndPos(const Value & v, std::span<Va
     } else if (v.isPrimOpApp())
         /* Resolve primOp eagerly. Must not hold on to a reference to a Value. */
         return PrimOpFrameInfo{.expr = v.primOpAppPrimOp(), .callPos = pos};
-    else if (state.isFunctor(v)) {
-        const auto functor = v.attrs()->get(state.s.functor);
+    else if (const auto functor = v.type() == nAttrs ? v.attrs()->get(state.s.functor) : nullptr) {
         if (auto pos_ = posCache.lookup(pos); std::holds_alternative<std::monostate>(pos_.origin))
             /* HACK: In case callsite position is unresolved. */
             return FunctorFrameInfo{.pos = functor->pos};

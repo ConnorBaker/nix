@@ -1047,8 +1047,6 @@ public:
      */
     void assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::string_view errorCtx);
 
-    bool isFunctor(const Value & fun) const;
-
     void callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
 
     void callFunction(Value & fun, Value & arg, Value & vRes, const PosIdx pos)
