@@ -20,7 +20,8 @@
 #include <array>
 #include <regex>
 #include <sstream>
-#include <variant>
+#include <tuple>
+#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 
@@ -379,13 +380,17 @@ void BinaryCacheStore::addMultipleToStore(
     CheckSigsFlag checkSigs,
     const std::function<Hash(const StorePath &, const Source &)> & narHash)
 {
-    /* Index the paths to copy by store path so the graph nodes below
-       can look up each path's info (NAR size, references) and source. */
-    std::map<StorePath, std::pair<ValidPathInfo, std::unique_ptr<Source>> *> infosMap;
+    enum class Stage { Nar, NarInfo };
+    /* The complement orders NAR uploads by descending size. Publication
+       keys have priority zero and order repeated destinations by input. */
+    using Node = std::tuple<Stage, uint64_t, StorePath, size_t>;
+    std::set<Node> nodes;
     uint64_t bytesExpected = 0;
-    for (auto & item : pathsToCopy) {
-        bytesExpected += item.first.narSize;
-        infosMap.insert_or_assign(item.first.path, &item);
+    for (size_t i = 0; i != pathsToCopy.size(); ++i) {
+        auto & info = pathsToCopy[i].first;
+        bytesExpected += info.narSize;
+        nodes.emplace(Stage::Nar, ~info.narSize, info.path, i);
+        nodes.emplace(Stage::NarInfo, 0, info.path, i);
     }
     act.setExpected(actCopyPath, bytesExpected);
 
@@ -393,117 +398,59 @@ void BinaryCacheStore::addMultipleToStore(
     std::atomic<uint64_t> nrRunning{0};
     auto showProgress = [&, nrTotal = pathsToCopy.size()]() { act.progress(nrDone, nrTotal, nrRunning); };
 
-    /* The NarInfos produced by uploading the NARs, to be consumed when
-       writing the .narinfo files. Populated by the `UploadNar` nodes
-       and read by the corresponding `UploadNarInfo` nodes. */
-    Sync<std::map<StorePath, ref<NarInfo>>> narInfos_;
-
-    /* The work graph has two kinds of nodes: uploading the NAR for a
-       path (which has no dependencies, since NARs are independent of
-       each other), and uploading the .narinfo for a path (which depends
-       on the corresponding NAR upload and on the .narinfo uploads of all
-       the path's references). Processing the latter in topological order
-       maintains the closure invariant: whenever a .narinfo exists, the
-       .narinfo files of all its references exist as well. */
-    struct UploadNar
-    {
-        StorePath path;
-        uint64_t narSize;
-
-        /* Order NAR uploads by descending size so that the largest
-           (and typically slowest) NARs are started first. */
-        bool operator<(const UploadNar & other) const
-        {
-            return narSize != other.narSize ? narSize > other.narSize : path < other.path;
-        }
-    };
-
-    struct UploadNarInfo
-    {
-        StorePath path;
-
-        bool operator<(const UploadNarInfo & other) const
-        {
-            return path < other.path;
-        }
-    };
-
-    /* `std::variant`'s `operator<` orders by alternative index first, so
-       all `UploadNar` nodes sort (and thus get enqueued) before any
-       `UploadNarInfo` node.
-       TODO: uploading the debug info and NAR listings could be turned into separate graph nodes as well.
-       */
-    using Node = std::variant<UploadNar, UploadNarInfo>;
-
-    std::set<Node> nodes;
-    for (auto & [path, item] : infosMap) {
-        nodes.insert(UploadNar{path, item->first.narSize});
-        nodes.insert(UploadNarInfo{path});
-    }
-
+    /* Each upload writes its own slot; the graph orders its publication
+       after that write and joins all work before these slots are destroyed. */
+    std::vector<std::optional<ref<NarInfo>>> narInfos(pathsToCopy.size());
     processGraph<Node>(
         nodes,
-
-        [&](const Node & node) -> std::set<Node> {
-            return std::visit(
-                overloaded{
-                    [&](const UploadNar &) -> std::set<Node> {
-                        /* NAR uploads have no dependencies. */
-                        return {};
-                    },
-                    [&](const UploadNarInfo & n) -> std::set<Node> {
-                        std::set<Node> edges;
-                        auto & info = infosMap.at(n.path)->first;
-                        /* Wait for our own NAR to be uploaded ... */
-                        edges.insert(UploadNar{n.path, info.narSize});
-                        /* ... and for the .narinfo files of all
-                           references that are part of this copy (other
-                           references are already valid in the store). */
-                        for (auto & ref : info.references) {
-                            if (ref != n.path && infosMap.count(ref))
-                                edges.insert(UploadNarInfo{ref});
-                        }
-                        return edges;
-                    },
-                },
-                node);
+        [&](const Node & node) {
+            auto & [stage, priority, path, index] = node;
+            std::set<Node> dependencies;
+            auto & info = pathsToCopy[index].first;
+            if (stage == Stage::Nar) {
+                auto here = nodes.find({Stage::NarInfo, 0, path, index});
+                if (here != nodes.begin()) {
+                    auto & previous = *std::prev(here);
+                    if (std::get<0>(previous) == Stage::NarInfo && std::get<2>(previous) == path)
+                        dependencies.insert(previous);
+                }
+            } else {
+                dependencies.emplace(Stage::Nar, ~info.narSize, path, index);
+                for (auto & ref : info.references)
+                    if (ref != path) {
+                        auto first = nodes.lower_bound({Stage::NarInfo, 0, ref, 0});
+                        if (first != nodes.end() && std::get<2>(*first) == ref && (!repair || !isValidPath(ref)))
+                            dependencies.insert(*first);
+                    }
+            }
+            return dependencies;
         },
-
         [&](const Node & node) {
             checkInterrupt();
-            std::visit(
-                overloaded{
-                    [&](const UploadNar & n) {
-                        auto & [info, source_] = *infosMap.at(n.path);
-
-                        /* Make sure the Source object is destroyed when
-                           we're done, e.g. to release the connection
-                           lock held by LegacySSHStore::narFromPath(). */
-                        auto source = std::move(source_);
-
-                        if (repair || !isValidPath(info.path)) {
-                            MaintainCount<decltype(nrRunning)> mc(nrRunning);
-                            showProgress();
-                            auto narInfo = uploadData(*source, repair, [&](const UploadedNar &) {
-                                auto info2 = info;
-                                info2.ultimate = false;
-                                return info2;
-                            });
-                            narInfos_.lock()->insert_or_assign(info.path, narInfo);
-                        }
-
-                        nrDone++;
-                        showProgress();
-                    },
-                    [&](const UploadNarInfo & n) {
-                        auto & info = infosMap.at(n.path)->first;
-                        if (!repair && isValidPath(info.path))
-                            return;
-                        auto narInfo = narInfos_.lock()->at(n.path);
-                        uploadNarInfo(narInfo);
-                    },
-                },
-                node);
+            auto & [stage, priority, path, index] = node;
+            auto & [info, source_] = pathsToCopy[index];
+            if (stage == Stage::Nar) {
+                /* Release the original Source after this transfer, including
+                   a validity hit which never needs its bytes. */
+                auto source = std::move(source_);
+                if (repair || !isValidPath(info.path)) {
+                    MaintainCount<decltype(nrRunning)> mc(nrRunning);
+                    showProgress();
+                    narInfos[index] = uploadData(*source, repair, [&](const UploadedNar &) {
+                        auto info2 = info;
+                        info2.ultimate = false;
+                        return info2;
+                    });
+                }
+                nrDone++;
+                showProgress();
+            } else {
+                if (!repair && isValidPath(info.path))
+                    return;
+                if (!narInfos[index])
+                    throw std::out_of_range("missing NAR upload for publication");
+                uploadNarInfo(*narInfos[index]);
+            }
         });
 }
 

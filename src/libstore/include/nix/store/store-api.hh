@@ -735,7 +735,7 @@ public:
     using PathsSource = std::vector<std::pair<ValidPathInfo, std::unique_ptr<Source>>>;
 
     /**
-     * Import multiple paths into the store.
+     * Import multiple paths, attempting already-valid destinations under Repair.
      * `narHash`, when supplied, replays the NAR hash for the destination
      * path named by a transfer. Its source identifies the particular transfer:
      * different input objects can be renamed to the same destination path.
@@ -1166,8 +1166,8 @@ void copyStorePath(
 
 /**
  * Copy store paths from one store to another. The paths may be copied
- * in parallel. They are copied in a topologically sorted order (i.e. if
- * A is a reference of B, then A is copied before B), but the set of
+ * in parallel. References must be available before their referrers; under
+ * Repair, an already-valid reference need not be replaced first. The set of
  * store paths is not automatically closed; use copyClosure() for that.
  *
  * @return a map of what each path was copied to the dstStore as.

@@ -2671,7 +2671,7 @@ TEST_F(TempLocalStoreTest, batchActionsReleaseSourcesAndPreserveFailures)
                         for (bool hash : {false, true})
                             for (Outcome outcome : {Outcome::Success, Outcome::Error, Outcome::DerivedError,
                                      Outcome::OtherError, Outcome::HashError}) {
-                                if ((!sourcePresent && !alreadyValid) || (!hash && outcome == Outcome::HashError))
+                                if ((!sourcePresent && (repair || !alreadyValid)) || (!hash && outcome == Outcome::HashError))
                                     continue;
                                 SCOPED_TRACE(fmt("case=%d width=%d valid=%d keep=%d repair=%d sigs=%d source=%d hash=%d outcome=%d",
                                     cases++, width, alreadyValid, keep, int(repair), int(checkSigs), sourcePresent, hash, int(outcome)));
@@ -2684,19 +2684,21 @@ TEST_F(TempLocalStoreTest, batchActionsReleaseSourcesAndPreserveFailures)
                                 if (!alreadyValid)
                                     info.path = StorePath::random("batch-missing");
                                 info.ultimate = true;
-                                std::atomic<unsigned> destroyed = 0, hashes = 0;
+                                std::atomic<unsigned> destroyed = 0, peerDestroyed = 0, hashes = 0;
                                 Store::PathsSource paths;
                                 paths.emplace_back(info, sourcePresent ? std::make_unique<BatchCopySource>(destroyed) : nullptr);
                                 auto * original = paths.front().second.get();
                                 if (width == 2)
-                                    paths.emplace_back(peer, nullptr); // a valid path never reads its source
+                                    paths.emplace_back(repair ? info : peer,
+                                        repair ? std::make_unique<BatchCopySource>(peerDestroyed) : nullptr);
+                                auto * second = width == 2 ? paths.back().second.get() : nullptr;
                                 std::function<Hash(const StorePath &, const Source &)> replay;
                                 if (hash)
                                     replay = [&](const StorePath & path, const Source & source) {
                                         ++hashes;
                                         EXPECT_EQ(path, info.path);
-                                        EXPECT_EQ(&source, original);
-                                        EXPECT_EQ(destroyed.load(), 0u);
+                                        EXPECT_TRUE(&source == original || (repair && &source == second));
+                                        EXPECT_EQ((&source == original ? destroyed : peerDestroyed).load(), 0u);
                                         if (outcome == Outcome::HashError)
                                             throw BatchCopyProbeStore::CopyError("hash replay error");
                                         return hashString(HashAlgorithm::SHA256, "probe hash");
@@ -2704,7 +2706,8 @@ TEST_F(TempLocalStoreTest, batchActionsReleaseSourcesAndPreserveFailures)
                                 BatchCopyProgress progress;
                                 Activity act{progress, lvlTalkative, actUnknown};
                                 auto run = [&] { target.addMultipleToStore(std::move(paths), act, repair, checkSigs, replay); };
-                                bool caught = !alreadyValid && outcome != Outcome::Success
+                                bool active = repair || !alreadyValid;
+                                bool caught = active && outcome != Outcome::Success
                                     && (outcome == Outcome::OtherError || !keep);
                                 if (caught) {
                                     if (outcome == Outcome::OtherError)
@@ -2715,16 +2718,20 @@ TEST_F(TempLocalStoreTest, batchActionsReleaseSourcesAndPreserveFailures)
                                         EXPECT_THROW(run(), BatchCopyProbeStore::CopyError);
                                 } else {
                                     ASSERT_NO_THROW(run());
-                                    auto failed = !alreadyValid && outcome != Outcome::Success;
+                                    size_t failed = outcome == Outcome::Success ? 0 : active + (repair && width == 2);
                                     EXPECT_TRUE(progress.observed.contains(
                                         std::array<uint64_t, 4>{width - failed, width, 0, failed}));
                                 }
                                 EXPECT_EQ(destroyed.load(), sourcePresent ? 1u : 0u);
                                 EXPECT_FALSE(paths.front().second);
-                                EXPECT_EQ(target.calls.load() - callsBefore, alreadyValid ? 0u : 1u);
-                                EXPECT_EQ(hashes.load(), hash && !alreadyValid ? 1u : 0u);
+                                size_t attempted = active + (repair && width == 2 && !caught);
+                                EXPECT_EQ(target.calls.load() - callsBefore, attempted);
+                                EXPECT_EQ(hashes.load(), hash ? attempted : 0u);
+                                EXPECT_EQ(peerDestroyed.load(), repair && width == 2 && !caught ? 1u : 0u);
+                                if (width == 2)
+                                    EXPECT_EQ(bool(paths.back().second), repair && caught);
                             }
-    EXPECT_EQ(cases, 432u);
+    EXPECT_EQ(cases, 360u);
 }
 
 TEST_F(TempLocalStoreTest, aSingletonCopyObservesPendingInterrupts)
@@ -2747,6 +2754,384 @@ TEST_F(TempLocalStoreTest, aSingletonCopyObservesPendingInterrupts)
     EXPECT_TRUE(paths.front().second) << "interruption precedes beginning the path action";
     EXPECT_EQ(destroyed.load(), 0u);
 #endif
+}
+
+/* Each description/source is an input transfer. The graph may reorder distinct
+   destinations, but must not replace earlier transfers by the last pointer. */
+TEST_F(TempLocalStoreTest, duplicateBatchTransfersKeepTheirSourcesAndFailureOrder)
+{
+    BatchCopyProbeStore target{ref{config}};
+    auto & keepGoing = settings.getWorkerSettings().keepGoing;
+    auto savedKeepGoing = keepGoing.get();
+    Finally restore{[&] { keepGoing = savedKeepGoing; }};
+    using Outcome = BatchCopyProbeStore::Outcome;
+    const std::array outcomes{Outcome::Success, Outcome::Error, Outcome::DerivedError,
+        Outcome::OtherError, Outcome::HashError};
+    const auto path = StorePath::random("duplicate-transfer");
+    size_t cases = 0;
+    for (size_t width : {size_t{2}, size_t{3}})
+        for (size_t encoded = 0, count = width == 2 ? 25 : 125; encoded != count; ++encoded)
+            for (bool keep : {false, true})
+                for (RepairFlag repair : {NoRepair, Repair})
+                    for (CheckSigsFlag checkSigs : {NoCheckSigs, CheckSigs}) {
+                        SCOPED_TRACE(fmt("case=%d width=%d outcomes=%d keep=%d repair=%d sigs=%d",
+                            cases++, width, encoded, keep, int(repair), int(checkSigs)));
+                        keepGoing = keep;
+                        target.expectedRepair = repair;
+                        target.expectedCheckSigs = checkSigs;
+                        target.outcome = Outcome::Success;
+                        std::vector<Outcome> selected;
+                        for (size_t code = encoded, i = 0; i != width; ++i, code /= outcomes.size())
+                            selected.push_back(outcomes[code % outcomes.size()]);
+                        std::atomic<unsigned> destroyed = 0;
+                        Store::PathsSource paths;
+                        std::vector<const Source *> originals;
+                        for (size_t i = 0; i != width; ++i) {
+                            ValidPathInfo info{path, UnkeyedValidPathInfo{target,
+                                ObjectHash{merkle::blobId(fmt("transfer-%d", i))}}};
+                            info.narSize = i + 1;
+                            info.ultimate = true;
+                            paths.emplace_back(std::move(info), std::make_unique<BatchCopySource>(destroyed));
+                            originals.push_back(paths.back().second.get());
+                        }
+                        std::vector<size_t> attempted;
+                        std::mutex attemptsMutex;
+                        auto replay = [&](const StorePath & destination, const Source & source) {
+                            EXPECT_EQ(destination, path);
+                            auto found = std::find(originals.begin(), originals.end(), &source);
+                            EXPECT_NE(found, originals.end());
+                            auto i = size_t(found - originals.begin());
+                            if (i == width)
+                                throw Error("foreign transfer source");
+                            std::lock_guard lock(attemptsMutex);
+                            attempted.push_back(i); // one destination is ordered, including callback lifetime
+                            EXPECT_EQ(destroyed.load(), i);
+                            if (selected[i] == Outcome::Error)
+                                throw Error("transfer callback error");
+                            if (selected[i] == Outcome::DerivedError || selected[i] == Outcome::HashError)
+                                throw BatchCopyProbeStore::CopyError("transfer hash error");
+                            if (selected[i] == Outcome::OtherError)
+                                throw std::runtime_error("transfer callback other error");
+                            return hashString(HashAlgorithm::SHA256, fmt("hash-%d", i));
+                        };
+                        size_t expected = width, failed = 0;
+                        std::optional<Outcome> fatal;
+                        for (size_t i = 0; i != width; ++i) {
+                            if (selected[i] == Outcome::Success)
+                                continue;
+                            ++failed;
+                            if (!keep || selected[i] == Outcome::OtherError) {
+                                expected = i + 1;
+                                fatal = selected[i];
+                                break;
+                            }
+                        }
+                        BatchCopyProgress progress;
+                        Activity act{progress, lvlTalkative, actUnknown};
+                        auto run = [&] { target.addMultipleToStore(std::move(paths), act, repair, checkSigs, replay); };
+                        if (!fatal)
+                            ASSERT_NO_THROW(run());
+                        else if (*fatal == Outcome::OtherError)
+                            EXPECT_THROW(run(), std::runtime_error);
+                        else if (*fatal == Outcome::Error)
+                            EXPECT_THROW(run(), Error);
+                        else
+                            EXPECT_THROW(run(), BatchCopyProbeStore::CopyError);
+                        ASSERT_EQ(attempted.size(), expected);
+                        for (size_t i = 0; i != expected; ++i)
+                            EXPECT_EQ(attempted[i], i);
+                        EXPECT_EQ(destroyed.load(), expected);
+                        for (size_t i = 0; i != width; ++i)
+                            EXPECT_EQ(bool(paths[i].second), i >= expected);
+                        if (!fatal)
+                            EXPECT_TRUE(progress.observed.contains(
+                                std::array<uint64_t, 4>{width - failed, width, 0, failed}));
+                    }
+    EXPECT_EQ(cases, 1200u);
+}
+
+TEST_F(TempLocalStoreTest, duplicateReferencesNeedAvailabilityNotTheLastTransfer)
+{
+    BatchCopyProbeStore target{ref{config}};
+    auto a = StorePath::random("available-a"), b = StorePath::random("available-b");
+    std::atomic<unsigned> destroyed = 0;
+    Store::PathsSource paths;
+    std::vector<const Source *> originals;
+    for (auto path : {a, a, b}) {
+        ValidPathInfo info{path, UnkeyedValidPathInfo{target, ObjectHash{merkle::blobId("available")}}};
+        if (paths.size() == 1)
+            info.references.insert(b);
+        if (paths.size() == 2)
+            info.references.insert(a);
+        info.references.insert(path); // self references do not add a dependency on a future transfer
+        paths.emplace_back(std::move(info), std::make_unique<BatchCopySource>(destroyed));
+        originals.push_back(paths.back().second.get());
+    }
+    std::vector<size_t> attempted;
+    std::mutex attemptsMutex;
+    Activity act{*logger, lvlTalkative, actUnknown};
+    ASSERT_NO_THROW(target.addMultipleToStore(std::move(paths), act, NoRepair, NoCheckSigs,
+        [&](const StorePath &, const Source & source) {
+            std::lock_guard lock(attemptsMutex);
+            attempted.push_back(std::find(originals.begin(), originals.end(), &source) - originals.begin());
+            return hashString(HashAlgorithm::SHA256, "available");
+        }));
+    EXPECT_EQ(attempted, (std::vector<size_t>{0, 2, 1}));
+    EXPECT_EQ(destroyed.load(), 3u);
+}
+
+TEST_F(LocalStoreObjectsTest, duplicateBatchDestinationsKeepTheFirstPublishedObject)
+{
+    for (bool reverse : {false, true}) {
+        auto path = StorePath::random("duplicate-publication");
+        std::deque<std::string> nars;
+        Store::PathsSource batch;
+        for (bool second : {false, true}) {
+            Nodes nodes{{"file", reverse == second ? "first" : "second", second ? 'x' : 'f'}};
+            auto accessor = treeAccessor(nodes);
+            auto & nar = nars.emplace_back(narOf(*accessor));
+            ValidPathInfo info{path, {*store, ObjectHash::of(objectHashOf(*accessor, CanonPath::root).root)}};
+            info.narSize = nar.size();
+            batch.emplace_back(std::move(info), std::make_unique<StringSource>(nar));
+        }
+        auto expected = batch.front().first.objectHash;
+        Activity act{*logger, lvlTalkative, actUnknown};
+        ASSERT_NO_THROW(store->addMultipleToStore(std::move(batch), act, NoRepair, NoCheckSigs));
+        EXPECT_EQ(store->queryPathInfo(path)->objectHash, expected);
+        EXPECT_EQ(readFile(store->toRealPath(path) / "file"), reverse ? "second" : "first");
+        for (auto & entry : batch)
+            EXPECT_FALSE(entry.second);
+    }
+}
+
+TEST_F(TempLocalStoreTest, duplicateBatchHitsAndCancellationRespectEverySource)
+{
+    ValidPathInfo info{StorePath::random("duplicate-valid"),
+        UnkeyedValidPathInfo{*store, ObjectHash{merkle::blobId("valid")}}};
+    store->registerValidPath(info);
+    auto saved = getInterrupted();
+    Finally restore{[&] { setInterrupted(saved); }};
+    for (size_t width : {size_t{0}, size_t{2}, size_t{3}})
+        for (bool present : {false, true})
+            for (bool interrupt : {false, true}) {
+#ifdef _WIN32
+                if (interrupt)
+                    continue;
+#endif
+                std::atomic<unsigned> destroyed = 0;
+                Store::PathsSource paths;
+                for (size_t i = 0; i != width; ++i)
+                    paths.emplace_back(info, present ? std::make_unique<BatchCopySource>(destroyed) : nullptr);
+                Activity act{*logger, lvlTalkative, actUnknown};
+                setInterrupted(interrupt);
+                auto run = [&] { store->addMultipleToStore(std::move(paths), act, NoRepair, NoCheckSigs); };
+                if (interrupt && width)
+                    EXPECT_THROW(run(), Interrupted);
+                else
+                    EXPECT_NO_THROW(run());
+                setInterrupted(false);
+                EXPECT_EQ(destroyed.load(), present && !interrupt ? width : 0u);
+                for (auto & entry : paths)
+                    EXPECT_EQ(bool(entry.second), present && interrupt);
+            }
+}
+
+TEST_F(LocalStoreObjectsTest, binaryCacheDuplicateTransfersPreservePublicationOrder)
+{
+    unsigned cases = 0;
+    for (size_t width : {size_t{2}, size_t{3}})
+        for (RepairFlag repair : {NoRepair, Repair})
+            for (bool alreadyValid : {false, true})
+                for (bool identical : {false, true})
+                    for (bool reverse : {false, true}) {
+                        auto cache = openStore("file://" + (tempStoreDir.path() / fmt("ordered-cache-%d", cases++)).string());
+                        const auto path = StorePath::random("ordered-cache-path");
+                        std::deque<std::string> nars;
+                        Store::PathsSource batch;
+                        for (size_t i = 0; i != width; ++i) {
+                            auto value = identical ? 0 : reverse ? width - i - 1 : i;
+                            Nodes nodes{{"file", fmt("transfer-%d", value), value % 2 ? 'x' : 'f'}};
+                            auto accessor = treeAccessor(nodes);
+                            auto & nar = nars.emplace_back(narOf(*accessor));
+                            ValidPathInfo info{path, {*cache, ObjectHash::of(objectHashOf(*accessor, CanonPath::root).root)}};
+                            info.narSize = nar.size();
+                            batch.emplace_back(std::move(info), std::make_unique<StringSource>(nar));
+                        }
+                        std::string seedNar;
+                        if (alreadyValid) {
+                            auto accessor = treeAccessor({{"file", "existing", 'f'}});
+                            seedNar = narOf(*accessor);
+                            ValidPathInfo info{path, {*cache, ObjectHash::of(objectHashOf(*accessor, CanonPath::root).root)}};
+                            info.narSize = seedNar.size();
+                            StringSource source{seedNar};
+                            cache->addToStore(info, source, NoRepair, NoCheckSigs);
+                        }
+                        Activity act{*logger, lvlTalkative, actUnknown};
+                        ASSERT_NO_THROW(cache->addMultipleToStore(std::move(batch), act, repair, NoCheckSigs));
+                        StringSink actual;
+                        cache->narFromPath(path, actual);
+                        EXPECT_EQ(actual.s, repair ? nars.back() : alreadyValid ? seedNar : nars.front());
+                        for (auto & entry : batch)
+                            EXPECT_FALSE(entry.second);
+                    }
+    EXPECT_EQ(cases, 32u);
+}
+
+TEST_F(LocalStoreObjectsTest, aDuplicateCacheTransferWaitsForPublicationNotJustUpload)
+{
+    auto cache = openStore("file://" + (tempStoreDir.path() / "failed-ordered-cache").string());
+    auto path = StorePath::random("unpublished-duplicate");
+    auto missing = StorePath::random("absent-reference");
+    auto accessor = treeAccessor({{"file", "uploaded but unpublished", 'f'}});
+    auto nar = narOf(*accessor);
+    ValidPathInfo info{path, {*cache, ObjectHash::of(objectHashOf(*accessor, CanonPath::root).root)}};
+    info.narSize = nar.size();
+    Store::PathsSource batch;
+    for (bool first : {true, false}) {
+        auto description = info;
+        if (first)
+            description.references.insert(missing);
+        batch.emplace_back(std::move(description), std::make_unique<StringSource>(nar));
+    }
+    Activity act{*logger, lvlTalkative, actUnknown};
+    EXPECT_THROW(cache->addMultipleToStore(std::move(batch), act, NoRepair, NoCheckSigs), Error);
+    EXPECT_FALSE(batch.front().second);
+    EXPECT_TRUE(batch.back().second) << "the next transfer cannot start before the prior publication";
+    EXPECT_FALSE(cache->isValidPath(path));
+}
+
+TEST_F(LocalStoreObjectsTest, batchRepairDoesNotTreatRegisteredBytesAsVerified)
+{
+    for (size_t width : {size_t{1}, size_t{2}, size_t{3}})
+        for (RepairFlag repair : {NoRepair, Repair}) {
+            const auto path = StorePath::random("batch-repair-bytes");
+            StringSink nar;
+            dumpString("good", nar);
+            ValidPathInfo info{path, {*store,
+                ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("good")})}};
+            info.narSize = nar.s.size();
+            StringSource seed{nar.s};
+            store->addToStore(info, seed, Repair, NoCheckSigs);
+            auto physical = store->toRealPath(path);
+            chmod(physical, 0644);
+            writeFile(physical, "oops");
+            chmod(physical, 0444);
+            setWriteTime(physical, 1, 1);
+            ASSERT_TRUE(store->isValidPath(path));
+            Store::PathsSource batch;
+            for (size_t i = 0; i != width; ++i)
+                batch.emplace_back(info, std::make_unique<StringSource>(nar.s));
+            Activity act{*logger, lvlTalkative, actUnknown};
+            ASSERT_NO_THROW(store->addMultipleToStore(std::move(batch), act, repair, NoCheckSigs));
+            EXPECT_EQ(readFile(physical), repair ? "good" : "oops");
+            EXPECT_EQ(store->queryPathInfo(path)->objectHash, info.objectHash);
+            for (auto & entry : batch)
+                EXPECT_FALSE(entry.second);
+        }
+}
+
+TEST_F(LocalStoreObjectsTest, batchRepairFailureDoesNotSkipALaterOrderedRepair)
+{
+    auto & keepGoing = settings.getWorkerSettings().keepGoing;
+    auto savedKeepGoing = keepGoing.get();
+    Finally restore{[&] { keepGoing = savedKeepGoing; }};
+    for (bool initiallyValid : {false, true})
+        for (bool keep : {false, true})
+            for (RepairFlag repair : {NoRepair, Repair}) {
+                keepGoing = keep;
+                auto path = StorePath::random("failed-batch-repair");
+                StringSink nar;
+                dumpString("repaired", nar);
+                ValidPathInfo info{path, {*store,
+                    ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId("repaired")})}};
+                info.narSize = nar.s.size();
+                if (initiallyValid) {
+                    StringSource seed{nar.s};
+                    store->addToStore(info, seed, Repair, NoCheckSigs);
+                }
+                auto bad = info;
+                bad.assertedNarHash = hashString(HashAlgorithm::SHA256, "not the NAR");
+                Store::PathsSource batch;
+                batch.emplace_back(bad, std::make_unique<StringSource>(nar.s));
+                batch.emplace_back(info, std::make_unique<StringSource>(nar.s));
+                Activity act{*logger, lvlTalkative, actUnknown};
+                auto run = [&] { store->addMultipleToStore(std::move(batch), act, repair, NoCheckSigs); };
+                bool fatal = (repair || !initiallyValid) && !keep;
+                if (fatal)
+                    EXPECT_THROW(run(), Error);
+                else {
+                    ASSERT_NO_THROW(run());
+                    EXPECT_TRUE(store->isValidPath(path));
+                    EXPECT_EQ(readFile(store->toRealPath(path)), "repaired");
+                }
+                EXPECT_FALSE(batch.front().second);
+                EXPECT_EQ(bool(batch.back().second), fatal);
+            }
+}
+
+TEST_F(LocalStoreObjectsTest, repairReferencesUseExistingAvailability)
+{
+    size_t cases = 0;
+    for (bool binary : {false, true})
+        for (bool copy : {false, true})
+            for (unsigned validMask = 0; validMask != 4; ++validMask) {
+                SCOPED_TRACE(fmt("binary=%d copy=%d valid=%d", binary, copy, validMask));
+                auto root = tempStoreDir.path() / fmt("repair-availability-%d", cases++);
+                ref<Store> target = binary
+                    ? openStore("file://" + root.string())
+                    : ref<Store>{std::make_shared<LocalStore>(make_ref<LocalStoreConfig>(root, StoreConfig::Params{}))};
+                std::array paths{StorePath::random("available-a"), StorePath::random("available-b")};
+                std::deque<std::string> nars;
+                std::vector<ValidPathInfo> infos;
+                for (size_t i = 0; i != paths.size(); ++i) {
+                    auto bytes = fmt("available-%d", i);
+                    StringSink nar;
+                    dumpString(bytes, nar);
+                    nars.push_back(std::move(nar.s));
+                    ValidPathInfo info{paths[i], {*store,
+                        ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId(bytes)})}};
+                    info.narSize = nars.back().size();
+                    if (copy) {
+                        StringSource seed{nars.back()};
+                        store->addToStore(info, seed, NoRepair, NoCheckSigs);
+                    }
+                    if (validMask & (1u << i)) {
+                        StringSource seed{nars.back()};
+                        target->addToStore(info, seed, NoRepair, NoCheckSigs);
+                    }
+                    infos.push_back(std::move(info));
+                }
+                for (size_t i = 0; i != paths.size(); ++i) {
+                    infos[i].references.insert(paths[1 - i]);
+                    infos[i].references.insert(paths[i]);
+                    if (copy)
+                        store->registerValidPath(infos[i]);
+                }
+                Store::PathsSource batch;
+                for (size_t i = 0; i != paths.size(); ++i)
+                    batch.emplace_back(infos[i], std::make_unique<StringSource>(nars[i]));
+                Activity act{*logger, lvlTalkative, actUnknown};
+                auto run = [&] {
+                    if (copy) {
+                        auto copied = copyPaths(*store, *target, StorePathSet{paths.begin(), paths.end()},
+                            Repair, NoCheckSigs, NoSubstitute);
+                        EXPECT_EQ(copied.size(), 2u);
+                    } else
+                        target->addMultipleToStore(std::move(batch), act, Repair, NoCheckSigs);
+                };
+                if (!validMask)
+                    EXPECT_THROW(run(), Error) << "an unavailable mutual cycle has no first publication";
+                else {
+                    ASSERT_NO_THROW(run());
+                    for (size_t i = 0; i != paths.size(); ++i) {
+                        EXPECT_EQ(target->queryPathInfo(paths[i])->references, infos[i].references);
+                        StringSink observed;
+                        target->narFromPath(paths[i], observed);
+                        EXPECT_EQ(observed.s, nars[i]);
+                    }
+                }
+            }
+    EXPECT_EQ(cases, 16u);
 }
 
 /* Each path of a batch registers independently and is its own ingestion: its own `Ingestions` row, its own

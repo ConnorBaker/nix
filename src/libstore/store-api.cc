@@ -265,7 +265,7 @@ void Store::addMultipleToStore(
             hashForPath = [&] { return narHash(info.path, *source); };
 
         bool failed = false;
-        if (!isValidPath(info.path)) {
+        if (repair || !isValidPath(info.path)) {
             MaintainCount mc(nrRunning);
             showProgress();
             try {
@@ -300,24 +300,34 @@ void Store::addMultipleToStore(
     std::atomic<uint64_t> nrRunning{0};
 
     uint64_t bytesExpected = 0;
-    std::map<StorePath, PathWithInfo *> infosMap;
-    StorePathSet storePathsToAdd;
-    for (auto & thingToAdd : pathsToCopy) {
-        bytesExpected += thingToAdd.first.narSize;
-        infosMap.insert_or_assign(thingToAdd.first.path, &thingToAdd);
-        storePathsToAdd.insert(thingToAdd.first.path);
+    using Transfer = std::pair<StorePath, size_t>;
+    std::set<Transfer> transfers;
+    for (size_t i = 0; i != pathsToCopy.size(); ++i) {
+        bytesExpected += pathsToCopy[i].first.narSize;
+        transfers.emplace(pathsToCopy[i].first.path, i);
     }
     act.setExpected(actCopyPath, bytesExpected);
     auto showProgress = [&, nrTotal = pathsToCopy.size()]() { act.progress(nrDone, nrTotal, nrRunning, nrFailed); };
 
-    processGraph<StorePath>(
-        storePathsToAdd,
-        [&](const StorePath & path) {
-            auto & info = infosMap.at(path)->first;
-            return isValidPath(info.path) ? StorePathSet{} : info.references;
+    processGraph<Transfer>(
+        transfers,
+        [&](const Transfer & transfer) {
+            std::set<Transfer> dependencies;
+            auto here = transfers.find(transfer);
+            if (here != transfers.begin() && std::prev(here)->first == transfer.first)
+                dependencies.insert(*std::prev(here));
+            auto & info = pathsToCopy[transfer.second].first;
+            if (repair || !isValidPath(info.path))
+                for (auto & ref : info.references)
+                    if (ref != transfer.first) {
+                        auto first = transfers.lower_bound({ref, 0});
+                        if (first != transfers.end() && first->first == ref && (!repair || !isValidPath(ref)))
+                            dependencies.insert(*first);
+                    }
+            return dependencies;
         },
-        [&](const StorePath & path) {
-            copyPath(*infosMap.at(path), nrDone, nrFailed, nrRunning, showProgress);
+        [&](const Transfer & transfer) {
+            copyPath(pathsToCopy[transfer.second], nrDone, nrFailed, nrRunning, showProgress);
         });
 }
 
@@ -1108,11 +1118,11 @@ std::map<StorePath, StorePath> copyPaths(
     CheckSigsFlag checkSigs,
     SubstituteFlag substitute)
 {
-    auto valid = dstStore.queryValidPaths(storePaths, substitute);
+    auto valid = dstStore.queryValidPaths(storePaths, repair ? NoSubstitute : substitute);
 
     StorePathSet missing;
     for (auto & path : storePaths)
-        if (!valid.count(path))
+        if (repair || !valid.count(path))
             missing.insert(path);
 
     /* Don't start an activity if there's no work to do. */
@@ -1123,7 +1133,11 @@ std::map<StorePath, StorePath> copyPaths(
 
     // In the general case, `addMultipleToStore` requires a sorted list of
     // store paths to add, so sort them right now
-    auto sortedMissing = srcStore.topoSortPaths(missing);
+    auto sortedMissing = repair ? srcStore.topoSortPathsBy(missing, [&](const StorePath & path) {
+        auto references = srcStore.queryPathInfo(path)->references;
+        std::erase_if(references, [&](const StorePath & ref) { return valid.contains(ref); });
+        return references;
+    }) : srcStore.topoSortPaths(missing);
 
     std::map<StorePath, StorePath> pathsMap;
     for (auto & path : storePaths)
