@@ -339,19 +339,18 @@ std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::
         throw SysError("opening store directory for %s", PathFmt(root));
     }
     auto parent = *coordinate.parent();
-    AutoCloseFD owned;
     try {
-        owned = parent.isRoot() ? std::move(anchor) : openFileEnsureBeneathNoSymlinks(anchor.get(), parent, flags);
+        AutoCloseFD owned{parent.isRoot() ? std::move(anchor) : openFileEnsureBeneathNoSymlinks(anchor.get(), parent, flags)};
+        if (!owned) {
+            if (missing())
+                return std::nullopt;
+            throw SysError([&] { return HintFmt("opening parent of blob holder %s", PathFmt(file())); });
+        }
+        auto fd = owned.get();
+        return std::tuple{std::move(owned), fd, std::string(*coordinate.baseName())};
     } catch (SymlinkNotAllowed &) {
         return std::nullopt;
     }
-    if (!owned) {
-        if (missing())
-            return std::nullopt;
-        throw SysError([&] { return HintFmt("opening parent of blob holder %s", PathFmt(file())); });
-    }
-    auto fd = owned.get();
-    return std::tuple{std::move(owned), fd, std::string(*coordinate.baseName())};
 }
 
 Hash GitObjectStore::blobIdOfFile(Descriptor parent, const std::string & name, uint64_t observedSize)

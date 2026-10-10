@@ -16,12 +16,12 @@ TEST(BumpMemoryResource, ConcurrentAllocation)
     BumpMemoryResource resource{BumpMemoryResource::defaultReserveSize, &fallbackResource};
     std::pmr::polymorphic_allocator alloc{&resource};
 
-    ThreadPool pool(numThreads);
     // Use std::optional to make sure our allocator is used.
     std::array<std::optional<std::pmr::vector<std::optional<std::pmr::vector<int>>>>, numThreads> vectors;
 
     static constexpr std::size_t intVecSize = 511;
     static constexpr std::size_t numIters = 311;
+    ThreadPool pool(numThreads);
 
     for (auto && [i, vec] : enumerate(vectors)) {
         pool.enqueue([i, &alloc, &vec]() {

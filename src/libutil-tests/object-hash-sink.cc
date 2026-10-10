@@ -215,14 +215,14 @@ TEST(ObjectHashSink, recursivePushPreservesOwnedCallbackState)
                 } context{each, completed, *this};
                 children.each([context = &context, ordinal = size_t{0}](
                              std::string_view name, bool isDirectory, Visit visit) mutable {
-                    auto child = visit(context->visitor);
+                    auto child = visit(context->visitor, false);
                     /* Both captures must remain valid after nested directory
                        callbacks, and the owned ordinal must persist. */
                     EXPECT_EQ(++ordinal, ++context->ordinal);
                     ++context->completed;
-                    context->consume(std::string_view(name), bool(isDirectory), [&](auto &) { return child; });
+                    context->consume(std::string_view(name), bool(isDirectory), [&](auto &, bool) { return child; });
                 });
-            }});
+            }, children.canDefer, children.mayFork});
         }
     } visitor;
 
@@ -263,7 +263,7 @@ TEST(ObjectHashSink, identifierDiagnosticsPreserveEveryNameClassAndDirectoryPath
                     HashingVisitor visitor;
                     try {
                         visitor.directory(path, {[&](auto each) {
-                            each(name, false, [&](auto &) -> HashedNode { return {{mode, hash}, std::nullopt}; });
+                            each(name, false, [&](auto &, bool) -> HashedNode { return {{mode, hash}, std::nullopt}; });
                         }});
                         ADD_FAILURE() << "wrong identifier algorithm was accepted";
                     } catch (const BadCanonPath &) {
@@ -309,7 +309,7 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                     tail, acceptedSize ? std::optional(merkle::nar::regular(4, false)) : std::nullopt};
                 std::vector<std::string> visits;
                 auto actual = visitor.directory(CanonPath::root, {[&](auto each) {
-                    each("keep", false, [&](auto &) {
+                    each("keep", false, [&](auto &, bool) {
                         visits.push_back("first");
                         return first;
                     });
@@ -319,12 +319,12 @@ TEST(ObjectHashSink, recoveredChildInsertionDoesNotContributeToTheDirectory)
                         each(
                             duplicate ? "keep" : "bad/name",
                             false,
-                            [&](auto &) {
+                            [&](auto &, bool) {
                                 visits.push_back("rejected");
                                 return rejected;
                             }),
                         Error);
-                    each("tail", false, [&](auto &) {
+                    each("tail", false, [&](auto &, bool) {
                         visits.push_back("last");
                         return last;
                     });
@@ -473,7 +473,7 @@ TEST(TreeTraversal, borrowedChildrenKeepsMoveOnlyEmitterStateThroughTheDirectory
                 wide.front() = 'z';
                 calls = ++*state;
                 for (auto & [name, node] : entries)
-                    each(std::string_view(name), true, [&, node](auto &) {
+                    each(std::string_view(name), true, [&, node](auto &, bool) {
                         EXPECT_EQ(emitted.load(), workers > 1);
                         EXPECT_EQ(wide.front(), 'z');
                         ++visited;
@@ -534,7 +534,7 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
     {
         bool directories;
 
-        std::string regular(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override
+        std::string regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)>) override
         {
             return path.abs();
         }
@@ -556,7 +556,7 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
             std::string result;
             /* Every enumeration/emitter stack frame has returned. */
             for (auto & [name, visit] : pending)
-                result += name + ":" + visit(*this) + "|";
+                result += name + ":" + visit(*this, children.mayFork) + "|";
             return result;
         }
     };
@@ -602,7 +602,7 @@ TEST(TreeTraversal, mutableFiltersKeepSourceCoordinatesAndObserveEveryChild)
         Visitor(std::function<void()> replace, bool beforeChildren, CanonPath logicalRoot)
             : replace(std::move(replace)), beforeChildren(beforeChildren), logicalRoot(std::move(logicalRoot)) {}
 
-        int regular(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override
+        int regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)>) override
         {
             EXPECT_TRUE(path.isWithin(logicalRoot));
             paths.push_back(path.abs());
@@ -621,7 +621,7 @@ TEST(TreeTraversal, mutableFiltersKeepSourceCoordinatesAndObserveEveryChild)
                 replace();
             children.each([&](std::string_view name, bool, Visit visit) {
                 names.emplace_back(name);
-                visit(*this);
+                visit(*this, children.mayFork);
                 if (!beforeChildren && !changed) {
                     changed = true;
                     replace();
@@ -776,14 +776,52 @@ TEST(TreeTraversal, rejectedDirectoryDoesNotObserveItsDescendantsOrFilterTheRoot
     RecordProperty("finite_cells", cases);
 }
 
-TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
+TEST(ThreadPool, firstAdmissionProgressAndRepeatedProcessPreserveOwnedCompletion)
+{
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (size_t count : {0u, 1u})
+            for (bool fail : {false, true}) {
+                SCOPED_TRACE(fmt("workers=%d count=%d fail=%d", workers, count, fail));
+                std::mutex mutex;
+                std::condition_variable wake;
+                size_t started = 0;
+                ThreadPool pool{workers};
+                if (count)
+                    pool.enqueue([&] {
+                        {
+                            std::lock_guard lock(mutex);
+                            ++started;
+                            wake.notify_all();
+                        }
+                        if (fail)
+                            throw std::runtime_error("work");
+                    });
+                {
+                    std::unique_lock lock(mutex);
+                    if (count && workers > 1)
+                        EXPECT_TRUE(wake.wait_for(lock, std::chrono::seconds(5), [&] { return started == 1; }));
+                    else
+                        EXPECT_EQ(started, 0u);
+                }
+                for (size_t pass = 0; pass < 2; ++pass) {
+                    if (count && fail)
+                        EXPECT_THROW(pool.process(), std::runtime_error);
+                    else
+                        EXPECT_NO_THROW(pool.process());
+                }
+                EXPECT_EQ(started, count);
+            }
+}
+
+struct SchedulingHint { bool directory; };
+
+TEST(OrderedFrontier, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 {
     /* Zero through three children: each succeeds, fails while reading, or
        fails while folding. Enumerate every assignment and every advisory
        scheduling mask, including unknown types (the all-inline mask). */
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers) {
-        CopyPool pool(workers);
         for (size_t count = 0; count <= 3; ++count)
             for (unsigned mask = 0; mask < (1u << count); ++mask)
                 for (unsigned outcomes = 0; outcomes < std::array<unsigned, 4>{1, 3, 9, 27}[count]; ++outcomes) {
@@ -801,13 +839,11 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
                     bool baseCaseOnCaller = true;
                     std::string failure;
                     try {
-                        pool.ordered(
-                            count,
-                            [&](size_t i) {
-                                if (count < 2)
-                                    baseCaseTrace.push_back("canFork");
-                                return mask & (1u << i);
-                            },
+                        std::array<SchedulingHint, 3> hints;
+                        for (size_t i = 0; i < count; ++i)
+                            hints[i].directory = mask & (1u << i);
+                        orderedFrontier(
+                            std::span<const SchedulingHint>{hints.data(), count}, &SchedulingHint::directory, workers,
                             [&](size_t i) {
                                 if (count < 2) {
                                     baseCaseTrace.push_back("run");
@@ -863,81 +899,81 @@ TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
     EXPECT_EQ(cases, 2072u);
 }
 
-TEST(CopyPool, predicateFailureJoinsTheLaunchedPrefixWithoutConsumingIt)
+/* The removed effectful canFork API had admission-dependent exceptions.
+   Materialized hints cannot throw: failures belong to producer, read, or fold. */
+TEST(HashingVisitor, schedulingPermissionPreservesProducerFailureAndBorrowingOrder)
 {
-    /* The first workers - 1 visits are admitted from an empty queue, so
-       their failures cannot stop launch or replace a reached predicate failure.
-       With one worker, the first visit fails inline and stops launch instead.
-       Every launched visit must finish before its captures can expire. */
+    const HashedNode file{
+        .entry = {merkle::Mode::Regular, merkle::blobId("")}, .narSize = merkle::nar::regular(0, false)};
     size_t cases = 0;
-    for (size_t workers = 1; workers <= 8; ++workers) {
-        CopyPool pool(workers);
-        for (bool failPrefix : {false, true})
-            for (size_t count = 2; count <= 4; ++count)
-                for (size_t throwIndex = 0; throwIndex < count; ++throwIndex) {
-                    SCOPED_TRACE(
-                        fmt("workers=%d count=%d throwIndex=%d failPrefix=%d", workers, count, throwIndex, failPrefix));
-                    std::atomic<size_t> active{0}, started{0}, completed{0}, childFailures{0};
-                    std::vector<size_t> predicates, consumed;
-                    std::string failure;
-                    try {
-                        pool.ordered(
-                            count,
-                            [&](size_t i) {
-                                predicates.push_back(i);
-                                if (i == throwIndex)
-                                    throw std::runtime_error("predicate");
-                                return true;
-                            },
-                            [&](size_t i) {
-                                ++active;
-                                ++started;
-                                Finally done{[&] {
-                                    --active;
-                                    ++completed;
-                                }};
-                                if (failPrefix && i < std::max<size_t>(workers - 1, 1)) {
-                                    ++childFailures;
-                                    throw std::runtime_error("child");
+    for (size_t workers = 1; workers <= 8; ++workers)
+        for (bool mayFork : {false, true})
+            for (bool canDefer : {false, true})
+                for (size_t count = 0; count <= 3; ++count)
+                    for (unsigned mask = 0; mask < (1u << count); ++mask)
+                        for (size_t throwAfter = 0; throwAfter <= count + 1; ++throwAfter)
+                            for (bool failChild : {false, true}) {
+                                SCOPED_TRACE(fmt("workers=%d mayFork=%d canDefer=%d count=%d mask=%d throwAfter=%d failChild=%d",
+                                    workers, mayFork, canDefer, count, mask, throwAfter, failChild));
+                                HashingVisitor visitor{workers};
+                                std::array<std::optional<bool>, 3> observed;
+                                std::atomic<size_t> started{0}, completed{0};
+                                const std::array names{"a", "b", "c"};
+                                std::string failure;
+                                try {
+                                    visitor.directory(CanonPath::root, {
+                                        [&](auto each) {
+                                            for (size_t i = 0; i <= count; ++i) {
+                                                if (i == throwAfter)
+                                                    throw std::runtime_error("producer");
+                                                if (i == count)
+                                                    break;
+                                                each(names[i], mask & (1u << i), [&, i](auto &, bool opportunity) {
+                                                    observed[i] = opportunity;
+                                                    ++started;
+                                                    Finally done{[&] { ++completed; }};
+                                                    if (failChild && i == 0)
+                                                        throw std::runtime_error("child");
+                                                    return file;
+                                                });
+                                            }
+                                        }, canDefer, mayFork});
+                                } catch (const std::runtime_error & e) {
+                                    failure = e.what();
                                 }
-                            },
-                            [&](size_t i) { consumed.push_back(i); });
-                    } catch (const std::runtime_error & e) {
-                        failure = e.what();
-                    }
-                    bool inlineFailure = failPrefix && workers == 1 && throwIndex != 0;
-                    std::vector<size_t> expectedPredicates;
-                    for (size_t i = 0; i <= (inlineFailure ? 0 : throwIndex); ++i)
-                        expectedPredicates.push_back(i);
-                    EXPECT_EQ(failure, inlineFailure ? "child" : "predicate");
-                    EXPECT_EQ(predicates, expectedPredicates);
-                    EXPECT_TRUE(consumed.empty());
-                    EXPECT_EQ(active.load(), 0u);
-                    EXPECT_EQ(started.load(), inlineFailure ? 1 : throwIndex);
-                    EXPECT_EQ(completed.load(), inlineFailure ? 1 : throwIndex);
-                    EXPECT_EQ(
-                        childFailures.load(), failPrefix ? std::min(throwIndex, std::max<size_t>(workers - 1, 1)) : 0u);
-                    ++cases;
-                }
-    }
-    EXPECT_EQ(cases, 144u);
+                                bool producerFails = throwAfter <= count;
+                                bool deferred = workers > 1 && canDefer;
+                                bool childWins = failChild && count && (!producerFails || (!deferred && throwAfter));
+                                EXPECT_EQ(failure, childWins ? "child" : producerFails ? "producer" : "");
+                                EXPECT_EQ(started.load(), completed.load());
+                                if (deferred && producerFails)
+                                    EXPECT_EQ(started.load(), 0u);
+                                bool frontier = deferred && mayFork && count > 1 && mask;
+                                for (auto observation : observed)
+                                    if (observation)
+                                        EXPECT_EQ(*observation, mayFork && !frontier);
+                                ++cases;
+                            }
+    EXPECT_EQ(cases, 4096u);
 }
 
-TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
+TEST(OrderedFrontier, failureObjectsMayReenterThePoolDuringCleanup)
 {
     /* An exception can own cleanup which itself visits children. Discarding
        a non-winning error must neither hold the pool lock nor outlive the
        joined child scope. Sharing the cleanup tolerates exception copies. */
     struct Cleanup
     {
-        CopyPool & pool;
+        size_t workers;
         std::atomic<size_t> & released;
         std::atomic<size_t> & visits;
         std::atomic<size_t> & folds;
 
         ~Cleanup()
         {
-            pool.ordered(2, [](size_t) { return false; }, [&](size_t) { ++visits; }, [&](size_t) { ++folds; });
+            const std::array hints{SchedulingHint{false}, SchedulingHint{false}};
+            orderedFrontier(std::span<const SchedulingHint>{hints}, &SchedulingHint::directory, workers,
+                [&](size_t) { ++visits; }, [&](size_t) { ++folds; });
             ++released;
         }
     };
@@ -950,18 +986,17 @@ TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
 
     size_t cases = 0;
     for (size_t workers = 1; workers <= 8; ++workers) {
-        CopyPool pool(workers);
         for (size_t count : {2u, 3u}) {
             SCOPED_TRACE(fmt("workers=%d count=%d", workers, count));
             std::atomic<size_t> started{0}, released{0}, visits{0}, folds{0};
             size_t failureIndex = count, consumed = 0;
             try {
-                pool.ordered(
-                    count,
-                    [](size_t) { return true; },
+                const std::array hints{SchedulingHint{true}, SchedulingHint{true}, SchedulingHint{true}};
+                orderedFrontier(
+                    std::span<const SchedulingHint>{hints.data(), count}, &SchedulingHint::directory, workers,
                     [&](size_t i) {
                         ++started;
-                        throw Failure{i, std::make_shared<Cleanup>(pool, released, visits, folds)};
+                        throw Failure{i, std::make_shared<Cleanup>(workers, released, visits, folds)};
                     },
                     [&](size_t) { ++consumed; });
             } catch (const Failure & failure) {
@@ -979,25 +1014,24 @@ TEST(CopyPool, failureObjectsMayReenterThePoolDuringCleanup)
     EXPECT_EQ(cases, 16u);
 }
 
-TEST(CopyPool, nestedScopesJoinBeforeReturning)
+TEST(OrderedFrontier, nestedScopesJoinBeforeReturning)
 {
     for (size_t workers = 1; workers <= 8; ++workers) {
-        CopyPool pool(workers);
         for (unsigned depth = 0; depth <= 3; ++depth) {
             SCOPED_TRACE(fmt("workers=%d depth=%d", workers, depth));
-            auto count = [&](this const auto & recurse, unsigned remaining) -> size_t {
+            auto count = [&](this const auto & recurse, unsigned remaining, size_t width) -> size_t {
                 if (!remaining)
                     return 1;
                 std::array<size_t, 3> children{};
                 size_t result = 1;
-                pool.ordered(
-                    3,
-                    [](size_t) { return true; },
-                    [&](size_t i) { children[i] = recurse(remaining - 1); },
+                const std::array hints{SchedulingHint{true}, SchedulingHint{true}, SchedulingHint{true}};
+                orderedFrontier(
+                    std::span<const SchedulingHint>{hints}, &SchedulingHint::directory, width,
+                    [&](size_t i) { children[i] = recurse(remaining - 1, 1); },
                     [&](size_t i) { result += children[i]; });
                 return result;
             };
-            EXPECT_EQ(count(depth), (std::array<size_t, 4>{1, 4, 13, 40}[depth]));
+            EXPECT_EQ(count(depth, workers), (std::array<size_t, 4>{1, 4, 13, 40}[depth]));
         }
     }
 }
@@ -1098,8 +1132,8 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
                     CanonPath("warm"),
                     HashingVisitor::Children{
                         [&](auto each) {
-                            each("directory", true, [&](auto &) { return empty; });
-                            each("file", false, [&](auto &) { return file; });
+                            each("directory", true, [&](auto &, bool) { return empty; });
+                            each("file", false, [&](auto &, bool) { return file; });
                         },
                         /*canDefer=*/true});
                 const std::array selected{first, second};
@@ -1112,7 +1146,7 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
                         HashingVisitor::Children{
                             [&](auto each) {
                                 for (size_t i = 0; i < selected.size(); ++i)
-                                    each(names[i], false, [&, i](auto &) {
+                                    each(names[i], false, [&, i](auto &, bool) {
                                         ++active;
                                         ++started;
                                         Finally done{[&] {
@@ -1164,17 +1198,17 @@ TEST(ObjectHashSink, warmHasherChoosesTheFirstChildFailure)
             CanonPath::root,
             HashingVisitor::Children{
                 [&](auto each) {
-                    each("directory", false, [&](auto &) {
+                    each("directory", false, [&](auto &, bool mayFork) {
                         return visitor.directory(
                             CanonPath("directory"),
                             HashingVisitor::Children{
                                 [&](auto nested) {
-                                    nested("a", true, [&](auto &) { return file; });
-                                    nested("b", true, [&](auto &) { return file; });
+                                    nested("a", true, [&](auto &, bool) { return file; });
+                                    nested("b", true, [&](auto &, bool) { return file; });
                                 },
-                                /*canDefer=*/true});
+                                /*canDefer=*/true, mayFork});
                     });
-                    each("file", false, [&](auto &) { return file; });
+                    each("file", false, [&](auto &, bool) { return file; });
                 },
                 /*canDefer=*/true});
         EXPECT_EQ(result.entry, expected);
@@ -1227,14 +1261,14 @@ TEST(ObjectHashSink, permittedPullUsesWorkersButAnExplicitVisitorKeepsItsCallerT
         bool wrongThread = false;
         std::vector<CanonPath> calls;
 
-        HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+        HashedNode regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
         {
             {
                 std::lock_guard lock(mutex);
                 wrongThread |= std::this_thread::get_id() != caller;
                 calls.push_back(path);
             }
-            return HashingVisitor::regular(path, std::move(read));
+            return HashingVisitor::regular(path, read);
         }
     };
 
@@ -2392,11 +2426,11 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
             record(path, true);
             return descend();
         }
-        HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+        HashedNode regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
         {
             record(path);
             fail(path, 1);
-            auto result = hasher.HashingVisitor::regular(path, std::move(read));
+            auto result = hasher.HashingVisitor::regular(path, read);
             fail(path, 2);
             return result;
         }
@@ -2417,14 +2451,14 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
                 auto select = [&](Children::Each each) {
                     children.each([&](std::string_view name, bool directory, Visit visit) {
                         if (name == "selected")
-                            each(name, directory, [visit = std::move(visit), &scoped](NodeVisitor<HashedNode> &) {
-                                return visit(scoped);
+                            each(name, directory, [visit = std::move(visit), &scoped](NodeVisitor<HashedNode> &, bool mayFork) {
+                                return visit(scoped, mayFork);
                             });
                         else
                             each(name, directory, std::move(visit));
                     });
                 };
-                return hasher.hashDirectory(path, {select, children.canDefer}, body, *this);
+                return hasher.hashDirectory(path, {select, children.canDefer, children.mayFork}, body, *this);
             }
             Consumer scoped{*this, environment + "/" + std::string(unhackName(*path.baseName()))};
             return hasher.hashDirectory(path, children, body, scoped);
@@ -2640,7 +2674,7 @@ TEST(HashingVisitor, permissionCallbackCannotLendAReplacedFilterParallelism)
     };
     Finally restoreWorkers{
         [old = HashingVisitor::workersForTest.load()] { HashingVisitor::workersForTest.store(old); }};
-    const auto defaultWorkers = CopyPool::defaultWorkers();
+    const auto defaultWorkers = std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
     size_t cases = 0, customWalks = 0;
     for (size_t configured = 0; configured <= 8; ++configured)
         for (bool initiallyAll : {false, true})

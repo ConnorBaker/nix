@@ -19,10 +19,10 @@ void copyRecursive(
             return {sink, path.isRoot() ? CanonPath(under) : under / *path.baseName()};
         }
 
-        std::monostate regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+        std::monostate regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
         {
             auto [sink, p] = at(path);
-            sink.createRegularFile(p, std::move(read));
+            sink.createRegularFile(p, std::ref(read));
             return {};
         }
 
@@ -38,7 +38,7 @@ void copyRecursive(
             auto [sink, p] = at(path);
             sink.createDirectory(p, [&](FileSystemObjectSink & dirSink, const CanonPath & rel) {
                 Copy child{dirSink, rel};
-                children.each([&](std::string_view, bool, Visit visit) { visit(child); });
+                children.each([&](std::string_view, bool, Visit visit) { visit(child, children.mayFork); });
             });
             return {};
         }

@@ -547,15 +547,16 @@ LocalStore::LocalStore(ref<const Config> config)
                 while (use.next()) {
                     auto key = GitObjectStore::Holder::Cursor{
                         use.getInt(1), use.getInt(0), static_cast<uint64_t>(use.getInt(5))};
-                    GitObjectStore::Holder candidate{
-                        .ino = static_cast<ino_t>(std::get<1>(key)),
-                        .dev = static_cast<dev_t>(std::get<0>(key)),
-                        .ingestion = static_cast<uint64_t>(std::get<2>(key))};
-                    if (candidate.cursor() != key || (holder && key >= holder->cursor()))
+                    auto ino = static_cast<ino_t>(std::get<1>(key));
+                    auto dev = static_cast<dev_t>(std::get<0>(key));
+                    if (static_cast<int64_t>(dev) != std::get<0>(key)
+                        || static_cast<int64_t>(ino) != std::get<1>(key) || (holder && key >= holder->cursor()))
                         continue;
-                    candidate.size = static_cast<uint64_t>(use.getInt(2));
                     holder = rootedBlobHolder(
-                        std::move(candidate),
+                        {.ino = ino,
+                         .dev = dev,
+                         .size = static_cast<uint64_t>(use.getInt(2)),
+                         .ingestion = std::get<2>(key)},
                         getRealStoreDir(), baseNameOf(use.getStr(3)), use.getStr(4));
                 }
                 return holder;

@@ -47,8 +47,6 @@ struct CmdCopySigs : StorePathsCommand
         for (auto & s : substituterUris)
             substituters.push_back(openStore(StoreReference{s}));
 
-        ThreadPool pool{fileTransferSettings.httpConnections};
-
         std::atomic<size_t> added{0};
 
         // logger->setExpected(doneLabel, storePaths.size());
@@ -103,6 +101,8 @@ struct CmdCopySigs : StorePathsCommand
 
             // logger->incProgress(doneLabel);
         };
+
+        ThreadPool pool{fileTransferSettings.httpConnections};
 
         for (auto & storePath : storePaths)
             pool.enqueue(std::bind(doPath, storePath));

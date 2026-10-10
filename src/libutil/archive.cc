@@ -101,7 +101,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
             return std::monostate{};
         }
 
-        std::monostate regular(const CanonPath &, fun<void(CreateRegularFileSink &)>) override
+        std::monostate regular(const CanonPath &, function_ref<void(CreateRegularFileSink &)>) override
         {
             return {};
         }
@@ -113,7 +113,7 @@ std::set<CanonPath> filteredPaths(SourceAccessor & accessor, const CanonPath & p
 
         std::monostate directory(const CanonPath &, Children children) override
         {
-            children.each([&](std::string_view, bool, Visit visit) { visit(*this); });
+            children.each([&](std::string_view, bool, Visit visit) { visit(*this, children.mayFork); });
             return {};
         }
     };
@@ -136,7 +136,7 @@ struct NarWriter : NodeVisitor<std::monostate>
     {
     }
 
-    std::monostate regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    std::monostate regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
     {
         struct Contents : CreateRegularFileSink
         {
@@ -186,7 +186,7 @@ struct NarWriter : NodeVisitor<std::monostate>
         sink << "(" << "type" << "directory";
         children.each([&](std::string_view name, bool, Visit visit) {
             sink << "entry" << "(" << "name" << name << "node";
-            visit(*this);
+            visit(*this, children.mayFork);
             sink << ")";
         });
         sink << ")";

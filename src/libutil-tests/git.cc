@@ -471,9 +471,9 @@ TEST_F(GitTest, both_roundrip)
             {
             }
 
-            HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+            HashedNode regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
             {
-                auto node = HashingVisitor::regular(path, std::move(read));
+                auto node = HashingVisitor::regular(path, read);
                 cas.insert_or_assign(node.entry.hash, blobObject(files.readFile(path)));
                 return node;
             }

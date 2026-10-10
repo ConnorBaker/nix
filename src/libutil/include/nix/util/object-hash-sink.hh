@@ -101,7 +101,6 @@ struct HashingVisitor : NodeVisitor<HashedNode>
 {
 private:
     size_t workers;
-    std::unique_ptr<CopyPool> pool;
 
 public:
     /* The default, including the push driver and arbitrary subclasses,
@@ -121,10 +120,10 @@ public:
         auto workers = filter.get_fn().target<AllPaths>() && accessor.allowsConcurrentTraversal()
             && filter.get_fn().target<AllPaths>()
             ? workersForTest.load(std::memory_order_relaxed) : 1;
-        return workers ? workers : CopyPool::defaultWorkers();
+        return workers ? workers : std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
     }
 
-    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override;
+    HashedNode regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override;
 
     HashedNode symlink(const CanonPath & path, const std::string & target) override;
 
@@ -135,7 +134,7 @@ public:
      */
     HashedNode directory(const CanonPath & path, Children children) override;
 
-    /** Fold children with this consumer, using this hasher's scheduler. */
+    /** Fold with this consumer, configured width and directory scope permissions. */
     HashedNode hashDirectory(
         const CanonPath & path, Children children, std::string & body, NodeVisitor<HashedNode> & consumer);
 };

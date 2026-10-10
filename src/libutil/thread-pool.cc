@@ -2,152 +2,11 @@
 #include "nix/util/signals.hh"
 #include "nix/util/util.hh"
 
-#include <algorithm>
 #include <cassert>
 #include <optional>
 #include <utility>
 
 namespace nix {
-
-CopyPool::CopyPool(size_t workers)
-    : capacity(workers - 1)
-{
-    assert(workers >= 1);
-    threads.reserve(capacity);
-    pending.reserve(capacity);
-}
-
-CopyPool::~CopyPool()
-{
-    {
-        std::lock_guard lock(mutex);
-        stopping = true;
-    }
-    wake.notify_all();
-    for (auto & thread : threads)
-        thread.join();
-}
-
-size_t CopyPool::defaultWorkers()
-{
-    return std::min<size_t>(std::max<unsigned int>(std::thread::hardware_concurrency(), 1), 8);
-}
-
-/** Run a removed job unlocked; return locked with its completion state. */
-static bool execute(const auto & job, std::unique_lock<std::mutex> & lock)
-{
-    lock.unlock();
-    std::exception_ptr failure;
-    try {
-        job.group->run(job.index);
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    lock.lock();
-    if (failure && job.index < job.group->failedIndex) {
-        job.group->failedIndex = job.index;
-        job.group->failure.swap(failure);
-    }
-    if (failure) {
-        /* A discarded exception's destructor may reenter the pool. Release
-           it outside the mutex, but before this job is observed as joined. */
-        lock.unlock();
-        failure = nullptr;
-        lock.lock();
-    }
-    return !--job.group->remaining;
-}
-
-bool CopyPool::tryAsync(Group & group, size_t i)
-{
-    std::unique_lock lock(mutex);
-    if (pending.size() == capacity)
-        return false;
-    if (threads.size() < capacity) {
-        threads.emplace_back([this, receiveInterrupts = ReceiveInterrupts{std::nullopt}] {
-#ifndef _WIN32
-            *receiveInterrupts.target->lock() = pthread_self();
-#endif
-            std::unique_lock lock(mutex);
-            while (true) {
-                wake.wait(lock, [&] { return stopping || !pending.empty(); });
-                if (pending.empty())
-                    return;
-                auto job = pending.back();
-                pending.pop_back();
-                /* Notify before unlocking: the waiter may destroy this group as soon
-                   as it observes completion under the same mutex. */
-                if (execute(job, lock))
-                    job.group->done.notify_one();
-            }
-        });
-    }
-    pending.push_back({&group, i});
-    ++group.remaining;
-    lock.unlock();
-    wake.notify_one();
-    return true;
-}
-
-void CopyPool::wait(Group & group)
-{
-    std::unique_lock lock(mutex);
-    --group.remaining; // Close the admission scope before joining its accepted jobs.
-    while (group.remaining) {
-        auto i = std::find_if(pending.begin(), pending.end(), [&](auto & job) { return job.group == &group; });
-        if (i == pending.end())
-            return group.done.wait(lock, [&] { return !group.remaining; });
-        auto job = std::exchange(*i, pending.back());
-        pending.pop_back();
-        execute(job, lock);
-    }
-}
-
-void CopyPool::ordered(size_t count, function_ref<bool(size_t)> canFork, function_ref<void(size_t)> run, function_ref<void(size_t)> consume)
-{
-    if (count < 2) {
-        if (count) {
-            run(0);
-            consume(0);
-        }
-        return;
-    }
-
-    Group group{run, count, {}, 1, {}};
-    std::exception_ptr failure;
-    try {
-        for (size_t i = 0; i < count; ++i) {
-            if (canFork(i) && tryAsync(group, i))
-                continue;
-            try {
-                run(i);
-            } catch (...) {
-                auto childFailure = std::current_exception();
-                {
-                    std::lock_guard lock(mutex);
-                    if (i < group.failedIndex) {
-                        group.failedIndex = i;
-                        group.failure.swap(childFailure);
-                    }
-                }
-                /* Stop launching, but let the ordered fold choose between
-                   this visit's failure and the preceding prefix. */
-                break;
-            }
-        }
-    } catch (...) {
-        failure = std::current_exception();
-    }
-    /* Join outside exception unwinding: helped jobs must still observe
-       interrupts, which are suppressed while a destructor is unwinding. */
-    wait(group);
-    if (failure)
-        std::rethrow_exception(failure);
-    for (size_t i = 0, end = group.failedIndex; i < end; ++i)
-        consume(i);
-    if (group.failure)
-        std::rethrow_exception(group.failure);
-}
 
 void ThreadPoolShutDown::anchor() {}
 
@@ -180,7 +39,8 @@ void ThreadPool::shutdown()
     if (workers.empty())
         return;
 
-    debug("reaping %d worker threads", workers.size());
+    if (lvlDebug <= verbosity)
+        logger->log(lvlDebug, "reaping worker threads");
 
     work.notify_all();
 
@@ -193,20 +53,33 @@ void ThreadPool::enqueue(work_t t)
     auto state(state_.lock());
     if (quit)
         throw ThreadPoolShutDown("cannot enqueue a work item while the thread pool is shutting down");
+    /* process() also executes items. Start the first background worker on
+       first admission, and reject a failed worker start before queuing work. */
+    if (state->pending.size() >= state->workers.size() && state->workers.size() + 1 < maxThreads)
+        state->workers.emplace_back([this, receiveInterrupts = ReceiveInterrupts{std::nullopt}]() mutable {
+            doWork(false, std::move(receiveInterrupts));
+        });
     state->pending.push(std::move(t));
-    /* Note: process() also executes items, so count it as a worker. */
-    if (state->pending.size() > state->workers.size() + 1 && state->workers.size() + 1 < maxThreads)
-        state->workers.emplace_back(&ThreadPool::doWork, this, false);
     work.notify_one();
 }
 
 void ThreadPool::process()
 {
+    try {
+        process(ReceiveInterrupts{});
+    } catch (...) {
+        shutdown();
+        throw;
+    }
+}
+
+void ThreadPool::process(ReceiveInterrupts receiveInterrupts)
+{
     state_.lock()->draining = true;
 
     /* Do work until no more work is pending or active. */
     try {
-        doWork(true);
+        doWork(true, std::move(receiveInterrupts));
 
         auto state(state_.lock());
 
@@ -226,11 +99,11 @@ void ThreadPool::process()
     }
 }
 
-void ThreadPool::doWork(bool mainThread)
+void ThreadPool::doWork(bool mainThread, ReceiveInterrupts receiveInterrupts)
 {
-    ReceiveInterrupts receiveInterrupts;
-
 #ifndef _WIN32 // Does Windows need anything similar for async exit handling?
+    if (receiveInterrupts.target)
+        *receiveInterrupts.target->lock() = pthread_self();
     if (!mainThread)
         unix::interruptCheck = [&]() { return (bool) quit; };
 #endif

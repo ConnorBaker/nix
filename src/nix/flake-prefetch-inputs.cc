@@ -3,6 +3,7 @@
 #include "nix/util/thread-pool.hh"
 #include "nix/store/filetransfer.hh"
 #include "nix/util/exit.hh"
+#include "nix/util/finally.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -59,6 +60,8 @@ struct CmdFlakePrefetchInputs : FlakeCommand
                     pool.enqueue([&visit, inputNode(*inputNode)] { visit(*inputNode); });
             }
         };
+
+        Finally join{[&] { pool.shutdown(); }};
 
         pool.enqueue([&] { visit(*flake.lockFile.root); });
 

@@ -347,7 +347,7 @@ struct BufferedRegularFile
    destination need not exist until the first streamed write. */
 static BufferedRegularFile readBufferedRegular(
     const CanonPath & path,
-    fun<void(CreateRegularFileSink &)> read,
+    function_ref<void(CreateRegularFileSink &)> read,
     function_ref<std::unique_ptr<RegularFileWriter>()> open,
     Sink * contents = nullptr)
 {
@@ -497,14 +497,14 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
                 auto named = [&](Children::Each each) {
                     CaseHackNames hack;
                     children.each([&](std::string_view name, bool directory, Visit visit) {
-                        each(name, directory, [disk = hack.diskName(name), visit = std::move(visit)](auto & consumer) {
+                        each(name, directory, [disk = hack.diskName(name), visit = std::move(visit)](auto & consumer, bool mayFork) {
                             auto & parent = static_cast<LinkingVisitor &>(consumer);
                             LinkingVisitor target{parent, parent.sink, &disk};
-                            return visit(target);
+                            return visit(target, mayFork);
                         });
                     });
                 };
-                result = hasher.hashDirectory(path, {named, children.canDefer}, body, child);
+                result = hasher.hashDirectory(path, {named, children.canDefer, children.mayFork}, body, child);
             } else
 #endif
                 result = hasher.hashDirectory(path, children, body, child);
@@ -524,14 +524,14 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
         return node;
     }
 
-    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
+    HashedNode regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) override
     {
         auto target = at(path);
         return placeRegular(
             target,
             readBufferedRegular(
                 path,
-                std::move(read),
+                read,
                 [&] {
                     return std::unique_ptr<RegularFileWriter>{
                         new RegularFileWriter(target.sink.beginRegularFile(target.name))};

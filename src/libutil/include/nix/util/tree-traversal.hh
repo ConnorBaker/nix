@@ -35,14 +35,15 @@ struct NodeVisitor
 {
     /* A child is independent of its consumer. The default consumer remains
        this visitor; a directory may substitute a scoped consumer whose
-       lifetime includes every joined child. */
-    using Visit = fun<Result(NodeVisitor &)>;
+       lifetime includes every joined child. mayFork carries an inherited
+       scheduling opportunity; it never grants accessor concurrency permission. */
+    using Visit = fun<Result(NodeVisitor &, bool mayFork)>;
     /**
      * A directory's admitted entries in visit order: calls its argument
      * once per entry with the tree's own name, whether the accessor's
      * listing typed that entry as a directory, and `visit`, which visits
      * the child and returns its result.  A writer that frames entries (the
-     * NAR) writes around `visit(visitor)`.
+     * NAR) writes around `visit(visitor, mayFork)`.
      *
      * The flag is **advisory** and nothing a visitor makes may depend on
      * it: a listing that gives no type says `false`, and the push driver,
@@ -66,6 +67,9 @@ struct NodeVisitor
            observations. Push producers borrow each visit only until Each
            returns; pull producers lend it through the directory scope. */
         bool canDefer = false;
+        /* Scheduling opportunity, independent of borrowed lifetime. A chosen
+           frontier passes false to every child, including inline children. */
+        bool mayFork = true;
     };
 
     virtual ~NodeVisitor() = default;
@@ -91,16 +95,16 @@ struct NodeVisitor
     }
 
     /**
-     * A regular file: `read(sink)` delivers it once -- `isExecutable()` when
-     * the bit is set, `preallocateContents` when the size is known first,
-     * then the bytes.
+     * A regular file's `read(sink)` is borrowed for this call and not retained.
+     * It delivers once: `isExecutable()` when set, `preallocateContents` when
+     * size is known first, then bytes. Its target outlives this call.
      */
-    virtual Result regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) = 0;
+    virtual Result regular(const CanonPath & path, function_ref<void(CreateRegularFileSink &)> read) = 0;
 
     virtual Result symlink(const CanonPath & path, const std::string & target) = 0;
 
     /**
-     * A directory: call `children.each` exactly once, and `visit(visitor)` once per
+     * A directory: call `children.each` exactly once, and `visit(visitor, mayFork)` once per
      * entry it hands over.  A scope the children need (a `RestoreSink`'s
      * directory callback) is opened around that call.
      */
@@ -129,7 +133,7 @@ Result traverse(
     /* `from` is the node in `acc`'s coordinates (a `readDirectory` callback
        may scope the accessor to a subdirectory); `to` is the node relative
        to `path`, spelt with the accessor's names. */
-    return [&](this const auto & walk, SourceAccessor & acc, const CanonPath & from, const CanonPath & to, size_t depth, NodeVisitor<Result> & visitor)
+    return [&](this const auto & walk, SourceAccessor & acc, const CanonPath & from, const CanonPath & to, size_t depth, NodeVisitor<Result> & visitor, bool mayFork)
                -> Result {
         checkInterrupt();
 
@@ -141,12 +145,11 @@ Result traverse(
         return visitor.node(acc, from, to, st, [&]() -> Result {
             switch (st.type) {
             case SourceAccessor::tRegular: {
-                auto read = [&](CreateRegularFileSink & crf) {
+                return visitor.regular(to, [&](CreateRegularFileSink & crf) {
                     if (st.isExecutable)
                         crf.isExecutable();
                     acc.readFile(from, crf, [&](uint64_t size) { crf.preallocateContents(size); });
-                };
-                return visitor.regular(to, std::ref(read));
+                });
             }
 
             case SourceAccessor::tSymlink:
@@ -177,8 +180,8 @@ Result traverse(
                                 return entry.first.find(caseHackSuffix) != std::string::npos;
                             }))
                             unhacked = unhackedEntries(entries, acc, from);
-                        auto visitChild = [&](const std::string & actual, NodeVisitor<Result> & childVisitor) {
-                            return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1, childVisitor);
+                        auto visitChild = [&](const std::string & actual, NodeVisitor<Result> & childVisitor, bool childMayFork) {
+                            return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1, childVisitor, mayFork && childMayFork);
                         };
                         auto children = [&](typename NodeVisitor<Result>::Children::Each each) {
                             auto child = [&](std::string_view name, const std::string & actual, auto type) {
@@ -189,7 +192,7 @@ Result traverse(
                                     each(
                                         std::string_view(name),
                                         type == SourceAccessor::tDirectory,
-                                        [&visitChild, &actual](NodeVisitor<Result> & childVisitor) { return visitChild(actual, childVisitor); });
+                                        [&visitChild, &actual](NodeVisitor<Result> & childVisitor, bool mayFork) { return visitChild(actual, childVisitor, mayFork); });
                             };
                             if (unhacked)
                                 for (auto & [name, actual] : *unhacked)
@@ -198,7 +201,7 @@ Result traverse(
                                 for (auto & [name, type] : entries)
                                     child(name, name, type);
                         };
-                        result = visitor.directory(to, {children, true});
+                        result = visitor.directory(to, {children, true, mayFork});
                     });
                 assert(result);
                 return std::move(*result);
@@ -213,7 +216,7 @@ Result traverse(
                 throw Error("file '%1%' has an unsupported type of %2%", from, st.typeString());
             }
         });
-    }(accessor, path, logicalRoot, std::ranges::distance(logicalRoot), v);
+    }(accessor, path, logicalRoot, std::ranges::distance(logicalRoot), v, true);
 }
 
 /**

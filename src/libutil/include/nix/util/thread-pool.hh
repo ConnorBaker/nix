@@ -4,6 +4,7 @@
 #include "nix/util/error.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/fun.hh"
+#include "nix/util/signals.hh"
 
 #include <boost/compat/move_only_function.hpp>
 
@@ -13,6 +14,9 @@
 #include <map>
 #include <atomic>
 #include <vector>
+#include <optional>
+#include <span>
+#include <utility>
 
 namespace nix {
 
@@ -58,6 +62,10 @@ public:
      */
     void process();
 
+    /** Drain with a registration owned before admission. Each invocation owns
+     * its registration, including when separate callers process concurrently. */
+    void process(ReceiveInterrupts receiveInterrupts);
+
     /**
      * Shut down all worker threads and wait until they've exited.
      * Active work items are finished, but any pending work items are discarded.
@@ -83,54 +91,88 @@ private:
 
     std::condition_variable work;
 
-    void doWork(bool mainThread);
+    void doWork(bool mainThread, ReceiveInterrupts receiveInterrupts);
 };
 
-/** A bounded pool whose nested directory scopes join their own children.
- * A full queue leaves work on the caller; a waiting caller may help only
- * its own group, so waiting parents do not exhaust the pool. */
-class CopyPool
+/** Evaluate independent, materialized child records, then fold in order.
+ * The bool member is an advisory scheduling hint, not an effectful predicate.
+ * Width is positive; the member pointer is valid, and its hint members remain
+ * unchanged until return. A const span does not freeze aliases to the records.
+ * Accepted work and exception cleanup finish before borrowed callbacks return.
+ * A caller choosing a frontier must deny nested scheduling to all its children. */
+template<typename Child>
+void orderedFrontier(
+    std::span<const Child> children,
+    bool Child::* hint,
+    size_t workers,
+    function_ref<void(size_t)> run,
+    function_ref<void(size_t)> consume)
 {
-    std::mutex mutex;
-    std::condition_variable wake;
-
+    auto count = children.size();
+    if (count < 2) {
+        if (count) {
+            run(0);
+            consume(0);
+        }
+        return;
+    }
     struct Group
     {
         function_ref<void(size_t)> run;
         size_t failedIndex;
         std::exception_ptr failure;
-        size_t remaining = 0;
-        std::condition_variable done;
-    };
-
-    struct Job
-    {
-        Group * group;
-        size_t index;
-    };
-
-    std::vector<Job> pending;
-    std::vector<std::thread> threads;
-    size_t capacity;
-    bool stopping = false;
-
-    bool tryAsync(Group & group, size_t i);
-    void wait(Group & group);
-
-public:
-    explicit CopyPool(size_t workers);
-    ~CopyPool();
-
-    static size_t defaultWorkers();
-
-    /** Evaluate a finite sequence, then consume its results in order.
-     * Visits and their results must be independent of consuming this sequence.
-     * Every submitted job is joined before return, including on failure. Child
-     * and consume failures are reported in traversal order, independently
-     * of completion order. Callbacks are borrowed until this call returns;
-     * each child owns its result storage, and captures must outlive the call. */
-    void ordered(size_t count, function_ref<bool(size_t)> canFork, function_ref<void(size_t)> run, function_ref<void(size_t)> consume);
-};
+        std::mutex mutex;
+        void recordFailure(size_t index, std::exception_ptr & childFailure)
+        {
+            std::lock_guard lock(mutex);
+            if (index < failedIndex) {
+                failedIndex = index;
+                failure.swap(childFailure);
+            }
+        }
+    } group{run, count, {}, {}};
+    // Registration precedes pool construction and every accepted job.
+    std::optional<std::pair<ReceiveInterrupts, ThreadPool>> frontier;
+    std::exception_ptr failure;
+    try {
+        for (size_t i = 0; i < count; ++i) {
+            if (workers > 1 && children[i].*hint) {
+                if (!frontier)
+                    frontier.emplace(std::nullopt, workers);
+                frontier->second.enqueue([&group, i] {
+                    std::exception_ptr failure;
+                    try {
+                        group.run(i);
+                    } catch (...) {
+                        failure = std::current_exception();
+                    }
+                    if (failure)
+                        group.recordFailure(i, failure);
+                    // Destroy a losing error outside the lock, before this job joins.
+                });
+                continue;
+            }
+            try {
+                run(i);
+            } catch (...) {
+                auto childFailure = std::current_exception();
+                group.recordFailure(i, childFailure);
+                break;
+            }
+        }
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    // Join outside exception unwinding, so child visits still observe interrupts.
+    if (frontier)
+        frontier->second.process(std::move(frontier->first));
+    if (failure)
+        std::rethrow_exception(failure);
+    for (size_t i = 0, end = group.failedIndex; i < end; ++i)
+        consume(i);
+    if (group.failure)
+        std::rethrow_exception(group.failure);
+}
 
 /**
  * Process in parallel a set of items of type T that have a partial
