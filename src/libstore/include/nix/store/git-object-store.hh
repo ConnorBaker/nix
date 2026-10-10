@@ -304,11 +304,9 @@ public:
             Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade);
             ~Lease();
         };
-    public:
         /* Behind a pointer so that `Hold` stays movable with a mutex in it. */
         struct Pending;
 
-    private:
         std::unique_ptr<Pending> pending;
         fun<std::shared_ptr<Lease>()> lease;
         explicit Hold(fun<std::shared_ptr<Lease>()> lease);

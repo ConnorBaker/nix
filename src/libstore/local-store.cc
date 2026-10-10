@@ -133,13 +133,14 @@ static Hash blobIdOf(std::string_view bytes)
 
 /* SQL holder names are exact canonical coordinates inside a registered root. */
 static GitObjectStore::Holder rootedBlobHolder(
-    GitObjectStore::Holder holder, const std::filesystem::path & root, std::string_view rawName)
+    GitObjectStore::Holder holder, std::filesystem::path root, std::string_view rootName, std::string_view rawName)
 {
     auto name = CanonPath(rawName);
-    if (name.rel() != rawName || std::filesystem::path(rawName).has_root_path())
+    if (name.rel() != rawName || std::filesystem::path(rawName).has_root_path()
+        || rootName.find_first_of(":\\") != rootName.npos)
         throw Error("blob index row has a noncanonical root-relative name");
-    auto coordinate = CanonPath::fromFilename(root.filename().string()) / name;
-    holder.address = GitObjectStore::Holder::Registered{root.parent_path(), std::move(coordinate)};
+    auto coordinate = CanonPath::fromFilename(rootName) / name;
+    holder.address = GitObjectStore::Holder::Registered{std::move(root), std::move(coordinate)};
     return holder;
 }
 
@@ -552,8 +553,7 @@ LocalStore::LocalStore(ref<const Config> config)
                          .dev = static_cast<dev_t>(std::get<0>(candidate)),
                          .size = static_cast<uint64_t>(use.getInt(2)),
                          .ingestion = static_cast<uint64_t>(std::get<2>(candidate))},
-                        getRealStoreDir() / baseNameOf(use.getStr(3)),
-                        use.getStr(4));
+                        getRealStoreDir(), baseNameOf(use.getStr(3)), use.getStr(4));
                 }
                 return holder;
             });
@@ -853,8 +853,7 @@ void LocalStore::coalesceBlobRows(
                  .dev = static_cast<dev_t>(use.getInt(3)),
                  .size = static_cast<uint64_t>(use.getInt(4)),
                  .ingestion = static_cast<uint64_t>(use.getInt(7))},
-                getRealStoreDir() / baseNameOf(use.getStr(5)),
-                use.getStr(6)));
+                getRealStoreDir(), baseNameOf(use.getStr(5)), use.getStr(6)));
         }
     }
     if (collisions.empty())

@@ -40,9 +40,9 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (!view.below.empty())
+        if (view.shape == ResolvedTree::Promoted)
             throw NotARegularFile("file '%s' is not a regular file", path.abs());
-        if (view.hidden)
+        if (view.shape == ResolvedTree::Hidden)
             throw FileNotFound("file '%s' does not exist", path.abs());
         return view.accessor->readFile(view.subpath, sink, std::move(sizeCallback));
     }
@@ -51,9 +51,9 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (!view.below.empty())
+        if (view.shape == ResolvedTree::Promoted)
             return Stat{.type = tDirectory};
-        if (view.hidden)
+        if (view.shape == ResolvedTree::Hidden)
             return std::nullopt;
         return view.accessor->maybeLstat(view.subpath);
     }
@@ -62,9 +62,9 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (!view.below.empty())
+        if (view.shape == ResolvedTree::Promoted)
             return Stat{.type = tDirectory};
-        if (view.hidden)
+        if (view.shape == ResolvedTree::Hidden)
             throw FileNotFound("file '%s' does not exist", path.abs());
         /* Unchanged subtrees retain their own errors, including explanations
            from access-control accessors. */
@@ -76,12 +76,12 @@ public:
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path, /*needDirectoryContents=*/true);
         if (view.below.empty()) {
-            if (view.hidden)
+            if (view.shape == ResolvedTree::Hidden)
                 throw FileNotFound("directory '%s' does not exist", path.abs());
             return view.accessor->readDirectory(view.subpath);
         }
         DirEntries result;
-        if (!view.hidden)
+        if (view.shape != ResolvedTree::Hidden)
             result = view.accessor->readDirectory(view.subpath);
         /* CanonPath order makes all grafts through one child contiguous. */
         for (auto i = view.below.begin(); i != view.below.end();) {
@@ -106,9 +106,9 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (!view.below.empty())
+        if (view.shape == ResolvedTree::Promoted)
             throw NotASymlink("file '%s' is not a symbolic link", path.abs());
-        if (view.hidden)
+        if (view.shape == ResolvedTree::Hidden)
             throw FileNotFound("file '%s' does not exist", path.abs());
         return view.accessor->readLink(view.subpath);
     }
@@ -136,7 +136,7 @@ public:
         ref<SourceAccessor> accessor;
         CanonPath subpath;
         std::vector<std::pair<CanonPath, ref<SourceAccessor>>> below;
-        bool hidden = false;
+        enum Shape : uint8_t { Available, Hidden, Promoted } shape = Available;
     };
 
     ResolvedTree resolveTree(const CanonPath & path, bool needDirectoryContents = false)
@@ -150,12 +150,12 @@ public:
             auto before = std::prev(next); // The required root mount is at or before every query.
             if (before->first == mountPoint && (next == state->end() || !next->first.isWithin(mountPoint)))
                 return result;
-            for (auto i = next; i != state->end() && i->first.isWithin(path)
-                                 && (needDirectoryContents || result.below.empty()); ++i)
-                result.below.emplace_back(*i);
-            /* Shape needs no fallback observation; listing and naming need its contents. */
-            if (!result.below.empty() && !needDirectoryContents)
+            if (!needDirectoryContents && next != state->end() && next->first.isWithin(path)) {
+                result.shape = ResolvedTree::Promoted;
                 return result;
+            }
+            for (auto i = next; i != state->end() && i->first.isWithin(path); ++i)
+                result.below.emplace_back(*i);
             /* Strict descendants of each query prefix form an ordered interval.
                If nonempty, it contains one of the query's two neighbours. */
             last = path;
@@ -167,8 +167,8 @@ public:
         auto component = result.subpath.begin();
         for (auto prefix = CanonPath::root;; prefix.push(*component++)) {
             auto st = result.accessor->maybeLstat(prefix);
-            result.hidden = !st || st->type != tDirectory;
-            if (result.hidden || prefix == last)
+            result.shape = !st || st->type != tDirectory ? ResolvedTree::Hidden : ResolvedTree::Available;
+            if (result.shape == ResolvedTree::Hidden || prefix == last)
                 break;
         }
         return result;
@@ -187,7 +187,7 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (view.hidden || !view.below.empty())
+        if (view.shape != ResolvedTree::Available)
             return std::nullopt;
         return view.accessor->getPhysicalPath(view.subpath);
     }
@@ -210,7 +210,7 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto view = resolveTree(path);
-        if (view.hidden || !view.below.empty())
+        if (view.shape != ResolvedTree::Available)
             return std::nullopt;
         return view.accessor->getKnownEntry(view.subpath);
     }
@@ -222,7 +222,7 @@ public:
             return std::pair{path, *fingerprint};
         auto view = resolveTree(path, /*needDirectoryContents=*/true);
         if (view.below.empty()) {
-            if (view.hidden)
+            if (view.shape == ResolvedTree::Hidden)
                 return std::nullopt;
             return view.accessor->getFingerprint(view.subpath);
         }
@@ -230,7 +230,7 @@ public:
            the discarded source node. Surviving fallback contents must be
            named, as must every explicit graft. */
         nlohmann::json tree = nullptr;
-        if (!view.hidden) {
+        if (view.shape != ResolvedTree::Hidden) {
             auto name = view.accessor->getFingerprint(view.subpath);
             if (!name)
                 return std::nullopt;

@@ -3146,4 +3146,55 @@ TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
     EXPECT_EQ(accessor->readLink(CanonPath("link")), "target");
 }
 
+TEST_F(GitUtilsTest, immutableBlobCallbacksMayReadTheSameAccessor)
+{
+    size_t cases = 0;
+    for (auto algorithm : {HashAlgorithm::SHA1, HashAlgorithm::SHA256}) {
+        GitRepo::Options options{.create = true, .bare = true, .oidType = algorithm};
+        auto path = tmpDir / printHashAlgo(algorithm);
+        auto repo = GitRepo::openRepo(path, options);
+        auto pool = GitRepoPool::create(path, options);
+        auto blob = writeString(*pool, "owned bytes");
+        auto tree = pool->makeDirectorySink();
+        tree->insertChild("regular", blob);
+        tree->insertChild("executable", {merkle::Mode::Executable, blob.hash});
+        tree->insertChild("link", pool->makeSymlink("target"));
+        auto root = std::move(*tree).finalize();
+        pool->flush();
+        for (auto node : {"/", "/regular", "/executable"})
+            for (bool fromSize : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << printHashAlgo(algorithm) << node << " size=" << fromSize);
+                CanonPath file(node);
+                auto accessor = repo->getAccessor(file.isRoot() ? blob.hash : root, {}, "");
+                bool reentered = false, sawSize = false;
+                auto reenter = [&] {
+                    EXPECT_FALSE(reentered);
+                    reentered = true;
+                    EXPECT_EQ(accessor->lstat(file).type, SourceAccessor::tRegular);
+                    EXPECT_EQ(accessor->readFile(file), "owned bytes");
+                    if (!file.isRoot())
+                        EXPECT_EQ(accessor->readLink(CanonPath("link")), "target");
+                };
+                std::string received;
+                LambdaSink sink([&](std::string_view bytes) {
+                    EXPECT_TRUE(sawSize);
+                    if (!fromSize)
+                        reenter();
+                    received.append(bytes);
+                });
+                accessor->readFile(file, sink, [&](uint64_t size) {
+                    sawSize = true;
+                    EXPECT_EQ(size, 11u);
+                    if (fromSize)
+                        reenter();
+                });
+                EXPECT_TRUE(reentered);
+                EXPECT_EQ(received, "owned bytes");
+                ++cases;
+            }
+    }
+    EXPECT_EQ(cases, 12u);
+    RecordProperty("finite_cases", cases);
+}
+
 } // namespace nix::fetchers

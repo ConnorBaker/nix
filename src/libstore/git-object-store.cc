@@ -260,24 +260,23 @@ GitObjectStore::Hold::Hold(Hold &&) = default;
 GitObjectStore::Hold::~Hold() = default;
 
 #ifndef _WIN32
-/* New leases contain only this ingestion's flat regular-file pins. Joined
-   workers cannot add entries. Never descend a surprising directory. */
-static AutoCloseDir releaseHoldContents(AutoCloseFD scan)
+/* Own the directory stream through the caller's final namespace operation. */
+template<typename Visit>
+static AutoCloseDir scanObjectDirectory(AutoCloseFD scan, const char * what, Visit && visit)
 {
     auto fd = scan.get();
     AutoCloseDir entries{fdopendir(fd)};
     if (!entries)
-        throw SysError("reading ingestion lease");
+        throw SysError("reading %s", what);
     scan.release();
     struct dirent * entry;
     while (errno = 0, entry = readdir(entries.get())) {
         if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
             continue;
-        if (unlinkat(fd, entry->d_name, 0) == -1 && errno != ENOENT)
-            throw SysError("unlinking ingestion pin '%s'", entry->d_name);
+        visit(fd, entry->d_name);
     }
     if (errno)
-        throw SysError("reading ingestion lease");
+        throw SysError("reading %s", what);
     return entries;
 }
 #endif
@@ -289,7 +288,11 @@ GitObjectStore::Hold::Lease::~Lease()
     try {
 #ifndef _WIN32
         /* The directory stream retains the lease lock through removal. */
-        auto entries = releaseHoldContents(std::move(fd));
+        auto entries = scanObjectDirectory(std::move(fd), "ingestion lease", [&](Descriptor parent, const char * name) {
+            /* Joined workers cannot add pins; never descend a surprising directory. */
+            if (unlinkat(parent, name, 0) == -1 && errno != ENOENT)
+                throw SysError("unlinking ingestion pin '%s'", name);
+        });
         if (::rmdir(dir.c_str()) == -1 && errno != ENOENT)
             throw SysError("removing hold %s", PathFmt(dir));
 #else
@@ -766,15 +769,6 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
             throw SysError("opening legacy object directory '%s'", name);
         return fd;
     };
-    auto status = [&](Descriptor parent, const char * name) -> std::optional<PosixStat> {
-        PosixStat st;
-        if (fstatat(parent, name, &st, AT_SYMLINK_NOFOLLOW) == -1) {
-            if (errno == ENOENT || errno == ENOTDIR)
-                return std::nullopt;
-            throw SysError("getting status of legacy object '%s'", name);
-        }
-        return st;
-    };
     auto remove = [&](Descriptor parent, const char * name, bool directory) {
         if (unlinkat(parent, name, directory ? AT_REMOVEDIR : 0) == 0) {
             removed();
@@ -787,27 +781,17 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
         throw SysError("removing legacy object '%s'", name);
     };
     auto scan = [&](AutoCloseFD fd, auto && visit) {
-        auto parent = fd.get();
-        AutoCloseDir stream{fdopendir(parent)};
-        if (!stream)
-            throw SysError("reading legacy object directory");
-        fd.release();
-        struct dirent * entry;
-        while (errno = 0, entry = readdir(stream.get())) {
-            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
-                continue;
+        scanObjectDirectory(std::move(fd), "legacy object directory", [&](Descriptor parent, const char * name) {
             checkInterrupt();
-            visit(parent, entry->d_name);
-        }
-        if (errno)
-            throw SysError("reading legacy object directory");
+            visit(parent, name);
+        });
     };
     auto cleanKind = [&](Descriptor parent, const char * kind, uint64_t * count) {
         auto fd = openChild(parent, kind);
         if (!fd)
             return;
         scan(std::move(fd), [&](Descriptor kindFd, const char * name) {
-            auto st = status(kindFd, name);
+            auto st = maybeLstat(name, kindFd);
             if (!st)
                 return;
             if (S_ISDIR(st->st_mode)) {
@@ -817,7 +801,7 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
                 if (!shard)
                     return;
                 scan(std::move(shard), [&](Descriptor shardFd, const char * leaf) {
-                    auto leafSt = status(shardFd, leaf);
+                    auto leafSt = maybeLstat(leaf, shardFd);
                     if (leafSt && !S_ISDIR(leafSt->st_mode) && remove(shardFd, leaf, false) && count)
                         ++*count;
                 });
@@ -837,7 +821,7 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
         }
         auto now = time(nullptr);
         scan(std::move(tmp), [&](Descriptor tmpFd, const char * name) {
-            auto st = status(tmpFd, name);
+            auto st = maybeLstat(name, tmpFd);
             if (!st)
                 return;
             if (!S_ISDIR(st->st_mode)) {
@@ -862,7 +846,7 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
                 return;
             }
             auto heldStat = nix::fstat(held.get());
-            auto current = status(tmpFd, name);
+            auto current = maybeLstat(name, tmpFd);
             if (!current || current->st_ino != heldStat.st_ino || current->st_dev != heldStat.st_dev)
                 return;
             try {
@@ -873,11 +857,11 @@ GitObjectStore::SweepStats GitObjectStore::sweep(const Owned * owned)
                 /* Regular coalescing pins and old flat temporary links are
                    leaves. Unknown directories are retained, not recursed. */
                 scan(dupDescriptor(held.get()), [&](Descriptor holdFd, const char * leaf) {
-                    auto leafSt = status(holdFd, leaf);
+                    auto leafSt = maybeLstat(leaf, holdFd);
                     if (leafSt && !S_ISDIR(leafSt->st_mode))
                         remove(holdFd, leaf, false);
                 });
-                if (!remove(tmpFd, name, true) && status(tmpFd, name))
+                if (!remove(tmpFd, name, true) && maybeLstat(name, tmpFd))
                     ++stats.holds;
             } catch (SystemError & e) {
                 printInfo("cannot remove the ingestion lease '%s': %s", name, e.msg());

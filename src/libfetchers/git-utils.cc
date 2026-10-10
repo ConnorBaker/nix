@@ -931,7 +931,7 @@ public:
 
     bool allowsConcurrentTraversal() override
     {
-        /* Object reads hold state_. LFS smudging additionally has ordered
+        /* Object acquisition holds state_. LFS smudging has ordered
            external effects (network and cache writes), so stays serial. */
         return !state_.lock()->options.smudgeLfs;
     }
@@ -949,29 +949,32 @@ public:
     void readBlob(const CanonPath & path, bool symlink, Sink & sink, std::function<void(uint64_t)> sizeCallback)
     {
         auto keepAlive = weak_from_this().lock();
-        auto state(state_.lock());
+        Blob blob;
+        {
+            auto state(state_.lock());
 
-        const auto blob = getBlob(*state, path, symlink);
+            blob = getBlob(*state, path, symlink);
 
-        if (state->lfsFetch) {
-            auto shouldFetch = [&] {
-                /* Always take the accessor state before the shared
-                   attribute lock; release it before network transfer. */
-                std::lock_guard attributeLock(state->repo->attributeMutex);
-                return state->lfsFetch->shouldFetch(path);
-            }();
-            if (shouldFetch) {
-                try {
-                    // FIXME: do we need to hold the state lock while
-                    // doing this?
-                    auto contents =
-                        std::string((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
-                    state->lfsFetch->fetch(contents, path, sink, std::move(sizeCallback));
-                } catch (Error & e) {
-                    e.addTrace({}, "while smudging git-lfs file '%s'", path);
-                    throw;
+            if (state->lfsFetch) {
+                auto shouldFetch = [&] {
+                    /* Always take the accessor state before the shared
+                       attribute lock; release it before network transfer. */
+                    std::lock_guard attributeLock(state->repo->attributeMutex);
+                    return state->lfsFetch->shouldFetch(path);
+                }();
+                if (shouldFetch) {
+                    try {
+                        // FIXME: do we need to hold the state lock while
+                        // doing this?
+                        auto contents =
+                            std::string((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
+                        state->lfsFetch->fetch(contents, path, sink, std::move(sizeCallback));
+                    } catch (Error & e) {
+                        e.addTrace({}, "while smudging git-lfs file '%s'", path);
+                        throw;
+                    }
+                    return;
                 }
-                return;
             }
         }
 

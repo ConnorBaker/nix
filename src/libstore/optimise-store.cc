@@ -232,7 +232,9 @@ struct EnterVisitor : HashingVisitor
         const SourceAccessor::Stat & st,
         function_ref<HashedNode()> descend) override
     {
-        if (inodes && !repair && st.type == SourceAccessor::tRegular) {
+        if (st.type != SourceAccessor::tRegular)
+            return descend();
+        if (inodes && !repair) {
             auto where = onDisk(root, path);
             auto file = lstat(where);
             auto i = inodes->find(file.st_ino);
@@ -268,12 +270,7 @@ struct EnterVisitor : HashingVisitor
                 }
             }
         }
-        return descend();
-    }
-
-    HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
-    {
-        auto node = HashingVisitor::regular(path, std::move(read));
+        auto node = descend();
         auto where = onDisk(root, path);
 
         switch (placementOf(where)) {
@@ -1039,7 +1036,9 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
 
     for (auto & collision : collisions) {
         auto & row = collision.row;
-        bool useOwn = true;
+        /* No usable donor means this file can become the holder. A file
+           refused sharing is an exception, not a new canonical donor. */
+        collision.eligible = true;
         for (auto & candidate : collision.candidates) {
             if (candidate.size != row.size) {
                 result.rejected.emplace_back(row, candidate);
@@ -1059,7 +1058,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                         PathFmt(own),
                         row.id.gitRev(),
                         observed.gitRev());
-                useOwn = false;
                 collision.eligible = true;
                 break;
             }
@@ -1086,7 +1084,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                     continue;
                 }
                 if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-                    useOwn = false;
+                    collision.eligible = false;
                     continue;
                 }
                 throw Error(
@@ -1102,7 +1100,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 result.rejected.emplace_back(row, candidate);
                 continue;
             }
-            useOwn = false;
+            collision.eligible = false;
             std::string * representative = nullptr;
             std::erase(row.aliases, row.name);
             std::ranges::sort(row.aliases);
@@ -1156,10 +1154,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             collision.eligible = true;
             break;
         }
-        /* No usable donor means this file can become the holder. A file
-           refused sharing is an exception, not a new canonical donor. */
-        if (useOwn)
-            collision.eligible = true;
     }
     return result;
 #endif

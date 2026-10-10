@@ -159,11 +159,17 @@ PosixStat stat(const std::filesystem::path & path);
 std::optional<PosixStat> maybeLstat(const std::filesystem::path & path);
 #ifndef _WIN32
 /** Borrow a native address relative to parent, preserving its full diagnostic spelling. */
-template<std::same_as<std::string> String>
+template<typename String>
+    requires(std::same_as<String, std::string> || std::same_as<String, const char *>)
 std::optional<PosixStat> maybeLstat(const String & path, Descriptor parent = AT_FDCWD)
 {
+    const char * native;
+    if constexpr (std::same_as<String, std::string>)
+        native = path.c_str();
+    else
+        native = path;
     std::optional<PosixStat> st{std::in_place};
-    if (::fstatat(parent, path.c_str(), &*st, AT_SYMLINK_NOFOLLOW)) {
+    if (::fstatat(parent, native, &*st, AT_SYMLINK_NOFOLLOW)) {
         if (errno == ENOENT || errno == ENOTDIR)
             return std::nullopt;
         throw SysError([&] { return HintFmt("getting status of %s", PathFmt(std::filesystem::path(path))); });
