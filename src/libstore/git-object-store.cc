@@ -312,7 +312,13 @@ std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::
         return std::tuple{AutoCloseFD{}, AT_FDCWD, file};
     auto & [root, coordinate] = *registered;
     auto missing = [] { return errno == ENOENT || errno == ENOTDIR; };
-    AutoCloseFD anchor{::open(root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+    int flags = O_DIRECTORY | O_CLOEXEC;
+#  ifdef O_PATH
+    flags |= O_PATH;
+#  else
+    flags |= O_RDONLY;
+#  endif
+    AutoCloseFD anchor{::open(root.c_str(), flags)};
     if (!anchor) {
         if (missing())
             return std::nullopt;
@@ -325,7 +331,7 @@ std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::
     }
     AutoCloseFD owned;
     try {
-        owned = openFileEnsureBeneathNoSymlinks(anchor.get(), parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        owned = openFileEnsureBeneathNoSymlinks(anchor.get(), parent, flags);
     } catch (SymlinkNotAllowed &) {
         return std::nullopt;
     }
