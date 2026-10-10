@@ -30,10 +30,11 @@ HashedNode HashingVisitor::symlink(const CanonPath &, const std::string & target
 HashedNode HashingVisitor::directory(const CanonPath & path, Children children)
 {
     std::string body;
-    return hashDirectory(path, std::move(children), body);
+    return hashDirectory(path, std::move(children), body, *this);
 }
 
-HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children children, std::string & body)
+HashedNode HashingVisitor::hashDirectory(
+    const CanonPath & path, Children children, std::string & body, NodeVisitor<HashedNode> & consumer)
 {
     merkle::Tree tree;
     std::optional<merkle::nar::Directory> size{std::in_place};
@@ -53,7 +54,7 @@ HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children childr
     };
     if (workers == 1 || !children.canDefer) {
         children.each([&](std::string_view name, bool, NodeVisitor<HashedNode>::Visit visit) {
-            auto child = visit(*this);
+            auto child = visit(consumer);
             consume(std::string(name), child);
         });
     } else {
@@ -74,18 +75,17 @@ HashedNode HashingVisitor::hashDirectory(const CanonPath & path, Children childr
             kids.push_back({std::string(name), subdirectory, std::move(visit)});
         });
         if (kids.size() > 1 && std::ranges::any_of(kids.data(), kids.data() + kids.size(), &Child::subdirectory)) {
-            auto & pool = (scheduler ? *scheduler : *this).pool;
             if (!pool)
                 pool = std::make_unique<CopyPool>(workers);
             std::vector<std::optional<HashedNode>> nodes(kids.size());
             pool->ordered(
                 kids.size(),
                 [&](size_t i) { return kids[i].subdirectory; },
-                [&](size_t i) { nodes[i] = kids[i].visit(*this); },
+                [&](size_t i) { nodes[i] = kids[i].visit(consumer); },
                 [&](size_t i) { consume(std::move(kids[i].name), nodes[i].value()); });
         } else
             for (auto & child : kids)
-                consume(std::move(child.name), child.visit(*this));
+                consume(std::move(child.name), child.visit(consumer));
     }
 
     body = merkle::serialiseTree(tree);

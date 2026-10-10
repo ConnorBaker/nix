@@ -189,9 +189,6 @@ struct ObjectStoreVisitor : HashingVisitor
     {
     }
 
-    ObjectStoreVisitor(ObjectStoreVisitor & parent, std::nullptr_t)
-        : HashingVisitor(parent, nullptr), objects(parent.objects), hold(parent.hold) {}
-
     HashedNode symlink(const CanonPath & path, const std::string & target) override
     {
         auto node = HashingVisitor::symlink(path, target);
@@ -202,7 +199,7 @@ struct ObjectStoreVisitor : HashingVisitor
     HashedNode directory(const CanonPath & path, Children children) override
     {
         std::string body;
-        auto node = hashDirectory(path, std::move(children), body);
+        auto node = hashDirectory(path, std::move(children), body, *this);
         hold.addAuxiliary({node.entry, std::move(body)});
         return node;
     }
@@ -431,8 +428,11 @@ static BufferedRegularFile readBufferedRegular(
 /* Buffer regular files up to restoreBufferLimit, then link or write;
    larger files stream before placement. Linked files fire no write hook.
    Directory scopes retain child sinks and canonicalise before staging the body. */
-struct LinkingVisitor : ObjectStoreVisitor
+struct LinkingVisitor : NodeVisitor<HashedNode>
 {
+    GitObjectStore & objects;
+    const GitObjectStore::Hold & hold;
+    HashingVisitor & hasher;
     RepairFlag repair;
     Sink * rootContents;
 
@@ -455,11 +455,11 @@ struct LinkingVisitor : ObjectStoreVisitor
     LinkingVisitor(
         GitObjectStore & objects,
         const GitObjectStore::Hold & hold,
+        HashingVisitor & hasher,
         RestoreSink & restore,
         RepairFlag repair,
-        Sink * rootContents = nullptr,
-        size_t workers = 1)
-        : ObjectStoreVisitor(objects, hold, workers)
+        Sink * rootContents = nullptr)
+        : objects(objects), hold(hold), hasher(hasher)
         , repair(repair)
         , rootContents(rootContents)
         , sink(restore)
@@ -467,7 +467,7 @@ struct LinkingVisitor : ObjectStoreVisitor
     }
 
     LinkingVisitor(LinkingVisitor & parent, RestoreSink & sink, const std::string * diskName = nullptr)
-        : ObjectStoreVisitor(parent, nullptr)
+        : objects(parent.objects), hold(parent.hold), hasher(parent.hasher)
         , repair(parent.repair), rootContents(parent.rootContents), sink(sink), diskName(diskName)
 #ifndef _WIN32
         , naming(parent.naming)
@@ -514,10 +514,10 @@ struct LinkingVisitor : ObjectStoreVisitor
                         });
                     });
                 };
-                result = child.hashDirectory(path, {named, children.canDefer}, body);
+                result = hasher.hashDirectory(path, {named, children.canDefer}, body, child);
             } else
 #endif
-                result = child.hashDirectory(path, children, body);
+                result = hasher.hashDirectory(path, children, body, child);
         };
         target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
@@ -529,7 +529,9 @@ struct LinkingVisitor : ObjectStoreVisitor
     {
         auto t = at(path);
         t.sink.createSymlink(t.name, target);
-        return ObjectStoreVisitor::symlink(path, target);
+        auto node = hasher.HashingVisitor::symlink(path, target);
+        hold.addAuxiliary({node.entry, target});
+        return node;
     }
 
     HashedNode regular(const CanonPath & path, fun<void(CreateRegularFileSink &)> read) override
@@ -823,7 +825,8 @@ ObjectHashSink::Result LocalStore::restoreThroughObjects(
 {
     RestoreSink restore{startFsync, hooks};
     restore.dstPath = path;
-    LinkingVisitor linking{objects, hold, restore, repair, rootContents};
+    HashingVisitor hasher;
+    LinkingVisitor linking{objects, hold, hasher, restore, repair, rootContents};
     ObjectHashSink adapter{linking};
     beginIngestion(hold, path);
     produce(adapter);
@@ -890,7 +893,8 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
             hold.addAuxiliary(std::move(auxiliary));
     };
     LinkingVisitor::Naming naming{std::move(namer), commitAttempt};
-    LinkingVisitor visitor{objects, hold, restore, repair, nullptr, workers};
+    HashingVisitor hasher{workers};
+    LinkingVisitor visitor{objects, hold, hasher, restore, repair};
     visitor.naming = &naming;
     beginIngestion(hold, dst);
     auto result = objectHashOf(*path.accessor, path.path, filter, visitor);
@@ -992,7 +996,8 @@ StorePath LocalStore::materialise(
             prepare();
             if (!buffered->writer)
                 beginIngestion(*hold, restore.dstPath);
-            LinkingVisitor linking{objects, *hold, restore, repair};
+            HashingVisitor hasher;
+            LinkingVisitor linking{objects, *hold, hasher, restore, repair};
             auto target = linking.at(CanonPath::root);
             linking.placeRegular(target, std::move(*buffered));
             buffered.reset();

@@ -94,15 +94,14 @@ public:
 /**
  * The object hasher as a visitor (`04` §1.7), under
  * `merkle::hashAlgo`, for both drivers, `traverse` and `ObjectHashSink`.
- * Consumers derive from it, override what they need and call this class's
- * action first; no method here calls another virtually.
+ * Primitive actions hash one node. Consumers may borrow them or derive from
+ * this class; directory folding invokes each child with its explicit consumer.
  */
 struct HashingVisitor : NodeVisitor<HashedNode>
 {
 private:
     size_t workers;
     std::unique_ptr<CopyPool> pool;
-    HashingVisitor * scheduler = nullptr;
 
 public:
     /* The default, including the push driver and arbitrary subclasses,
@@ -138,14 +137,9 @@ public:
      */
     HashedNode directory(const CanonPath & path, Children children) override;
 
-protected:
-    HashingVisitor(HashingVisitor & parent, std::nullptr_t)
-        : workers(parent.workers), scheduler(parent.scheduler ? parent.scheduler : &parent)
-    {
-    }
-
-    /** Hash the directory with this scoped consumer and retain its encoding. */
-    HashedNode hashDirectory(const CanonPath & path, Children children, std::string & body);
+    /** Fold children with this consumer, using this hasher's scheduler. */
+    HashedNode hashDirectory(
+        const CanonPath & path, Children children, std::string & body, NodeVisitor<HashedNode> & consumer);
 };
 
 /**

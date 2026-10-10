@@ -2119,16 +2119,17 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
             return live.size();
         }
     };
-    struct Consumer : HashingVisitor
+    struct Consumer : NodeVisitor<HashedNode>
     {
+        HashingVisitor & hasher;
         State & state;
         const std::string environment;
         const size_t id;
 
-        Consumer(State & state, size_t workers)
-            : HashingVisitor(workers), state(state), environment("/original"), id(state.enter()) {}
+        Consumer(State & state, HashingVisitor & hasher)
+            : hasher(hasher), state(state), environment("/original"), id(state.enter()) {}
         Consumer(Consumer & parent, std::string environment)
-            : HashingVisitor(parent, nullptr), state(parent.state), environment(std::move(environment)), id(state.enter()) {}
+            : hasher(parent.hasher), state(parent.state), environment(std::move(environment)), id(state.enter()) {}
         ~Consumer() override
         {
             std::lock_guard lock(state.mutex);
@@ -2161,7 +2162,7 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
         {
             record(path);
             fail(path, 1);
-            auto result = HashingVisitor::regular(path, std::move(read));
+            auto result = hasher.HashingVisitor::regular(path, std::move(read));
             fail(path, 2);
             return result;
         }
@@ -2169,7 +2170,7 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
         {
             record(path);
             fail(path, 1);
-            auto result = HashingVisitor::symlink(path, target);
+            auto result = hasher.HashingVisitor::symlink(path, target);
             fail(path, 2);
             return result;
         }
@@ -2189,10 +2190,10 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
                             each(name, directory, std::move(visit));
                     });
                 };
-                return hashDirectory(path, {select, children.canDefer}, body);
+                return hasher.hashDirectory(path, {select, children.canDefer}, body, *this);
             }
             Consumer scoped{*this, environment + "/" + std::string(unhackName(*path.baseName()))};
-            return scoped.hashDirectory(path, children, body);
+            return hasher.hashDirectory(path, children, body, scoped);
         }
     };
     struct Source final : MemorySourceAccessor
@@ -2229,7 +2230,8 @@ TEST(TreeTraversal, childContinuationsUseTheirSelectedScopedConsumer)
                         state.failure = failure;
                         state.failAt = rootMode == merkle::Mode::Directory ? "/selected/deep/first" : "/";
                         {
-                            Consumer original{state, workers};
+                            HashingVisitor hasher{workers};
+                            Consumer original{state, hasher};
                             bool failed = false;
                             try {
                                 auto result = [&] {
