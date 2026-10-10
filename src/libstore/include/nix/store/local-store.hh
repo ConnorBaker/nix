@@ -226,11 +226,7 @@ private:
          */
         std::chrono::time_point<std::chrono::steady_clock> lastGCCheck;
 
-        /**
-         * Whether auto-GC is running. If so, get gcFuture to wait for
-         * the GC to finish.
-         */
-        bool gcRunning = false;
+        /** Valid exactly while an automatic collection is active. */
         std::shared_future<void> gcFuture;
         std::thread gcThread;
 

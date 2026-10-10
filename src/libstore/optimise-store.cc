@@ -686,7 +686,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
                 if (auto child = i++; child->second.mode == merkle::Mode::Directory) {
                     auto directory = tree.extract(child);
                     directory.key().pop_back();
-                    tree.insert(std::move(directory));
+                    tree.insert(i, std::move(directory));
                 }
             merkle::nar::Directory size;
             auto populate = [&](RestoreSink & sub, const CanonPath & rel) {

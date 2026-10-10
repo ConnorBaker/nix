@@ -1634,7 +1634,7 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
         auto key = std::string(name);
         if (entry.mode == merkle::Mode::Directory)
             key += '/';
-        entries.insert_or_assign(std::move(key), git::TreeEntry{.mode = entry.mode, .hash = entry.hash});
+        entries.insert_or_assign(entries.end(), std::move(key), git::TreeEntry{.mode = entry.mode, .hash = entry.hash});
     }
 
     Hash finalize() && override

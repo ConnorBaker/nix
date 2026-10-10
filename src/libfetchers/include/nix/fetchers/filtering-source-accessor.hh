@@ -2,6 +2,7 @@
 
 #include "nix/util/source-path.hh"
 
+#include <memory>
 #include <set>
 #include <unordered_set>
 
@@ -75,8 +76,8 @@ struct FilteringSourceAccessor : SourceAccessor
     virtual bool isAllowed(const CanonPath & path) = 0;
 
 private:
-    /* Callers keep the receiver alive across policy callbacks. */
-    void checkAllowed(const CanonPath & path);
+    /* Admission retains shared receivers; stack-scoped receivers remain borrowed. */
+    std::shared_ptr<SourceAccessor> checkAllowed(const CanonPath & path);
 };
 
 /**

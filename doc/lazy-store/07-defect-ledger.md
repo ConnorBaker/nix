@@ -4,6 +4,7 @@ The lazy-store work kept a ledger of every defect the branch introduced and foun
 
 | defect | pinned by |
 |---|---|
+| failed automatic-GC startup published an invalid, stale-ready or broken completion, preventing retry or terminating owner release | [SDK startup-failure probe](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/auto-gc-startup-failure-probe-oct10/fixed-after-store-build/execution/READOUT.md): 72 admitted baseline counterexamples across two promise allocations and thread-start EAGAIN; all 96 fixed controls/fault cases pass |
 | directory cleanup followed a replaced pathname, changing an unrelated replacement and leaving the opened directory writable | `LocalStoreObjectsTest.placementRestoresTheOpenedDirectoryAfterEveryNameChange`; all 48 permission/name-change/repair/executable cells run, with 20 failures before descriptor-based cleanup |
 | a wrong-algorithm child result constructed its diagnostic through `CanonPath`, aborting on dot names or throwing `BadCanonPath` for NUL before reporting the identifier error | `ObjectHashSink.identifierDiagnosticsPreserveEveryNameClassAndDirectoryPath`; the isolated baseline reproduces both failure classes before the one-expression fix |
 | `builtins.storePath` and `fetchTree` of a pending object dereferenced a name that was not written | `WriteBufferTest.everyBuiltinAgreesWithEagerEvaluationOnPendingInputs`, `dereferencingBuiltinsWriteFirst`, `tests/functional/lazy-store-doors.sh` |

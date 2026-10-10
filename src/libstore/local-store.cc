@@ -1005,8 +1005,7 @@ void LocalStore::waitForAutoGC()
 
     {
         auto state(_state->lock());
-        if (state->gcRunning)
-            future = state->gcFuture;
+        future = state->gcFuture;
     }
 
     if (future.valid()) {

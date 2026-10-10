@@ -106,17 +106,17 @@ void insertEntry(Tree & tree, std::string name, const TreeEntry & entry)
         throw Error("invalid tree entry name '%s'", name);
     /* The trailing slash orders directories; it does not make a second
        child name. Reject either encoding of an existing logical name. */
-    if (entry.mode == Mode::Directory) {
+    const auto isDir = entry.mode == Mode::Directory;
+    if (isDir) {
         if (tree.contains(name))
             throw Error("duplicate tree entry name '%s'", name);
         name += '/';
     } else if (tree.contains(name + '/'))
         throw Error("duplicate tree entry name '%s'", name);
-    if (!tree.try_emplace(std::move(name), entry).second) {
-        if (entry.mode == Mode::Directory)
-            name.pop_back();
-        throw Error("duplicate tree entry name '%s'", name);
-    }
+    const auto size = tree.size();
+    const auto i = tree.try_emplace(tree.end(), std::move(name), entry);
+    if (tree.size() == size)
+        throw Error("duplicate tree entry name '%s'", std::string_view(i->first).substr(0, i->first.size() - isDir));
 }
 
 std::optional<std::string> syntheticRootTree(const TreeEntry & root)

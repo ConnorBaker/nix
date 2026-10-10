@@ -963,7 +963,7 @@ void LocalStore::autoGC(bool sync)
     {
         auto state(_state->lock());
 
-        if (state->gcRunning) {
+        if (state->gcFuture.valid()) {
             future = state->gcFuture;
             debug("waiting for auto-GC to finish");
             goto sync;
@@ -984,15 +984,12 @@ void LocalStore::autoGC(bool sync)
         if (avail > state->availAfterGC * 0.97)
             return;
 
-        /* Note: since gcRunning is false here, any previous GC thread has exited / is exiting so the join() should be
-         * almost instantenous. */
+        std::promise<void> promise;
+        auto completion = promise.get_future().share();
+        future = completion;
+
         if (state->gcThread.joinable())
             state->gcThread.join();
-
-        state->gcRunning = true;
-
-        std::promise<void> promise;
-        future = state->gcFuture = promise.get_future().share();
 
         state->gcThread = std::thread([promise{std::move(promise)}, this, avail, getAvail, &gcSettings]() mutable {
             try {
@@ -1000,7 +997,7 @@ void LocalStore::autoGC(bool sync)
                 /* Wake up any threads waiting for the auto-GC to finish. */
                 Finally wakeup([&]() {
                     auto state(_state->lock());
-                    state->gcRunning = false;
+                    state->gcFuture = {};
                     state->lastGCCheck = std::chrono::steady_clock::now();
                     promise.set_value();
                 });
@@ -1022,6 +1019,7 @@ void LocalStore::autoGC(bool sync)
                 ignoreExceptionInDestructor();
             }
         });
+        state->gcFuture = std::move(completion);
     }
 
 sync:

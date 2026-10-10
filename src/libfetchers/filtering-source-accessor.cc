@@ -11,8 +11,7 @@ namespace nix {
 
 std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(const CanonPath & path)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     auto innerPath = prefix / path;
     /* Admission of a directory says nothing about its descendants. A
        physical directory would bypass their filtering policy. */
@@ -23,8 +22,7 @@ std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(co
 
 void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     return next->readFile(prefix / path, sink, std::move(sizeCallback));
 }
 
@@ -46,15 +44,13 @@ std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const Ca
 
 SourceAccessor::Stat FilteringSourceAccessor::lstat(const CanonPath & path)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     return next->lstat(prefix / path);
 }
 
 SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPath & path)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     auto entries = next->readDirectory(prefix / path);
     std::erase_if(entries, [&](const auto & entry) { return !isAllowed(path / entry.first); });
     return entries;
@@ -64,8 +60,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
 {
     /* The scoped view borrows this policy throughout the callback. Stack
        scopes are already kept alive by their enclosing directory call. */
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     next->readDirectoryWithEntries(prefix / path, [&](auto & inner, const auto & relative, auto && listing) {
         struct Scoped final : FilteringSourceAccessor
         {
@@ -132,8 +127,7 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
 
 std::string FilteringSourceAccessor::readLink(const CanonPath & path)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
     return next->readLink(prefix / path);
 }
 
@@ -145,14 +139,15 @@ std::string FilteringSourceAccessor::showPath(const CanonPath & path)
 
 void FilteringSourceAccessor::checkAccess(const CanonPath & path)
 {
-    auto owner = weak_from_this().lock();
-    checkAllowed(path);
+    auto owner = checkAllowed(path);
 }
 
-void FilteringSourceAccessor::checkAllowed(const CanonPath & path)
+std::shared_ptr<SourceAccessor> FilteringSourceAccessor::checkAllowed(const CanonPath & path)
 {
+    auto owner = weak_from_this().lock();
     if (!isAllowed(path))
         throw makeNotAllowedError(path);
+    return owner;
 }
 
 struct AllowListSourceAccessorImpl final : AllowListSourceAccessor

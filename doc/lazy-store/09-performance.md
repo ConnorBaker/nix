@@ -44,6 +44,21 @@ The [complete warm-Git width diagnostic](/home/connorbaker/Benchmarks/w9r1/analy
 
 All outputs, logical graphs, authority and source/runtime guards pass. Root independently checked all 1,089 artifact hashes against the [closure seal](/home/connorbaker/Benchmarks/w9r1/CLOSURE-SEAL.json). Copied states preserve logical contents but change inode identities; original inode-bound cache reuse was not counted. The imported root snapshot helper lacks a separate interval guard, though its final hash matches preparation. Controller polling limits narrow elapsed comparisons. These are diagnostics of instrumented 38756a, not a new comparison against base. No production change follows from them.
 
+The separate [cold32-path width diagnostic](/home/connorbaker/Benchmarks/k9w1/READOUT.json) covers all widths 1–8 in eight balanced Williams blocks: **64 observations**, each with fresh private store/cache state, and all **28 × 8** within-block width comparisons. Kernel caches were not evicted. Every output, all 64 complete identity-address graph/content comparisons, launch authority and complete source/runtime/configuration/fixture guards pass, including an explicit pre/post pin of the imported snapshot helper. Root independently checked all **716 artifact hashes** against the [seal](/home/connorbaker/Benchmarks/k9w1/INDEPENDENT-SEAL.json), SHA `05e0e319e925bb5680018978f9c94648a03f7ab1e215810a57743a129852a983`. No observation is excluded; all 64 states remain retained pending evidence-preserving retirement.
+
+| Cold width | Elapsed median (s) | CPU median (s) |
+|---|---:|---:|
+| 1 | 3.964 | 3.630 |
+| 2 | 3.858 | 3.780 |
+| 3 | 3.429 | 4.030 |
+| 4 | 3.231 | 4.425 |
+| 5 | 2.850 | 4.690 |
+| 6 | 2.910 | 4.895 |
+| 7 | 2.874 | 4.965 |
+| 8 | 2.875 | 5.260 |
+
+The cold tradeoff is explicit: width1/width8 paired median elapsed is **1.375110**, higher in all eight blocks, while CPU is **0.696113**, lower in all eight. System-CPU medians rise **2.070→3.575 seconds** and voluntary-switch medians **1,008→14,809**. Width five's lower separate elapsed median does not establish a universal improvement: its paired width5/width8 elapsed median is **1.008148**, with four wins and four losses; CPU is **0.897968**, lower in all eight. Measurement-tagged PSI maxima are CPU **0.25%**, I/O **3.09%**, memory **4.04%** across 824 samples; all-phase maxima separately retain verification I/O **36.58%** across 4,719 samples. These aggregate pressures do not establish causes. Elapsed includes the authority launcher and bounded controller polling. The intervention remains a diagnosis of instrumented **38756a**, changes both scheduling and deferred child storage, and justifies neither a universal default-width change nor a speedup against base.
+
 ### Earlier f05 comparison
 
 Measured **f05adeff82965dc67d91ee00110e61d811e40578** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, using matching release builds and dependencies. It wins **40/54 wall**, **33/54 CPU** and **18/54 RSS** pairs. Both warm-Git cases regress in wall and CPU; cold path regresses in CPU. Cold Git's CPU median is only marginally lower, with three wins and three losses. Uniform performance and substantial source reduction remain unfinished.
