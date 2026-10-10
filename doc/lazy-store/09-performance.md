@@ -2,7 +2,27 @@
 
 ## Latest matched comparison
 
-The latest measured committed endpoint **bf502aa89ee799884af3280b766a213acbf12e54** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path CPU and both warm-Git CPU regress in all six pairs. **The performance goal remains unmet.** Subsequent ownership, publication and traversal changes are **unmeasured**; correctness checks and static native comparisons do not extend these timings to them.
+The latest measured committed endpoint **05b7398bd80a3df0656ef714221bacebff9b336c** has lower paired wall medians in **seven of nine cases** and CPU medians in **five of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path, cold-Git and both warm-Git CPU regress in all six pairs; both warm-Git wall cases also regress in all six. **The performance goal remains unmet.** These whole-endpoint measurements do not isolate the contribution of ownership, publication or traversal changes.
+
+| Case | Wall / base | CPU / base | Wall wins | CPU wins |
+| --- | ---: | ---: | ---: | ---: |
+| cold 32 path | 0.766070 | 1.536124 | 6/6 | 0/6 |
+| cold 32 git | 0.851419 | 1.024697 | 6/6 | 0/6 |
+| cold 32 github | 0.683167 | 0.354781 | 6/6 | 6/6 |
+| warm 8 path | 0.148511 | 0.317713 | 6/6 | 6/6 |
+| warm 8 git | 1.070312 | 1.865672 | 0/6 | 0/6 |
+| warm 8 github | 0.931115 | 0.896552 | 6/6 | 6/6 |
+| warm 32 path | 0.295171 | 0.441967 | 6/6 | 6/6 |
+| warm 32 git | 1.038347 | 1.442720 | 0/6 | 0/6 |
+| warm 32 github | 0.941631 | 0.936447 | 5/6 | 6/6 |
+
+The [c9r5 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/READOUT.md), [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/INDEPENDENT-SEAL.json) and [actual process closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/COHORT-JOB-FINAL-CLOSURE.json) retain all **114 outputs, 54 balanced pairs and 21 complete graphs**. The wrapper closed zero and was reaped; all 527 artifact hashes and 98 runtime providers were read back successfully. Sources, full fixtures and runtime providers remain unchanged. Each case has three AB and three BA pairs, with no exclusions; all 42 states remain present. Graph comparison passes after address rewriting, with nonidentity mappings, rather than proving address formulas. Cold means fresh application state with host page caches intact; warm states reuse their original physical roots.
+
+The [pressure readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/ownership-current-release-oct10/PRESSURE-READOUT.json) retains **1,503 samples**, including **951 tagged timed**. Timed CPU some avg10 peaks at **5.56%**, I/O some/full at **1.43%/1.43%**, and memory avg10 remains zero despite nonzero total-counter changes. All-phase CPU peaks at 6.11%. Last-minus-first timed counter differences include intervening guard periods; these rolling host observations establish neither workload causes nor causal time fractions. The earlier bf502 profiles below do not attribute the current endpoint's regressions.
+
+## Historical bf502 matched comparison
+
+The measured committed endpoint **bf502aa89ee799884af3280b766a213acbf12e54** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path CPU and both warm-Git CPU regress in all six pairs. **The performance goal remains unmet.**
 
 | Case | Wall / base | CPU / base | Wall wins | CPU wins |
 | --- | ---: | ---: | ---: | ---: |
