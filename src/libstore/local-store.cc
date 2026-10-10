@@ -183,7 +183,9 @@ struct LocalStore::State::Stmts
 static constexpr auto lookupBlobSql =
     "select b.ino, b.dev, b.size, i.path, b.name, b.ingestion from Blobs b"
     " join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path"
-    " where b.id = ? and b.exec = ? and i.id > 0 and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
+    " where b.id = ? and b.exec = ? and i.id > 0"
+    " and typeof(b.dev) = 'integer' and typeof(b.ino) = 'integer'"
+    " and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
 
 /* Storage class is part of an incarnation key; unary + removes column affinity. */
 static constexpr auto auxiliaryExactKeySql =
@@ -537,22 +539,23 @@ LocalStore::LocalStore(ref<const Config> config)
                     .apply(int64_t(executable ? 1 : 0))
                     .apply(std::get<0>(cursor))
                     .apply(std::get<1>(cursor))
-                    .apply(static_cast<int64_t>(std::get<2>(cursor)));
+                    .apply(static_cast<int64_t>(std::min<uint64_t>(
+                        std::get<2>(cursor), std::numeric_limits<int64_t>::max())));
                 std::optional<GitObjectStore::Holder> holder;
-                std::tuple<int64_t, int64_t, int64_t> minimum;
-                /* Select the same physical minimum without opening SQLite's
-                   temporary sorter on every miss. Compare signed database
-                   coordinates before converting to platform inode types. */
+                /* Keep only exact native cursors, selecting their signed minimum
+                   without opening SQLite's temporary sorter on every miss. */
                 while (use.next()) {
-                    auto candidate = std::tuple{use.getInt(1), use.getInt(0), use.getInt(5)};
-                    if (holder && candidate >= minimum)
+                    auto key = GitObjectStore::Holder::Cursor{
+                        use.getInt(1), use.getInt(0), static_cast<uint64_t>(use.getInt(5))};
+                    GitObjectStore::Holder candidate{
+                        .ino = static_cast<ino_t>(std::get<1>(key)),
+                        .dev = static_cast<dev_t>(std::get<0>(key)),
+                        .ingestion = static_cast<uint64_t>(std::get<2>(key))};
+                    if (candidate.cursor() != key || (holder && key >= holder->cursor()))
                         continue;
-                    minimum = candidate;
+                    candidate.size = static_cast<uint64_t>(use.getInt(2));
                     holder = rootedBlobHolder(
-                        {.ino = static_cast<ino_t>(std::get<1>(candidate)),
-                         .dev = static_cast<dev_t>(std::get<0>(candidate)),
-                         .size = static_cast<uint64_t>(use.getInt(2)),
-                         .ingestion = static_cast<uint64_t>(std::get<2>(candidate))},
+                        std::move(candidate),
                         getRealStoreDir(), baseNameOf(use.getStr(3)), use.getStr(4));
                 }
                 return holder;

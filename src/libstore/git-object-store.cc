@@ -339,13 +339,9 @@ std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::
         throw SysError("opening store directory for %s", PathFmt(root));
     }
     auto parent = *coordinate.parent();
-    if (parent.isRoot()) {
-        auto fd = anchor.get();
-        return std::tuple{std::move(anchor), fd, std::string(*coordinate.baseName())};
-    }
     AutoCloseFD owned;
     try {
-        owned = openFileEnsureBeneathNoSymlinks(anchor.get(), parent, flags);
+        owned = parent.isRoot() ? std::move(anchor) : openFileEnsureBeneathNoSymlinks(anchor.get(), parent, flags);
     } catch (SymlinkNotAllowed &) {
         return std::nullopt;
     }

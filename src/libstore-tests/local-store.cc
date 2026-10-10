@@ -5202,6 +5202,12 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
         {high, low},
         {high, high},
     }};
+    /* SQL signed values encode all bits of a 64-bit native coordinate. A
+       narrower native coordinate admits only its mathematical range. */
+    const auto minDev = sizeof(dev_t) >= sizeof(int64_t) ? low : int64_t(std::numeric_limits<dev_t>::min());
+    const auto maxDev = sizeof(dev_t) >= sizeof(int64_t) ? high : int64_t(std::numeric_limits<dev_t>::max());
+    const auto minIno = sizeof(ino_t) >= sizeof(int64_t) ? low : int64_t(std::numeric_limits<ino_t>::min());
+    const auto maxIno = sizeof(ino_t) >= sizeof(int64_t) ? high : int64_t(std::numeric_limits<ino_t>::max());
     const std::array<int64_t, 2> ingestions{1, high};
     const std::array<std::string, 2> paths{
         store->printStorePath(StorePath::random("cursor-root")),
@@ -5251,7 +5257,9 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
                                     .apply(names[i])
                                     .apply(int64_t(i + 1))
                                     .exec();
-                                if (states[i] == 3)
+                                if (states[i] == 3 && std::get<0>(keys[i]) >= minDev
+                                    && std::get<0>(keys[i]) <= maxDev && std::get<1>(keys[i]) >= minIno
+                                    && std::get<1>(keys[i]) <= maxIno)
                                     eligible.push_back(i);
                             }
                             /* A different address or mode must never supply the minimum. */
@@ -5283,14 +5291,18 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
                              {GitObjectStore::Holder::initialCursor,
                               keys[0],
                               keys[1],
+                              Cursor{first.first, first.second, uint64_t(high) + 1},
+                              Cursor{second.first, second.second, std::numeric_limits<uint64_t>::max()},
                               Cursor{high, high, static_cast<uint64_t>(high)}}) {
                             auto expected = std::find_if(
                                 eligible.begin(), eligible.end(), [&](size_t i) { return keys[i] > cursor; });
                             auto actual = store->objects.index->lookup(id, executable, cursor);
-                            ASSERT_EQ(actual.has_value(), expected != eligible.end());
-                            if (!actual)
+                            EXPECT_EQ(actual.has_value(), expected != eligible.end());
+                            if (!actual || expected == eligible.end())
                                 continue;
                             auto i = *expected;
+                            EXPECT_EQ(actual->cursor(), keys[i]);
+                            EXPECT_GT(actual->cursor(), cursor);
                             EXPECT_EQ(actual->ingestion, static_cast<uint64_t>(ingestions[i]));
                             EXPECT_EQ(actual->dev, static_cast<dev_t>(std::get<0>(keys[i])));
                             EXPECT_EQ(actual->ino, static_cast<ino_t>(std::get<1>(keys[i])));
@@ -5302,6 +5314,152 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
                         }
                     }
     EXPECT_EQ(cases, 512u);
+}
+
+TEST_F(LocalStoreObjectsTest, candidateLookupAdmitsOnlyLosslessIntegerCoordinates)
+{
+    using Cursor = GitObjectStore::Holder::Cursor;
+    constexpr auto low = std::numeric_limits<int64_t>::min();
+    constexpr auto high = std::numeric_limits<int64_t>::max();
+    auto path = store->printStorePath(StorePath::random("coordinate-types"));
+    auto id = merkle::blobId("coordinate-types");
+    SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+    SQLiteStmt{db, "insert into ValidPaths(path, hash, registrationTime) values (?, '', 0);"}
+        .use().apply(path).exec();
+    SQLiteStmt{db, "insert into Ingestions(id, path) values (1, ?);"}.use().apply(path).exec();
+    unsigned cases = 0;
+    for (bool device : {false, true}) {
+        auto minimum = device
+            ? (sizeof(dev_t) >= sizeof(int64_t) ? low : int64_t(std::numeric_limits<dev_t>::min()))
+            : (sizeof(ino_t) >= sizeof(int64_t) ? low : int64_t(std::numeric_limits<ino_t>::min()));
+        auto maximum = device
+            ? (sizeof(dev_t) >= sizeof(int64_t) ? high : int64_t(std::numeric_limits<dev_t>::max()))
+            : (sizeof(ino_t) >= sizeof(int64_t) ? high : int64_t(std::numeric_limits<ino_t>::max()));
+        std::set<int64_t> integers{low, low + 1, -1, 0, 1, 7, high - 1, high, minimum, maximum};
+        if (minimum != low)
+            integers.insert(minimum - 1);
+        if (maximum != high)
+            integers.insert(maximum + 1);
+        struct Value
+        {
+            std::string sql, type;
+            int64_t integer = 0;
+        };
+        std::vector<Value> values{
+            {"7.0", "integer", 7}, {"'7'", "integer", 7},
+            {"'7.0'", "integer", 7}, {"'7e0'", "integer", 7},
+            {"2.5", "real"}, {"'not-an-integer'", "text"}, {"x'00'", "blob"}, {"NULL", "null"},
+        };
+        for (auto value : integers)
+            values.push_back({std::to_string(value), "integer", value});
+        for (bool executable : {false, true})
+            for (const auto & value : values) {
+                SCOPED_TRACE(fmt("case=%d device=%d mode=%d sql=%s", cases++, device, executable, value.sql));
+                db.exec("delete from Blobs;");
+                SQLiteStmt insert{db, fmt(
+                    "insert into Blobs(id, exec, ino, dev, ingestion, name, size) values (?, ?, %s, %s, 1, '', 1);",
+                    device ? "7" : value.sql, device ? value.sql : "7")};
+                if (value.type == "null") {
+                    /* This SQL class is rejected by the real schema, not manufactured by weakening it. */
+                    EXPECT_THROW(
+                        insert.use().apply(id.hash, id.hashSize).apply(int64_t(executable)).exec(), SQLiteError);
+                } else {
+                    insert.use().apply(id.hash, id.hashSize).apply(int64_t(executable)).exec();
+                    SQLiteStmt stored{db, fmt("select typeof(%s) from Blobs;", device ? "dev" : "ino")};
+                    auto use = stored.use();
+                    ASSERT_TRUE(use.next());
+                    EXPECT_EQ(use.getStr(0), value.type);
+                }
+                bool eligible = value.type == "integer" && value.integer >= minimum && value.integer <= maximum;
+                auto actual = store->objects.index->lookup(id, executable, GitObjectStore::Holder::initialCursor);
+                EXPECT_EQ(bool(actual), eligible);
+                if (actual) {
+                    if (eligible)
+                        EXPECT_EQ(actual->cursor(), (Cursor{device ? value.integer : 7,
+                            device ? 7 : value.integer, 1}));
+                    /* A finite second call exposes old truncation/repetition without entering its consumer loop. */
+                    EXPECT_FALSE(store->objects.index->lookup(id, executable, actual->cursor()));
+                }
+            }
+    }
+    RecordProperty("finite_cases", cases);
+}
+
+TEST_F(LocalStoreObjectsTest, malformedCoordinatesCannotHideAValidHolderOrStallReadOnlyLookup)
+{
+    unsigned cases = 0;
+    for (bool executable : {false, true}) {
+        auto bytes = fmt("coordinate-fallback-%d", executable);
+        auto id = merkle::blobId(bytes);
+        auto hold = store->objects.hold();
+        auto info = restoreOutput("coordinate-fallback", treeNar({{"file", bytes, executable ? 'x' : 'f'}}), hold);
+        store->registerValidPath(info, hold);
+        auto file = store->toRealPath(info.path) / "file";
+        auto before = st(file);
+        SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+        for (bool device : {false, true})
+            for (unsigned storage = 0; storage != 3; ++storage)
+                for (bool readOnly : {false, true})
+                    for (auto repair : {NoRepair, Repair}) {
+                        SCOPED_TRACE(fmt("case=%d mode=%d device=%d storage=%d readonly=%d repair=%d",
+                            cases++, executable, device, storage, readOnly, repair));
+                        /* The converted value disagrees with the real inode even on a device numbered zero. */
+                        auto wrong = (device ? int64_t(before.st_dev) : int64_t(before.st_ino)) == 0 ? 1 : 0;
+                        auto malformed = storage == 0 ? fmt("%d.5", wrong)
+                            : storage == 1 ? fmt("'%d-not-an-integer'", wrong)
+                            : (wrong ? "x'31'" : "x'30'");
+                        SQLiteStmt{db, "insert into Ingestions(path) values (?);"}
+                            .use().apply(store->printStorePath(info.path)).exec();
+                        auto ingestion = int64_t(sqlite3_last_insert_rowid(db));
+                        SQLiteStmt{db, fmt(
+                            "insert into Blobs(id, exec, ino, dev, ingestion, name, size)"
+                            " values (?, ?, %s, %s, ?, 'file', ?);",
+                            device ? std::to_string(int64_t(before.st_ino)) : malformed,
+                            device ? malformed : std::to_string(int64_t(before.st_dev)))}
+                            .use().apply(id.hash, id.hashSize).apply(int64_t(executable))
+                            .apply(ingestion).apply(int64_t(bytes.size())).exec();
+                        {
+                            auto original = store->objects.index;
+                            auto index = *original;
+                            index.lookup = [original](
+                                const Hash & hash, bool mode, GitObjectStore::Holder::Cursor cursor) {
+                                auto row = original->lookup(hash, mode, cursor);
+                                /* Enforce the public progress contract before the old assert/release loop. */
+                                if (row && row->cursor() <= cursor)
+                                    throw Error("registered holder lookup did not advance its cursor");
+                                return row;
+                            };
+                            config->readOnly = readOnly;
+                            store->objects.index = &index;
+                            Finally restoreState{[&] {
+                                store->objects.index = original;
+                                config->readOnly = false;
+                            }};
+                            std::optional<GitObjectStore::Holder> holder;
+                            EXPECT_NO_THROW(holder = store->objects.holderOrForget(id, executable, repair));
+                            EXPECT_TRUE(holder);
+                            if (holder) {
+                                EXPECT_EQ(holder->file(), file);
+                                EXPECT_EQ(holder->dev, before.st_dev);
+                                EXPECT_EQ(holder->ino, before.st_ino);
+                                EXPECT_TRUE(GitObjectStore::validHolderMetadata(*holder, executable, st(file)));
+                            }
+                            EXPECT_TRUE(store->isValidPath(info.path));
+                            EXPECT_EQ(readFile(file), bytes);
+                            EXPECT_EQ(st(file).st_mode, before.st_mode);
+                            if (readOnly) {
+                                SQLiteStmt count{db, "select count(*) from Blobs where ingestion = ?;"};
+                                auto use = count.use();
+                                use.apply(ingestion);
+                                ASSERT_TRUE(use.next());
+                                EXPECT_EQ(use.getInt(0), 1);
+                            }
+                        }
+                        SQLiteStmt{db, "delete from Ingestions where id = ?;"}.use().apply(ingestion).exec();
+                    }
+    }
+    EXPECT_EQ(cases, 48u);
+    RecordProperty("finite_cases", cases);
 }
 
 TEST_F(LocalStoreObjectsTest, completedOutputsRetainIdentityWithoutRecoveringItFromTheDatabase)
