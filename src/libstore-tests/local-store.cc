@@ -571,6 +571,12 @@ struct ConcurrentMemorySourceAccessor final : MemorySourceAccessor
    restore enters it. */
 class LocalStoreObjectsTest : public TempLocalStoreTest
 {
+public:
+    static void SetUpTestSuite()
+    {
+        initLibStore(false);
+    }
+
 protected:
     /* The regular files the last `restore` created (wrote), as its hooks
        counted them; a file linked from the object store is not one. */
@@ -12462,6 +12468,185 @@ TEST_F(TempLocalStoreTest, storeAccessorDelegationSurvivesReleasingTheWrapperInC
             }
 }
 
+#endif
+
+#ifndef _WIN32
+TEST_F(LocalStoreObjectsTest, registeredHolderAcquisitionFamiliesCannotEscapeTheirOwningRoot)
+{
+    enum class Name { Absolute, Parent, Null, Symlink, Valid, EmptyRoot, FinalSymlink, RootSymlink };
+    enum class Operation { LookupLink, Place, Publication };
+    unsigned cells = 0;
+    for (auto kind : {Name::Absolute, Name::Parent, Name::Null, Name::Symlink, Name::Valid, Name::EmptyRoot, Name::FinalSymlink, Name::RootSymlink})
+        for (auto repair : {NoRepair, Repair})
+            for (auto operation : {Operation::LookupLink, Operation::Place, Operation::Publication}) {
+                SCOPED_TRACE(fmt("name=%d repair=%d operation=%d", int(kind), int(repair), int(operation)));
+                auto label = fmt("rooted-holder-%u", cells++);
+                auto bytes = "observed-" + label;
+                auto id = merkle::blobId(bytes);
+                auto outside = tempStoreDir.path() / (label + "-outside") / "file";
+                createDirs(outside.parent_path());
+                writeFile(outside, bytes);
+                chmod(outside, 0444);
+                setWriteTime(outside, 1, 1);
+                auto outsideBefore = st(outside);
+                bool rootRegular = kind == Name::EmptyRoot;
+                bool valid = kind == Name::Valid || rootRegular;
+                auto input = [&]() -> ref<SourceAccessor> {
+                    if (rootRegular || kind == Name::RootSymlink) {
+                        auto memory = make_ref<MemorySourceAccessor>();
+                        if (rootRegular)
+                            memory->root = MemorySourceAccessor::File::Regular{.contents = bytes};
+                        else
+                            memory->root = MemorySourceAccessor::File::Symlink{outside.string()};
+                        return memory;
+                    }
+                    if (kind == Name::FinalSymlink)
+                        return treeAccessor({{"anchor", "different blob", 'f'}, {"link", outside.string(), 'l'}});
+                    return treeAccessor({{"file", bytes, 'f'}, {"link", outside.parent_path().string(), 'l'}});
+                }();
+                auto ownerPath = store->addToStoreSlow(label + "-owner", SourcePath{input},
+                    ContentAddressMethod::Raw::Git, HashAlgorithm::SHA256);
+                auto owner = store->toRealPath(ownerPath.path);
+                auto donor = rootRegular ? owner : valid ? owner / "file" : outside;
+                auto witness = st(donor);
+                if (valid) {
+                    ASSERT_EQ(witness.st_dev, outsideBefore.st_dev);
+                    ASSERT_NE(witness.st_ino, outsideBefore.st_ino);
+                }
+                std::string name;
+                switch (kind) {
+                case Name::Absolute: name = outside.string(); break;
+                case Name::Parent: name = outside.lexically_relative(owner).string(); break;
+                case Name::Null:
+                    name = outside.lexically_relative(owner).string();
+                    name.append("\0unobserved", 11);
+                    break;
+                case Name::Symlink: name = "link/file"; break;
+                case Name::Valid: name = "file"; break;
+                case Name::EmptyRoot:
+                case Name::RootSymlink: name = ""; break;
+                case Name::FinalSymlink: name = "link"; break;
+                }
+                {
+                    SQLite db{store->dbDir / "db.sqlite",
+                        {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                    SQLiteTxn txn{db};
+                    SQLiteStmt erase{db, "delete from Blobs where id = ? and exec = 0"
+                        " and ingestion in (select id from Ingestions where path = ?);"};
+                    erase.use().apply(id.hash, id.hashSize).apply(store->printStorePath(ownerPath.path)).exec();
+                    SQLiteStmt change{db,
+                        "insert into Blobs(id, exec, ino, dev, size, name, ingestion)"
+                        " select ?, 0, ?, ?, ?, ?, id from Ingestions where path = ?;"};
+                    change.use().apply(id.hash, id.hashSize)
+                        .apply(static_cast<int64_t>(witness.st_ino))
+                        .apply(static_cast<int64_t>(witness.st_dev))
+                        .apply(static_cast<int64_t>(witness.st_size))
+                        .apply(name).apply(store->printStorePath(ownerPath.path)).exec();
+                    ASSERT_EQ(sqlite3_changes(db), 1);
+                    txn.commit();
+                }
+                bool accepted = false;
+                if (operation == Operation::Place) {
+                    auto target = tempStoreDir.path() / (label + "-place");
+                    writeFile(target, bytes);
+                    chmod(target, 0444);
+                    setWriteTime(target, 1, 1);
+                    auto before = st(target);
+                    auto hold = store->objects.hold();
+                    hold.setRoot(target);
+                    AutoCloseFD parent{::open(target.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)};
+                    ASSERT_TRUE(parent);
+                    std::optional<GitObjectStore::Placed> placed;
+                    try {
+                        placed = store->objects.place(id, false, parent.get(),
+                            CanonPath::fromFilename(target.filename().string()), target, before, repair, hold);
+                    } catch (Error &) {
+                        if (valid)
+                            throw;
+                    }
+                    EXPECT_EQ(readFile(target), bytes);
+                    if (valid) {
+                        ASSERT_TRUE(placed);
+                        EXPECT_FALSE(placed->entered);
+                        EXPECT_EQ(st(target).st_ino, witness.st_ino);
+                    } else {
+                        EXPECT_NE(st(target).st_ino, outsideBefore.st_ino);
+                    }
+                } else if (operation == Operation::LookupLink) {
+                    try {
+                        auto holder = store->objects.holderOrForget(id, false, repair);
+                        accepted = holder.has_value();
+                    } catch (Error &) {
+                        if (valid)
+                            throw;
+                    }
+                    EXPECT_EQ(accepted, valid) << "ordinary holder acquisition";
+                    auto target = tempStoreDir.path() / (label + "-linked");
+                    auto parent = openDirectory(target.parent_path());
+                    auto hold = store->objects.hold();
+                    hold.setRoot(target);
+                    accepted = false;
+                    try {
+                        accepted = store->objects.link(id, false, parent.get(),
+                            CanonPath::fromFilename(target.filename().string()), target, bytes.size(), repair, hold)
+                                       .has_value();
+                    } catch (Error &) {
+                        if (valid)
+                            throw;
+                    }
+                    EXPECT_EQ(accepted, valid) << "actual link acquisition";
+                    if (maybeLstat(target)) {
+                        EXPECT_NE(st(target).st_ino, outsideBefore.st_ino);
+                        EXPECT_EQ(readFile(target), bytes);
+                        if (valid)
+                            EXPECT_EQ(st(target).st_ino, witness.st_ino);
+                    }
+                } else {
+                    ValidPathInfo info{StorePath::random(label + "-target"),
+                        UnkeyedValidPathInfo{*store, std::nullopt}};
+                    auto target = store->toRealPath(info.path);
+                    auto hold = store->objects.hold();
+                    auto hooks = makeCanonicalisingRestoreHooks(
+                        NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+                    auto nar = [&] {
+                        if (!rootRegular)
+                            return treeNar({{"file", bytes, 'f'}});
+                        StringSink sink;
+                        dumpString(bytes, sink);
+                        return sink.s;
+                    }();
+                    StringSource source{nar};
+                    auto result = [&] {
+                        auto index = store->objects.index;
+                        Finally restoreIndex{[&] { store->objects.index = index; }};
+                        store->objects.index = nullptr;
+                        return store->restoreThroughObjects(target,
+                            [&](FileSystemObjectSink & sink) { parseDump(sink, source); },
+                            false, hooks.get(), hold, repair);
+                    }();
+                    auto completed = rootRegular ? target : target / "file";
+                    ASSERT_NE(st(completed).st_ino, witness.st_ino);
+                    info.objectHash = ObjectHash::of(result.root);
+                    info.narSize = result.narSize.value();
+                    bool failed = false;
+                    try {
+                        store->registerValidPath(info, hold);
+                    } catch (Error &) {
+                        failed = true;
+                    }
+                    EXPECT_FALSE(failed && valid);
+                    EXPECT_NE(st(completed).st_ino, outsideBefore.st_ino);
+                    EXPECT_EQ(readFile(completed), bytes);
+                    if (valid && !failed)
+                        EXPECT_EQ(st(completed).st_ino, witness.st_ino);
+                }
+                EXPECT_EQ(readFile(outside), bytes);
+                EXPECT_EQ(st(outside).st_ino, outsideBefore.st_ino);
+                EXPECT_EQ(st(outside).st_nlink, outsideBefore.st_nlink);
+            }
+    RecordProperty("finite_cases", cells);
+    EXPECT_EQ(cells, 48u);
+}
 #endif
 
 } // namespace nix

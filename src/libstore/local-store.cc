@@ -129,6 +129,19 @@ static Hash blobIdOf(std::string_view bytes)
     return id;
 }
 
+/* SQL holder names are exact canonical coordinates inside a registered root. */
+static GitObjectStore::Holder rootedBlobHolder(
+    GitObjectStore::Holder holder, const std::filesystem::path & root, std::string_view rawName)
+{
+    auto name = CanonPath(rawName);
+    if (name.rel() != rawName || std::filesystem::path(rawName).has_root_path())
+        throw Error("blob index row has a noncanonical root-relative name");
+    auto coordinate = CanonPath::fromFilename(root.filename().string()) / name;
+    holder.registered = std::pair{root.parent_path(), std::move(coordinate)};
+    holder.file = (holder.registered->first / holder.registered->second.rel()).string();
+    return holder;
+}
+
 struct LocalStore::State::Stmts
 {
     /* Some precompiled SQLite statements. */
@@ -527,20 +540,13 @@ LocalStore::LocalStore(ref<const Config> config)
                     if (holder && candidate >= minimum)
                         continue;
                     minimum = candidate;
-                    holder = GitObjectStore::Holder{
-                        .ino = static_cast<ino_t>(std::get<1>(candidate)),
-                        .dev = static_cast<dev_t>(std::get<0>(candidate)),
-                        .size = static_cast<uint64_t>(use.getInt(2)),
-                        /* The column holds the *logical* store path; the holder is
-                           a file on disk under the real store directory. */
-                        .file = (getRealStoreDir() / baseNameOf(use.getStr(3))).string(),
-                        .ingestion = static_cast<uint64_t>(std::get<2>(candidate)),
-                    };
-                    auto name = use.getStr(4);
-                    if (!name.empty()) {
-                        holder->file += '/';
-                        holder->file += name;
-                    }
+                    holder = rootedBlobHolder(
+                        {.ino = static_cast<ino_t>(std::get<1>(candidate)),
+                         .dev = static_cast<dev_t>(std::get<0>(candidate)),
+                         .size = static_cast<uint64_t>(use.getInt(2)),
+                         .ingestion = static_cast<uint64_t>(std::get<2>(candidate))},
+                        getRealStoreDir() / baseNameOf(use.getStr(3)),
+                        use.getStr(4));
                 }
                 return holder;
             });
@@ -846,17 +852,13 @@ void LocalStore::coalesceBlobRows(
                          use.getStr(5)},
                     .candidates = {},
                 });
-            auto file = getRealStoreDir() / baseNameOf(use.getStr(9));
-            auto name = use.getStr(10);
-            if (!name.empty())
-                file /= name;
-            collisions.back().candidates.push_back({
-                .ino = static_cast<ino_t>(use.getInt(6)),
-                .dev = static_cast<dev_t>(use.getInt(7)),
-                .size = static_cast<uint64_t>(use.getInt(8)),
-                .file = file.string(),
-                .ingestion = static_cast<uint64_t>(use.getInt(11)),
-            });
+            collisions.back().candidates.push_back(rootedBlobHolder(
+                {.ino = static_cast<ino_t>(use.getInt(6)),
+                 .dev = static_cast<dev_t>(use.getInt(7)),
+                 .size = static_cast<uint64_t>(use.getInt(8)),
+                 .ingestion = static_cast<uint64_t>(use.getInt(11))},
+                getRealStoreDir() / baseNameOf(use.getStr(9)),
+                use.getStr(10)));
         }
     }
     if (collisions.empty())

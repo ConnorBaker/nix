@@ -649,7 +649,14 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
                 holder = objects.holderOrForget(entry.hash, !executable, repair);
             if (!holder)
                 throw ObjectUnavailable{};
-            auto bytes = nix::readFile(std::filesystem::path(holder->file));
+            auto source = holder->parentOf();
+            if (!source)
+                throw ObjectUnavailable{};
+            auto & [owned, parent, name] = *source;
+            AutoCloseFD fd{openat(parent, name.c_str(), O_RDONLY | O_CLOEXEC | (parent == AT_FDCWD ? 0 : O_NOFOLLOW))};
+            if (!fd)
+                throw SysError("opening blob holder %s", PathFmt(std::filesystem::path(holder->file)));
+            auto bytes = nix::readFile(fd.get());
             if (merkle::blobId(bytes) != entry.hash)
                 throw Error("blob object %s does not hash to its name", entry.hash.gitRev());
             target.sink.createRegularFile(target.name, [&](CreateRegularFileSink & writer) {
@@ -1063,18 +1070,25 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 collision.eligible = true;
                 break;
             }
+            auto source = candidate.parentOf();
+            if (!source) {
+                result.rejected.emplace_back(row, candidate);
+                continue;
+            }
+            auto & [owned, parent, name] = *source;
             auto pin = temporary();
             std::error_code ec;
             if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(pin))
                 ec = std::make_error_code(std::errc::no_space_on_device);
-            else
-                std::filesystem::create_hard_link(candidate.file, pin, ec);
+            else if (::linkat(parent, name.c_str(), AT_FDCWD, pin.c_str(), 0) == -1)
+                ec = std::error_code(errno, std::generic_category());
             if (ec) {
                 /* A stale candidate is rejected even when pinning met a link
                    limit; a refusal applies only to a current physical holder. */
                 auto now = ec == std::errc::no_such_file_or_directory
                                ? std::nullopt
-                               : maybeLstat(std::filesystem::path(candidate.file));
+                               : parent == AT_FDCWD ? maybeLstat(std::filesystem::path(name))
+                                                     : maybeFstatat(parent, std::filesystem::path(name));
                 if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
                     result.rejected.emplace_back(row, candidate);
                     continue;

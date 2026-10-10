@@ -75,10 +75,17 @@ public:
         ino_t ino;
         dev_t dev;
         uint64_t size;
-        /** The holder's absolute on-disk path. */
+        /** Unrestricted native address, or the registered address's diagnostic rendering. */
         std::string file;
         /** The ingestion that owns this candidate, strictly positive. */
         uint64_t ingestion = 0;
+        /** Registered roots bound advisory names; private/custom holders remain unrestricted. */
+        std::optional<std::pair<std::filesystem::path, CanonPath>> registered;
+
+#ifndef _WIN32
+        /** Keep the owned parent alive through every native operation on the returned name. */
+        std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> parentOf() const;
+#endif
 
         Cursor cursor() const
         {
@@ -178,6 +185,9 @@ public:
      * with the expected canonical blob identifier. This does not establish
      * a snapshot of a concurrently mutable file. */
     static Hash blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize);
+#ifndef _WIN32
+    static Hash blobIdOfFile(Descriptor parent, const std::filesystem::path & name, uint64_t observedSize);
+#endif
 
     /**
      * The index's holder for the blob under a mode when it is still what
