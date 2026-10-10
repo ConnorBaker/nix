@@ -10,6 +10,7 @@
 #include "nix/util/object-hash.hh"
 #include "nix/util/repair-flag.hh"
 #include "nix/util/fun.hh"
+#include "nix/util/logging.hh"
 
 #include <boost/container/flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -18,13 +19,19 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <variant>
 #include <memory>
 
 #include <sys/stat.h>
+#ifndef _WIN32
+#  include <fcntl.h>
+#  include <unistd.h>
+#endif
 
 namespace nix {
 
@@ -75,12 +82,18 @@ public:
         ino_t ino;
         dev_t dev;
         uint64_t size;
-        /** Unrestricted native address, or the registered address's diagnostic rendering. */
-        std::string file;
+        /** Registered roots bound advisory names; private/custom holders remain unrestricted. */
+        using Registered = std::pair<std::filesystem::path, CanonPath>;
+        std::variant<std::string, Registered> address;
         /** The ingestion that owns this candidate, strictly positive. */
         uint64_t ingestion = 0;
-        /** Registered roots bound advisory names; private/custom holders remain unrestricted. */
-        std::optional<std::pair<std::filesystem::path, CanonPath>> registered;
+
+        std::filesystem::path file() const
+        {
+            if (auto registered = std::get_if<Registered>(&address))
+                return registered->first / registered->second.rel();
+            return std::get<std::string>(address);
+        }
 
 #ifndef _WIN32
         /** Keep the owned parent alive through every native operation on the returned name. */
@@ -186,7 +199,7 @@ public:
      * a snapshot of a concurrently mutable file. */
     static Hash blobIdOfFile(const std::filesystem::path & path, uint64_t observedSize);
 #ifndef _WIN32
-    static Hash blobIdOfFile(Descriptor parent, const std::filesystem::path & name, uint64_t observedSize);
+    static Hash blobIdOfFile(Descriptor parent, const std::string & name, uint64_t observedSize);
 #endif
 
     /**
@@ -325,14 +338,23 @@ public:
             dev_t dev;
             uint64_t size;
             /**
-             * The holder's name under the ingestion's root -- the store
-             * path's own name for it, empty for a regular-file root. It is
+             * The physical names under the ingestion's root -- the store
+             * path's representative is empty for a regular-file root. Each is
              * made *here*, on the worker that wrote the file, and not at
              * the registration: forty thousand relative names built on one
              * thread after the copy is forty thousand strings on the
              * critical path (`05` section 6).
              */
-            std::string name;
+            mutable std::string name;
+            mutable std::vector<std::string> aliases{};
+
+            auto names() const
+            {
+                return std::views::iota(size_t{}, aliases.size() + 1)
+                       | std::views::transform([this](size_t i) -> std::string & {
+                             return i == aliases.size() ? name : aliases[i];
+                         });
+            }
         };
 
         /**
@@ -364,13 +386,10 @@ public:
          * algorithms and hash widths are rejected before touching the map. */
         void addAuxiliary(Auxiliary object) const;
 
-        /** Active per-path state. The ID can name a previously staged projection. */
-        using Ingestion = std::optional<uint64_t>;
-
-        /* Accessed only before or after the path's walking workers run. */
-        mutable std::optional<Ingestion> ingestion;
+        /** A fresh source operation whose physical projection has not completed. */
+        mutable bool ingesting = false;
         /** Completed outputs retain their database identity across the next beginIngestion. */
-        mutable boost::container::flat_map<std::string, uint64_t> completedIngestions;
+        mutable boost::container::flat_map<std::string, std::pair<uint64_t, std::vector<Row>>> completedIngestions;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
@@ -382,6 +401,9 @@ public:
          * it intact and return the first holder. Claims remain stable until
          * the ingestion finishes. */
         std::optional<std::string> addRow(Row && row) const;
+
+        /** Transfer distinct completed physical names into their already claimed key. */
+        void appendNames(Row && row) const;
 
         /**
          * The completed file this ingestion owns for (id, mode), if any:
@@ -397,6 +419,68 @@ public:
 
     /** A fresh projection; its shared lease is created only when its directory is needed. */
     Hold hold() const;
+
+#ifndef _WIN32
+    /* Replace a completed file by the chosen holder. Shared by placement and
+       a link whose registered-holder probe raced this ingestion's first claim. */
+    template<typename Accept>
+    static std::optional<Placed> linkOver(
+        const GitObjectStore::Hold & hold,
+        const std::pair<Descriptor, const std::string &> & source,
+        const std::string & file,
+        Descriptor dirFd,
+        const CanonPath & name,
+        const std::filesystem::path & where,
+        const PosixStat & before,
+        Accept && accept,
+        const Holder * pinned = nullptr)
+    {
+        auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
+        auto tempLink = hold.tempPath("link");
+        if (::linkat(source.first, source.second.c_str(), AT_FDCWD, tempLink.c_str(), 0) == -1) {
+            auto ec = std::error_code(errno, std::generic_category());
+            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+                printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
+                return std::nullopt;
+            }
+            if (!pinned) {
+                if (ec == std::errc::no_such_file_or_directory) {
+                    accept(source, std::optional<PosixStat>{});
+                    return std::nullopt;
+                }
+                auto current = maybeLstat(source.second, source.first);
+                if (!accept(source, current))
+                    return std::nullopt;
+            }
+            throw Error("creating hard link from %1% to %2%: %3%", filePath(), PathFmt(tempLink), ec.message());
+        }
+        AutoDelete cleanup(tempLink, false);
+        PosixStat placed;
+        if (pinned) {
+            placed.st_ino = pinned->ino;
+            placed.st_dev = pinned->dev;
+        } else {
+            placed = lstat(tempLink);
+            std::pair<Descriptor, const std::string &> pin{AT_FDCWD, tempLink.native()};
+            if (!accept(pin, placed))
+                return std::nullopt;
+        }
+        if (::renameat(AT_FDCWD, tempLink.c_str(), dirFd, name.rel_c_str()) == -1) {
+            auto ec = std::error_code(errno, std::generic_category());
+            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
+                printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
+                return std::nullopt;
+            }
+            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), filePath(), ec.message());
+        }
+        /* Renaming two names of the same inode succeeds without removing
+           either name. Only that case leaves the temporary link behind. */
+        if (placed.st_ino != before.st_ino || placed.st_dev != before.st_dev)
+            cleanup.cancel();
+        return Placed{placed.st_ino, false};
+    }
+
+#endif
 
     /** Stage the synthetic directory body of an executable or symlink root. */
     void putRootTree(const merkle::TreeEntry & root, const Hold & hold);

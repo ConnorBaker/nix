@@ -88,13 +88,7 @@ PosixStat lstat(const std::filesystem::path & path)
 
 std::optional<PosixStat> maybeLstat(const std::filesystem::path & path)
 {
-    std::optional<PosixStat> st{std::in_place};
-    if (::lstat(path.c_str(), &*st)) {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return std::nullopt;
-        throw SysError("getting status of %s", PathFmt(path));
-    }
-    return st;
+    return maybeLstat(path.native());
 }
 
 void setWriteTime(

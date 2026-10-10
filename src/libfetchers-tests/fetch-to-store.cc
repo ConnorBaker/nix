@@ -1347,8 +1347,8 @@ TEST_F(FetchToStoreLocalTest, copyIsMadeFromTheObjectStoreWhereTheMemoNamesWhatI
     {
         auto holder = store->objects.holderOrForget(merkle::blobId("four"), false, NoRepair);
         ASSERT_TRUE(holder.has_value());
-        EXPECT_EQ(holder->file, (realPath(p1) / "e/x").string());
-        EXPECT_EQ(ino(realPath(p2) / "e/x"), ino(std::filesystem::path(holder->file)));
+        EXPECT_EQ(holder->file().string(), (realPath(p1) / "e/x").string());
+        EXPECT_EQ(ino(realPath(p2) / "e/x"), ino(holder->file()));
     }
     EXPECT_EQ(readFile(realPath(p2) / "d/b"), "TWO");
 

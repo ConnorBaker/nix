@@ -13,6 +13,7 @@
 #include "nix/util/util.hh"
 
 #include <utility>
+#include <ranges>
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include <atomic>
@@ -136,6 +137,14 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row && row) const
         return std::nullopt;
     auto & name = i->name;
     return name.empty() ? pending->root.string() : (pending->root / name).string();
+}
+
+void GitObjectStore::Hold::appendNames(Row && row) const
+{
+    auto regular = pending->regular.lock();
+    auto i = regular->find(Pending::Key{row});
+    assert(i != regular->end());
+    i->aliases.append_range(row.names() | std::views::as_rvalue);
 }
 
 void GitObjectStore::Hold::addAuxiliary(Auxiliary object) const
@@ -308,8 +317,9 @@ GitObjectStore::Hold GitObjectStore::hold() const
 #ifndef _WIN32
 std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::Holder::parentOf() const
 {
+    auto registered = std::get_if<Registered>(&address);
     if (!registered)
-        return std::tuple{AutoCloseFD{}, AT_FDCWD, file};
+        return std::tuple{AutoCloseFD{}, AT_FDCWD, std::get<std::string>(address)};
     auto & [root, coordinate] = *registered;
     auto missing = [] { return errno == ENOENT || errno == ENOTDIR; };
     int flags = O_DIRECTORY | O_CLOEXEC;
@@ -338,36 +348,22 @@ std::optional<std::tuple<AutoCloseFD, Descriptor, std::string>> GitObjectStore::
     if (!owned) {
         if (missing())
             return std::nullopt;
-        throw SysError("opening parent of blob holder %s", PathFmt(std::filesystem::path(file)));
+        throw SysError([&] { return HintFmt("opening parent of blob holder %s", PathFmt(file())); });
     }
     auto fd = owned.get();
     return std::tuple{std::move(owned), fd, std::string(*coordinate.baseName())};
 }
 
-Hash GitObjectStore::blobIdOfFile(Descriptor parent, const std::filesystem::path & name, uint64_t observedSize)
+Hash GitObjectStore::blobIdOfFile(Descriptor parent, const std::string & name, uint64_t observedSize)
 {
     if (parent == AT_FDCWD)
-        return blobIdOfFile(name, observedSize);
+        return blobIdOfFile(std::filesystem::path(name), observedSize);
     AutoCloseFD fd{openat(parent, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW)};
     if (!fd)
-        throw SysError("opening blob holder %s", PathFmt(name));
+        throw SysError([&] { return HintFmt("opening blob holder %s", PathFmt(std::filesystem::path(name))); });
     merkle::ObjectHasher hasher{"blob", observedSize};
     drainFD(fd.get(), hasher);
     return hasher.finish();
-}
-
-/* The status of a file by name, without following a symlink; nothing when
-   there is no such file.  As `nix::maybeLstat`, but over a string, so that
-   the object store's names need not be `std::filesystem::path`s. */
-static std::optional<PosixStat> maybeLstatOf(const std::string & path, Descriptor parent = AT_FDCWD)
-{
-    std::optional<PosixStat> st{std::in_place};
-    if (::fstatat(parent, path.c_str(), &*st, AT_SYMLINK_NOFOLLOW)) {
-        if (errno == ENOENT || errno == ENOTDIR)
-            return std::nullopt;
-        throw SysError("getting status of %s", PathFmt(std::filesystem::path(path)));
-    }
-    return st;
 }
 
 /* A hard link `name` in the directory `dirFd` for the file `from`: the
@@ -379,13 +375,6 @@ static std::error_code linkPathIntoDir(const std::string & from, Descriptor dirF
     return {};
 }
 
-/* Rename `from`, by full path, over `name` in `dirFd`. */
-static std::error_code renameInto(const std::filesystem::path & from, Descriptor dirFd, const CanonPath & name)
-{
-    if (renameat(AT_FDCWD, from.c_str(), dirFd, name.rel_c_str()) == -1)
-        return {errno, std::generic_category()};
-    return {};
-}
 #endif
 
 bool GitObjectStore::validHolderMetadata(const Holder & holder, bool executable, const PosixStat & st)
@@ -418,7 +407,7 @@ GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repa
         if (counters)
             counters->blobsStatted++;
         auto source = row->parentOf();
-        auto st = source ? maybeLstatOf(std::get<2>(*source), std::get<1>(*source)) : std::nullopt;
+        auto st = source ? maybeLstat(std::get<2>(*source), std::get<1>(*source)) : std::nullopt;
         /* Forget only this candidate. Advance even when read-only cleanup is a no-op. */
         if (st && validHolderMetadata(*row, executable, *st) && (!repair || blobIdOfFile(std::get<1>(*source), std::get<2>(*source), row->size) == id)) {
             return row;
@@ -431,55 +420,6 @@ GitObjectStore::holderOrForget(const Hash & id, bool executable, RepairFlag repa
 }
 
 #ifndef _WIN32
-/* Replace a completed file by the chosen holder. Shared by placement and
-   a link whose registered-holder probe raced this ingestion's first claim. */
-template<typename Accept>
-static std::optional<GitObjectStore::Placed> linkOver(
-    const GitObjectStore::Hold & hold,
-    const std::pair<Descriptor, std::filesystem::path> & source,
-    const std::string & file,
-    Descriptor dirFd,
-    const CanonPath & name,
-    const std::filesystem::path & where,
-    const PosixStat & before,
-    Accept && accept)
-{
-    auto filePath = [&] { return PathFmt(std::filesystem::path(file)); };
-    auto tempLink = hold.tempPath("link");
-    if (::linkat(source.first, source.second.c_str(), AT_FDCWD, tempLink.c_str(), 0) == -1) {
-        auto ec = std::error_code(errno, std::generic_category());
-        if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-            printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
-            return std::nullopt;
-        }
-        if (ec == std::errc::no_such_file_or_directory) {
-            accept(source, std::optional<PosixStat>{});
-            return std::nullopt;
-        }
-        auto current = maybeLstatOf(source.second.string(), source.first);
-        if (!accept(source, current))
-            return std::nullopt;
-        throw Error("creating hard link from %1% to %2%: %3%", filePath(), PathFmt(tempLink), ec.message());
-    }
-    AutoDelete cleanup(tempLink, false);
-    auto placed = lstat(tempLink);
-    auto pin = std::pair{AT_FDCWD, tempLink};
-    if (!accept(pin, placed))
-        return std::nullopt;
-    if (auto ec = renameInto(tempLink, dirFd, name)) {
-        if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-            printInfo("%1% has maximum number of links; %2% is left as it is", filePath(), PathFmt(where));
-            return std::nullopt;
-        }
-        throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), filePath(), ec.message());
-    }
-    /* Renaming two names of the same inode succeeds without removing
-       either name. Only that case leaves the temporary link behind. */
-    if (placed.st_ino != before.st_ino || placed.st_dev != before.st_dev)
-        cleanup.cancel();
-    return GitObjectStore::Placed{placed.st_ino, false};
-}
-
 /* Names are relative to the ingestion root, empty for the root itself.
    Empty or nonmatching roots retain the caller's absolute name. */
 static std::string nameUnderRoot(const std::filesystem::path & where, const std::filesystem::path & root)
@@ -501,7 +441,8 @@ static GitObjectStore::Hold::Row rowOf(
     const std::filesystem::path & where,
     const GitObjectStore::Hold & hold)
 {
-    return {id, executable, st.st_ino, st.st_dev, static_cast<uint64_t>(st.st_size), nameUnderRoot(where, hold.root())};
+    return {id, executable, st.st_ino, st.st_dev, static_cast<uint64_t>(st.st_size),
+        nameUnderRoot(where, hold.root())};
 }
 
 static std::optional<GitObjectStore::Placed> placePending(
@@ -512,12 +453,12 @@ static std::optional<GitObjectStore::Placed> placePending(
     const std::filesystem::path & where,
     const PosixStat & before)
 {
-    auto st = maybeLstatOf(file);
+    auto st = maybeLstat(file);
     if (!st)
         return std::nullopt;
     if (st->st_ino == before.st_ino && st->st_dev == before.st_dev)
         return GitObjectStore::Placed{before.st_ino, false};
-    return linkOver(hold, {AT_FDCWD, std::filesystem::path(file)}, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
+    return GitObjectStore::linkOver(hold, {AT_FDCWD, file}, file, dirFd, name, where, before, [](auto &, const auto &) { return true; });
 }
 
 #endif
@@ -543,7 +484,7 @@ std::optional<uint64_t> GitObjectStore::link(
         /* The first completed file belongs to this ingestion's locked
            destination. Speculative directory attempts keep separate rows
            until success, so their rollback cannot remove this name. */
-        st = maybeLstatOf(*mine);
+        st = maybeLstat(*mine);
         if (st && size && static_cast<uint64_t>(st->st_size) != *size)
             st = std::nullopt;
         if (!st)
@@ -582,14 +523,14 @@ std::optional<uint64_t> GitObjectStore::link(
                     forget();
                     continue;
                 }
-                auto current = maybeLstatOf(fromName, fromFd);
+                auto current = maybeLstat(fromName, fromFd);
                 if (!current || !validHolderMetadata(*holder, executable, *current)) {
                     forget();
                     continue;
                 }
                 throw Error(
                     "creating hard link from %1% to %2%: %3%",
-                    PathFmt(std::filesystem::path(holder->file)),
+                    PathFmt(holder->file()),
                     PathFmt(where),
                     ec.message());
             }
@@ -616,9 +557,13 @@ std::optional<uint64_t> GitObjectStore::link(
     /* This path now holds the blob even if the donor is collected before
        registration. Keep its own witness, using the status already read.
        A concurrent worker may have claimed a different holder meanwhile. */
-    if (!mine)
-        if (auto other = hold.addRow(rowOf(id, executable, *st, where, hold)))
-            linkOver(hold, {AT_FDCWD, std::filesystem::path(*other)}, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
+    auto row = rowOf(id, executable, *st, where, hold);
+    if (mine)
+        hold.appendNames(std::move(row));
+    else if (auto other = hold.addRow(std::move(row))) {
+        linkOver(hold, {AT_FDCWD, *other}, *other, dirFd, name, where, *st, [](auto &, const auto &) { return true; });
+        hold.appendNames(std::move(row));
+    }
     return static_cast<uint64_t>(st->st_size);
 #endif
 }
@@ -644,6 +589,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
        within one path), then the index's holder. */
     bool entered = true;
     if (auto mine = hold.pendingHolder(id, executable)) {
+        hold.appendNames(rowOf(id, executable, before, where, hold));
         return placePending(hold, *mine, dirFd, name, where, before);
     } else if (index && index->lookup) {
         auto cursor = Holder::initialCursor;
@@ -664,7 +610,7 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
                 continue;
             }
             if (auto placed = linkOver(
-                    hold, {std::get<1>(*source), std::get<2>(*source)}, holder->file,
+                    hold, {std::get<1>(*source), std::get<2>(*source)}, holder->file().native(),
                     dirFd, name, where, after, [&](const auto & pin, const std::optional<PosixStat> & acquired) {
                     if (acquired && validHolderMetadata(*holder, executable, *acquired)
                         && (!repair || blobIdOfFile(pin.first, pin.second, holder->size) == id))
@@ -686,9 +632,13 @@ std::optional<GitObjectStore::Placed> GitObjectStore::place(
         printInfo("cannot enter %s: %s", PathFmt(where), std::make_error_code(std::errc::no_space_on_device).message());
         return std::nullopt;
     }
-    auto other = hold.addRow(rowOf(id, executable, after, where, hold));
-    if (other)
-        return linkOver(hold, {AT_FDCWD, std::filesystem::path(*other)}, *other, dirFd, name, where, after, [](auto &, const auto &) { return true; });
+    auto row = rowOf(id, executable, after, where, hold);
+    auto other = hold.addRow(std::move(row));
+    if (other) {
+        auto placed = linkOver(hold, {AT_FDCWD, *other}, *other, dirFd, name, where, after, [](auto &, const auto &) { return true; });
+        hold.appendNames(std::move(row));
+        return placed;
+    }
     return Placed{after.st_ino, entered};
 #endif
 }
@@ -714,9 +664,12 @@ void GitObjectStore::enterWritten(
         place(id, executable, dirFd, name, where, st, repair, hold);
         return;
     }
-    auto other = hold.addRow(rowOf(id, executable, st, where, hold));
-    if (other)
+    auto row = rowOf(id, executable, st, where, hold);
+    auto other = hold.addRow(std::move(row));
+    if (other) {
         placePending(hold, *other, dirFd, name, where, st);
+        hold.appendNames(std::move(row));
+    }
 #endif
 }
 

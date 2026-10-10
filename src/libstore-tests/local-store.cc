@@ -597,8 +597,8 @@ protected:
        these rows in memory until its completed-path boundary. */
     void stageLegacyUnregisteredRows(const GitObjectStore::Hold & hold)
     {
-        ASSERT_TRUE(hold.ingestion);
-        ASSERT_FALSE(*hold.ingestion);
+        ASSERT_TRUE(hold.ingesting);
+        ASSERT_TRUE(hold.completedIngestions.empty());
         auto projection = hold.takeProjection();
         auto state = store->_state->lock();
         SQLiteTxn txn(state->db);
@@ -608,7 +608,7 @@ protected:
         store->insertBlobRows(*state, id, projection.regular);
         store->insertAuxiliaryRows(*state, id, projection.auxiliary);
         txn.commit();
-        *hold.ingestion = id;
+        hold.ingesting = false;
     }
 
     /* Fixture roots such as <store>/t1 are not StorePaths. Give them validity
@@ -616,11 +616,11 @@ protected:
        Actual row/chunk insertion remains the production operation under test. */
     void recordBlobsAtPath(const GitObjectStore::Hold & hold, const std::filesystem::path & root)
     {
-        if (!hold.ingestion)
+        if (!hold.ingesting)
             return;
         auto projection = hold.takeProjection();
         auto logical = (std::filesystem::path(store->config->storeDir) / root.filename()).string();
-        auto ingestion = *hold.ingestion;
+        std::optional<uint64_t> ingestion;
         retrySQLite<void>([&] {
             auto state = store->_state->lock();
             SQLiteTxn txn(state->db);
@@ -648,7 +648,8 @@ protected:
             previous.use().apply(logical).exec();
             name.use().apply(logical).apply(static_cast<int64_t>(*id)).exec();
             txn.commit();
-            *hold.ingestion = id;
+            hold.completedIngestions.insert_or_assign(logical, std::pair{*id, std::move(projection.regular)});
+            hold.ingesting = false;
         });
     }
 
@@ -693,6 +694,19 @@ protected:
         return r;
     }
 
+    ValidPathInfo restoreOutput(std::string_view label, std::string_view nar, const GitObjectStore::Hold & hold)
+    {
+        auto path = StorePath::random(label);
+        StringSource source{nar};
+        auto hooks = makeCanonicalisingRestoreHooks(NIX_WHEN_SUPPORT_ACLS2(settings.getLocalSettings().ignoredAcls));
+        auto result = store->restoreThroughObjects(
+            store->toRealPath(path), [&](FileSystemObjectSink & sink) { parseDump(sink, source); },
+            false, hooks.get(), hold, NoRepair);
+        ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
+        info.narSize = result.narSize.value();
+        return info;
+    }
+
     static PosixStat st(const std::filesystem::path & p)
     {
         return lstat(p);
@@ -713,7 +727,7 @@ protected:
         auto holder = store->objects.holderOrForget(id, executable, NoRepair);
         if (!holder)
             throw Error("no regular-file holder %s", id.gitRev());
-        return holder->file;
+        return holder->file();
     }
 
     static void dropLock(GitObjectStore::Hold & hold)
@@ -835,7 +849,7 @@ protected:
         for (auto & value : values)
             hold.addAuxiliary(std::move(value));
         recordBlobsAtPath(hold, path);
-        return **hold.ingestion;
+        return hold.completedIngestions.begin()->second.first;
     }
 
     void forgetFixturePath(const std::filesystem::path & path)
@@ -3449,7 +3463,7 @@ TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
     auto pending = store->objects.hold();
     auto second = enter("cycle-second", pending);
     store->endIngestion(pending, second.path);
-    ASSERT_FALSE(pending.ingestion);
+    ASSERT_FALSE(pending.ingesting);
     ASSERT_EQ(pending.completedIngestions.size(), 1u);
     auto validBefore = store->queryAllValidPaths();
     auto blobsBefore = blobRowCount(*store, false);
@@ -3477,7 +3491,7 @@ TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
     SQLiteStmt named{db, "select path from Ingestions where id = ?"};
     {
         auto row = named.use();
-        row.apply(static_cast<int64_t>(pending.completedIngestions.begin()->second));
+        row.apply(static_cast<int64_t>(pending.completedIngestions.begin()->second.first));
         ASSERT_TRUE(row.next());
         ASSERT_FALSE(row.isNull(0));
         EXPECT_EQ(row.getStr(0), store->printStorePath(second.path));
@@ -3498,8 +3512,8 @@ TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
    SQLite reject publication, then consume that rolled-back ID independently. */
 TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentities)
 {
-    enum class Origin { Fresh, Staged, Completed };
-    for (auto origin : {Origin::Fresh, Origin::Staged, Origin::Completed}) {
+    enum class Origin { Fresh, Registered, Completed };
+    for (auto origin : {Origin::Fresh, Origin::Registered, Origin::Completed}) {
         SCOPED_TRACE(static_cast<int>(origin));
         auto bytes = fmt("registration-retry-%d", static_cast<int>(origin));
         auto hold = store->objects.hold();
@@ -3515,12 +3529,12 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
             NoRepair);
         ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
         info.narSize = result.narSize.value();
-        if (origin == Origin::Staged)
-            stageLegacyUnregisteredRows(hold);
+        if (origin == Origin::Registered)
+            store->registerValidPath(info, hold);
         else if (origin == Origin::Completed)
             store->endIngestion(hold, path);
-        auto original = origin == Origin::Completed ? std::optional(hold.completedIngestions.begin()->second)
-                                                   : *hold.ingestion;
+        auto original = origin == Origin::Fresh ? std::optional<uint64_t>{}
+                                                : std::optional(hold.completedIngestions.begin()->second.first);
 
         SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
         struct Retry
@@ -3534,7 +3548,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
             auto state = lockStoreState();
             sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
             EXPECT_EQ(
-                sqlite3_exec(state->db, "drop trigger if exists registration_retry;", nullptr, nullptr, nullptr),
+                sqlite3_exec(state->db, "drop trigger if exists registration_retry; drop trigger if exists registration_retry_update;", nullptr, nullptr, nullptr),
                 SQLITE_OK);
             EXPECT_EQ(
                 sqlite3_create_function_v2(
@@ -3564,6 +3578,8 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
                 SQLITE_OK);
             state->db.exec(
                 "create temp trigger registration_retry after insert on ValidPaths begin "
+                "select registration_retry((select id from Ingestions where path = new.path)); end; "
+                "create temp trigger registration_retry_update after update on ValidPaths begin "
                 "select registration_retry((select id from Ingestions where path = new.path)); end;");
             ASSERT_EQ(
                 sqlite3_trace_v2(
@@ -3594,7 +3610,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
         ASSERT_EQ(retry.publications, 2u);
         ASSERT_EQ(retry.interleaved, SQLITE_OK);
         ASSERT_GT(retry.rejected, 0);
-        auto committed = origin == Origin::Completed ? hold.completedIngestions.begin()->second : **hold.ingestion;
+        auto committed = hold.completedIngestions.begin()->second.first;
         if (original) {
             EXPECT_EQ(retry.rejected, static_cast<int64_t>(*original));
             EXPECT_EQ(committed, *original);
@@ -3630,9 +3646,10 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
     }
 }
 
-/* The SQL key must be admitted before any physical coalescing, including
-   when a prior SQL rollback left selected representatives in memory. */
-TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
+/* Owned SQL keys are a replaceable cache. Every storage-class, digest-width,
+   and mode case is rebuilt from the captured output; malformed foreign keys
+   cannot authorize physical sharing, even after a real SQL rollback. */
+TEST_F(LocalStoreObjectsTest, capturedKeysReplaceCorruptOwnCacheWithoutAdmittingForeignKeys)
 {
     struct Key
     {
@@ -3712,9 +3729,9 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             ASSERT_NE(st(files[0]).st_ino, st(files[1]).st_ino);
             store->registerValidPath(infos[0], holds[0]);
             store->endIngestion(holds[1], infos[1].path);
-            ASSERT_FALSE(holds[1].ingestion);
-            auto own = holds[1].completedIngestions.begin()->second;
-            auto donor = **holds[0].ingestion;
+            ASSERT_FALSE(holds[1].ingesting);
+            auto own = holds[1].completedIngestions.begin()->second.first;
+            auto donor = holds[0].completedIngestions.begin()->second.first;
             std::map<int64_t, std::string> names{
                 {int64_t(own), store->printStorePath(infos[1].path)},
                 {int64_t(donor), store->printStorePath(infos[0].path)}};
@@ -3724,7 +3741,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
                    relation even after retry reinserts the selected own row. */
                 store->endIngestion(holds[2], infos[2].path);
                 store->registerValidPath(infos[2]);
-                names.emplace(holds[2].completedIngestions.begin()->second, store->printStorePath(infos[2].path));
+                names.emplace(holds[2].completedIngestions.begin()->second.first, store->printStorePath(infos[2].path));
                 ASSERT_NE(st(files[0]).st_ino, st(files[2]).st_ino);
                 ASSERT_NE(st(files[1]).st_ino, st(files[2]).st_ino);
             }
@@ -3732,7 +3749,7 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             SQLite other{
                 store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
             auto domain = fmt(
-                "ingestion in (%d, %d, %d)", own, donor, key.triple ? holds[2].completedIngestions.begin()->second : donor);
+                "ingestion in (%d, %d, %d)", own, donor, key.triple ? holds[2].completedIngestions.begin()->second.first : donor);
             other.exec("create temp table original as select * from Blobs where " + domain);
             auto mutation = "begin; delete from Blobs where " + domain + "; insert into Blobs select " + key.id + ", "
                             + key.mode + ", ino, dev, ingestion, name, size from original"
@@ -3836,12 +3853,10 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             ASSERT_EQ(attempt.mutation, null ? SQLITE_CONSTRAINT : SQLITE_OK);
             ASSERT_EQ(attempt.rollback, SQLITE_OK);
             ASSERT_EQ(attempt.begins, retry ? 2u : 1u);
-            EXPECT_EQ(attempt.publications, unsigned(retry) + unsigned(!key.error));
-            if (key.error) {
-                EXPECT_THAT(error, ::testing::HasSubstr(key.error));
-                EXPECT_EQ(pins, attempt.pinsBefore);
-            } else
-                EXPECT_TRUE(error.empty()) << error;
+            EXPECT_EQ(attempt.publications, unsigned(retry) + 1u);
+            EXPECT_TRUE(error.empty()) << error;
+            if (key.error && !key.triple)
+                EXPECT_EQ(pins, attempt.pinsBefore) << "malformed foreign keys provide no sharing witness";
             if (retry) {
                 EXPECT_GT(attempt.pinsBefore, 0u);
                 EXPECT_TRUE(
@@ -3852,15 +3867,15 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
             for (unsigned i = 0; i < fileCount; ++i) {
                 ASSERT_EQ(attempt.statResults[i], 0);
                 auto after = st(files[i]);
-                if (key.error) {
+                if (key.error && !key.triple) {
                     EXPECT_EQ(after.st_ino, attempt.before[i].st_ino);
                     EXPECT_EQ(after.st_dev, attempt.before[i].st_dev);
                 }
                 EXPECT_EQ(after.st_mode, attempt.before[i].st_mode);
                 EXPECT_EQ(readFile(files[i]), bytes);
             }
-            EXPECT_EQ(store->isValidPath(infos[1].path), !key.error);
-            EXPECT_EQ(holds[1].completedIngestions.begin()->second, own);
+            EXPECT_TRUE(store->isValidPath(infos[1].path));
+            EXPECT_EQ(holds[1].completedIngestions.begin()->second.first, own);
             EXPECT_TRUE(pathExists(lease));
             EXPECT_TRUE(store->isValidPath(infos[0].path));
             SQLiteStmt rows{
@@ -3869,20 +3884,29 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
                 " from Blobs b join Ingestions i on i.id = b.ingestion where "
                     + domain + " order by ingestion, exec"};
             unsigned count = 0;
+            std::map<int64_t, unsigned> counts;
             {
                 auto row = rows.use();
                 while (row.next()) {
-                    EXPECT_EQ(row.getStr(0), null ? "blob" : key.idType);
-                    EXPECT_EQ(row.getStr(1), null ? "integer" : key.modeType);
-                    if (key.width >= 0)
-                        EXPECT_EQ(row.getInt(2), key.width);
-                    if (key.triple)
-                        EXPECT_EQ(row.getInt(3), int64_t(count % 3) - 1);
+                    auto owner = row.getInt(5);
+                    if (owner == static_cast<int64_t>(own)) {
+                        EXPECT_EQ(row.getStr(0), "blob");
+                        EXPECT_EQ(row.getStr(1), "integer");
+                        EXPECT_EQ(row.getInt(2), 32);
+                        EXPECT_EQ(row.getInt(3), int64_t(key.executable));
+                    } else {
+                        EXPECT_EQ(row.getStr(0), null ? "blob" : key.idType);
+                        EXPECT_EQ(row.getStr(1), null ? "integer" : key.modeType);
+                        if (key.width >= 0) EXPECT_EQ(row.getInt(2), key.width);
+                        if (key.triple) EXPECT_EQ(row.getInt(3), int64_t(counts[owner]) - 1);
+                    }
+                    ++counts[owner];
                     EXPECT_EQ(row.getStr(4), names.at(row.getInt(5)));
                     ++count;
                 }
             }
-            EXPECT_EQ(count, key.triple ? 9u : 2u);
+            EXPECT_EQ(count, key.triple ? 7u : 2u);
+            EXPECT_EQ(counts[static_cast<int64_t>(own)], 1u);
             if (key.error) {
                 other.exec(
                     "begin; delete from Blobs where " + domain + "; insert into Blobs select * from original; commit;");
@@ -3893,14 +3917,340 @@ TEST_F(LocalStoreObjectsTest, coalescingAdmitsOnlyBinaryDigestsAndBooleanModes)
                 || (key.triple && st(files[1]).st_ino == st(files[2]).st_ino));
             EXPECT_TRUE(store->isValidPath(infos[1].path));
         }
+    RecordProperty("finite_cases", cases);
     EXPECT_EQ(cases, 310u);
+}
+
+/* A completed output's physical aliases outlive SQL cache corruption and
+   transaction rollback. SQL names and inode snapshots cannot replace them. */
+TEST_F(LocalStoreObjectsTest, capturedAliasesSurviveCacheCorruptionAndRepeatedPublicationRetry)
+{
+    enum class Cache { Sound, Absent, Name, Inode, Device, Size, ExtraKey, WrongMode, WrongType, ShortID };
+    bool savedWAL = settings.useSQLiteWAL;
+    Finally restoreSettings{[&] {
+        store.reset();
+        settings.useSQLiteWAL = savedWAL;
+    }};
+    unsigned cases = 0, ordinaryCases = 0, completedCases = 0, unexpectedErrors = 0;
+    for (bool wal : {false, true}) {
+        store.reset();
+        settings.useSQLiteWAL = wal;
+        config = std::make_shared<LocalStoreConfig>(
+            tempStoreDir.path() / fmt("completed-alias-authority-%d", wal), StoreConfig::Params{});
+        store = std::make_shared<LocalStore>(ref{config});
+        for (bool executable : {false, true})
+            for (bool retry : {false, true})
+                for (bool ordinary : {false, true})
+                for (auto cache : {Cache::Sound, Cache::Absent, Cache::Name, Cache::Inode, Cache::Device, Cache::Size, Cache::ExtraKey, Cache::WrongMode, Cache::WrongType, Cache::ShortID}) {
+                    ++(ordinary ? ordinaryCases : completedCases);
+                    auto bytes = fmt("completed-alias-authority-%d", cases++);
+                    SCOPED_TRACE(fmt("wal=%d executable=%d retry=%d ordinary=%d cache=%d", wal, executable, retry, ordinary, int(cache)));
+                    auto nar = treeNar({
+                        {"a", bytes, executable ? 'x' : 'f'},
+                        {"nested/alias", bytes, executable ? 'x' : 'f'}});
+                    std::array holds{store->objects.hold(), store->objects.hold()};
+                    std::vector<ValidPathInfo> infos;
+                    for (unsigned i = 0; i < holds.size(); ++i)
+                        infos.push_back(restoreOutput(bytes + fmt("-%d", i), nar, holds[i]));
+                    auto target = store->toRealPath(infos[0].path);
+                    auto donor = store->toRealPath(infos[1].path) / "a";
+                    ASSERT_NE(st(target / "a").st_ino, st(donor).st_ino);
+                    SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                    if (ordinary) {
+                        store->registerValidPath(infos[0], holds[0]);
+                        /* Hide the target's cached witness while publishing a
+                           genuinely different donor, then restore that cache. */
+                        SQLiteStmt save{other,
+                            "create temp table before_donor as select b.* from Blobs b join Ingestions i on i.id = b.ingestion "
+                            "where i.path = ?;"};
+                        save.use().apply(store->printStorePath(infos[0].path)).exec();
+                        other.exec("delete from Blobs where ingestion in (select ingestion from before_donor);");
+                        store->registerValidPath(infos[1], holds[1]);
+                        other.exec("insert into Blobs select * from before_donor;");
+                    } else {
+                        store->endIngestion(holds[0], infos[0].path);
+                        store->registerValidPath(infos[1], holds[1]);
+                    }
+                    ASSERT_NE(st(target / "a").st_ino, st(donor).st_ino);
+                    auto completedId = [&] {
+                        SQLiteStmt identity{other, "select id from Ingestions where path = ?;"};
+                        auto row = identity.use();
+                        row.apply(store->printStorePath(infos[0].path));
+                        if (!row.next()) throw Error("missing completed ingestion identity");
+                        return static_cast<uint64_t>(row.getInt(0));
+                    };
+                    auto own = completedId();
+                    auto where = fmt(" where ingestion = %d", own);
+                    switch (cache) {
+                    case Cache::Sound: break;
+                    case Cache::Absent: other.exec("delete from Blobs" + where); break;
+                    case Cache::Name: other.exec("update Blobs set name = 'not-an-owned-alias'" + where); break;
+                    case Cache::Inode:
+                        other.exec(fmt("update Blobs set ino = %d", st(donor).st_ino) + where);
+                        break;
+                    case Cache::Device: other.exec("update Blobs set dev = dev + 1" + where); break;
+                    case Cache::Size: other.exec("update Blobs set size = size + 1" + where); break;
+                    case Cache::ExtraKey:
+                        other.exec("insert into Blobs select X'00', exec, ino, dev, ingestion, 'unknown-owned-key', size from Blobs" + where);
+                        break;
+                    case Cache::WrongMode: other.exec("update Blobs set exec = 2" + where); break;
+                    case Cache::WrongType: other.exec("update Blobs set id = 'not-a-blob'" + where); break;
+                    case Cache::ShortID: other.exec("update Blobs set id = X'00'" + where); break;
+                    }
+                    struct Retry { bool enabled; unsigned publications = 0; } attempt{retry};
+                    Finally clear{[&] {
+                        auto state = lockStoreState();
+                        sqlite3_exec(state->db, "drop trigger if exists alias_retry;", nullptr, nullptr, nullptr);
+                        sqlite3_create_function_v2(
+                            state->db, "alias_retry", 0, SQLITE_UTF8, nullptr, nullptr, nullptr, nullptr, nullptr);
+                    }};
+                    {
+                        auto state = lockStoreState();
+                        ASSERT_EQ(sqlite3_create_function_v2(
+                            state->db, "alias_retry", 0, SQLITE_UTF8, &attempt,
+                            [](sqlite3_context * context, int, sqlite3_value **) {
+                                auto & a = *static_cast<Retry *>(sqlite3_user_data(context));
+                                if (++a.publications == 1 && a.enabled)
+                                    sqlite3_result_error_code(context, SQLITE_BUSY);
+                                else sqlite3_result_null(context);
+                            }, nullptr, nullptr, nullptr), SQLITE_OK);
+                        state->db.exec(fmt(
+                            "create temp trigger alias_retry after %s on ValidPaths begin select alias_retry(); end;",
+                            ordinary ? "update" : "insert"));
+                    }
+                    try { store->registerValidPath(infos[0], holds[0]); }
+                    catch (Error & error) { ++unexpectedErrors; ADD_FAILURE() << "unexpected Store Error: " << error.what(); }
+                    EXPECT_EQ(attempt.publications, retry ? 2u : 1u);
+                    EXPECT_EQ(completedId(), own);
+                    EXPECT_TRUE(store->isValidPath(infos[0].path));
+                    for (auto name : {"a", "nested/alias"}) {
+                        auto physical = st(target / name);
+                        EXPECT_EQ(physical.st_ino, st(donor).st_ino);
+                        EXPECT_EQ(physical.st_dev, st(donor).st_dev);
+                        EXPECT_EQ(readFile(target / name), bytes);
+                    }
+                    SQLiteStmt witness{other, "select ino, dev, size, name, typeof(id), length(id), exec from Blobs where ingestion = ?;"};
+                    auto row = witness.use();
+                    row.apply(static_cast<int64_t>(own));
+                    if (!row.next()) {
+                        ADD_FAILURE() << "the completed output has no surviving physical witness";
+                        continue;
+                    }
+                    EXPECT_EQ(row.getStr(4), "blob");
+                    EXPECT_EQ(row.getInt(5), 32);
+                    EXPECT_EQ(row.getInt(6), int64_t(executable));
+                    auto name = row.getStr(3);
+                    if (name != "a" && name != "nested/alias") {
+                        ADD_FAILURE() << "SQL witness is not an actual owned alias: " << name;
+                        continue;
+                    }
+                    auto physical = st(target / name);
+                    EXPECT_EQ(row.getInt(0), static_cast<int64_t>(physical.st_ino));
+                    EXPECT_EQ(row.getInt(1), static_cast<int64_t>(physical.st_dev));
+                    EXPECT_EQ(row.getInt(2), static_cast<int64_t>(bytes.size()));
+                    EXPECT_FALSE(row.next());
+                }
+    }
+    RecordProperty("ordinary_cases", ordinaryCases);
+    RecordProperty("completed_cases", completedCases);
+    RecordProperty("unexpected_errors", unexpectedErrors);
+    RecordProperty("finite_cases", cases);
+    EXPECT_EQ(cases, 160u);
+}
+
+/* A real SQL retry after refused physical sharing must not reintroduce the
+   refused row into the ingestion's authoritative physical projection. */
+TEST_F(LocalStoreObjectsTest, refusedAliasesArePrunedBeforeSQLRetry)
+{
+    unsigned cases = 0;
+    for (bool executable : {false, true})
+        for (bool completed : {false, true})
+            for (bool refusePin : {false, true}) {
+                auto bytes = fmt("refused-sql-retry-%d", cases++);
+                SCOPED_TRACE(fmt("executable=%d completed=%d pin=%d", executable, completed, refusePin));
+                auto nar = treeNar({{"a", bytes, executable ? 'x' : 'f'}, {"nested/alias", bytes, executable ? 'x' : 'f'}});
+                std::array holds{store->objects.hold(), store->objects.hold()};
+                std::vector<ValidPathInfo> infos;
+                for (unsigned i = 0; i < holds.size(); ++i)
+                    infos.push_back(restoreOutput(bytes + fmt("-%d", i), nar, holds[i]));
+                if (completed) store->endIngestion(holds[0], infos[0].path);
+                store->registerValidPath(infos[1], holds[1]);
+                SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                auto donorId = holds[1].completedIngestions.begin()->second.first;
+                auto key = merkle::blobId(bytes).to_string(HashFormat::Base16, false);
+                auto target = store->toRealPath(infos[0].path);
+                auto before = st(target / "a");
+                struct Attempt { unsigned refusals = 0, beforeRetry = 0, deletes = 0; } attempt;
+                store->objects.failPlaceWithNoSpace = [&](const std::filesystem::path & where) {
+                    bool refuse = refusePin ? where.parent_path() == holds[0].directory()
+                                            : where == target / "a" || where == target / "nested/alias";
+                    if (refuse) ++attempt.refusals;
+                    return refuse;
+                };
+                Finally clear{[&] {
+                    store->objects.failPlaceWithNoSpace = {};
+                    auto state = lockStoreState();
+                    sqlite3_exec(state->db, "drop trigger if exists refused_retry;", nullptr, nullptr, nullptr);
+                    sqlite3_create_function_v2(
+                        state->db, "refused_retry", 0, SQLITE_UTF8, nullptr, nullptr, nullptr, nullptr, nullptr);
+                }};
+                {
+                    auto state = lockStoreState();
+                    ASSERT_EQ(sqlite3_create_function_v2(
+                        state->db, "refused_retry", 0, SQLITE_UTF8, &attempt,
+                        [](sqlite3_context * context, int, sqlite3_value **) {
+                            auto & a = *static_cast<Attempt *>(sqlite3_user_data(context));
+                            if (a.refusals == 0) {
+                                sqlite3_result_null(context);
+                                return;
+                            }
+                            if (++a.deletes == 1) {
+                                a.beforeRetry = a.refusals;
+                                sqlite3_result_error_code(context, SQLITE_BUSY);
+                            } else sqlite3_result_null(context);
+                        }, nullptr, nullptr, nullptr), SQLITE_OK);
+                    state->db.exec(fmt(
+                        "create temp trigger refused_retry before delete on Blobs when old.id = X'%s' and old.exec = %d "
+                        "and old.ingestion != %d begin select refused_retry(); end;", key, int(executable), donorId));
+                }
+                ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                EXPECT_EQ(attempt.deletes, completed ? 2u : 1u);
+                EXPECT_GT(attempt.beforeRetry, 0u);
+                EXPECT_EQ(attempt.refusals, attempt.beforeRetry) << "SQL rollback does not restore a refused physical claim";
+                EXPECT_TRUE(store->isValidPath(infos[0].path));
+                for (auto name : {"a", "nested/alias"}) {
+                    EXPECT_EQ(st(target / name).st_ino, before.st_ino);
+                    EXPECT_EQ(readFile(target / name), bytes);
+                }
+                SQLiteStmt identity{other, "select id from Ingestions where path = ?;"};
+                auto committed = identity.use(); committed.apply(store->printStorePath(infos[0].path));
+                ASSERT_TRUE(committed.next()); auto own = static_cast<uint64_t>(committed.getInt(0));
+                SQLiteStmt count{other, "select count(*) from Blobs where ingestion = ?;"};
+                auto row = count.use(); row.apply(static_cast<int64_t>(own));
+                ASSERT_TRUE(row.next()); EXPECT_EQ(row.getInt(0), 0);
+            }
+    RecordProperty("finite_cases", cases);
+    EXPECT_EQ(cases, 8u);
+}
+
+/* SQL rollback can restore a refused cache key after its last donor retires.
+   The retained physical relation, including absence, governs the next attempt. */
+TEST_F(LocalStoreObjectsTest, publicationRetryRetainsAbsenceAfterTheLastDonorRetires)
+{
+    bool savedWAL = settings.useSQLiteWAL;
+    Finally restoreSettings{[&] { store.reset(); settings.useSQLiteWAL = savedWAL; }};
+    unsigned cases = 0;
+    for (bool wal : {false, true}) {
+        store.reset(); settings.useSQLiteWAL = wal;
+        config = std::make_shared<LocalStoreConfig>(
+            tempStoreDir.path() / fmt("retry-absence-%d", wal), StoreConfig::Params{});
+        store = std::make_shared<LocalStore>(ref{config});
+        for (bool executable : {false, true})
+            for (bool aliases : {false, true})
+                for (bool completed : {false, true})
+                    for (bool refused : {false, true}) {
+                        auto bytes = fmt("retry-absence-%d", cases++);
+                        SCOPED_TRACE(fmt("wal=%d executable=%d aliases=%d completed=%d refused=%d",
+                            wal, executable, aliases, completed, refused));
+                        auto tree = treeAccessor({{"a", bytes, executable ? 'x' : 'f'},
+                                                  {"nested/alias", bytes, executable ? 'x' : 'f'}});
+                        StringSink archive;
+                        tree->dumpPath(aliases ? CanonPath::root : CanonPath("/a"), archive);
+                        std::array holds{store->objects.hold(), store->objects.hold()};
+                        std::vector<ValidPathInfo> infos;
+                        for (unsigned i = 0; i < holds.size(); ++i)
+                            infos.push_back(restoreOutput(bytes + fmt("-%d", i), archive.s, holds[i]));
+                        if (completed) store->endIngestion(holds[0], infos[0].path);
+                        store->registerValidPath(infos[1], holds[1]);
+                        auto target = store->toRealPath(infos[0].path);
+                        auto donor = store->toRealPath(infos[1].path);
+                        auto targetFile = aliases ? target / "a" : target;
+                        auto donorFile = aliases ? donor / "a" : donor;
+                        auto original = st(targetFile), winning = st(donorFile);
+                        ASSERT_NE(original.st_ino, winning.st_ino);
+                        SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
+                        auto donorId = holds[1].completedIngestions.begin()->second.first;
+                        auto key = merkle::blobId(bytes).to_string(HashFormat::Base16, false);
+                        auto retire = fmt("delete from Ingestions where id = %d;", holds[1].completedIngestions.begin()->second.first);
+                        struct Attempt {
+                            sqlite3 * other; const char * retire; bool refused;
+                            unsigned begins = 0, inserts = 0, deletes = 0, refusals = 0, beforeRetry = 0;
+                            int retirement = SQLITE_ERROR;
+                        } attempt{other, retire.c_str(), refused};
+                        store->objects.failPlaceWithNoSpace = [&](const std::filesystem::path & where) {
+                            bool refuse = refused && (where.parent_path() == holds[0].directory()
+                                || where == targetFile || (aliases && where == target / "nested/alias"));
+                            if (refuse) ++attempt.refusals;
+                            return refuse;
+                        };
+                        Finally clear{[&] {
+                            store->objects.failPlaceWithNoSpace = {};
+                            auto state = lockStoreState(); sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+                            sqlite3_exec(state->db, "drop trigger if exists absence_delete; drop trigger if exists absence_insert;",
+                                nullptr, nullptr, nullptr);
+                            sqlite3_create_function_v2(state->db, "absence_retry", 1, SQLITE_UTF8,
+                                nullptr, nullptr, nullptr, nullptr, nullptr);
+                        }};
+                        {
+                            auto state = lockStoreState();
+                            ASSERT_EQ(sqlite3_create_function_v2(state->db, "absence_retry", 1, SQLITE_UTF8, &attempt,
+                                [](sqlite3_context * context, int, sqlite3_value ** args) {
+                                    auto & a = *static_cast<Attempt *>(sqlite3_user_data(context));
+                                    bool insertion = sqlite3_value_int(args[0]) != 0;
+                                    if (!insertion && a.refusals == 0) {
+                                        sqlite3_result_null(context);
+                                        return;
+                                    }
+                                    unsigned count = insertion ? ++a.inserts : ++a.deletes;
+                                    if ((a.refused && !insertion && count == 1)
+                                        || (!a.refused && insertion && count == 2)) {
+                                        a.beforeRetry = a.refusals;
+                                        sqlite3_result_error_code(context, SQLITE_BUSY);
+                                    } else sqlite3_result_null(context);
+                                }, nullptr, nullptr, nullptr), SQLITE_OK);
+                            state->db.exec(fmt(
+                                "create temp trigger absence_delete before delete on Blobs when old.id = X'%s' and old.exec = %d "
+                                "and old.ingestion != %d begin select absence_retry(0); end; "
+                                "create temp trigger absence_insert after insert on Blobs when new.id = X'%s' and new.exec = %d "
+                                "and new.ingestion != %d begin select absence_retry(1); end;",
+                                key, int(executable), donorId, key, int(executable), donorId));
+                            ASSERT_EQ(sqlite3_trace_v2(state->db, SQLITE_TRACE_STMT,
+                                [](unsigned, void * context, void * statement, void *) -> int {
+                                    auto & a = *static_cast<Attempt *>(context);
+                                    auto sql = sqlite3_sql(static_cast<sqlite3_stmt *>(statement));
+                                    if (sql && std::string_view(sql) == "begin;" && ++a.begins == 2)
+                                        a.retirement = sqlite3_exec(a.other, a.retire, nullptr, nullptr, nullptr);
+                                    return 0;
+                                }, &attempt), SQLITE_OK);
+                        }
+                        ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                        EXPECT_EQ(attempt.begins, 2u);
+                        EXPECT_EQ(attempt.retirement, SQLITE_OK);
+                        EXPECT_EQ(attempt.refusals, attempt.beforeRetry);
+                        EXPECT_TRUE(store->isValidPath(infos[0].path));
+                        for (auto name : aliases ? std::vector<std::string>{"a", "nested/alias"}
+                                                 : std::vector<std::string>{""}) {
+                            auto file = name.empty() ? target : target / name;
+                            EXPECT_EQ(st(file).st_ino, refused ? original.st_ino : winning.st_ino);
+                            EXPECT_EQ(readFile(file), bytes);
+                        }
+                        SQLiteStmt identity{other, "select id from Ingestions where path = ?;"};
+                        auto committed = identity.use(); committed.apply(store->printStorePath(infos[0].path));
+                        ASSERT_TRUE(committed.next()); auto own = static_cast<uint64_t>(committed.getInt(0));
+                        SQLiteStmt count{other, "select count(*) from Blobs where ingestion = ?;"};
+                        auto row = count.use(); row.apply(static_cast<int64_t>(own));
+                        ASSERT_TRUE(row.next()); EXPECT_EQ(row.getInt(0), refused ? 0 : 1);
+                    }
+    }
+    RecordProperty("finite_cases", cases);
+    EXPECT_EQ(cases, 32u);
 }
 
 TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolders)
 {
-    /* All six orders respecting legacy insertion before completion. Each
+    /* All six orders respecting named completion before validity publication. Each
        ingestion is either wholly pending (current writers) or has rows
-       persisted by an older concurrent writer. Deduplicate absent stages. */
+       completed by the current writer. Deduplicate absent completions. */
     const std::array<std::array<unsigned, 4>, 6> interleavings{{
         {0, 1, 2, 3},
         {0, 2, 1, 3},
@@ -3952,7 +4302,7 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
                 for (auto event : order) {
                     auto i = event / 2;
                     if (!(event & 1)) {
-                        stageLegacyUnregisteredRows(holds[i]);
+                        store->endIngestion(holds[i], infos[i].path);
                         auxiliaryPersisted[i] = true;
                     } else if (success & (1 << i)) {
                         store->registerValidPath(infos[i], holds[i]);
@@ -4079,7 +4429,7 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
                             update.use()
                                 .apply(static_cast<int64_t>(st(files[i]).st_ino))
                                 .apply(static_cast<int64_t>(st(files[i]).st_dev))
-                                .apply(static_cast<int64_t>(**holds[i].ingestion))
+                                .apply(static_cast<int64_t>(holds[i].completedIngestions.begin()->second.first))
                                 .exec();
                     }
                     auto canonical =
@@ -4171,7 +4521,7 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
                 update.use()
                     .apply(static_cast<int64_t>(status.st_ino))
                     .apply(static_cast<int64_t>(status.st_dev))
-                    .apply(static_cast<int64_t>(**holds[i].ingestion))
+                    .apply(static_cast<int64_t>(holds[i].completedIngestions.begin()->second.first))
                     .apply(id.hash, id.hashSize)
                     .exec();
             }
@@ -4209,14 +4559,14 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
            and reference closure on failure, not cache completeness after
            interrupted optimisation. A remaining witness must still be sound. */
         if (auto holder = store->objects.holderOrForget(id, executable, NoRepair)) {
-            EXPECT_TRUE(GitObjectStore::validHolderMetadata(*holder, executable, st(holder->file)));
-            EXPECT_EQ(GitObjectStore::blobIdOfFile(holder->file, holder->size), id);
+            EXPECT_TRUE(GitObjectStore::validHolderMetadata(*holder, executable, st(holder->file())));
+            EXPECT_EQ(GitObjectStore::blobIdOfFile(holder->file(), holder->size), id);
         }
         OptimiseStats retried;
         ASSERT_NO_THROW(store->optimiseStore(retried));
         auto holder = store->objects.holderOrForget(id, executable, Repair);
         ASSERT_TRUE(holder);
-        EXPECT_EQ(physicalClass(holder->file), physicalClass(roots[0] / "a"));
+        EXPECT_EQ(physicalClass(holder->file()), physicalClass(roots[0] / "a"));
         EXPECT_TRUE(store->verifyObjects(roots[0]).second.empty());
     }
 }
@@ -4280,7 +4630,7 @@ TEST_F(LocalStoreObjectsTest, optimiseKeepsTheCanonicalInodeWhenItsFirstHolderIs
                 update.use()
                     .apply(static_cast<int64_t>(st(files[i]).st_ino))
                     .apply(static_cast<int64_t>(st(files[i]).st_dev))
-                    .apply(static_cast<int64_t>(**holds[i].ingestion))
+                    .apply(static_cast<int64_t>(holds[i].completedIngestions.begin()->second.first))
                     .exec();
         }
         auto originalIndex = store->objects.index;
@@ -4453,7 +4803,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     infos.back().narSize = result.narSize.value();
                 }
                 if (earlierId)
-                    stageLegacyUnregisteredRows(holds[0]);
+                    store->endIngestion(holds[0], infos[0].path);
                 store->registerValidPath(infos[1], holds[1]);
                 auto target = store->toRealPath(infos[0].path);
                 auto canonical = store->toRealPath(infos[1].path) / "a";
@@ -4485,7 +4835,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     SQLiteStmt count;
                     count.create(db, "select count(*) from Blobs where ingestion = ?;");
                     auto use(count.use());
-                    use.apply(static_cast<int64_t>(**holds[0].ingestion));
+                    use.apply(static_cast<int64_t>(holds[0].completedIngestions.begin()->second.first));
                     ASSERT_TRUE(use.next());
                     EXPECT_EQ(use.getInt(0), refusal == 2 ? 1 : 0);
                 }
@@ -4534,7 +4884,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     auto abandoned = store->objects.hold();
                     auto old = restoreInfo(path, treeNar({{"old", tag + "-old", 'f'}}), abandoned);
                     store->endIngestion(abandoned, path);
-                    oldIngestion = abandoned.completedIngestions.begin()->second;
+                    oldIngestion = abandoned.completedIngestions.begin()->second.first;
                     if (wasValid)
                         store->registerValidPath(old, abandoned);
                 }
@@ -4699,7 +5049,7 @@ TEST_F(LocalStoreObjectsTest, candidateLookupReturnsTheLeastEligibleSignedPhysic
                             auto file = store->getRealStoreDir() / std::filesystem::path(paths[i]).filename();
                             if (!names[i].empty())
                                 file /= names[i];
-                            EXPECT_EQ(actual->file, file.string());
+                            EXPECT_EQ(actual->file().string(), file.string());
                         }
                     }
     EXPECT_EQ(cases, 512u);
@@ -4729,15 +5079,15 @@ TEST_F(LocalStoreObjectsTest, completedOutputsRetainIdentityWithoutRecoveringItF
     };
     auto old = store->objects.hold();
     complete(old, path, "first");
-    auto first = old.completedIngestions.begin()->second;
+    auto first = old.completedIngestions.begin()->second.first;
     complete(old, path, "replacement");
     ASSERT_EQ(old.completedIngestions.size(), 1u);
-    EXPECT_NE(old.completedIngestions.begin()->second, first);
-    EXPECT_FALSE(old.ingestion);
+    EXPECT_NE(old.completedIngestions.begin()->second.first, first);
+    EXPECT_FALSE(old.ingesting);
 
     auto current = store->objects.hold();
     auto info = complete(current, path, "current");
-    auto currentId = current.completedIngestions.begin()->second;
+    auto currentId = current.completedIngestions.begin()->second.first;
     auto other = complete(current, sibling, "sibling");
     ASSERT_EQ(current.completedIngestions.size(), 2u);
     /* Registration through a superseded hold must not remove the replacement. */
@@ -4769,7 +5119,7 @@ TEST_F(LocalStoreObjectsTest, ingestionDeletionOwnsBothProjectionsAndRollsBackTo
         hold,
         NoRepair);
     store->endIngestion(hold, path);
-    auto id = static_cast<int64_t>(hold.completedIngestions.begin()->second);
+    auto id = static_cast<int64_t>(hold.completedIngestions.begin()->second.first);
     SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
     auto counts = [&] {
         SQLiteStmt query{
@@ -5007,7 +5357,7 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                     EXPECT_EQ(holder->ino, old.ino);
                     EXPECT_EQ(holder->dev, old.dev);
                     EXPECT_EQ(holder->size, old.size);
-                    EXPECT_EQ(holder->file, old.file);
+                    EXPECT_EQ(holder->file().string(), old.file().string());
                 }
                 EXPECT_FALSE(current.objects.holderOrForget(unnamedId, false, NoRepair));
                 EXPECT_FALSE(current.objects.holderOrForget(invalidId, true, NoRepair));
@@ -5018,8 +5368,8 @@ TEST_F(LocalStoreObjectsTest, candidateMigrationPreservesOldHoldersAndReadOnlyAc
                 auto ro = make_ref<LocalStore>(roConfig);
                 checkHolders(*ro);
                 /* Read-only rejection cannot remove a row, but must exhaust its candidates. */
-                chmod(before[0].file, 0644);
-                Finally restoreMode{[&] { canonicaliseTimestampAndPermissions(before[0].file); }};
+                chmod(before[0].file(), 0644);
+                Finally restoreMode{[&] { canonicaliseTimestampAndPermissions(before[0].file()); }};
                 EXPECT_FALSE(ro->objects.holderOrForget(id, false, NoRepair));
             }
             {
@@ -5567,7 +5917,7 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             ASSERT_NE(donorClass, otherClass);
             auto candidateRow = store->objects.index->lookup(id, executable, GitObjectStore::Holder::initialCursor);
             ASSERT_TRUE(candidateRow);
-            ASSERT_TRUE(GitObjectStore::validHolderMetadata(*candidateRow, executable, st(candidateRow->file)));
+            ASSERT_TRUE(GitObjectStore::validHolderMetadata(*candidateRow, executable, st(candidateRow->file())));
 
             /* Retain the original same-size content-corruption case: NoRepair
                can reuse it during restore, but publication must reject it. */
@@ -5600,8 +5950,8 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             ASSERT_EQ(st(real / "file").st_dev, candidateRow->dev);
             ASSERT_EQ(readFile(real / "file"), change == Change::Content ? corrupt : bytes);
             ASSERT_EQ(hold.pendingHolder(id, executable), std::optional{(real / "file").string()});
-            ASSERT_TRUE(hold.ingestion);
-            ASSERT_FALSE(*hold.ingestion);
+            ASSERT_TRUE(hold.ingesting);
+            ASSERT_TRUE(hold.completedIngestions.empty());
 
             /* Change physical metadata only after restore has linked the owned
                target. Both saved donor rows remain unchanged. Two inode classes
@@ -5633,7 +5983,6 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             else
                 EXPECT_THROW(store->registerValidPath(info, hold), Error);
             EXPECT_EQ(store->isValidPath(info.path), change == Change::None);
-            EXPECT_EQ(hold.ingestion->has_value(), change == Change::None);
             EXPECT_EQ(blobRowCount(*store, executable), rowsBefore + (change == Change::None ? 1 : 0));
 
             if (change == Change::None)
@@ -5644,7 +5993,7 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
                    raw lookup: holderOrForget would itself change the stale index. */
                 auto retained = store->objects.index->lookup(id, executable, GitObjectStore::Holder::initialCursor);
                 ASSERT_TRUE(retained);
-                EXPECT_EQ(retained->file, candidateRow->file);
+                EXPECT_EQ(retained->file().string(), candidateRow->file().string());
                 EXPECT_EQ(retained->ingestion, candidateRow->ingestion);
                 EXPECT_EQ(retained->ino, candidateRow->ino);
                 EXPECT_EQ(retained->dev, candidateRow->dev);
@@ -6003,7 +6352,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
             SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
             SQLiteStmt query{db, "select chunk, typeof(body), body from AuxValues where ingestion = ? order by chunk;"};
             auto use = query.use();
-            use.apply(static_cast<int64_t>(**hold.ingestion));
+            use.apply(static_cast<int64_t>(hold.completedIngestions.begin()->second.first));
             size_t ordinal = 0, offset = 0;
             while (use.next()) {
                 EXPECT_EQ(use.getInt(0), static_cast<int64_t>(ordinal));
@@ -7189,7 +7538,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                 store->registerValidPath(info, hold);
                 auto witness = objects.holderOrForget(id, executable, Repair);
                 ASSERT_TRUE(witness);
-                EXPECT_EQ(std::filesystem::path(witness->file).parent_path(), root);
+                EXPECT_EQ(std::filesystem::path(witness->file()).parent_path(), root);
                 EXPECT_EQ(witness->ino, st(root / "a").st_ino);
                 EXPECT_EQ(readFile(root / "a"), bytes);
                 EXPECT_TRUE(store->verifyObjects(root).second.empty());
@@ -9481,7 +9830,7 @@ TEST_F(LocalStoreObjectsTest, materialiseFromObjectsFallsBackOnAMissingOrCorrupt
             bool found = false;
             while (auto row = store->objects.index->lookup(id, kind == 'x', cursor)) {
                 cursor = row->cursor();
-                if (std::filesystem::path(row->file) != dst / name)
+                if (std::filesystem::path(row->file()) != dst / name)
                     continue;
                 EXPECT_TRUE(GitObjectStore::validHolderMetadata(*row, kind == 'x', st(dst / name)));
                 found = true;
@@ -9698,7 +10047,7 @@ TEST_F(LocalStoreObjectsTest, speculativeSubtreeRollbackCannotInvalidateSiblingH
             ASSERT_TRUE(holder);
             EXPECT_EQ(holder->ino, st(dst / "q/a").st_ino);
             EXPECT_TRUE(
-                GitObjectStore::validHolderMetadata(*holder, executable, st(std::filesystem::path(holder->file))));
+                GitObjectStore::validHolderMetadata(*holder, executable, st(std::filesystem::path(holder->file()))));
         }
 }
 
@@ -9777,7 +10126,7 @@ TEST_F(LocalStoreObjectsTest, completedSubtreeMergesEveryAliasAndNeverRollsBackP
                 bool ownUnique = false;
                 while (auto row = originalIndex->lookup(merkle::blobId(unique), false, cursor)) {
                     cursor = row->cursor();
-                    if (row->file == (dst / "p/u").string()) {
+                    if (row->file().string() == (dst / "p/u").string()) {
                         ownUnique = true;
                         EXPECT_TRUE(GitObjectStore::validHolderMetadata(*row, false, st(dst / "p/u")));
                     }
@@ -12050,7 +12399,7 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 auto hold = target->objects.hold();
                 auto file = target->toRealPath(input.begin()->first);
                 target->beginIngestion(hold, file);
-                ASSERT_TRUE(hold.ingestion);
+                ASSERT_TRUE(hold.ingesting);
                 auto status = lstat(file);
                 auto id = merkle::blobId(bytes);
                 hold.addRow(
@@ -12068,7 +12417,6 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 EXPECT_EQ(rows.size(), 1u);
                 if (rows.size() == 1)
                     EXPECT_EQ(rows.front().id, id);
-                EXPECT_FALSE(hold.ingestion->has_value());
                 EXPECT_TRUE(hold.completedIngestions.empty());
             }
         }

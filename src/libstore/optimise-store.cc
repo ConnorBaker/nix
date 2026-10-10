@@ -19,7 +19,7 @@
 #include "nix/util/sync.hh"
 
 #include <algorithm>
-#include <map>
+#include <ranges>
 #include <set>
 #include <fcntl.h>
 #include <regex>
@@ -249,18 +249,20 @@ struct EnterVisitor : HashingVisitor
                     /* Keep this path's own witness if the queried donor is collected.
                        If an earlier file won this ingestion's claim, use the existing
                        placement operation to resolve a different inode before return. */
-                    if (auto first = hold.addRow({
+                    GitObjectStore::Hold::Row row{
                             .id = node.entry.hash,
                             .executable = st.isExecutable,
                             .ino = file.st_ino,
                             .dev = file.st_dev,
                             .size = static_cast<uint64_t>(file.st_size),
                             .name = std::string(path.rel()),
-                        })) {
-                        auto earlier = maybeLstat(std::filesystem::path(*first));
+                        };
+                    if (auto first = hold.addRow(std::move(row))) {
+                        auto earlier = maybeLstat(*first);
                         if (!earlier || earlier->st_ino != file.st_ino || earlier->st_dev != file.st_dev) {
                             placeRegularFile(store, where, node.entry, repair, hold, inodes, stats, act);
-                        }
+                        } else
+                            hold.appendNames(std::move(row));
                     }
                     return node;
                 }
@@ -655,7 +657,7 @@ struct LinkingVisitor : NodeVisitor<HashedNode>
             auto & [owned, parent, name] = *source;
             AutoCloseFD fd{openat(parent, name.c_str(), O_RDONLY | O_CLOEXEC | (parent == AT_FDCWD ? 0 : O_NOFOLLOW))};
             if (!fd)
-                throw SysError("opening blob holder %s", PathFmt(std::filesystem::path(holder->file)));
+                throw SysError([&] { return HintFmt("opening blob holder %s", PathFmt(holder->file())); });
             auto bytes = nix::readFile(fd.get());
             if (merkle::blobId(bytes) != entry.hash)
                 throw Error("blob object %s does not hash to its name", entry.hash.gitRev());
@@ -870,12 +872,12 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
             if (!other)
                 continue;
             auto current = lstat(std::filesystem::path(*other));
-            if (current.st_ino == row.ino && current.st_dev == row.dev)
+            if (current.st_ino == row.ino && current.st_dev == row.dev) {
+                hold.appendNames(std::move(row));
                 continue;
-            auto own = row.name.empty() ? hold.root() : hold.root() / row.name;
-            row.name = own == subtree ? "" : own.lexically_relative(subtree).string();
+            }
             collisions.push_back({
-                std::move(row),
+                row,
                 {{current.st_ino, current.st_dev, static_cast<uint64_t>(current.st_size), *other}},
             });
         }
@@ -883,9 +885,11 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
            inode. Reconcile all of them before returning, using the same
            physical walk as publication; replacing one row is insufficient. */
         if (!collisions.empty()) {
-            auto result = coalesceBlobs(subtree, hold, collisions);
+            auto result = coalesceBlobs(hold.root(), hold, collisions);
             if (!result.rejected.empty())
                 throw Error("a completed ingestion holder changed while materialising %s", PathFmt(subtree));
+            for (auto & collision : collisions)
+                hold.appendNames(std::move(collision.row));
         }
         for (auto & auxiliary : projection.auxiliary)
             hold.addAuxiliary(std::move(auxiliary));
@@ -1030,18 +1034,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
 #else
     /* Publication holds the database writer; speculative completion owns its names.
        Pin and verify without index calls, temp roots or auxiliary-object locks. */
-    struct Winner
-    {
-        BlobCoalescing & collision;
-        const GitObjectStore::Holder & holder;
-        AutoDelete cleanup;
-        std::optional<std::filesystem::path> representative;
-    };
-
-    std::vector<Winner> winners;
-    winners.reserve(collisions.size());
     BlobCoalescingResult result;
-    std::map<std::pair<dev_t, ino_t>, size_t> byInode;
     auto temporary = [&] { return hold.tempPath("coalesce"); };
 
     for (auto & collision : collisions) {
@@ -1087,8 +1080,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                    limit; a refusal applies only to a current physical holder. */
                 auto now = ec == std::errc::no_such_file_or_directory
                                ? std::nullopt
-                               : parent == AT_FDCWD ? maybeLstat(std::filesystem::path(name))
-                                                     : maybeFstatat(parent, std::filesystem::path(name));
+                               : maybeLstat(name, parent);
                 if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
                     result.rejected.emplace_back(row, candidate);
                     continue;
@@ -1099,7 +1091,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 }
                 throw Error(
                     "pinning blob holder %1% as %2%: %3%",
-                    PathFmt(std::filesystem::path(candidate.file)),
+                    PathFmt(candidate.file()),
                     PathFmt(pin),
                     ec.message());
             }
@@ -1111,112 +1103,62 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                 continue;
             }
             useOwn = false;
-            auto [_, inserted] = byInode.emplace(std::pair{row.dev, row.ino}, winners.size());
-            if (!inserted)
-                throw Error("one ingestion records different blobs for the same inode in %s", PathFmt(root));
-            winners.push_back(Winner{collision, candidate, std::move(cleanup), std::nullopt});
+            std::string * representative = nullptr;
+            std::erase(row.aliases, row.name);
+            std::ranges::sort(row.aliases);
+            row.aliases.erase(std::unique(row.aliases.begin(), row.aliases.end()), row.aliases.end());
+            for (auto & recorded : row.names()) {
+                auto where = recorded.empty() ? root : root / recorded;
+                checkInterrupt();
+                auto observed = maybeLstat(where);
+                if (!observed || !linkableOnThisSystem(where))
+                    continue;
+                auto & st = *observed;
+                /* A name may already share the winning class. */
+                if (row.dev != st.st_dev || row.ino != st.st_ino) {
+                    if (!representative && GitObjectStore::validHolderMetadata(candidate, row.executable, st))
+                        representative = &recorded;
+                    continue;
+                }
+                auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, {}};
+                if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
+                    continue;
+                if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(where))
+                    continue;
+
+                auto parent = where.parent_path();
+                WritableDirectory dir(parent, parent != config->realStoreDir.get());
+                auto name = CanonPath::fromFilename(where.filename().string());
+                /* Re-check after opening the containing directory, so a pathname
+                   replaced since enumeration is never intentionally overwritten. */
+                auto before = statIn(dir.fd.get(), name, where);
+                if (!GitObjectStore::validHolderMetadata(expected, row.executable, before))
+                    continue;
+                if (!GitObjectStore::linkOver(
+                        hold, {AT_FDCWD, cleanup.path().native()}, cleanup.path().native(), dir.fd.get(), name, where, before,
+                        [](auto &, const auto &) { return true; }, &candidate))
+                    continue;
+                result.modified = true;
+                if (!representative)
+                    representative = &recorded;
+            }
+            /* Retain this class's physical representative before any later SQL can retry. */
+            if (!representative)
+                break;
+            auto st = maybeLstat(representative->empty() ? root : root / *representative);
+            if (!st || !GitObjectStore::validHolderMetadata(candidate, row.executable, *st))
+                break;
+            row.ino = st->st_ino;
+            row.dev = st->st_dev;
+            row.size = static_cast<uint64_t>(st->st_size);
+            row.name.swap(*representative);
+            collision.eligible = true;
             break;
         }
         /* No usable donor means this file can become the holder. A file
            refused sharing is an exception, not a new canonical donor. */
         if (useOwn)
             collision.eligible = true;
-    }
-    if (winners.empty())
-        return result;
-    /* Add winning classes after losing classes: the latter always take priority. */
-    for (size_t i = 0; i < winners.size(); ++i)
-        byInode.emplace(std::pair{winners[i].holder.dev, winners[i].holder.ino}, i);
-
-    /* Walk physical aliases: case-hack spellings need not be canonical.
-       Use the final root; hold.root() may still name a moved temporary. */
-    auto walk = [&](auto && self, const std::filesystem::path & where, size_t depth) -> void {
-        checkInterrupt();
-        auto st = lstat(where);
-        if (S_ISDIR(st.st_mode)) {
-            if (depth >= narMaxDepth)
-                throw Error("path %s exceeds maximum NAR directory depth of %d", PathFmt(where), narMaxDepth);
-            /* Replacing a directory entry while its iterator is live has
-               unspecified visibility. Finish enumerating before relinking. */
-            std::vector<std::filesystem::path> children;
-            for (auto & entry : DirectoryIterator{where})
-                children.push_back(entry.path());
-            for (auto & child : children)
-                self(self, child, depth + 1);
-            return;
-        }
-        if (!S_ISREG(st.st_mode))
-            return;
-        auto i = byInode.find({st.st_dev, st.st_ino});
-        if (!linkableOnThisSystem(where))
-            return;
-        if (i == byInode.end())
-            return;
-        auto & winner = winners[i->second];
-        auto & row = winner.collision.row;
-        /* Losing classes take priority; other hits are already-winning aliases. */
-        if (row.dev != st.st_dev || row.ino != st.st_ino) {
-            if (!winner.representative && GitObjectStore::validHolderMetadata(winner.holder, row.executable, st))
-                winner.representative = where;
-            return;
-        }
-        auto expected = GitObjectStore::Holder{row.ino, row.dev, row.size, {}};
-        if (!GitObjectStore::validHolderMetadata(expected, row.executable, st))
-            return;
-        if (objects.failPlaceWithNoSpace && objects.failPlaceWithNoSpace(where))
-            return;
-
-        auto parent = where.parent_path();
-        WritableDirectory dir(parent, parent != config->realStoreDir.get());
-        auto name = CanonPath::fromFilename(where.filename().string());
-        /* Re-check after opening the containing directory, so a pathname
-           replaced since enumeration is never intentionally overwritten. */
-        auto before = statIn(dir.fd.get(), name, where);
-        if (!GitObjectStore::validHolderMetadata(expected, row.executable, before))
-            return;
-        const auto & pin = winner.cleanup.path();
-        auto link = temporary();
-        std::error_code ec;
-        std::filesystem::create_hard_link(pin, link, ec);
-        if (ec) {
-            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-                printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
-                return;
-            }
-            throw Error("creating hard link from %1% to %2%: %3%", PathFmt(pin), PathFmt(link), ec.message());
-        }
-        AutoDelete cleanup(link, false);
-        if (::renameat(AT_FDCWD, link.c_str(), dir.fd.get(), name.rel_c_str()) == -1) {
-            auto ec = std::error_code(errno, std::generic_category());
-            if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
-                printInfo("cannot share %s: %s; left as written", PathFmt(where), ec.message());
-                return;
-            }
-            throw Error("replacing %1% by a link to %2%: %3%", PathFmt(where), PathFmt(pin), ec.message());
-        }
-        cleanup.cancel();
-        result.modified = true;
-        if (!winner.representative)
-            winner.representative = where;
-    };
-    walk(walk, root, 0);
-
-    /* A link limit can leave some aliases unchanged. Publish a surviving
-       winning alias, or no representative if every replacement was refused;
-       an exceptional unshared inode must not become a donor for later paths. */
-    for (auto & winner : winners) {
-        auto & row = winner.collision.row;
-        if (!winner.representative)
-            continue;
-        auto st = maybeLstat(*winner.representative);
-        if (!st || !GitObjectStore::validHolderMetadata(winner.holder, row.executable, *st))
-            continue;
-        auto name = *winner.representative == root ? "" : winner.representative->lexically_relative(root).string();
-        row.ino = st->st_ino;
-        row.dev = st->st_dev;
-        row.size = static_cast<uint64_t>(st->st_size);
-        row.name = std::move(name);
-        winner.collision.eligible = true;
     }
     return result;
 #endif

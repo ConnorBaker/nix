@@ -753,7 +753,7 @@ private:
 
     struct BlobCoalescing
     {
-        GitObjectStore::Hold::Row row;
+        GitObjectStore::Hold::Row & row;
         std::vector<GitObjectStore::Holder> candidates;
         /** The row becomes the selected own witness, or stays ineligible. */
         bool eligible = false;

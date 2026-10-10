@@ -15,10 +15,15 @@
 #include "nix/util/deleter.hh"
 
 #include <filesystem>
+#include <cerrno>
+#include <concepts>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <unistd.h>
+#ifndef _WIN32
+#  include <fcntl.h>
+#endif
 #ifdef _WIN32
 #  include <windef.h>
 #  include <wchar.h>
@@ -152,6 +157,20 @@ PosixStat stat(const std::filesystem::path & path);
  * @return std::nullopt if the path doesn't exist, or an optional containing the result of `lstat` otherwise
  */
 std::optional<PosixStat> maybeLstat(const std::filesystem::path & path);
+#ifndef _WIN32
+/** Borrow a native address relative to parent, preserving its full diagnostic spelling. */
+template<std::same_as<std::string> String>
+std::optional<PosixStat> maybeLstat(const String & path, Descriptor parent = AT_FDCWD)
+{
+    std::optional<PosixStat> st{std::in_place};
+    if (::fstatat(parent, path.c_str(), &*st, AT_SYMLINK_NOFOLLOW)) {
+        if (errno == ENOENT || errno == ENOTDIR)
+            return std::nullopt;
+        throw SysError([&] { return HintFmt("getting status of %s", PathFmt(std::filesystem::path(path))); });
+    }
+    return st;
+}
+#endif
 std::optional<PosixStat> maybeStat(const std::filesystem::path & path);
 
 /**
