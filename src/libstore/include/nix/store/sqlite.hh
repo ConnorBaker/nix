@@ -149,7 +149,7 @@ struct SQLiteStmt
         bool next();
 
         std::string getStr(int col);
-        /** BLOB view; invalidated by exec/next, reset, Use exit, finalize, or conversion of that column. */
+        /** BLOB view; throws on OOM. Invalidated by next/exec, reset, Use exit, finalize, or column conversion. */
         std::string_view getBlobView(int col);
         int64_t getInt(int col);
         bool isNull(int col);

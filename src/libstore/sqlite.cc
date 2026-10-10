@@ -251,6 +251,8 @@ bool SQLiteStmt::Use::next()
 std::string_view SQLiteStmt::Use::getBlobView(int col)
 {
     auto p = (const char *) sqlite3_column_blob(stmt, col);
+    if (!p && sqlite3_errcode(stmt.db) == SQLITE_NOMEM)
+        SQLiteError::throw_(stmt.db, "reading SQLite BLOB");
     auto n = sqlite3_column_bytes(stmt, col);
     return p ? std::string_view(p, n) : std::string_view();
 }

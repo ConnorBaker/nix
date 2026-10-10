@@ -642,17 +642,14 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
             result.emplace(use.getInt(0), std::string());
         if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER || sqlite3_column_type(stmt, 2) != SQLITE_BLOB)
             return AuxiliaryCandidate{result->ingestion, std::nullopt};
-        auto * data = sqlite3_column_blob(stmt, 2);
-        if (!data && sqlite3_errcode(stmt.db) == SQLITE_NOMEM)
-            SQLiteError::throw_(stmt.db, "reading auxiliary body chunk");
-        auto size = static_cast<size_t>(sqlite3_column_bytes(stmt, 2));
+        auto data = use.getBlobView(2);
+        auto size = data.size();
         if (!std::cmp_equal(use.getInt(1), result->body->size() / auxiliaryChunkSize) || size > auxiliaryChunkSize
             || result->body->size() % auxiliaryChunkSize != 0 || (!first && result->body->empty())
             || (size == 0 && !first)
             || size > result->body->max_size() - result->body->size())
             return AuxiliaryCandidate{result->ingestion, std::nullopt};
-        if (size)
-            result->body->append(static_cast<const char *>(data), size);
+        result->body->append(data);
     }
     return result;
 }
