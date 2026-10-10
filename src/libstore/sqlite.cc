@@ -215,6 +215,11 @@ SQLiteStmt::Use & SQLiteStmt::Use::apply(int64_t value, bool notNull)
     return notNull ? checkBind(sqlite3_bind_int64(stmt, curArg++, value)) : bind();
 }
 
+SQLiteStmt::Use & SQLiteStmt::Use::apply(const sqlite3_value & value)
+{
+    return checkBind(sqlite3_bind_value(stmt, curArg++, &value));
+}
+
 SQLiteStmt::Use & SQLiteStmt::Use::bind()
 {
     return checkBind(sqlite3_bind_null(stmt, curArg++));
@@ -271,6 +276,14 @@ int64_t SQLiteStmt::Use::getInt(int col)
 {
     // FIXME: detect nulls?
     return sqlite3_column_int64(stmt, col);
+}
+
+SQLiteValue SQLiteStmt::Use::getValue(int col)
+{
+    SQLiteValue value{sqlite3_value_dup(sqlite3_column_value(stmt, col)), sqlite3_value_free};
+    if (!value)
+        throw std::bad_alloc();
+    return value;
 }
 
 bool SQLiteStmt::Use::isNull(int col)

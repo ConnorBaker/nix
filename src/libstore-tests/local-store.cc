@@ -6490,11 +6490,11 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
 {
     SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
     /* Preserve actual classes, without INTEGER affinity coercing REAL or TEXT. */
-    db.exec("create table UnconstrainedAux(kind integer, id blob, ingestion, chunk integer, body blob); "
+    db.exec("create table UnconstrainedAux(kind, id, ingestion, chunk integer, body blob); "
             "insert into UnconstrainedAux select * from AuxValues; drop table AuxValues; "
             "alter table UnconstrainedAux rename to AuxValues;");
     using Identity = std::tuple<const char *, const char *, int64_t>;
-    const std::array<Identity, 10> identities{{
+    const std::array<Identity, 16> identities{{
         {"-9223372036854775808", "integer", std::numeric_limits<int64_t>::min()},
         {"-1", "integer", -1},
         {"0", "integer", 0},
@@ -6505,6 +6505,12 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
         {"'7'", "text", 7},
         {"x'00'", "blob", 0},
         {"null", "null", 0},
+        {"0.0", "real", 0},
+        {"'0'", "text", 0},
+        {"'0007'", "text", 7},
+        {"7.5", "real", 7},
+        {"x''", "blob", 0},
+        {"cast(x'3000' as text)", "text", 0},
     }};
     size_t cases = 0, duplicates = 0;
     for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
@@ -6570,11 +6576,83 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupChecksTheCompleteIncarnationDomain)
                     if (integer && ownerId != std::numeric_limits<int64_t>::max())
                         EXPECT_GT(static_cast<int64_t>(sound), ownerId);
                     EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                    /* A sound copy survives repair, including integer zero
+                       beside the numerically equal REAL-zero duplicate. */
+                    EXPECT_EQ(
+                        verifyAuxiliaryForTest(NoRepair),
+                        !integer || corrupt || (ownerId == 0 && !corrupt));
+                    EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
+                    EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));
+                    {
+                        SQLiteStmt surviving{
+                            db, "select typeof(ingestion), body from AuxValues where kind = ? and id = ?;"};
+                        auto use = surviving.use();
+                        use.apply(static_cast<int64_t>(mode)).apply(entry.hash.hash, entry.hash.hashSize);
+                        size_t retained = 0;
+                        while (use.next()) {
+                            EXPECT_EQ(use.getStr(0), "integer");
+                            EXPECT_EQ(use.getBlobView(1), body);
+                            ++retained;
+                        }
+                        EXPECT_EQ(retained, integer && !corrupt ? 2u : 1u);
+                    }
                     remove.use().apply(ownerId).exec();
                     ++cases;
                 }
-    EXPECT_EQ(cases, 80u);
+    EXPECT_EQ(cases, 128u);
     EXPECT_EQ(duplicates, 4u);
+
+    /* Invalid projected keys must not erase the sound integer-zero
+       incarnation with the original typed address and exact bytes. */
+    size_t projections = 0;
+    for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
+        for (bool changeKind : {false, true})
+            for (unsigned fault = 0; fault < 6; ++fault) {
+                SCOPED_TRACE(fmt("projection mode=%o kind=%d fault=%u", (RawMode) mode, changeKind, fault));
+                auto body = fmt("exact-projection-%u", unsigned(projections));
+                merkle::TreeEntry entry{
+                    mode, mode == merkle::Mode::Directory ? merkle::treeId(body) : merkle::blobId(body)};
+                auto bad = publishAuxiliary(
+                    config->realStoreDir.get() / fmt("bad-projection-%u", unsigned(projections)), {{entry, body}});
+                const std::array kindFaults{
+                    std::string("0"),
+                    fmt("%u.0", (RawMode) mode),
+                    fmt("'%u'", (RawMode) mode),
+                    fmt("cast(%u as blob)", (RawMode) mode),
+                    std::string("null"),
+                    fmt("%u", (RawMode) (mode == merkle::Mode::Directory ? merkle::Mode::Symlink
+                                                                        : merkle::Mode::Directory))};
+                const std::array idFaults{
+                    "0", "0.0", "cast(id as text)", "zeroblob(32)", "zeroblob(31)", "null"};
+                SQLiteStmt change{
+                    db,
+                    fmt("update AuxValues set %s = %s, ingestion = 0 where ingestion = ?;",
+                        changeKind ? "kind" : "id", changeKind ? kindFaults[fault] : idFaults[fault])};
+                change.use().apply(static_cast<int64_t>(bad)).exec();
+                auto good = publishAuxiliary(
+                    config->realStoreDir.get() / fmt("good-projection-%u", unsigned(projections)), {{entry, body}});
+                SQLiteStmt zero{db, "update AuxValues set ingestion = 0 where ingestion = ?;"};
+                zero.use().apply(static_cast<int64_t>(good)).exec();
+                EXPECT_TRUE(verifyAuxiliaryForTest(NoRepair));
+                EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
+                EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));
+                SQLiteStmt surviving{
+                    db, "select typeof(kind), kind, typeof(id), id, typeof(ingestion), ingestion"
+                        " from AuxValues where body = ?;"};
+                auto use = surviving.use();
+                use.apply(reinterpret_cast<const unsigned char *>(body.data()), body.size());
+                ASSERT_TRUE(use.next());
+                EXPECT_EQ(use.getStr(0), "integer");
+                EXPECT_EQ(use.getInt(1), static_cast<int64_t>(mode));
+                EXPECT_EQ(use.getStr(2), "blob");
+                EXPECT_EQ(use.getBlobView(3), entry.hash.bytes());
+                EXPECT_EQ(use.getStr(4), "integer");
+                EXPECT_EQ(use.getInt(5), 0);
+                EXPECT_FALSE(use.next());
+                EXPECT_EQ(store->objects.readAuxiliary(entry), body);
+                ++projections;
+            }
+    EXPECT_EQ(projections, 24u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliarySchemaRejectsIncompleteOwnershipAndDuplicateChunks)

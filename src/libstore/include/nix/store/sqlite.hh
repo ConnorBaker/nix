@@ -3,6 +3,7 @@
 
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <string>
 #include <string_view>
 
@@ -10,8 +11,11 @@
 
 struct sqlite3;
 struct sqlite3_stmt;
+struct sqlite3_value;
 
 namespace nix {
+
+using SQLiteValue = std::unique_ptr<sqlite3_value, void (*)(sqlite3_value *)>;
 
 enum class SQLiteOpenMode {
     /**
@@ -132,6 +136,7 @@ struct SQLiteStmt
         Use & apply(std::string_view value, bool notNull = true);
         Use & apply(const unsigned char * data, size_t len, bool notNull = true);
         Use & apply(int64_t value, bool notNull = true);
+        Use & apply(const sqlite3_value & value);
         Use & bind(); // null
 
         /** Restart parameter binding/execution, retaining current bound values. */
@@ -152,6 +157,8 @@ struct SQLiteStmt
         /** BLOB view; throws on OOM. Invalidated by next/exec, reset, Use exit, finalize, or column conversion. */
         std::string_view getBlobView(int col);
         int64_t getInt(int col);
+        /** Own the original SQLite storage class and value beyond this statement. */
+        SQLiteValue getValue(int col);
         bool isNull(int col);
     };
 

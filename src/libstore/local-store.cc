@@ -21,6 +21,7 @@
 #include "nix/store/store-registration.hh"
 
 #include <algorithm>
+#include <array>
 #include <cstring>
 #include <limits>
 #include <type_traits>
@@ -149,9 +150,9 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
     SQLiteStmt ReadAuxiliary;
-    SQLiteStmt ReadAuxiliaryExact;
+    std::array<SQLiteStmt, 2> ReadAuxiliaryExact;
     SQLiteStmt InsertAuxiliary;
-    SQLiteStmt DeleteAuxiliary;
+    std::array<SQLiteStmt, 2> DeleteAuxiliary;
     /* The blob index (`06-holder-index.md`). */
     SQLiteStmt LookupBlob;
     SQLiteStmt InsertBlob;
@@ -166,6 +167,12 @@ static constexpr auto lookupBlobSql =
     "select b.ino, b.dev, b.size, i.path, b.name, b.ingestion from Blobs b"
     " join Ingestions i on i.id = b.ingestion join ValidPaths v on v.path = i.path"
     " where b.id = ? and b.exec = ? and (b.dev, b.ino, b.ingestion) > (?, ?, ?);";
+
+/* Storage class is part of an incarnation key; unary + removes column affinity. */
+static constexpr auto auxiliaryExactKeySql =
+    "typeof(kind) = typeof(?1) and +kind collate binary is ?1"
+    " and typeof(id) = typeof(?2) and +id collate binary is ?2"
+    " and typeof(ingestion) = typeof(?3) and +ingestion collate binary is ?3";
 
 LocalStore::LocalStore(ref<const Config> config)
     : Store{*config}
@@ -435,14 +442,8 @@ LocalStore::LocalStore(ref<const Config> config)
             " where a.kind = ?1 and a.id = ?2 and a.ingestion = ("
             " select min(ingestion) from AuxValues where typeof(ingestion) = 'integer'"
             " and kind = ?1 and id = ?2 and (?3 is null or ingestion > ?3)) order by a.chunk;");
-        state->stmts->ReadAuxiliaryExact.create(
-            state->db,
-            "select ingestion, chunk, body from AuxValues"
-            " where kind = ? and id = ? and ingestion = ? order by chunk;");
         state->stmts->InsertAuxiliary.create(
             state->db, "insert into AuxValues (kind, id, ingestion, chunk, body) values (?, ?, ?, ?, ?);");
-        state->stmts->DeleteAuxiliary.create(
-            state->db, "delete from AuxValues where kind = ? and id = ? and ingestion = ?;");
     }
     if (hasBlobIndex) {
         state->stmts->LookupBlob.create(state->db, lookupBlobSql);
@@ -716,9 +717,15 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
 {
     struct Key
     {
-        int64_t kind;
-        std::string id;
-        int64_t ingestion;
+        std::array<SQLiteValue, 3> values;
+        std::string ingestion;
+
+        bool hasDeclaredTypes() const
+        {
+            return sqlite3_value_type(values[0].get()) == SQLITE_INTEGER
+                && sqlite3_value_type(values[1].get()) == SQLITE_BLOB
+                && sqlite3_value_type(values[2].get()) == SQLITE_INTEGER;
+        }
     };
 
     auto keys = retrySQLite<std::vector<Key>>([&] {
@@ -726,22 +733,48 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
         std::vector<Key> keys;
         if (!state->stmts->ReadAuxiliary)
             return keys;
-        SQLiteStmt query(state->db, "select distinct kind, id, ingestion from AuxValues;");
+        SQLiteStmt query(
+            state->db,
+            "select distinct kind collate binary, id collate binary, ingestion collate binary,"
+            " typeof(kind), typeof(id), typeof(ingestion),"
+            " quote(ingestion) from AuxValues;");
         auto use(query.use());
         while (use.next())
-            keys.push_back({use.getInt(0), std::string(use.getBlobView(1)), use.getInt(2)});
+            keys.push_back({{use.getValue(0), use.getValue(1), use.getValue(2)}, use.getStr(6)});
         return keys;
     });
+    auto statement = [&](State & state, const Key & key, bool erase) -> SQLiteStmt & {
+        bool indexed = key.hasDeclaredTypes();
+        auto & stmt = (erase ? state.stmts->DeleteAuxiliary : state.stmts->ReadAuxiliaryExact)[indexed];
+        if (!stmt) {
+            auto where = std::string(auxiliaryExactKeySql);
+            if (indexed)
+                where += " and kind collate binary is ?1 and id collate binary is ?2 and ingestion collate binary is ?3";
+            stmt.create(
+                state.db,
+                (erase ? "delete from AuxValues where " : "select ingestion, chunk, body from AuxValues where ") + where
+                    + (erase ? ";" : " order by chunk;"));
+        }
+        return stmt;
+    };
     auto inspect = [&](State & state, const Key & key) {
-        auto & stmt = state.stmts->ReadAuxiliaryExact;
+        auto & stmt = statement(state, key, false);
         auto use(stmt.use());
-        use.apply(key.kind)
-            .apply(reinterpret_cast<const unsigned char *>(key.id.data()), key.id.size())
-            .apply(key.ingestion);
+        for (auto & value : key.values)
+            use.apply(*value);
         return readAuxiliaryChunks(stmt, use);
     };
     auto bad = [&](const Key & key, const std::optional<AuxiliaryCandidate> & candidate) {
-        return candidate && !auxiliaryBodyMatches(key.kind, key.id, candidate->body);
+        if (!candidate)
+            return false;
+        auto & [kind, id, ingestion] = key.values;
+        if (!key.hasDeclaredTypes())
+            return true;
+        auto bytes = static_cast<const char *>(sqlite3_value_blob(id.get()));
+        return !auxiliaryBodyMatches(
+            sqlite3_value_int64(kind.get()),
+            bytes ? std::string_view(bytes, sqlite3_value_bytes(id.get())) : std::string_view(),
+            candidate->body);
     };
     bool errors = false;
     for (auto & key : keys) {
@@ -757,18 +790,18 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
             retrySQLite<void>([&] {
                 auto state(_state->lock());
                 SQLiteTxn txn(state->db);
-                if (bad(key, inspect(*state, key)))
-                    state->stmts->DeleteAuxiliary.use()
-                        .apply(key.kind)
-                        .apply(reinterpret_cast<const unsigned char *>(key.id.data()), key.id.size())
-                        .apply(key.ingestion)
-                        .exec();
+                if (bad(key, inspect(*state, key))) {
+                    auto use = statement(*state, key, true).use();
+                    for (auto & value : key.values)
+                        use.apply(*value);
+                    use.exec();
+                }
                 txn.commit();
             });
         else
             errors = true;
         printError(
-            "auxiliary cache body in ingestion %d was modified or has an incomplete chunk sequence", key.ingestion);
+            "auxiliary cache body in ingestion %s was modified or has an incomplete chunk sequence", key.ingestion);
     }
     return errors;
 }
