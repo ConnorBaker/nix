@@ -3069,69 +3069,80 @@ TEST_F(LocalStoreObjectsTest, batchRepairFailureDoesNotSkipALaterOrderedRepair)
             }
 }
 
-TEST_F(LocalStoreObjectsTest, repairReferencesUseExistingAvailability)
+TEST_F(LocalStoreObjectsTest, batchReferencesUseExistingAvailability)
 {
     size_t cases = 0;
-    for (bool binary : {false, true})
-        for (bool copy : {false, true})
-            for (unsigned validMask = 0; validMask != 4; ++validMask) {
-                SCOPED_TRACE(fmt("binary=%d copy=%d valid=%d", binary, copy, validMask));
-                auto root = tempStoreDir.path() / fmt("repair-availability-%d", cases++);
-                ref<Store> target = binary
-                    ? openStore("file://" + root.string())
-                    : ref<Store>{std::make_shared<LocalStore>(make_ref<LocalStoreConfig>(root, StoreConfig::Params{}))};
-                std::array paths{StorePath::random("available-a"), StorePath::random("available-b")};
-                std::deque<std::string> nars;
-                std::vector<ValidPathInfo> infos;
-                for (size_t i = 0; i != paths.size(); ++i) {
-                    auto bytes = fmt("available-%d", i);
-                    StringSink nar;
-                    dumpString(bytes, nar);
-                    nars.push_back(std::move(nar.s));
-                    ValidPathInfo info{paths[i], {*store,
-                        ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId(bytes)})}};
-                    info.narSize = nars.back().size();
-                    if (copy) {
-                        StringSource seed{nars.back()};
-                        store->addToStore(info, seed, NoRepair, NoCheckSigs);
-                    }
-                    if (validMask & (1u << i)) {
-                        StringSource seed{nars.back()};
-                        target->addToStore(info, seed, NoRepair, NoCheckSigs);
-                    }
-                    infos.push_back(std::move(info));
-                }
-                for (size_t i = 0; i != paths.size(); ++i) {
-                    infos[i].references.insert(paths[1 - i]);
-                    infos[i].references.insert(paths[i]);
-                    if (copy)
-                        store->registerValidPath(infos[i]);
-                }
-                Store::PathsSource batch;
-                for (size_t i = 0; i != paths.size(); ++i)
-                    batch.emplace_back(infos[i], std::make_unique<StringSource>(nars[i]));
-                Activity act{*logger, lvlTalkative, actUnknown};
-                auto run = [&] {
-                    if (copy) {
-                        auto copied = copyPaths(*store, *target, StorePathSet{paths.begin(), paths.end()},
-                            Repair, NoCheckSigs, NoSubstitute);
-                        EXPECT_EQ(copied.size(), 2u);
-                    } else
-                        target->addMultipleToStore(std::move(batch), act, Repair, NoCheckSigs);
-                };
-                if (!validMask)
-                    EXPECT_THROW(run(), Error) << "an unavailable mutual cycle has no first publication";
-                else {
-                    ASSERT_NO_THROW(run());
+    for (RepairFlag repair : {NoRepair, Repair})
+        for (bool binary : {false, true})
+            for (bool copy : {false, true})
+                for (unsigned validMask = 0; validMask != 4; ++validMask) {
+                    SCOPED_TRACE(fmt("binary=%d copy=%d repair=%d valid=%d", binary, copy, int(repair), validMask));
+                    auto root = tempStoreDir.path() / fmt("repair-availability-%d", cases++);
+                    ref<Store> target = binary
+                        ? openStore("file://" + root.string())
+                        : ref<Store>{std::make_shared<LocalStore>(make_ref<LocalStoreConfig>(root, StoreConfig::Params{}))};
+                    std::array paths{StorePath::random("available-a"), StorePath::random("available-b")};
+                    std::deque<std::string> nars;
+                    std::vector<ValidPathInfo> infos;
                     for (size_t i = 0; i != paths.size(); ++i) {
-                        EXPECT_EQ(target->queryPathInfo(paths[i])->references, infos[i].references);
-                        StringSink observed;
-                        target->narFromPath(paths[i], observed);
-                        EXPECT_EQ(observed.s, nars[i]);
+                        auto bytes = fmt("available-%d", i);
+                        StringSink nar;
+                        dumpString(bytes, nar);
+                        nars.push_back(std::move(nar.s));
+                        ValidPathInfo info{paths[i], {*store,
+                            ObjectHash::of(merkle::TreeEntry{merkle::Mode::Regular, merkle::blobId(bytes)})}};
+                        info.narSize = nars.back().size();
+                        if (copy) {
+                            StringSource seed{nars.back()};
+                            store->addToStore(info, seed, NoRepair, NoCheckSigs);
+                        }
+                        if (validMask & (1u << i)) {
+                            StringSource seed{nars.back()};
+                            target->addToStore(info, seed, NoRepair, NoCheckSigs);
+                        }
+                        infos.push_back(std::move(info));
+                    }
+                    for (size_t i = 0; i != paths.size(); ++i) {
+                        infos[i].references.insert(paths[1 - i]);
+                        infos[i].references.insert(paths[i]);
+                        if (copy)
+                            store->registerValidPath(infos[i]);
+                    }
+                    std::atomic<unsigned> skippedSources = 0;
+                    Store::PathsSource batch;
+                    for (size_t i = 0; i != paths.size(); ++i)
+                        if (!repair && (validMask & (1u << i)))
+                            batch.emplace_back(infos[i], std::make_unique<BatchCopySource>(skippedSources));
+                        else
+                            batch.emplace_back(infos[i], std::make_unique<StringSource>(nars[i]));
+                    Activity act{*logger, lvlTalkative, actUnknown};
+                    auto run = [&] {
+                        if (copy) {
+                            auto copied = copyPaths(*store, *target, StorePathSet{paths.begin(), paths.end()},
+                                repair, NoCheckSigs, NoSubstitute);
+                            EXPECT_EQ(copied.size(), !repair && validMask == 3 ? 0u : 2u);
+                        } else
+                            target->addMultipleToStore(std::move(batch), act, repair, NoCheckSigs);
+                    };
+                    if (!validMask)
+                        EXPECT_THROW(run(), Error) << "an unavailable mutual cycle has no first publication";
+                    else {
+                        ASSERT_NO_THROW(run());
+                        for (size_t i = 0; i != paths.size(); ++i) {
+                            auto expectedRefs = !repair && (validMask & (1u << i)) ? StorePathSet{} : infos[i].references;
+                            EXPECT_EQ(target->queryPathInfo(paths[i])->references, expectedRefs);
+                            StringSink observed;
+                            target->narFromPath(paths[i], observed);
+                            EXPECT_EQ(observed.s, nars[i]);
+                        }
+                        if (!copy) {
+                            for (auto & entry : batch)
+                                EXPECT_FALSE(entry.second);
+                            EXPECT_EQ(skippedSources.load(), repair ? 0u : (validMask & 1u) + ((validMask >> 1) & 1u));
+                        }
                     }
                 }
-            }
-    EXPECT_EQ(cases, 16u);
+    EXPECT_EQ(cases, 32u);
 }
 
 /* Each path of a batch registers independently and is its own ingestion: its own `Ingestions` row, its own

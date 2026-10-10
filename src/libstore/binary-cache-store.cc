@@ -416,12 +416,13 @@ void BinaryCacheStore::addMultipleToStore(
                 }
             } else {
                 dependencies.emplace(Stage::Nar, ~info.narSize, path, index);
-                for (auto & ref : info.references)
-                    if (ref != path) {
-                        auto first = nodes.lower_bound({Stage::NarInfo, 0, ref, 0});
-                        if (first != nodes.end() && std::get<2>(*first) == ref && (!repair || !isValidPath(ref)))
-                            dependencies.insert(*first);
-                    }
+                if (!info.references.empty() && (repair || !isValidPath(info.path)))
+                    for (auto & ref : info.references)
+                        if (ref != path) {
+                            auto first = nodes.lower_bound({Stage::NarInfo, 0, ref, 0});
+                            if (first != nodes.end() && std::get<2>(*first) == ref && (!repair || !isValidPath(ref)))
+                                dependencies.insert(*first);
+                        }
             }
             return dependencies;
         },

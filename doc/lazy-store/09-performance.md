@@ -2,6 +2,28 @@
 
 ## Current matched comparison
 
+The combined committed endpoint **38756a39671430c7b30e7e0ef7e033efdff096b0** remains faster in seven wall medians and six CPU medians against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Cold-path CPU and both warm-Git wall/CPU regressions occur in **all six pairs**. The performance goal remains unmet.
+
+| Case | Wall / base | CPU / base | RSS / base | Wall wins | CPU wins |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cold 32 path | 0.907405 | 1.292193 | 1.132151 | 6/6 | 0/6 |
+| cold 32 git | 0.877816 | 0.984593 | 1.005656 | 6/6 | 5/6 |
+| cold 32 github | 0.658656 | 0.330963 | 0.921292 | 6/6 | 6/6 |
+| warm 8 path | 0.174250 | 0.269304 | 0.869551 | 6/6 | 6/6 |
+| warm 8 git | 1.184267 | 1.655702 | 1.008127 | 0/6 | 0/6 |
+| warm 8 github | 0.864344 | 0.907670 | 1.023850 | 5/6 | 6/6 |
+| warm 32 path | 0.338212 | 0.400842 | 0.934078 | 6/6 | 6/6 |
+| warm 32 git | 1.139408 | 1.391197 | 1.003988 | 0/6 | 0/6 |
+| warm 32 github | 0.949686 | 0.932707 | 1.007721 | 4/6 | 6/6 |
+
+The [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/INDEPENDENT-SEAL.json) retains all 114 successful outputs, 54 balanced pairs and 21 complete graphs, with unchanged source, actual runtime providers and full fixture. Comparison passes after address rewriting; every graph has nonidentity address mappings. The specification permits Git object addressing in place of NAR source addressing, which also changes referring derivation addresses. Graph equivalence does not independently prove the address formulas or failure contracts. All 42 current states remain present.
+
+The [full readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/final-combined-oct10/READOUT.md) retains every pair. Cold means fresh application state; host page caches were not flushed. All 1,664 pressure samples are retained: maximum CPU avg10 pressure is 5.95%, I/O some/full 0.20%/0.19%, and memory 0.28%. These observations do not attribute the regressions to host I/O or establish causal time fractions. Earlier PMU, syscall and stack captures below describe f05; they are not profiles of this combined endpoint.
+
+The [complete source census](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/runtime-source-census-38756a-vs-8aad/SUMMARY.json), using the unchanged historical classification, counts +13,283/−4,506 across 187 changed production files: **net +8,777 physical lines**. This remains excessive; the recent 41-line reduction does not achieve substantial implementation shrinkage.
+
+### Earlier f05 comparison
+
 Measured **f05adeff82965dc67d91ee00110e61d811e40578** has lower paired wall medians in **seven of nine cases** and CPU medians in **six of nine cases** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**, using matching release builds and dependencies. It wins **40/54 wall**, **33/54 CPU** and **18/54 RSS** pairs. Both warm-Git cases regress in wall and CPU; cold path regresses in CPU. Cold Git's CPU median is only marginally lower, with three wins and three losses. Uniform performance and substantial source reduction remain unfinished.
 
 The [fresh cohort seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/fresh-cohort-seal.json) retains **114 outputs, 54 balanced pairs and 21 complete store graphs**, including returned derivation addresses, contents, modes and SQLite reference edges. [Every paired measurement](/home/connorbaker/Benchmarks/b9r1/paired-metrics.json) is retained. Fresh private stores define cold application state; host page caches are not flushed. The 42 benchmark states remain available for separate profiling. Earlier results below describe earlier endpoints, and historical `/tmp` links may no longer resolve; they are not current validation receipts.
@@ -62,7 +84,7 @@ The [complete syscall census](/home/connorbaker/Benchmarks/nix-performance-fixes
 
 Every nonempty cold-reference file is read by the warm candidate. Both endpoints read the Git index as 20 + 7,221,989 + 20 bytes; this is not three complete index scans. Store/fetcher SQLite traffic differs independently: warm thirty-two-attribute main-file `fstat` counts move from 561 fetcher / 4 store to 8 fetcher / 4,273 store, while store WAL reads fall from 65,397,624 bytes to zero. File status calls are not SQL-statement counts. Different warmed database histories and tracing overhead prevent treating these counts as isolated query costs or causal seconds.
 
-`getAccessorFromWorkdir` deliberately supplies no fingerprint: a revision or clean Git status does not identify raw rendered bytes when normalization, filters or ignored changes apply. `fetchToStore2` consequently cannot use a persistent root-name hit; `LocalStore::materialise` prepares and traverses the directory before learning its address. A hash-only pass followed by another mutable-source read would repeat source observations and could copy different bytes. Avoiding that work requires retaining the delivered value or a valid identity, rather than assuming HEAD is that identity. The [filesystem source audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/warm-git-filesystem-source-audit/READOUT.md) separately accounts for libgit2, descriptor scopes, permissions and mutation.
+`getAccessorFromWorkdir` deliberately supplies no fingerprint: a revision or clean Git status does not identify raw rendered bytes when normalization, filters or ignored changes apply. `mountInput` invokes `fetchToStore2` in `DryRun`, so whole-tree raw naming can precede any materialization. Separately, an unnamed directory copied by `LocalStore::materialise` is prepared and traversed before its address is known. These are distinct callers; a copy optimization cannot be credited with eliminating the dry-run naming observation. A hash-only pass followed by another mutable-source read would repeat observations and could copy different bytes. Avoiding repeated work requires retaining the delivered value or a valid identity, rather than assuming HEAD is that identity. The [filesystem source audit](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/warm-git-filesystem-source-audit/READOUT.md) separately accounts for libgit2, descriptor scopes, permissions and mutation.
 
 [Sampled stacks](/home/connorbaker/Benchmarks/p9r6/analysis/READOUT.md) observe raw directory traversal and file-copy frames in the warm candidate where the base has none. All 5,152 samples reconcile, but 1,417 contain an unknown DSO frame and 118 stacks reach the 1,024-frame limit. The sampled copy frames do not establish the entire outer caller chain; no missing frames are inferred.
 
