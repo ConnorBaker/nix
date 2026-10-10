@@ -587,6 +587,195 @@ TEST(TreeTraversal, deferredVisitsKeepBothNameRepresentationsAlive)
     EXPECT_EQ(cases, 18u);
 }
 
+TEST(TreeTraversal, mutableFiltersKeepSourceCoordinatesAndObserveEveryChild)
+{
+    enum class Mode { All, Deny, Paths, AllToPaths, PathsToAll, PathsToDeny };
+    struct Visitor : NodeVisitor<int>
+    {
+        std::function<void()> replace;
+        bool beforeChildren;
+        bool changed = false;
+        CanonPath logicalRoot;
+        std::vector<std::string> names;
+        std::vector<std::string> paths;
+
+        Visitor(std::function<void()> replace, bool beforeChildren, CanonPath logicalRoot)
+            : replace(std::move(replace)), beforeChildren(beforeChildren), logicalRoot(std::move(logicalRoot)) {}
+
+        int regular(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override
+        {
+            EXPECT_TRUE(path.isWithin(logicalRoot));
+            paths.push_back(path.abs());
+            return 0;
+        }
+
+        int symlink(const CanonPath &, const std::string &) override
+        {
+            ADD_FAILURE() << "fixture has no symlinks";
+            return 0;
+        }
+
+        int directory(const CanonPath &, Children children) override
+        {
+            if (beforeChildren)
+                replace();
+            children.each([&](std::string_view name, bool, Visit visit) {
+                names.emplace_back(name);
+                visit(*this);
+                if (!beforeChildren && !changed) {
+                    changed = true;
+                    replace();
+                }
+            });
+            return 0;
+        }
+    };
+    size_t cases = 0;
+    for (bool sourceRoot : {false, true})
+        for (bool logicalRoot : {false, true})
+            for (bool caseHack : {false, true})
+                for (bool suffix : {false, true})
+                    for (auto mode : {Mode::All, Mode::Deny, Mode::Paths, Mode::AllToPaths, Mode::PathsToAll, Mode::PathsToDeny})
+                        for (bool beforeChildren : {false, true}) {
+                            SCOPED_TRACE(fmt("sourceRoot=%d logicalRoot=%d caseHack=%d suffix=%d mode=%d before=%d",
+                                sourceRoot, logicalRoot, caseHack, suffix, int(mode), beforeChildren));
+                            WithCaseHack scope{caseHack};
+                            auto source = make_ref<MemorySourceAccessor>();
+                            auto from = sourceRoot ? CanonPath::root : CanonPath("selected");
+                            auto logical = logicalRoot ? CanonPath::root : CanonPath("continued");
+                            auto actualA = suffix ? "a" + std::string(caseHackSuffix) + "1" : "a";
+                            source->addFile(from / actualA, "a");
+                            source->addFile(from / "b", "b");
+                            auto all = [&](bool changed) {
+                                return mode == Mode::All || (mode == Mode::AllToPaths && !changed)
+                                    || (mode == Mode::PathsToAll && changed);
+                            };
+                            auto admits = [&](bool changed, std::string_view name) {
+                                if (all(changed)) return true;
+                                if (mode == Mode::Deny || (mode == Mode::PathsToDeny && changed)) return false;
+                                return name == "b" || (mode != Mode::Paths && mode != Mode::AllToPaths);
+                            };
+                            PathFilter filter = AllPaths{};
+                            std::vector<std::string> calls;
+                            auto assign = [&](bool changed) {
+                                if (all(changed)) filter = AllPaths{};
+                                else filter = [&, changed](const std::string & path) {
+                                    calls.push_back(path);
+                                    return (path == (from / "a").abs() && admits(changed, "a"))
+                                        || (path == (from / "b").abs() && admits(changed, "b"));
+                                };
+                            };
+                            assign(false);
+                            Visitor visitor{[&] { assign(true); }, beforeChildren, logical};
+                            if (suffix && !caseHack) {
+                                EXPECT_THROW(traverse(*source, from, filter, visitor, logical), Error);
+                                EXPECT_TRUE(visitor.names.empty());
+                                EXPECT_TRUE(calls.empty());
+                            } else {
+                                std::vector<std::string> expectedNames, expectedPaths, expectedCalls;
+                                bool changed = beforeChildren;
+                                for (auto name : {"a", "b"}) {
+                                    if (!all(changed)) expectedCalls.push_back((from / name).abs());
+                                    if (!admits(changed, name)) continue;
+                                    expectedNames.emplace_back(name);
+                                    expectedPaths.push_back((logical / (std::string_view(name) == "a" ? actualA : "b")).abs());
+                                    changed = true;
+                                }
+                                EXPECT_EQ(traverse(*source, from, filter, visitor, logical), 0);
+                                EXPECT_EQ(visitor.names, expectedNames);
+                                EXPECT_EQ(visitor.paths, expectedPaths);
+                                EXPECT_EQ(calls, expectedCalls);
+                            }
+                            ++cases;
+                        }
+    EXPECT_EQ(cases, 192u);
+    RecordProperty("finite_cells", cases);
+}
+
+TEST(TreeTraversal, narSinkMayReplaceIdentityFilterAtDirectoryHeader)
+{
+    struct MutatingSink : Sink
+    {
+        StringSink bytes;
+        PathFilter & filter;
+        std::string keep;
+        bool changed = false;
+        size_t headers = 0, targetHeader;
+
+        MutatingSink(PathFilter & filter, std::string keep, size_t targetHeader)
+            : filter(filter), keep(std::move(keep)), targetHeader(targetHeader) {}
+
+        void operator()(std::string_view data) override
+        {
+            bytes(data);
+            if (data == "directory") ++headers;
+            if (!changed && headers == targetHeader) {
+                changed = true;
+                filter = [this](const std::string & path) { return path == keep; };
+            }
+        }
+    };
+    size_t cases = 0;
+    for (bool sourceRoot : {false, true})
+        for (bool suffix : {false, true})
+            for (bool nested : {false, true}) {
+                WithCaseHack scope{true};
+                auto source = make_ref<MemorySourceAccessor>();
+                auto from = sourceRoot ? CanonPath::root : CanonPath("selected");
+                auto directory = nested ? from / "dir" : from;
+                source->addFile(directory / (suffix ? "a" + std::string(caseHackSuffix) + "1" : "a"), "discarded");
+                source->addFile(directory / "b", "kept");
+                auto keep = (directory / "b").abs();
+                PathFilter expectedFilter = [&](const std::string & path) {
+                    return path == keep || (nested && path == directory.abs());
+                };
+                StringSink expected;
+                source->dumpPath(from, expected, expectedFilter);
+                PathFilter mutableFilter = AllPaths{};
+                MutatingSink actual{mutableFilter, keep, nested ? 2u : 1u};
+                source->dumpPath(from, actual, mutableFilter);
+                EXPECT_TRUE(actual.changed);
+                EXPECT_EQ(actual.bytes.s, expected.s);
+                ++cases;
+            }
+    EXPECT_EQ(cases, 8u);
+    RecordProperty("finite_cells", cases);
+}
+
+TEST(TreeTraversal, rejectedDirectoryDoesNotObserveItsDescendantsOrFilterTheRoot)
+{
+    size_t cases = 0;
+    for (bool sourceRoot : {false, true})
+        for (bool logicalRoot : {false, true}) {
+            struct Source : MemorySourceAccessor
+            {
+                std::vector<CanonPath> observed;
+                std::optional<Stat> maybeLstat(const CanonPath & path) override
+                {
+                    observed.push_back(path);
+                    return MemorySourceAccessor::maybeLstat(path);
+                }
+            };
+            auto source = make_ref<Source>();
+            auto from = sourceRoot ? CanonPath::root : CanonPath("selected");
+            auto logical = logicalRoot ? CanonPath::root : CanonPath("continued");
+            source->addFile(from / CanonPath("drop/hidden"), "unobserved");
+            source->addFile(from / "keep", "kept");
+            std::vector<std::string> calls;
+            PathFilter filter = [&](const std::string & path) {
+                calls.push_back(path);
+                return path == (from / "keep").abs();
+            };
+            HashingVisitor visitor;
+            EXPECT_NO_THROW(traverse(*source, from, filter, visitor, logical));
+            EXPECT_EQ(calls, (std::vector<std::string>{(from / "drop").abs(), (from / "keep").abs()}));
+            EXPECT_EQ(source->observed, (std::vector<CanonPath>{from, from / "keep"}));
+            ++cases;
+        }
+    EXPECT_EQ(cases, 4u);
+    RecordProperty("finite_cells", cases);
+}
+
 TEST(CopyPool, orderedFoldChoosesTheFirstFailureAndJoinsEveryAcceptedChild)
 {
     /* Zero through three children: each succeeds, fails while reading, or

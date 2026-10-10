@@ -153,62 +153,55 @@ Result traverse(
                 return visitor.symlink(to, acc.readLink(from));
 
             case SourceAccessor::tDirectory: {
-                auto visitDirectory = [&](const CanonPath & filterBase) -> Result {
-                    /* The entries and, from the same listing, which of them the
-                       accessor typed as directories -- advisory, and read by a
-                       visitor that may walk siblings on a pool (`Children`). */
-                    /* The accessor is scoped around the *whole* of `v.directory`,
-                       not around the loop alone: an accessor's scoped form may be
-                       a stack object of its own (`PosixDirectorySourceAccessor`
-                       makes one and hands it to the callback), and a visitor is
-                       allowed to hold a child's `visit` and call it after the loop
-                       has ended -- which the parallel copy does (`01` §9.10). So
-                       the scope must outlive every visit, and the only bound that
-                       does is the directory node itself. */
-                    std::optional<Result> result;
-                    acc.readDirectoryWithEntries(
-                        from, [&](auto & subdirAccessor, const auto & subdirFrom, auto && listing) {
-                            const auto & entries = listing.entries();
-                            /* Without a suffix the listing already has the tree's
-                               unique names in its order, under either case-hack
-                               setting. Otherwise validate and reorder every name
-                               before exposing any directory or child callbacks. */
-                            std::optional<StringMap> unhacked;
-                            if (std::any_of(entries.begin(), entries.end(), [](const auto & entry) {
-                                    return entry.first.find(caseHackSuffix) != std::string::npos;
-                                }))
-                                unhacked = unhackedEntries(entries, acc, from);
-                            auto visitChild = [&](const std::string & actual, NodeVisitor<Result> & childVisitor) {
-                                return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1, childVisitor);
+                /* The entries and, from the same listing, which of them the
+                   accessor typed as directories -- advisory, and read by a
+                   visitor that may walk siblings on a pool (`Children`). */
+                /* The accessor is scoped around the *whole* of `v.directory`,
+                   not around the loop alone: an accessor's scoped form may be
+                   a stack object of its own (`PosixDirectorySourceAccessor`
+                   makes one and hands it to the callback), and a visitor is
+                   allowed to hold a child's `visit` and call it after the loop
+                   has ended -- which the parallel copy does (`01` §9.10). So
+                   the scope must outlive every visit, and the only bound that
+                   does is the directory node itself. */
+                std::optional<Result> result;
+                acc.readDirectoryWithEntries(
+                    from, [&](auto & subdirAccessor, const auto & subdirFrom, auto && listing) {
+                        const auto & entries = listing.entries();
+                        /* Without a suffix the listing already has the tree's
+                           unique names in its order, under either case-hack
+                           setting. Otherwise validate and reorder every name
+                           before exposing any directory or child callbacks. */
+                        std::optional<StringMap> unhacked;
+                        if (std::any_of(entries.begin(), entries.end(), [](const auto & entry) {
+                                return entry.first.find(caseHackSuffix) != std::string::npos;
+                            }))
+                            unhacked = unhackedEntries(entries, acc, from);
+                        auto visitChild = [&](const std::string & actual, NodeVisitor<Result> & childVisitor) {
+                            return walk(subdirAccessor, subdirFrom / actual, to / actual, depth + 1, childVisitor);
+                        };
+                        auto children = [&](typename NodeVisitor<Result>::Children::Each each) {
+                            auto child = [&](std::string_view name, const std::string & actual, auto type) {
+                                if (filter.get_fn().target<AllPaths>() || filter((path / to.removePrefix(logicalRoot) / name).abs()))
+                                    /* The context and name both live for this
+                                       directory scope; each deferred visit only
+                                       borrows those two existing objects. */
+                                    each(
+                                        std::string_view(name),
+                                        type == SourceAccessor::tDirectory,
+                                        [&visitChild, &actual](NodeVisitor<Result> & childVisitor) { return visitChild(actual, childVisitor); });
                             };
-                            auto children = [&](typename NodeVisitor<Result>::Children::Each each) {
-                                auto child = [&](std::string_view name, const std::string & actual, auto type) {
-                                    if (filter.get_fn().target<AllPaths>() || filter((filterBase / name).abs()))
-                                        /* The context and name both live for this
-                                           directory scope; each deferred visit only
-                                           borrows those two existing objects. */
-                                        each(
-                                            std::string_view(name),
-                                            type == SourceAccessor::tDirectory,
-                                            [&visitChild, &actual](NodeVisitor<Result> & childVisitor) { return visitChild(actual, childVisitor); });
-                                };
-                                if (unhacked)
-                                    for (auto & [name, actual] : *unhacked)
-                                        child(name, actual, entries.at(actual));
-                                else
-                                    for (auto & [name, type] : entries)
-                                        child(name, name, type);
-                            };
-                            result = visitor.directory(to, {children, true});
-                        });
-                    assert(result);
-                    return std::move(*result);
-                };
-                /* At the accessor root, the walk already owns this prefix. */
-                if (filter.get_fn().target<AllPaths>())
-                    return visitDirectory(CanonPath::root);
-                auto relative = logicalRoot.isRoot() ? to : to.removePrefix(logicalRoot);
-                return path.isRoot() ? visitDirectory(relative) : visitDirectory(path / relative);
+                            if (unhacked)
+                                for (auto & [name, actual] : *unhacked)
+                                    child(name, actual, entries.at(actual));
+                            else
+                                for (auto & [name, type] : entries)
+                                    child(name, name, type);
+                        };
+                        result = visitor.directory(to, {children, true});
+                    });
+                assert(result);
+                return std::move(*result);
             }
 
             case SourceAccessor::tChar:
