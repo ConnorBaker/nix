@@ -106,7 +106,7 @@ struct CacheImpl : Cache
         SQLiteTxn txn(state->db);
         auto now = time(nullptr);
         for (auto & [domain, key, value] : encoded)
-            state->upsert.use().apply(domain).apply(key).apply(value).apply(now).exec();
+            state->upsert.exec(domain, key, value, now);
         txn.commit();
     }
 

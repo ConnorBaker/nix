@@ -259,10 +259,25 @@ TEST(SQLite, borrowedBindingsPreserveEmptyNullAndFailureReuse)
             use.apply(value);
         EXPECT_NO_THROW(use.exec());
     }
+    SQLiteStmt once{db, "insert into item values (?1 || ?2)"};
+    once.exec(std::string("temporary"), 19);
+    EXPECT_THROW(once.exec(std::string("temporary"), 19), SQLiteError);
+    EXPECT_THROW(once.exec(std::string("unused"), 23, 29), SQLiteError);
+    EXPECT_FALSE(sqlite3_stmt_busy(once));
+    ASSERT_EQ(sqlite3_step(once), SQLITE_DONE);
+    ASSERT_EQ(sqlite3_reset(once), SQLITE_OK);
+    SQLiteStmt check{db, "select value, value is null from item where rowid > 4 order by rowid"};
+    auto newRows = check.use();
+    ASSERT_TRUE(newRows.next());
+    EXPECT_EQ(newRows.getStr(0), "temporary19");
+    EXPECT_FALSE(newRows.getInt(1));
+    ASSERT_TRUE(newRows.next());
+    EXPECT_TRUE(newRows.getInt(1));
+    EXPECT_FALSE(newRows.next());
     SQLiteStmt count{db, "select count(*) from item"};
     auto rows = count.use();
     ASSERT_TRUE(rows.next());
-    EXPECT_EQ(rows.getInt(0), 4);
+    EXPECT_EQ(rows.getInt(0), 6);
 }
 
 TEST(SQLite, busyBorrowedInsertionCanBeRetriedAfterItsOwnerChanges)

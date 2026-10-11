@@ -166,6 +166,18 @@ struct SQLiteStmt
     {
         return Use(*this, bindings);
     }
+
+    /**
+     * Execute without rows; pass every parameter and keep borrowed text valid and unchanged throughout this call.
+     * Resets and clears all bindings before returning or propagating a bind/execution error.
+     */
+    template<typename... Args>
+    void exec(const Args &... args)
+    {
+        auto use = this->use(Bindings::Borrow);
+        (static_cast<void>(use.apply(args)), ...);
+        use.exec();
+    }
 };
 
 /**

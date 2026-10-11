@@ -157,7 +157,8 @@ void SQLiteStmt::create(sqlite3 * db, const std::string & sql)
 {
     checkInterrupt();
     assert(!stmt);
-    if (sqlite3_prepare_v2(db, sql.c_str(), -1, &stmt, 0) != SQLITE_OK)
+    /* Keep statement preparation out of lookaside, leaving it for execution. */
+    if (sqlite3_prepare_v3(db, sql.c_str(), -1, SQLITE_PREPARE_PERSISTENT, &stmt, 0) != SQLITE_OK)
         SQLiteError::throw_(db, "creating statement '%s'", sql);
     this->db = db;
 }

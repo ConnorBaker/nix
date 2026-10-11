@@ -451,9 +451,9 @@ LocalStore::LocalStore(ref<const Config> config)
     /* Cache tables are optional in an older read-only store. Its valid
        paths and their hashes remain readable without migrating a cache. */
     SQLiteStmt tables(state->db, "select 1 from sqlite_master where type = 'table' and name = ?;");
-    bool hasBlobs = tables.use().apply("Blobs").next();
-    bool hasBlobIndex = hasBlobs && tables.use().apply("Ingestions").next();
-    bool hasAuxiliary = tables.use().apply("AuxValues").next();
+    bool hasBlobs = tables.use(SQLiteStmt::Bindings::Borrow).apply("Blobs").next();
+    bool hasBlobIndex = hasBlobs && tables.use(SQLiteStmt::Bindings::Borrow).apply("Ingestions").next();
+    bool hasAuxiliary = tables.use(SQLiteStmt::Bindings::Borrow).apply("AuxValues").next();
     if (hasAuxiliary) {
         state->stmts->ReadAuxiliary.create(
             state->db,
@@ -683,7 +683,7 @@ std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & e
         auto candidate = retrySQLite<std::optional<AuxiliaryCandidate>>([&] {
             auto state(_state->lock());
             auto & stmt = state->stmts->ReadAuxiliary;
-            auto use(stmt.use());
+            auto use(stmt.use(SQLiteStmt::Bindings::Borrow));
             use.apply(static_cast<int64_t>(entry.mode))
                 .apply(entry.hash.hash, entry.hash.hashSize)
                 .apply(cursor.value_or(0), cursor.has_value());
@@ -838,7 +838,7 @@ void LocalStore::coalesceBlobRows(
        between this query and pinning its file. No collision means no walk. */
     std::vector<BlobCoalescing> collisions;
     auto deleteOwn = [&](const Hash & id, bool executable) {
-        state.stmts->DeleteOwnBlob.use().apply(id.hash, id.hashSize)
+        state.stmts->DeleteOwnBlob.use(SQLiteStmt::Bindings::Borrow).apply(id.hash, id.hashSize)
             .apply(int64_t(executable)).apply(static_cast<int64_t>(ingestion)).exec();
     };
     {
@@ -872,7 +872,7 @@ void LocalStore::coalesceBlobRows(
     auto rejected = coalesceBlobs(toRealPath(path), hold, collisions);
     for (auto & collision : collisions)
         if (collision.eligible)
-            writeBlobRow(state.stmts->InsertBlob.use(), ingestion, collision.row);
+            writeBlobRow(state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow), ingestion, collision.row);
         else
             deleteOwn(collision.row.id, collision.row.executable);
     for (auto & [row, holder] : rejected) {
@@ -921,7 +921,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
-        state->stmts->NewIngestion.use().apply("", false).apply(holdName).exec();
+        state->stmts->NewIngestion.use(SQLiteStmt::Bindings::Borrow).apply("", false).apply(holdName).exec();
         auto id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
         insertBlobRows(*state, id, rows);
         insertAuxiliaryRows(*state, id, projection.auxiliary);
@@ -937,8 +937,8 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
 #endif
         }
 
-        state->stmts->DeletePathIngestions.use().apply(logical).exec();
-        state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(id)).exec();
+        state->stmts->DeletePathIngestions.exec(logical);
+        state->stmts->SetIngestionPath.exec(logical, static_cast<int64_t>(id));
         txn.commit();
         completed.insert_or_assign(std::move(logical), std::pair{id, std::move(rows)});
         hold.ingesting = false;
@@ -980,7 +980,7 @@ void LocalStore::sweepStaleBlobRows()
         SQLiteStmt erase(state->db, "delete from Ingestions where id = ?;");
         for (auto id : stale) {
 
-            erase.use().apply(static_cast<int64_t>(id)).exec();
+            erase.exec(static_cast<int64_t>(id));
         }
         txn.commit();
     });
@@ -1297,11 +1297,10 @@ void LocalStore::registerDrvOutputUnchecked(const Realisation & info)
         if (auto oldR = queryRealisation_(*state, info.id)) {
             if (info.isCompatibleWith(*oldR)) {
                 oldR->signatures.insert(info.signatures.begin(), info.signatures.end());
-                state->stmts->UpdateRealisedOutput.use()
-                    .apply(concatStringsSep(" ", Signature::toStrings(oldR->signatures)))
-                    .apply(info.id.drvPath.to_string())
-                    .apply(info.id.outputName)
-                    .exec();
+                state->stmts->UpdateRealisedOutput.exec(
+                    concatStringsSep(" ", Signature::toStrings(oldR->signatures)),
+                    info.id.drvPath.to_string(),
+                    info.id.outputName);
             } else {
                 throw Error(
                     "Trying to register a realisation of '%s', but we already "
@@ -1313,12 +1312,11 @@ void LocalStore::registerDrvOutputUnchecked(const Realisation & info)
                     printStorePath(info.outPath));
             }
         } else {
-            state->stmts->RegisterRealisedOutput.use()
-                .apply(info.id.drvPath.to_string())
-                .apply(info.id.outputName)
-                .apply(printStorePath(info.outPath))
-                .apply(concatStringsSep(" ", Signature::toStrings(info.signatures)))
-                .exec();
+            state->stmts->RegisterRealisedOutput.exec(
+                info.id.drvPath.to_string(),
+                info.id.outputName,
+                printStorePath(info.outPath),
+                concatStringsSep(" ", Signature::toStrings(info.signatures)));
         }
     });
 }
@@ -1330,7 +1328,7 @@ void LocalStore::deleteBuildTraces(const std::set<DrvOutput> & keys)
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
         for (const auto & key : keys) {
-            state->stmts->DeleteRealisedOutputByName.use().apply(key.drvPath.to_string()).apply(key.outputName).exec();
+            state->stmts->DeleteRealisedOutputByName.exec(key.drvPath.to_string(), key.outputName);
         }
         txn.commit();
     });
@@ -1340,7 +1338,7 @@ void LocalStore::cacheDrvOutputMapping(
     State & state, const uint64_t deriver, const std::string & outputName, const StorePath & output)
 {
     retrySQLite<void>([&]() {
-        state.stmts->AddDerivationOutput.use().apply(deriver).apply(outputName).apply(printStorePath(output)).exec();
+        state.stmts->AddDerivationOutput.exec(deriver, outputName, printStorePath(output));
     });
 }
 
@@ -1584,7 +1582,7 @@ uint64_t LocalStore::queryValidPathId(State & state, const StorePath & path)
 
 bool LocalStore::isValidPath_(State & state, std::string_view logical)
 {
-    return state.stmts->QueryValidPathId.use().apply(logical).next();
+    return state.stmts->QueryValidPathId.use(SQLiteStmt::Bindings::Borrow).apply(logical).next();
 }
 
 bool LocalStore::isValidPathUncached(const StorePath & path)
@@ -1712,7 +1710,7 @@ std::optional<StorePath> LocalStore::queryPathFromHashPart(const std::string & h
     return retrySQLite<std::optional<StorePath>>([&]() -> std::optional<StorePath> {
         auto state(_state->lock());
 
-        auto useQueryPathFromHashPart(state->stmts->QueryPathFromHashPart.use());
+        auto useQueryPathFromHashPart(state->stmts->QueryPathFromHashPart.use(SQLiteStmt::Bindings::Borrow));
         useQueryPathFromHashPart.apply(prefix);
 
         if (!useQueryPathFromHashPart.next())
@@ -1794,7 +1792,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                     publication = publications.erase(publication);
                     continue;
                 }
-                state->stmts->DeleteOwnBlobs.use().apply(static_cast<int64_t>(id)).exec();
+                state->stmts->DeleteOwnBlobs.exec(static_cast<int64_t>(id));
             }
             publication->id = id;
             insertBlobRows(*state, id, *publication->rows);
@@ -1838,8 +1836,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 coalesceBlobRows(*state, publication.info->path, *hold, publication.id, *publication.rows);
         auto publish = [&](const Publication & publication) {
             auto & logical = publication.logical;
-            state->stmts->DeletePathIngestions.use().apply(logical).exec();
-            state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(publication.id)).exec();
+            state->stmts->DeletePathIngestions.exec(logical);
+            state->stmts->SetIngestionPath.exec(logical, static_cast<int64_t>(publication.id));
         };
         for (auto & publication : publications)
             if (pathIds.contains(publication.info->path))
@@ -1865,7 +1863,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         for (auto & [_, info] : infos) {
             auto referrer = pathIds.at(info.path).first;
             for (auto & reference : info.references)
-                state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference).first).exec();
+                state->stmts->AddReference.exec(referrer, pathIds.at(reference).first);
         }
         /* Physical publication must finish durability on every attempt, even
            when an earlier attempt changed aliases and its SQL rolled back. */
@@ -1925,7 +1923,7 @@ void LocalStore::invalidatePath(State & state, const StorePath & path)
 {
     debug("invalidating path '%s'", printStorePath(path));
 
-    state.stmts->InvalidatePath.use().apply(printStorePath(path)).exec();
+    state.stmts->InvalidatePath.exec(printStorePath(path));
 
     /* Note that the foreign key constraints on the Refs table take
        care of deleting the references entries for `path'. */

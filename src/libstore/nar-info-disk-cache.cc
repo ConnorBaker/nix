@@ -160,19 +160,16 @@ public:
                 SQLiteStmt(
                     state->db,
                     "delete from NARs where ((present = 0 and timestamp < ?) or (present = 1 and timestamp < ?))")
-                    .use()
                     // Use a minimum TTL to prevent --refresh from
                     // nuking the entire disk cache.
-                    .apply(now - std::max(settings.ttlNegative.get(), 3600U))
-                    .apply(now - std::max(settings.ttlPositive.get(), 30 * 24 * 3600U))
-                    .exec();
+                    .exec(
+                        now - std::max(settings.ttlNegative.get(), 3600U),
+                        now - std::max(settings.ttlPositive.get(), 30 * 24 * 3600U));
 
                 debug("deleted %d entries from the NAR info disk cache", sqlite3_changes(state->db));
 
                 SQLiteStmt(state->db, "insert or replace into LastPurge(dummy, value) values ('', ?)")
-                    .use()
-                    .apply(now)
-                    .exec();
+                    .exec(now);
             }
         });
     }

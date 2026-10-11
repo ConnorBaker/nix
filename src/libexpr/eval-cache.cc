@@ -146,7 +146,7 @@ struct AttrDb
             upsertAttribute.next();
             auto rowId = (AttrId) upsertAttribute.getInt(0);
             assert(rowId);
-            state->deleteMissingChildren.use().apply(rowId).exec();
+            state->deleteMissingChildren.exec(rowId);
 
             // Insert children as placeholders, but don't replace existing entries
             for (auto & attr : attrs)
@@ -175,20 +175,9 @@ struct AttrDb
                     ctx.append(elem->view());
                     first = false;
                 }
-                state->insertAttributeWithContext.use()
-                    .apply(key.first)
-                    .apply(symbols[key.second])
-                    .apply(AttrType::String)
-                    .apply(s)
-                    .apply(ctx)
-                    .exec();
+                state->insertAttributeWithContext.exec(key.first, symbols[key.second], AttrType::String, s, ctx);
             } else {
-                state->insertAttribute.use()
-                    .apply(key.first)
-                    .apply(symbols[key.second])
-                    .apply(AttrType::String)
-                    .apply(s)
-                    .exec();
+                state->insertAttribute.exec(key.first, symbols[key.second], AttrType::String, s);
             }
 
             return state->db.getLastInsertedRowId();
@@ -200,12 +189,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Bool)
-                .apply(b ? 1 : 0)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Bool, b ? 1 : 0);
 
             return state->db.getLastInsertedRowId();
         });
@@ -216,12 +200,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Int)
-                .apply(n)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Int, n);
 
             return state->db.getLastInsertedRowId();
         });
@@ -232,12 +211,11 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::ListOfStrings)
-                .apply(dropEmptyInitThenConcatStringsSep("\t", l))
-                .exec();
+            state->insertAttribute.exec(
+                key.first,
+                symbols[key.second],
+                AttrType::ListOfStrings,
+                dropEmptyInitThenConcatStringsSep("\t", l));
 
             return state->db.getLastInsertedRowId();
         });
