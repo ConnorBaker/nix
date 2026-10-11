@@ -764,6 +764,11 @@ protected:
         hold.lease()->fd.close();
     }
 
+    static void skipLeaseNamesUntilReuse()
+    {
+        GitObjectStore::Hold::Lease::counter.fetch_add(std::numeric_limits<uint32_t>::max());
+    }
+
     bool hasTree(const Hash & id)
     {
         return hasAuxiliary(id, merkle::Mode::Directory);
@@ -2470,6 +2475,43 @@ TEST_F(LocalStoreObjectsTest, ingestionSurvivesASweepWhileItsHoldIsMade)
     objects.sweep();
     EXPECT_EQ(count("trees"), 2u);
 }
+
+#ifndef _WIN32
+TEST_F(LocalStoreObjectsTest, reusedLeaseNameDoesNotTransferAnotherHoldsProtection)
+{
+    auto & objects = store->objects;
+    bool collected = false;
+    std::optional<GitObjectStore::Hold> replacement;
+    objects.atHoldMade = [&] {
+        if (collected)
+            return;
+        collected = true;
+        ASSERT_EQ(count("tmp"), 1u);
+        auto removed = DirectoryIterator{objects.dir / "tmp"}->path();
+        EXPECT_EQ(objects.sweep(), 0u);
+        ASSERT_FALSE(pathExists(removed)) << "the collector removed the unlocked lease";
+        /* Compress 2^32 - 1 completed lease demands, leaving their names absent. */
+        skipLeaseNamesUntilReuse();
+        replacement.emplace(objects.hold());
+        ASSERT_EQ(replacement->directory(), removed) << "ordinary allocation recreated the collected name";
+    };
+    Finally disarm{[&] { objects.atHoldMade = nullptr; }};
+    {
+        auto hold = objects.hold();
+        auto directory = hold.directory();
+        ASSERT_TRUE(collected);
+        ASSERT_TRUE(replacement);
+        auto pin = directory / "pin";
+        writeFile(pin, "owned");
+        replacement.reset();
+        EXPECT_TRUE(pathExists(pin)) << "releasing another lease must not remove this hold's pin";
+        EXPECT_EQ(objects.sweep(), 1u) << "the surviving hold must protect its own named directory";
+        if (pathExists(pin))
+            EXPECT_EQ(readFile(pin), "owned");
+    }
+    EXPECT_EQ(count("tmp"), 0u);
+}
+#endif
 
 TEST_F(LocalStoreObjectsTest, deadHoldIsReleasedBySweep)
 {
@@ -6901,11 +6943,11 @@ TEST_F(LocalStoreObjectsTest, auxiliaryValuesPublishOnlyCompleteChunkSequences)
     EXPECT_EQ(cases, 14u);
 }
 
-TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
+TEST_F(LocalStoreObjectsTest, auxiliaryLookupAuthenticatesBodiesIndependentlyOfWriterChunking)
 {
     enum class Fault {
         MissingFirst, Gap, TrailingEmpty, ShortNonfinal, Oversized, Text, WrongHash, Truncated,
-        DuplicateEmpty, DuplicateFull
+        DuplicateEmpty, DuplicateFull, PositionMin, PositionMinusOne, PositionZero, PositionMax
     };
     constexpr size_t chunkSize = 1 << 20;
     const std::array faults{
@@ -6918,11 +6960,18 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
         Fault::WrongHash,
         Fault::Truncated,
         Fault::DuplicateEmpty,
-        Fault::DuplicateFull};
+        Fault::DuplicateFull,
+        Fault::PositionMin,
+        Fault::PositionMinusOne,
+        Fault::PositionZero,
+        Fault::PositionMax};
+    const std::array positions{std::numeric_limits<int64_t>::min(), int64_t{-1}, int64_t{0},
+                               std::numeric_limits<int64_t>::max()};
     auto savedFeatures = experimentalFeatureSettings.experimentalFeatures.get();
     Finally restoreFeatures{[&] { experimentalFeatureSettings.experimentalFeatures = savedFeatures; }};
     experimentalFeatureSettings.experimentalFeatures.get().insert(Xp::ReadOnlyLocalStore);
     size_t cases = 0;
+    bool converted = false;
     for (auto mode : {merkle::Mode::Directory, merkle::Mode::Symlink})
         for (auto fault : faults) {
             SCOPED_TRACE(fmt("mode=%o fault=%d", (RawMode) mode, int(fault)));
@@ -6955,6 +7004,12 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                     offset += size;
                 }
             };
+            bool positionCase = fault >= Fault::PositionMin;
+            bool unconstrained = positionCase || fault == Fault::DuplicateEmpty || fault == Fault::DuplicateFull;
+            if (unconstrained && !std::exchange(converted, true))
+                /* Convert once; subsequent cases retain this older-table domain. */
+                db.exec("create table UnconstrainedAux as select * from AuxValues; drop table AuxValues; "
+                        "alter table UnconstrainedAux rename to AuxValues;");
             switch (fault) {
             case Fault::MissingFirst:
                 mutate("update AuxValues set chunk = 3 where ingestion = ? and chunk = 2;");
@@ -6986,14 +7041,20 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                 break;
             case Fault::DuplicateEmpty:
             case Fault::DuplicateFull:
-                /* A read-only provider admits existing tables without producer constraints.
-                   Duplicate ordinals must fail even when their joined bytes hash correctly. */
-                db.exec("create table UnconstrainedAux as select * from AuxValues; drop table AuxValues; "
-                        "alter table UnconstrainedAux rename to AuxValues;");
                 mutate(fault == Fault::DuplicateEmpty
                            ? "insert into AuxValues select * from AuxValues where ingestion = ?;"
                            : "update AuxValues set chunk = 0 where ingestion = ? and chunk = 1;");
                 break;
+            case Fault::PositionMin:
+            case Fault::PositionMinusOne:
+            case Fault::PositionZero:
+            case Fault::PositionMax: {
+                repartition(body.size());
+                SQLiteStmt change{db, "update AuxValues set chunk = ? where ingestion = ?;"};
+                change.use().apply(positions[int(fault) - int(Fault::PositionMin)])
+                    .apply(static_cast<int64_t>(first)).exec();
+                break;
+            }
             }
             if (fault != Fault::WrongHash && fault != Fault::Truncated) {
                 SQLiteStmt pieces{db, "select body from AuxValues where ingestion = ? order by chunk;"};
@@ -7003,7 +7064,7 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                 while (use.next())
                     joined += use.getBlobView(0);
                 EXPECT_EQ(joined, body)
-                    << "this malformed encoding is rejected independently of its correct framed hash";
+                    << "this alternate encoding retains the same complete byte value";
             }
             auto reader = store;
             auto readOnlyReader = [&] {
@@ -7011,26 +7072,34 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLookupRejectsMalformedChunkSequences)
                 return std::make_shared<LocalStore>(
                     make_ref<LocalStoreConfig>(tempStoreDir.path(), StoreConfig::Params{{"read-only", "true"}}));
             };
-            if (fault == Fault::DuplicateEmpty || fault == Fault::DuplicateFull) {
+            if (unconstrained) {
                 reader = readOnlyReader();
                 SQLite snapshot{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::Immutable}};
                 SQLiteStmt query{snapshot, "select count(*) from AuxValues where ingestion = ?;"};
                 auto use = query.use();
                 use.apply(static_cast<int64_t>(first));
                 ASSERT_TRUE(use.next());
-                EXPECT_EQ(use.getInt(0), 2);
+                EXPECT_EQ(use.getInt(0), positionCase ? 1 : 2);
             }
             auto before = auxiliaryRowCount();
-            EXPECT_FALSE(reader->objects.readAuxiliary(entry));
-            EXPECT_EQ(auxiliaryRowCount(), before) << "ordinary lookup does not mutate a corrupt incarnation";
+            const bool rejected = fault == Fault::Text || fault == Fault::WrongHash || fault == Fault::Truncated;
+            EXPECT_EQ(reader->objects.readAuxiliary(entry), rejected ? std::nullopt : std::optional{body});
+            EXPECT_EQ(auxiliaryRowCount(), before) << "ordinary lookup does not mutate an incarnation";
             reader = store; // An immutable read-only connection must close before another publication.
             publishAuxiliary(config->realStoreDir.get() / fmt("sound-chunks-%d", cases), {{entry, body}});
-            if (fault == Fault::DuplicateEmpty || fault == Fault::DuplicateFull)
+            if (unconstrained)
                 reader = readOnlyReader();
             EXPECT_EQ(reader->objects.readAuxiliary(entry), body) << "a corrupt older donor cannot hide a sound donor";
+            reader = store; // Close the immutable reader before repair.
+            auto beforeRepair = auxiliaryRowCount();
+            EXPECT_EQ(verifyAuxiliaryForTest(NoRepair), rejected);
+            EXPECT_FALSE(verifyAuxiliaryForTest(Repair));
+            EXPECT_FALSE(verifyAuxiliaryForTest(NoRepair));
+            if (!rejected)
+                EXPECT_EQ(auxiliaryRowCount(), beforeRepair) << "authenticated alternate encodings survive repair";
             ++cases;
         }
-    EXPECT_EQ(cases, 20u);
+    EXPECT_EQ(cases, 28u);
 }
 
 TEST_F(LocalStoreObjectsTest, auxiliaryLookupEnumeratesTheFullSignedIngestionCursor)

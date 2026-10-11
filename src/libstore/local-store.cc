@@ -627,7 +627,7 @@ static auto blobRowKey(const GitObjectStore::Hold::Row & row) noexcept
 template<typename Values, typename Key>
 static auto publicationOrder(const Values & values, Key key)
 {
-    std::vector<const typename Values::value_type *> order;
+    boost::container::small_vector<const typename Values::value_type *, 1> order;
     order.reserve(values.size());
     for (const auto & value : values)
         order.push_back(&value);
@@ -668,17 +668,12 @@ static std::optional<AuxiliaryCandidate> readAuxiliaryChunks(SQLiteStmt & stmt, 
 {
     std::optional<AuxiliaryCandidate> result;
     while (use.next()) {
-        bool first = !result;
-        if (first)
+        if (!result)
             result.emplace(use.getInt(0), std::string());
         if (sqlite3_column_type(stmt, 1) != SQLITE_INTEGER || sqlite3_column_type(stmt, 2) != SQLITE_BLOB)
             return AuxiliaryCandidate{result->ingestion, std::nullopt};
         auto data = use.getBlobView(2);
-        auto size = data.size();
-        if (!std::cmp_equal(use.getInt(1), result->body->size() / auxiliaryChunkSize) || size > auxiliaryChunkSize
-            || result->body->size() % auxiliaryChunkSize != 0 || (!first && result->body->empty())
-            || (size == 0 && !first)
-            || size > result->body->max_size() - result->body->size())
+        if (data.size() > result->body->max_size() - result->body->size())
             return AuxiliaryCandidate{result->ingestion, std::nullopt};
         result->body->append(data);
     }

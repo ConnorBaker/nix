@@ -30,26 +30,23 @@ struct Regular
  * Child parameter because sometimes we want "shallow" directories without
  * full file children.
  */
-template<typename Child>
+template<typename Child, template<typename...> typename Map = std::map>
 struct DirectoryT
 {
     using Name = std::string;
 
-    std::map<Name, Child, std::less<>> entries;
+    Map<Name, Child, std::less<>> entries;
 
     inline bool operator==(const DirectoryT &) const noexcept;
     inline std::strong_ordering operator<=>(const DirectoryT &) const noexcept;
 };
 
-template<typename Contents>
-struct SymlinkT
+struct Symlink
 {
-    Contents target;
+    std::string target;
 
-    auto operator<=>(const SymlinkT &) const = default;
+    auto operator<=>(const Symlink &) const = default;
 };
-
-using Symlink = SymlinkT<std::string>;
 
 /**
  * For when we know there is child, but don't know anything about it.
@@ -70,7 +67,7 @@ struct Opaque
  * version is that abstract syntax for a "NAR listing".
  */
 template<typename RegularContents, bool recur, typename Metadata = std::monostate,
-         typename SymlinkContents = std::string>
+         template<typename...> typename Map = std::map>
 struct VariantT
 {
     bool operator==(const VariantT &) const noexcept;
@@ -81,9 +78,9 @@ struct VariantT
     /**
      * In the default case, we do want full file children for our directory.
      */
-    using Directory = nix::fso::DirectoryT<std::conditional_t<recur, VariantT, Opaque>>;
+    using Directory = nix::fso::DirectoryT<std::conditional_t<recur, VariantT, Opaque>, Map>;
 
-    using Symlink = nix::fso::SymlinkT<SymlinkContents>;
+    using Symlink = nix::fso::Symlink;
 
     using Raw = std::variant<Regular, Directory, Symlink>;
     Raw raw;
@@ -99,24 +96,22 @@ struct VariantT
     SourceAccessor::Stat lstat() const;
 };
 
-template<typename Child>
-inline bool DirectoryT<Child>::operator==(const DirectoryT &) const noexcept = default;
+template<typename Child, template<typename...> typename Map>
+inline bool DirectoryT<Child, Map>::operator==(const DirectoryT &) const noexcept = default;
 
-template<typename Child>
-inline std::strong_ordering DirectoryT<Child>::operator<=>(const DirectoryT &) const noexcept = default;
+template<typename Child, template<typename...> typename Map>
+inline std::strong_ordering DirectoryT<Child, Map>::operator<=>(const DirectoryT &) const noexcept = default;
 
-template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
-inline bool
-VariantT<RegularContents, recur, Metadata, SymlinkContents>::operator==(
-    const VariantT<RegularContents, recur, Metadata, SymlinkContents> &) const noexcept = default;
+template<typename RegularContents, bool recur, typename Metadata, template<typename...> typename Map>
+inline bool VariantT<RegularContents, recur, Metadata, Map>::operator==(
+    const VariantT<RegularContents, recur, Metadata, Map> &) const noexcept = default;
 
-template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
-inline std::strong_ordering
-VariantT<RegularContents, recur, Metadata, SymlinkContents>::operator<=>(
-    const VariantT<RegularContents, recur, Metadata, SymlinkContents> &) const noexcept = default;
+template<typename RegularContents, bool recur, typename Metadata, template<typename...> typename Map>
+inline std::strong_ordering VariantT<RegularContents, recur, Metadata, Map>::operator<=>(
+    const VariantT<RegularContents, recur, Metadata, Map> &) const noexcept = default;
 
-template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
-SourceAccessor::Stat VariantT<RegularContents, recur, Metadata, SymlinkContents>::lstat() const
+template<typename RegularContents, bool recur, typename Metadata, template<typename...> typename Map>
+SourceAccessor::Stat VariantT<RegularContents, recur, Metadata, Map>::lstat() const
 {
     return std::visit(
         overloaded{

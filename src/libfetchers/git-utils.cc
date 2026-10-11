@@ -49,6 +49,7 @@
 #include <git2/tag.h>
 #include <git2/tree.h>
 
+#include <boost/container/flat_map.hpp>
 #include <boost/unordered/concurrent_flat_set.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -1695,7 +1696,7 @@ static GitRepo::Options tarballCacheOptions()
 
 ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
 {
-    using File = fso::VariantT<std::string, true, merkle::TreeEntry>;
+    using File = fso::VariantT<std::string, true, merkle::TreeEntry, boost::container::flat_map>;
     struct Acquire : NodeVisitor<File>
     {
         std::exception_ptr failure;
@@ -1739,7 +1740,7 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
                     if (failure) std::rethrow_exception(failure);
                     auto file = visit(*this, false);
                     merkle::insertEntry(tree, std::string(name), file.metadata);
-                    directory.entries.emplace(std::string(name), std::move(file));
+                    directory.entries.emplace_hint(directory.entries.end(), std::string(name), std::move(file));
                 });
                 if (failure) std::rethrow_exception(failure);
                 return File{std::pair{

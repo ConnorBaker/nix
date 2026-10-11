@@ -150,12 +150,13 @@ static void createAccessibleDirs(const std::filesystem::path & path)
     }
 }
 
+std::atomic<uint32_t> GitObjectStore::Hold::Lease::counter{0};
+
 GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std::function<void()> & atHoldMade)
 {
     /* GC may remove the empty directory before its lock is acquired.
-       Retry under a fresh name until the lease exists while locked. A
-       reused PID must not adopt a previous ingestion's directory. */
-    static std::atomic<uint32_t> counter(0);
+       Retry until its name identifies the locked directory. A reused
+       PID must not adopt a previous ingestion's directory. */
     createAccessibleDirs(tmp);
     while (true) {
         dir = tmp / fmt("hold-%d-%d", getpid(), counter.fetch_add(1));
@@ -185,9 +186,16 @@ GitObjectStore::Hold::Lease::Lease(const std::filesystem::path & tmp, const std:
         }
         if (atHoldMade)
             atHoldMade();
-        if (!lockFile(fd.get(), ltWrite, true) || !pathExists(dir))
+        if (!lockFile(fd.get(), ltWrite, true))
             continue;
-        return;
+        if (auto current = maybeLstat(dir)) {
+#ifndef _WIN32
+            auto heldStat = nix::fstat(fd.get());
+            if (current->st_ino != heldStat.st_ino || current->st_dev != heldStat.st_dev)
+                continue;
+#endif
+            return;
+        }
     }
 }
 

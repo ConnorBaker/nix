@@ -156,8 +156,6 @@ struct PathInputScheme : InputScheme
             if (!storePath || storePath->name() != "source" || !store.isValidPath(*storePath)) {
                 auto source = makeFSSourceAccessor(absPath, /*trackLastModified=*/true);
                 auto acquired = GitRepo::acquire(SourcePath{source});
-                auto objectHash = merkle::objectHash(*acquired->getKnownEntry(CanonPath::root));
-                acquired->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
                 auto copied = fetchToStore2(settings, store, SourcePath{acquired}, FetchMode::Copy, "source");
                 acquired->setPathDisplay(store.printStorePath(copied.first));
                 mtime = source->getLastModified().value();

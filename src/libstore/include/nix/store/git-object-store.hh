@@ -13,9 +13,11 @@
 #include "nix/util/logging.hh"
 
 #include <boost/container/flat_map.hpp>
+#include <boost/container_hash/hash.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include <atomic>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -285,6 +287,7 @@ public:
         /* The physical lease is shared; pending values belong to each view. */
         struct Lease
         {
+            static std::atomic<uint32_t> counter;
             std::filesystem::path dir;
             AutoCloseFD fd;
 
@@ -370,14 +373,9 @@ public:
             }
         };
 
-        struct KeyHash
+        struct KeyHash : boost::hash<Key>
         {
             using is_transparent = void;
-
-            size_t operator()(Key key) const noexcept
-            {
-                return std::hash<std::string_view>{}(key.second) ^ static_cast<size_t>(key.first);
-            }
         };
 
         struct KeyEqual : std::equal_to<Key>
