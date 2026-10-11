@@ -28,6 +28,11 @@ subdir('nix-meson-build-support/subprojects')
 # found and 1 for found. One therefore uses it with `#if` not `#ifdef`.
 check_funcs = [
   [
+    'getdents64',
+    'Reads private directory descriptors without a shared DIR stream.',
+    '#include <dirent.h>',
+  ],
+  [
     'posix_fallocate',
     'Optionally used to preallocate files to be large enough before writing to them.',
   ],

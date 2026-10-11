@@ -4,12 +4,17 @@
 #include "nix/util/sync.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/signals.hh"
+#include "util-config-private.hh"
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 
 #ifndef _WIN32
 #  include <sys/resource.h>
@@ -252,7 +257,7 @@ private:
 
     AutoCloseFD openSubdirectory(const CanonPath & path);
 
-    std::pair<AutoCloseDir, DirEntries> openDirectoryWithEntries(const CanonPath & path);
+    auto openDirectoryWithEntries(const CanonPath & path);
 
 public:
     PosixDirectorySourceAccessor(
@@ -491,16 +496,18 @@ AutoCloseFD PosixDirectorySourceAccessor::openSubdirectory(const CanonPath & pat
     return dirFdOwning;
 }
 
-std::pair<AutoCloseDir, SourceAccessor::DirEntries>
-PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
+auto PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
 {
-    AutoCloseFD dirFdOwning = openSubdirectory(path);
-    std::pair<AutoCloseDir, DirEntries> result;
-    auto & [dir, entries] = result;
-    dir.reset(::fdopendir(dirFdOwning.get()));
+    auto dirFdOwning = openSubdirectory(path);
+#if defined(__linux__) && defined(__GLIBC__) && _DIRENT_MATCHES_DIRENT64 && HAVE_GETDENTS64
+    auto dir = std::move(dirFdOwning);
+#else
+    AutoCloseDir dir(::fdopendir(dirFdOwning.get()));
     if (!dir)
         throw SysError("reading directory '%s'", showPath(path));
     dirFdOwning.release();
+#endif
+    DirEntries entries;
 
     static constexpr auto types = [] {
         std::array<Type, std::max({DT_REG, DT_DIR, DT_LNK, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK}) + 1> table{};
@@ -515,22 +522,46 @@ PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
         return table;
     }();
 
-    const ::dirent * dirent = nullptr;
-
-    while (errno = 0, dirent = ::readdir(dir.get())) {
+    auto addEntry = [&](const char * entryName, unsigned char entryType) {
         checkInterrupt();
-        std::string_view name(dirent->d_name);
+        std::string_view name(entryName);
         if (name == "." || name == "..")
-            continue;
-
-        auto type = dirent->d_type < types.size() ? types[dirent->d_type] : tUnknown;
+            return;
+        auto type = entryType < types.size() ? types[entryType] : tUnknown;
         entries.emplace(name, type == tUnknown ? std::nullopt : std::optional{type});
-    }
+    };
 
+#if defined(__linux__) && defined(__GLIBC__) && _DIRENT_MATCHES_DIRENT64 && HAVE_GETDENTS64
+    constexpr size_t bufferSize = 1 << 16;
+    std::unique_ptr<char, Deleter<std::free>> buffer(static_cast<char *>(std::malloc(bufferSize)));
+    if (!buffer)
+        throw SysError("reading directory '%s'", showPath(path));
+    for (;;) {
+        auto count = ::getdents64(dir.get(), buffer.get(), bufferSize);
+        if (count <= 0) {
+            if (count < 0 && errno != ENOENT)
+                throw SysError("reading directory '%1%'", showPath(path));
+            errno = 0;
+            break;
+        }
+        for (size_t offset = 0; offset < static_cast<size_t>(count);) {
+            auto record = buffer.get() + offset;
+            unsigned short length;
+            std::memcpy(&length, record + offsetof(::dirent64, d_reclen), sizeof(length));
+            addEntry(
+                record + offsetof(::dirent64, d_name), static_cast<unsigned char>(record[offsetof(::dirent64, d_type)]));
+            offset += length;
+        }
+    }
+#else
+    const ::dirent * dirent = nullptr;
+    while (errno = 0, dirent = ::readdir(dir.get()))
+        addEntry(dirent->d_name, dirent->d_type);
     if (errno)
         throw SysError("reading directory '%1%'", showPath(path));
+#endif
 
-    return result;
+    return std::pair{std::move(dir), std::move(entries)};
 }
 
 SourceAccessor::DirEntries PosixDirectorySourceAccessor::readDirectory(const CanonPath & path)
@@ -549,9 +580,13 @@ void PosixDirectorySourceAccessor::readDirectoryWithEntries(const CanonPath & pa
     try {
         auto [dir, entries] = openDirectoryWithEntries(path);
 
-        /* fdopendir owns the descriptor for the whole callback. The scoped
-           accessor borrows it, including while directory workers run. */
-        PosixDirectorySourceAccessor accessor{::dirfd(dir.get()), fsPath / path.rel(), trackLastModified};
+        /* The listing owner retains the descriptor throughout the callback. */
+#if defined(__linux__) && defined(__GLIBC__) && _DIRENT_MATCHES_DIRENT64 && HAVE_GETDENTS64
+        auto fd = dir.get();
+#else
+        auto fd = ::dirfd(dir.get());
+#endif
+        PosixDirectorySourceAccessor accessor{fd, fsPath / path.rel(), trackLastModified};
         callback(accessor, CanonPath::root, DirectoryListing(std::move(entries)));
         PosixSourceAccessorBase::maybeUpdateMtime(accessor.mtime);
     } catch (SymlinkNotAllowed & e) {

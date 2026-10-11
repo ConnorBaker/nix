@@ -22,7 +22,7 @@ typedef fun<RestrictedPathError(const CanonPath & path)> MakeNotAllowedError;
  * control. Subclasses should override `isAllowed()` to implement an
  * access control policy. The error message is customized at construction.
  */
-struct FilteringSourceAccessor : SourceAccessor
+struct FilteringSourceAccessor : ForwardingSourceAccessor<FilteringSourceAccessor>
 {
     ref<SourceAccessor> next;
     CanonPath prefix;
@@ -38,9 +38,14 @@ struct FilteringSourceAccessor : SourceAccessor
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override;
 
-    using SourceAccessor::readFile;
+    using ForwardingSourceAccessor<FilteringSourceAccessor>::readFile;
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
+    template<typename Read>
+    decltype(auto) withSource(const CanonPath & path, Read && read)
+    {
+        auto owner = checkAllowed(path);
+        return std::invoke(std::forward<Read>(read), *next, prefix / path);
+    }
 
     bool pathExists(const CanonPath & path) override;
 
@@ -53,8 +58,6 @@ struct FilteringSourceAccessor : SourceAccessor
     /** Scope a view that only filters access and forwards the bytes.
      * Subclasses that change reads must retain their own traversal. */
     void readDirectoryScoped(const CanonPath & path, ReadDirectoryCallback callback);
-
-    std::string readLink(const CanonPath & path) override;
 
     std::string showPath(const CanonPath & path) override;
 

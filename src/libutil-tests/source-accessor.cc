@@ -568,6 +568,118 @@ TEST_F(FSSourceAccessorTest, listingAndScopeUseTheSameOpenedDirectory)
     EXPECT_GT(accessor->getLastModified(), 0);
 }
 
+TEST_F(FSSourceAccessorTest, directoryListingsRemainCompleteAcrossFreshReads)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "Linux directory batch reader";
+#else
+    auto base = tmpDir / "wide";
+    createDirs(base);
+    SourceAccessor::DirEntries expected;
+    /* Basename bytes alone exceed a complete native read buffer. */
+    auto nameLimit = ::pathconf(base.c_str(), _PC_NAME_MAX);
+    ASSERT_GE(nameLimit, 14);
+    auto nameSize = std::min<size_t>(220, nameLimit);
+    for (unsigned i = 0; i <= 65536 / nameSize; ++i) {
+        auto suffix = std::to_string(i);
+        auto name = std::string(nameSize - suffix.size(), 'x') + suffix;
+        writeFile(base / name, "");
+        expected.emplace(std::move(name), SourceAccessor::tRegular);
+    }
+    for (const auto & name : {std::string(".hidden"), std::string("byte-\xff")}) {
+        writeFile(base / name, "");
+        expected.emplace(name, SourceAccessor::tRegular);
+    }
+    createDirs(base / "directory");
+    createSymlink("directory", base / "link");
+    ASSERT_EQ(::mkfifo((base / "fifo").c_str(), 0600), 0);
+    auto socket = createUnixDomainSocket(base / "socket", 0600);
+    expected.emplace("directory", SourceAccessor::tDirectory);
+    expected.emplace("link", SourceAccessor::tSymlink);
+    expected.emplace("fifo", SourceAccessor::tFifo);
+    expected.emplace("socket", SourceAccessor::tSocket);
+    unsigned cells = 0;
+    auto check = [&](SourceAccessor & accessor, const CanonPath & path) {
+        for (bool callback : {false, true})
+            for (unsigned repeat = 0; repeat < 2; ++repeat) {
+                SCOPED_TRACE(::testing::Message() << cells << ' ' << callback << ' ' << repeat);
+                ++cells;
+                auto compare = [&](const SourceAccessor::DirEntries & entries) {
+                    EXPECT_EQ(entries, expected);
+                };
+                unsigned calls = 0;
+                auto read = [&] {
+                    if (callback)
+                        accessor.readDirectoryWithEntries(path, [&](auto &, const auto & root, auto && listing) {
+                            ++calls;
+                            EXPECT_EQ(root, CanonPath::root);
+                            compare(listing.entries());
+                        });
+                    else
+                        compare(accessor.readDirectory(path));
+                };
+                EXPECT_NO_THROW(read());
+                EXPECT_EQ(calls, callback ? 1u : 0u);
+            }
+    };
+    auto parent = makeFSSourceAccessor(tmpDir);
+    auto rooted = makeFSSourceAccessor(base);
+    check(*parent, CanonPath("wide"));
+    check(*rooted, CanonPath::root);
+    rooted->readDirectoryWithEntries(
+        CanonPath::root, [&](auto & scoped, const auto & root, auto &&) { check(scoped, root); });
+    EXPECT_EQ(cells, 12u);
+    RecordProperty("finite_cases", cells);
+#endif
+}
+
+TEST_F(FSSourceAccessorTest, deletedOpenedDirectoriesRemainEmpty)
+{
+#ifndef __linux__
+    GTEST_SKIP() << "Linux deleted directory EOF";
+#else
+    unsigned cells = 0;
+    for (bool borrowed : {false, true})
+        for (bool callback : {false, true}) {
+            auto base = tmpDir / std::to_string(cells);
+            createDirs(base);
+            auto owner = makeFSSourceAccessor(base);
+            auto check = [&](SourceAccessor & accessor) {
+                for (bool deleted : {false, true}) {
+                    SCOPED_TRACE(::testing::Message() << borrowed << ' ' << callback << ' ' << deleted);
+                    if (deleted)
+                        ASSERT_EQ(::rmdir(base.c_str()), 0);
+                    ++cells;
+                    unsigned calls = 0;
+                    auto read = [&] {
+                        if (callback)
+                            accessor.readDirectoryWithEntries(
+                                CanonPath::root, [&](auto & scoped, const auto & root, auto && listing) {
+                                    ++calls;
+                                    EXPECT_EQ(root, CanonPath::root);
+                                    EXPECT_TRUE(listing.entries().empty());
+                                    EXPECT_TRUE(scoped.pathExists(root));
+                                    EXPECT_EQ(scoped.lstat(root).type, SourceAccessor::tDirectory);
+                                });
+                        else
+                            EXPECT_TRUE(accessor.readDirectory(CanonPath::root).empty());
+                    };
+                    EXPECT_NO_THROW(read());
+                    EXPECT_EQ(calls, callback ? 1u : 0u);
+                }
+            };
+            if (borrowed)
+                owner->readDirectoryWithEntries(
+                    CanonPath::root, [&](auto & scoped, const auto &, auto &&) { check(scoped); });
+            else
+                check(*owner);
+        }
+    EXPECT_EQ(cells, 8u);
+    RecordProperty("finite_cases", cells);
+#endif
+}
+
+
 TEST_F(FSSourceAccessorTest, invalidateCacheDropsStaleDirFds)
 {
 #ifdef _WIN32

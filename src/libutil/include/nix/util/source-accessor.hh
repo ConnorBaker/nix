@@ -342,6 +342,31 @@ public:
     virtual void invalidateCache() {}
 };
 
+/** Forward ordinary reads through a derived, callback-scoped source route.
+ * Directory merging, filtering and traversal scopes remain wrapper operations. */
+template<typename Derived>
+struct ForwardingSourceAccessor : SourceAccessor
+{
+    using SourceAccessor::readFile;
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        static_cast<Derived &>(*this).withSource(path, [&](auto & source, const auto & resolved) {
+            source.readFile(resolved, sink, std::move(sizeCallback));
+        });
+    }
+
+    DirEntries readDirectory(const CanonPath & path) override
+    {
+        return static_cast<Derived &>(*this).withSource(path, &SourceAccessor::readDirectory);
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        return static_cast<Derived &>(*this).withSource(path, &SourceAccessor::readLink);
+    }
+};
+
 /**
  * Return a source accessor that contains only an empty root directory.
  */

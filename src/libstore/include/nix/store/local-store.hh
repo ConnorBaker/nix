@@ -658,17 +658,13 @@ public:
      * path of a derivation, that it has been produced by a successful
      * execution of the derivation (or something equivalent).  Also
      * register the object hash of the path's contents, which `info`
-     * must carry: an info without one is refused.
+     * must carry: an info without one is refused. An optional hold publishes
+     * its remaining ingestion projection atomically with validity.
      */
-    void registerValidPath(const ValidPathInfo & info);
-
-    /** Register a path and its remaining ingestion projection atomically. */
-    void registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold);
+    void registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold * hold = nullptr);
 
     /** Every map key must equal its description's path. */
-    virtual void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold);
-
-    virtual void registerValidPaths(const ValidPathInfos & infos);
+    virtual void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold = nullptr);
 
     unsigned int getProtocol() override;
 

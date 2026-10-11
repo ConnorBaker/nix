@@ -178,9 +178,7 @@ private:
      * First copy up any lower store realisation with the same key, so we
      * merge rather than mask it.
      */
-    void registerValidPaths(const ValidPathInfos & infos) override;
-
-    void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold) override;
+    void registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold = nullptr) override;
 
     /**
      * Check lower store if upper DB does not have.

@@ -1168,7 +1168,7 @@ TEST_F(LocalStoreObjectsTest, acquiredRegularRelationPreservesPendingAndPublishe
                             EXPECT_EQ(lookups, 1u) << "pending duplicates bypass the foreign provider";
                         info.objectHash = ObjectHash::of(result.root);
                         info.narSize = result.narSize.value();
-                        store->registerValidPath(info, hold);
+                        store->registerValidPath(info, &hold);
                         for (auto name : {"a", "b"}) {
                             EXPECT_EQ(st(real / name).st_ino, st(seed / "a").st_ino);
                             EXPECT_EQ(st(real / name).st_dev, st(seed / "a").st_dev);
@@ -2424,7 +2424,7 @@ TEST_F(LocalStoreObjectsTest, ingestionSurvivesASweepWhileItsHoldIsMade)
         info.objectHash = ObjectHash::of(result.root);
         EXPECT_EQ(result.narSize, info.narSize);
         store->endIngestion(hold, info.path);
-        store->registerValidPath(info, hold);
+        store->registerValidPath(info, &hold);
     }
     ASSERT_TRUE(made);
     ASSERT_EQ(collections, 2u);
@@ -3592,11 +3592,11 @@ TEST_F(LocalStoreObjectsTest, cyclicRegistrationRollsBackPublicationAndCache)
     };
     auto firstHold = store->objects.hold();
     auto first = enter("cycle-first", firstHold);
-    store->registerValidPath(first, firstHold);
+    store->registerValidPath(first, &firstHold);
     auto outsideHold = store->objects.hold();
     auto outside = enter("cycle-outside", outsideHold);
     outside.references.insert(first.path);
-    store->registerValidPath(outside, outsideHold);
+    store->registerValidPath(outside, &outsideHold);
     auto pending = store->objects.hold();
     auto second = enter("cycle-second", pending);
     store->endIngestion(pending, second.path);
@@ -3667,7 +3667,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
         ValidPathInfo info{path, UnkeyedValidPathInfo{*store, ObjectHash::of(result.root)}};
         info.narSize = result.narSize.value();
         if (origin == Origin::Registered)
-            store->registerValidPath(info, hold);
+            store->registerValidPath(info, &hold);
         else if (origin == Origin::Completed)
             store->endIngestion(hold, path);
         auto original = origin == Origin::Fresh ? std::optional<uint64_t>{}
@@ -3742,7 +3742,7 @@ TEST_F(LocalStoreObjectsTest, registrationRetriesOnlyCommittedIngestionIdentitie
                 SQLITE_OK);
         }
 
-        ASSERT_NO_THROW(store->registerValidPath(info, hold));
+        ASSERT_NO_THROW(store->registerValidPath(info, &hold));
         ASSERT_EQ(retry.attempts, 2u);
         ASSERT_EQ(retry.publications, 2u);
         ASSERT_EQ(retry.interleaved, SQLITE_OK);
@@ -3852,7 +3852,7 @@ TEST_F(LocalStoreObjectsTest, capturedKeysReplaceCorruptOwnCacheWithoutAdmitting
                 files[i] = store->toRealPath(infos.back().path) / "file";
             }
             ASSERT_NE(st(files[0]).st_ino, st(files[1]).st_ino);
-            store->registerValidPath(infos[0], holds[0]);
+            store->registerValidPath(infos[0], &holds[0]);
             store->endIngestion(holds[1], infos[1].path);
             ASSERT_FALSE(holds[1].ingesting);
             auto own = holds[1].completedIngestions.begin()->second.first;
@@ -3964,7 +3964,7 @@ TEST_F(LocalStoreObjectsTest, capturedKeysReplaceCorruptOwnCacheWithoutAdmitting
                 attempt.inject();
             std::string error;
             try {
-                store->registerValidPath(infos[1], holds[1]);
+                store->registerValidPath(infos[1], &holds[1]);
             } catch (Error & e) {
                 error = e.what();
             }
@@ -4035,7 +4035,7 @@ TEST_F(LocalStoreObjectsTest, capturedKeysReplaceCorruptOwnCacheWithoutAdmitting
             if (key.error) {
                 other.exec(
                     "begin; delete from Blobs where " + domain + "; insert into Blobs select * from original; commit;");
-                ASSERT_NO_THROW(store->registerValidPath(infos[1], holds[1]));
+                ASSERT_NO_THROW(store->registerValidPath(infos[1], &holds[1]));
             }
             EXPECT_TRUE(
                 st(files[1]).st_ino == st(files[0]).st_ino
@@ -4082,7 +4082,7 @@ TEST_F(LocalStoreObjectsTest, capturedAliasesSurviveCacheCorruptionAndRepeatedPu
                     ASSERT_NE(st(target / "a").st_ino, st(donor).st_ino);
                     SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = wal}};
                     if (ordinary) {
-                        store->registerValidPath(infos[0], holds[0]);
+                        store->registerValidPath(infos[0], &holds[0]);
                         /* Hide the target's cached witness while publishing a
                            genuinely different donor, then restore that cache. */
                         SQLiteStmt save{other,
@@ -4090,11 +4090,11 @@ TEST_F(LocalStoreObjectsTest, capturedAliasesSurviveCacheCorruptionAndRepeatedPu
                             "where i.path = ?;"};
                         save.use().apply(store->printStorePath(infos[0].path)).exec();
                         other.exec("delete from Blobs where ingestion in (select ingestion from before_donor);");
-                        store->registerValidPath(infos[1], holds[1]);
+                        store->registerValidPath(infos[1], &holds[1]);
                         other.exec("insert into Blobs select * from before_donor;");
                     } else {
                         store->endIngestion(holds[0], infos[0].path);
-                        store->registerValidPath(infos[1], holds[1]);
+                        store->registerValidPath(infos[1], &holds[1]);
                     }
                     ASSERT_NE(st(target / "a").st_ino, st(donor).st_ino);
                     auto completedId = [&] {
@@ -4143,7 +4143,7 @@ TEST_F(LocalStoreObjectsTest, capturedAliasesSurviveCacheCorruptionAndRepeatedPu
                             "create temp trigger alias_retry after %s on ValidPaths begin select alias_retry(); end;",
                             ordinary ? "update" : "insert"));
                     }
-                    try { store->registerValidPath(infos[0], holds[0]); }
+                    try { store->registerValidPath(infos[0], &holds[0]); }
                     catch (Error & error) { ++unexpectedErrors; ADD_FAILURE() << "unexpected Store Error: " << error.what(); }
                     EXPECT_EQ(attempt.publications, retry ? 2u : 1u);
                     EXPECT_EQ(completedId(), own);
@@ -4199,7 +4199,7 @@ TEST_F(LocalStoreObjectsTest, refusedAliasesArePrunedBeforeSQLRetry)
                 for (unsigned i = 0; i < holds.size(); ++i)
                     infos.push_back(restoreOutput(StorePath::random(bytes + fmt("-%d", i)), nar, holds[i]));
                 if (completed) store->endIngestion(holds[0], infos[0].path);
-                store->registerValidPath(infos[1], holds[1]);
+                store->registerValidPath(infos[1], &holds[1]);
                 SQLite other{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
                 auto donorId = holds[1].completedIngestions.begin()->second.first;
                 auto key = merkle::blobId(bytes).to_string(HashFormat::Base16, false);
@@ -4238,7 +4238,7 @@ TEST_F(LocalStoreObjectsTest, refusedAliasesArePrunedBeforeSQLRetry)
                         "create temp trigger refused_retry before delete on Blobs when old.id = X'%s' and old.exec = %d "
                         "and old.ingestion != %d begin select refused_retry(); end;", key, int(executable), donorId));
                 }
-                ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                ASSERT_NO_THROW(store->registerValidPath(infos[0], &holds[0]));
                 EXPECT_EQ(attempt.deletes, completed ? 2u : 1u);
                 EXPECT_GT(attempt.beforeRetry, 0u);
                 EXPECT_EQ(attempt.refusals, attempt.beforeRetry) << "SQL rollback does not restore a refused physical claim";
@@ -4280,7 +4280,7 @@ TEST_F(LocalStoreObjectsTest, publicationRetryStillRequiresParentDurability)
                     infos.push_back(restoreOutput(StorePath::random(bytes + fmt("-%d", i)), nar, holds[i]));
                 if (completed)
                     store->endIngestion(holds[0], infos[0].path);
-                store->registerValidPath(infos[1], holds[1]);
+                store->registerValidPath(infos[1], &holds[1]);
                 auto target = store->toRealPath(infos[0].path);
                 auto donor = store->toRealPath(infos[1].path) / "a";
                 auto winning = st(donor);
@@ -4305,7 +4305,7 @@ TEST_F(LocalStoreObjectsTest, publicationRetryStillRequiresParentDurability)
                 };
                 auto expectParentFailure = [&] {
                     try {
-                        store->registerValidPath(infos[0], holds[0]);
+                        store->registerValidPath(infos[0], &holds[0]);
                         ADD_FAILURE() << "publication bypassed its unreadable durability parent";
                     } catch (const SysError & error) {
                         EXPECT_TRUE(error.is(std::errc::permission_denied));
@@ -4336,7 +4336,7 @@ TEST_F(LocalStoreObjectsTest, publicationRetryStillRequiresParentDurability)
                     EXPECT_EQ(use.getInt(0), 0);
                 }
                 chmod(storeRoot, mode);
-                ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                ASSERT_NO_THROW(store->registerValidPath(infos[0], &holds[0]));
                 EXPECT_TRUE(store->isValidPath(infos[0].path));
                 for (auto name : {"a", "nested/alias"}) {
                     EXPECT_EQ(st(target / name).st_ino, winning.st_ino);
@@ -4385,7 +4385,7 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                             store->endIngestion(holds[0], infos[0].path);
                         if (end)
                             store->registerValidPath(infos[0]);
-                        store->registerValidPath(infos[1], holds[1]);
+                        store->registerValidPath(infos[1], &holds[1]);
                         auto target = store->toRealPath(infos[0].path), donor = store->toRealPath(infos[1].path);
                         auto beforeA = st(target / "a"), beforeC = st(target / "c");
                         ASSERT_NE(st(target / "b").st_ino, st(donor / "b").st_ino);
@@ -4456,7 +4456,7 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                             if (end)
                                 store->endIngestion(holds[0], infos[0].path);
                             else
-                                store->registerValidPath(infos[0], holds[0]);
+                                store->registerValidPath(infos[0], &holds[0]);
                         };
                         if (failure == 0)
                             EXPECT_THROW(publish(), Error);
@@ -4533,7 +4533,7 @@ TEST_F(LocalStoreObjectsTest, publicationRetryRetainsAbsenceAfterTheLastDonorRet
                             infos.push_back(restoreOutput(
                                 StorePath::random(bytes + fmt("-%d", i)), archive.s, holds[i]));
                         if (completed) store->endIngestion(holds[0], infos[0].path);
-                        store->registerValidPath(infos[1], holds[1]);
+                        store->registerValidPath(infos[1], &holds[1]);
                         auto target = store->toRealPath(infos[0].path);
                         auto donor = store->toRealPath(infos[1].path);
                         auto targetFile = aliases ? target / "a" : target;
@@ -4595,7 +4595,7 @@ TEST_F(LocalStoreObjectsTest, publicationRetryRetainsAbsenceAfterTheLastDonorRet
                                     return 0;
                                 }, &attempt), SQLITE_OK);
                         }
-                        ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                        ASSERT_NO_THROW(store->registerValidPath(infos[0], &holds[0]));
                         EXPECT_EQ(attempt.begins, 2u);
                         EXPECT_EQ(attempt.retirement, SQLITE_OK);
                         EXPECT_EQ(attempt.refusals, attempt.beforeRetry);
@@ -4664,12 +4664,12 @@ TEST_F(LocalStoreObjectsTest, everyCandidatePublicationOrderKeepsRegisteredHolde
                         store->endIngestion(holds[i], infos[i].path);
                         auxiliaryPersisted[i] = true;
                     } else if (success & (1 << i)) {
-                        store->registerValidPath(infos[i], holds[i]);
+                        store->registerValidPath(infos[i], &holds[i]);
                         registered[i] = true;
                         auxiliaryPersisted[i] = true;
                     } else {
                         infos[i].references.insert(StorePath::random("missing-reference"));
-                        EXPECT_THROW(store->registerValidPath(infos[i], holds[i]), InvalidPath);
+                        EXPECT_THROW(store->registerValidPath(infos[i], &holds[i]), InvalidPath);
                     }
                     EXPECT_EQ(hasTree(infos[0].objectHash->hash), auxiliaryPersisted[0] || auxiliaryPersisted[1])
                         << "auxiliary publication event " << event;
@@ -4733,7 +4733,7 @@ TEST_F(LocalStoreObjectsTest, optimiseCoalescesConcurrentCandidates)
                         files[i] = store->toRealPath(infos.back().path) / "file";
                     }
                     for (auto i : order)
-                        store->registerValidPath(infos[i], holds[i]);
+                        store->registerValidPath(infos[i], &holds[i]);
                     auto holder = store->objects.holderOrForget(id, executable, NoRepair);
                     ASSERT_TRUE(holder);
                     for (const auto & file : files)
@@ -4822,7 +4822,7 @@ TEST_F(LocalStoreObjectsTest, interruptedOptimisePreservesPathsAndRetryRestoresI
                 StorePath{fmt("%032d-interrupted-optimise-%d-%d", 2 * unsigned(executable) + i, executable, i)},
                 treeNar(nodes), holds[i]));
             roots[i] = store->toRealPath(infos.back().path);
-            store->registerValidPath(infos.back(), holds[i]);
+            store->registerValidPath(infos.back(), &holds[i]);
         }
         /* A supported legacy store may have two physical representatives.
            Make the first path noncanonical regardless of allocation order. */
@@ -4928,7 +4928,7 @@ TEST_F(LocalStoreObjectsTest, optimiseKeepsTheCanonicalInodeWhenItsFirstHolderIs
         /* The donor is registered first and visited last. Its alias is
            visited first, before the divergent legacy holder in between. */
         for (size_t i : {2u, 1u, 0u})
-            store->registerValidPath(infos[i], holds[i]);
+            store->registerValidPath(infos[i], &holds[i]);
         unlinkInPlace(files[1]);
         auto low = files[0], high = files[1];
         if (static_cast<int64_t>(st(high).st_ino) < static_cast<int64_t>(st(low).st_ino))
@@ -5077,7 +5077,7 @@ TEST_F(LocalStoreObjectsTest, everyWriterReconcilesBeforeEveryPublicationBoundar
                                 if (boundary == 2)
                                     store->endIngestion(holds[n], infos[n].path);
                                 else
-                                    store->registerValidPath(infos[n], holds[n]);
+                                    store->registerValidPath(infos[n], &holds[n]);
                             }
                         }
                         for (size_t n = 0; n < 2; ++n) {
@@ -5114,7 +5114,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                 }
                 if (earlierId)
                     store->endIngestion(holds[0], infos[0].path);
-                store->registerValidPath(infos[1], holds[1]);
+                store->registerValidPath(infos[1], &holds[1]);
                 auto target = store->toRealPath(infos[0].path);
                 auto canonical = store->toRealPath(infos[1].path) / "a";
                 ASSERT_NE(st(target / "a").st_ino, st(canonical).st_ino);
@@ -5128,7 +5128,7 @@ TEST_F(LocalStoreObjectsTest, refusedPublicationDoesNotPromoteAnExceptionalInode
                     return refuse;
                 };
                 Finally clearRefusal{[&] { store->objects.failPlaceWithNoSpace = {}; }};
-                store->registerValidPath(infos[0], holds[0]);
+                store->registerValidPath(infos[0], &holds[0]);
                 store->objects.failPlaceWithNoSpace = {};
                 ASSERT_GT(refusals, 0u);
                 EXPECT_NE(st(target / "a").st_ino, st(canonical).st_ino);
@@ -5178,7 +5178,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     store->endIngestion(abandoned, path);
                     oldIngestion = abandoned.completedIngestions.begin()->second.first;
                     if (wasValid)
-                        store->registerValidPath(old, abandoned);
+                        store->registerValidPath(old, &abandoned);
                 }
                 /* No GC sweep removes the failed named ingestion. The next
                    completed projection must retire it itself, including when
@@ -5196,7 +5196,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionReplacesThePathsEntireCandidateP
                     infos.emplace(siblingPath, sibling);
                     store->registerValidPaths(infos, &hold);
                 } else
-                    store->registerValidPath(fresh, hold);
+                    store->registerValidPath(fresh, &hold);
 
                 auto projection = [&] {
                     SQLite db{
@@ -5250,7 +5250,7 @@ TEST_F(LocalStoreObjectsTest, regularOwnerIdentityDomainKeepsLookupHintsAndPubli
                 infos.push_back(restoreOutput(StorePath::random("owner-donor"), nar, holds[1]));
                 size_t bad = 0;
                 if (shape == 0) {
-                    store->registerValidPath(infos[0], holds[1]);
+                    store->registerValidPath(infos[0], &holds[1]);
                     infos.push_back(restoreOutput(StorePath::random("owner-receiver"), nar, holds[0]));
                 } else {
                     infos.push_back(restoreOutput(
@@ -5258,7 +5258,7 @@ TEST_F(LocalStoreObjectsTest, regularOwnerIdentityDomainKeepsLookupHintsAndPubli
                     ASSERT_NE(st(store->toRealPath(infos[0].path) / "a").st_ino,
                               st(store->toRealPath(infos[1].path) / "a").st_ino);
                     if (shape == 1)
-                        store->registerValidPath(infos[0], holds[1]);
+                        store->registerValidPath(infos[0], &holds[1]);
                     else {
                         auto physical = [&](size_t n) {
                             auto stat = st(store->toRealPath(infos[n].path) / "a");
@@ -5267,7 +5267,7 @@ TEST_F(LocalStoreObjectsTest, regularOwnerIdentityDomainKeepsLookupHintsAndPubli
                         // The corrupt class precedes the usable one in the actual signed order.
                         bad = physical(0) < physical(1) ? 0 : 1;
                         auto good = 1 - bad;
-                        store->registerValidPath(infos[good], holds[good + 1]);
+                        store->registerValidPath(infos[good], &holds[good + 1]);
                         store->registerValidPath(infos[bad]);
                         infos.push_back(restoreOutput(StorePath::random("owner-receiver"), nar, holds[0]));
                     }
@@ -5323,7 +5323,7 @@ TEST_F(LocalStoreObjectsTest, regularOwnerIdentityDomainKeepsLookupHintsAndPubli
                     auto state = lockStoreState();
                     sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
                 }};
-                store->registerValidPath(receiver, holds[0]);
+                store->registerValidPath(receiver, &holds[0]);
                 EXPECT_EQ(collisionRows, 0u);
                 EXPECT_EQ(st(target).st_ino, before.st_ino);
                 EXPECT_EQ(st(target).st_mode, before.st_mode);
@@ -5548,7 +5548,7 @@ TEST_F(LocalStoreObjectsTest, malformedCoordinatesCannotHideAValidHolderOrStallR
         auto hold = store->objects.hold();
         auto info = restoreOutput(
             StorePath::random("coordinate-fallback"), treeNar({{"file", bytes, executable ? 'x' : 'f'}}), hold);
-        store->registerValidPath(info, hold);
+        store->registerValidPath(info, &hold);
         auto file = store->toRealPath(info.path) / "file";
         auto before = st(file);
         SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
@@ -5641,7 +5641,7 @@ TEST_F(LocalStoreObjectsTest, completedOutputsRetainIdentityWithoutRecoveringItF
     auto other = complete(current, sibling, "sibling");
     ASSERT_EQ(current.completedIngestions.size(), 2u);
     /* Registration through a superseded hold must not remove the replacement. */
-    store->registerValidPath(info, old);
+    store->registerValidPath(info, &old);
     store->registerValidPaths({{path, info}, {sibling, other}}, &current);
     SQLite db{store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
     SQLiteStmt named{db, "select id from Ingestions where path = ?"};
@@ -6445,9 +6445,9 @@ TEST_F(LocalStoreObjectsTest, publicationRejectsProvenCorruptionOfItsOwnHolder)
             auto expectedBytes = change == Change::Content ? corrupt : change == Change::Size ? bytes + "!" : bytes;
             auto rowsBefore = blobRowCount(*store, executable);
             if (change == Change::None)
-                EXPECT_NO_THROW(store->registerValidPath(info, hold));
+                EXPECT_NO_THROW(store->registerValidPath(info, &hold));
             else
-                EXPECT_THROW(store->registerValidPath(info, hold), Error);
+                EXPECT_THROW(store->registerValidPath(info, &hold), Error);
             EXPECT_EQ(store->isValidPath(info.path), change == Change::None);
             EXPECT_EQ(blobRowCount(*store, executable), rowsBefore + (change == Change::None ? 1 : 0));
 
@@ -7954,7 +7954,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                 {
                     auto hold = objects.hold();
                     auto info = restoreOutput(donor, treeNar({{"a", bytes, executable ? 'x' : 'f'}}), hold);
-                    store->registerValidPath(info, hold);
+                    store->registerValidPath(info, &hold);
                 }
 
                 auto recipient = StorePath::random("recipient");
@@ -8009,7 +8009,7 @@ TEST_F(LocalStoreObjectsTest, reusedBlobsRetainAWitnessWhenTheirDonorIsCollected
                 ASSERT_FALSE(objects.holderOrForget(id, executable, NoRepair));
 
                 ValidPathInfo info{recipient, UnkeyedValidPathInfo{*store, ObjectHash{tree}}};
-                store->registerValidPath(info, hold);
+                store->registerValidPath(info, &hold);
                 auto witness = objects.holderOrForget(id, executable, Repair);
                 ASSERT_TRUE(witness);
                 EXPECT_EQ(std::filesystem::path(witness->file()).parent_path(), root);
@@ -13795,7 +13795,7 @@ TEST_F(LocalStoreObjectsTest, registeredHolderAcquisitionFamiliesCannotEscapeThe
                     info.narSize = result.narSize.value();
                     bool failed = false;
                     try {
-                        store->registerValidPath(info, hold);
+                        store->registerValidPath(info, &hold);
                     } catch (Error &) {
                         failed = true;
                     }

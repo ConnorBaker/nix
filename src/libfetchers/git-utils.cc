@@ -56,7 +56,6 @@
 #include <regex>
 #include <ranges>
 #include <future>
-#include <unordered_map>
 
 namespace std {
 
@@ -1696,11 +1695,9 @@ static GitRepo::Options tarballCacheOptions()
 
 ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
 {
-    using File = fso::VariantT<std::string_view, true, merkle::TreeEntry, std::string_view>;
-    using Bodies = std::unordered_map<Hash, std::string>;
+    using File = fso::VariantT<std::string, true, merkle::TreeEntry>;
     struct Acquire : NodeVisitor<File>
     {
-        Bodies bodies;
         std::exception_ptr failure;
         File regular(const CanonPath &, function_ref<void(CreateRegularFileSink &)> read) override
         {
@@ -1723,17 +1720,14 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
             merkle::TreeEntry entry{
                 file.executable ? merkle::Mode::Executable : merkle::Mode::Regular,
                 merkle::blobId(file.contents)};
-            auto body = bodies.try_emplace(entry.hash, std::move(file.contents)).first;
             return File{std::pair{
-                File::Raw{File::Regular{file.executable, std::string_view(body->second)}}, entry}};
+                File::Raw{File::Regular{file.executable, std::move(file.contents)}}, entry}};
         }
         File symlink(const CanonPath &, const std::string & target) override
         {
             auto hash = merkle::blobId(target);
-            auto body = bodies.try_emplace(hash, target).first;
             return File{std::pair{
-                File::Raw{File::Symlink{std::string_view(body->second)}},
-                merkle::TreeEntry{merkle::Mode::Symlink, hash}}};
+                File::Raw{File::Symlink{target}}, merkle::TreeEntry{merkle::Mode::Symlink, hash}}};
         }
         File directory(const CanonPath &, Children children) override
         {
@@ -1759,11 +1753,16 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
     } acquire;
     struct Accessor final : FsoSourceAccessor<Accessor, File>
     {
-        const Bodies bodies;
         const File root;
         friend struct FsoSourceAccessor<Accessor, File>;
         void anchor() override {}
-        Accessor(File value, Bodies bodies) : bodies(std::move(bodies)), root(std::move(value))
+        void deliverRegular(const File::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
+        {
+            sizeCallback(regular.contents.size());
+            if (!regular.contents.empty())
+                sink(regular.contents);
+        }
+        Accessor(File value) : root(std::move(value))
         {
             knownRoot = root.metadata;
             fingerprint = gitObjectFingerprint(root.metadata.mode, root.metadata.hash);
@@ -1787,7 +1786,7 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
     if (acquire.failure)
         std::rethrow_exception(acquire.failure);
     auto display = source.to_string();
-    auto accessor = make_ref<Accessor>(std::move(value), std::move(acquire.bodies));
+    auto accessor = make_ref<Accessor>(std::move(value));
     accessor->setPathDisplay(std::move(display));
     return ref<SourceAccessor>{std::move(accessor).get_ptr()};
 }

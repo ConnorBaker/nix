@@ -9,7 +9,7 @@ namespace nix {
 
 namespace {
 
-class CachingSourceAccessor : public SourceAccessor
+class CachingSourceAccessor : public ForwardingSourceAccessor<CachingSourceAccessor>
 {
     ref<SourceAccessor> next;
 
@@ -67,9 +67,10 @@ public:
         displayPrefix.clear();
     }
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    template<typename Read>
+    decltype(auto) withSource(const CanonPath & path, Read && read)
     {
-        next.get_ptr()->readFile(path, sink, std::move(sizeCallback));
+        return std::invoke(std::forward<Read>(read), *next.get_ptr(), path);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
@@ -80,11 +81,6 @@ public:
     Stat lstat(const CanonPath & path) override
     {
         return cached(&Caches::lstat, path, [&] { return next->lstat(path); });
-    }
-
-    DirEntries readDirectory(const CanonPath & path) override
-    {
-        return next.get_ptr()->readDirectory(path);
     }
 
     std::string readLink(const CanonPath & path) override

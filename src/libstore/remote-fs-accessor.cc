@@ -11,14 +11,6 @@ RemoteFSAccessor::RemoteFSAccessor(ref<Store> store, bool requireValidPath, std:
 {
 }
 
-std::pair<ref<SourceAccessor>, CanonPath> RemoteFSAccessor::fetch(const CanonPath & path)
-{
-    auto [storePath, restPath] = store->toStorePath(store->storeDir + path.abs());
-    if (requireValidPath && !store->isValidPath(storePath))
-        throw InvalidPath("path '%1%' is not a valid store path", store->printStorePath(storePath));
-    return {ref{accessObject(storePath)}, restPath};
-}
-
 std::shared_ptr<SourceAccessor> RemoteFSAccessor::accessObject(const StorePath & storePath)
 {
     // Check if we already have the cache key for this store path
@@ -49,26 +41,7 @@ std::optional<SourceAccessor::Stat> RemoteFSAccessor::maybeLstat(const CanonPath
         return Stat{.type = tDirectory};
     /* FIXME: Correctly handle invalid names (return nullopt) and don't fail on
        non-existent paths. */
-    auto res = fetch(path);
-    return res.first->maybeLstat(res.second);
-}
-
-SourceAccessor::DirEntries RemoteFSAccessor::readDirectory(const CanonPath & path)
-{
-    auto res = fetch(path);
-    return res.first->readDirectory(res.second);
-}
-
-void RemoteFSAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
-{
-    auto res = fetch(path);
-    res.first->readFile(res.second, sink, std::move(sizeCallback));
-}
-
-std::string RemoteFSAccessor::readLink(const CanonPath & path)
-{
-    auto res = fetch(path);
-    return res.first->readLink(res.second);
+    return withSource(path, &SourceAccessor::maybeLstat);
 }
 
 } // namespace nix

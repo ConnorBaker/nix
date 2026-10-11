@@ -215,11 +215,6 @@ std::optional<StorePath> LocalOverlayStore::queryPathFromHashPart(const std::str
         return lowerStore->queryPathFromHashPart(hashPart);
 }
 
-void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos)
-{
-    registerValidPaths(infos, nullptr);
-}
-
 void LocalOverlayStore::registerValidPaths(const ValidPathInfos & infos, const GitObjectStore::Hold * hold)
 {
     validatePathInfoKeys(infos);

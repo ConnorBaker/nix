@@ -14,7 +14,7 @@ namespace {
  * collisions; a non-directory hides the later children's subtrees at and
  * below it.
  */
-struct UnionSourceAccessor : SourceAccessor
+struct UnionSourceAccessor : ForwardingSourceAccessor<UnionSourceAccessor>
 {
 private:
     void anchor() override {};
@@ -109,9 +109,10 @@ public:
         return res;
     }
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    template<typename Read>
+    decltype(auto) withSource(const CanonPath & path, Read && read)
     {
-        requireOwner(path)->readFile(path, sink, std::move(sizeCallback));
+        return std::invoke(std::forward<Read>(read), *requireOwner(path), path);
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
@@ -136,11 +137,6 @@ public:
             /* Transfer owned entries; earlier children win name collisions. */
             result.merge(accessor->readDirectory(path));
         return result;
-    }
-
-    std::string readLink(const CanonPath & path) override
-    {
-        return requireOwner(path)->readLink(path);
     }
 
     std::string showPath(const CanonPath & path) override

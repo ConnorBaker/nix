@@ -1725,19 +1725,9 @@ std::optional<StorePath> LocalStore::queryPathFromHashPart(const std::string & h
     });
 }
 
-void LocalStore::registerValidPath(const ValidPathInfo & info)
+void LocalStore::registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold * hold)
 {
-    registerValidPaths({{info.path, info}});
-}
-
-void LocalStore::registerValidPaths(const ValidPathInfos & infos)
-{
-    registerValidPaths(infos, nullptr);
-}
-
-void LocalStore::registerValidPath(const ValidPathInfo & info, const GitObjectStore::Hold & hold)
-{
-    registerValidPaths({{info.path, info}}, &hold);
+    registerValidPaths({{info.path, info}}, hold);
 }
 
 void LocalStore::validatePathInfoKeys(const ValidPathInfos & infos)
@@ -2126,7 +2116,7 @@ void LocalStore::addToStore(
 
         toRegister.objectHash = std::move(objectHash);
         toRegister.assertedNarHash = std::nullopt;
-        registerValidPath(toRegister, hold);
+        registerValidPath(toRegister, &hold);
     });
 }
 
@@ -2165,7 +2155,7 @@ StorePath LocalStore::addToStorePrepared(
         auto [result, hold] = populate(realPath);
         auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
         info.narSize = result.narSize.value();
-        registerValidPath(info, hold);
+        registerValidPath(info, &hold);
     });
     return dstPath;
 }

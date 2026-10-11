@@ -8,7 +8,7 @@
 
 namespace nix {
 
-class RemoteFSAccessor : public SourceAccessor
+class RemoteFSAccessor : public ForwardingSourceAccessor<RemoteFSAccessor>
 {
     void anchor() override;
 
@@ -26,8 +26,6 @@ class RemoteFSAccessor : public SourceAccessor
 
     bool requireValidPath;
 
-    std::pair<ref<SourceAccessor>, CanonPath> fetch(const CanonPath & path);
-
     friend struct BinaryCacheStore;
 
 public:
@@ -43,13 +41,16 @@ public:
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override;
 
-    DirEntries readDirectory(const CanonPath & path) override;
+    using ForwardingSourceAccessor<RemoteFSAccessor>::readFile;
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
-
-    using SourceAccessor::readFile;
-
-    std::string readLink(const CanonPath & path) override;
+    template<typename Read>
+    decltype(auto) withSource(const CanonPath & path, Read && read)
+    {
+        auto [storePath, restPath] = store->toStorePath(store->storeDir + path.abs());
+        if (requireValidPath && !store->isValidPath(storePath))
+            throw InvalidPath("path '%1%' is not a valid store path", store->printStorePath(storePath));
+        return std::invoke(std::forward<Read>(read), *ref{accessObject(storePath)}, restPath);
+    }
 };
 
 } // namespace nix

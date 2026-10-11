@@ -20,12 +20,6 @@ std::optional<std::filesystem::path> FilteringSourceAccessor::getPhysicalPath(co
     return std::nullopt;
 }
 
-void FilteringSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
-{
-    auto owner = checkAllowed(path);
-    return next->readFile(prefix / path, sink, std::move(sizeCallback));
-}
-
 bool FilteringSourceAccessor::pathExists(const CanonPath & path)
 {
     auto owner = weak_from_this().lock();
@@ -44,8 +38,7 @@ std::optional<SourceAccessor::Stat> FilteringSourceAccessor::maybeLstat(const Ca
 
 SourceAccessor::Stat FilteringSourceAccessor::lstat(const CanonPath & path)
 {
-    auto owner = checkAllowed(path);
-    return next->lstat(prefix / path);
+    return withSource(path, &SourceAccessor::lstat);
 }
 
 SourceAccessor::DirEntries FilteringSourceAccessor::readDirectory(const CanonPath & path)
@@ -123,12 +116,6 @@ void FilteringSourceAccessor::readDirectoryScoped(const CanonPath & path, ReadDi
         Scoped scoped{inner, relative, *this, path, parent, std::move(listing)};
         callback(scoped, CanonPath::root, DirectoryListing(std::cref(scoped.admitted)));
     });
-}
-
-std::string FilteringSourceAccessor::readLink(const CanonPath & path)
-{
-    auto owner = checkAllowed(path);
-    return next->readLink(prefix / path);
 }
 
 std::string FilteringSourceAccessor::showPath(const CanonPath & path)
