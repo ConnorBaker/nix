@@ -113,15 +113,41 @@ public:
         maybeUpdateMtime(st_.st_mtime);
     }
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        auto keepAlive = weak_from_this().lock();
+        if (!path.isRoot()) /* We are the parent and also a regular file. */
+            throw NotADirectory("reading file '%1%': %2%", showPath(path), "Not a directory");
 
-    bool pathExists(const CanonPath & path) override;
+        sizeCallback(*st.fileSize);
+        /* Write the captured size to the sink. copyFdRange throws EndOfFile if
+           the file has become shorter. */
+        copyFdRange(fd.get(), /*offset=*/0, *st.fileSize, sink, /*tryCoW=*/true);
+    }
 
-    std::optional<Stat> maybeLstat(const CanonPath & path) override;
+    bool pathExists(const CanonPath & path) override
+    {
+        return path.isRoot();
+    }
 
-    DirEntries readDirectory(const CanonPath & path) override;
+    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    {
+        if (!path.isRoot())
+            return std::nullopt;
+        return st;
+    }
 
-    std::string readLink(const CanonPath & path) override;
+    DirEntries readDirectory(const CanonPath & path) override
+    {
+        throw NotADirectory("reading directory '%1%': %2%", showPath(path), "Not a directory");
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        if (!path.isRoot())
+            throw NotADirectory("reading symlink '%1%': %2%", showPath(path), "Not a directory");
+        throw NotASymlink("path '%1%' is not a symlink", showPath(path));
+    }
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
@@ -137,42 +163,6 @@ public:
         return displayPrefix + path.abs();
     }
 };
-
-void PosixFileSourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
-{
-    auto keepAlive = weak_from_this().lock();
-    if (!path.isRoot()) /* We are the parent and also a regular file. */
-        throw NotADirectory("reading file '%1%': %2%", showPath(path), "Not a directory");
-
-    sizeCallback(*st.fileSize);
-    /* Write the captured size to the sink. copyFdRange throws EndOfFile if
-       the file has become shorter. */
-    copyFdRange(fd.get(), /*offset=*/0, *st.fileSize, sink, /*tryCoW=*/true);
-}
-
-bool PosixFileSourceAccessor::pathExists(const CanonPath & path)
-{
-    return path.isRoot();
-}
-
-std::optional<SourceAccessor::Stat> PosixFileSourceAccessor::maybeLstat(const CanonPath & path)
-{
-    if (!path.isRoot())
-        return std::nullopt;
-    return st;
-}
-
-SourceAccessor::DirEntries PosixFileSourceAccessor::readDirectory(const CanonPath & path)
-{
-    throw NotADirectory("reading directory '%1%': %2%", showPath(path), "Not a directory");
-}
-
-std::string PosixFileSourceAccessor::readLink(const CanonPath & path)
-{
-    if (!path.isRoot())
-        throw NotADirectory("reading symlink '%1%': %2%", showPath(path), "Not a directory");
-    throw NotASymlink("path '%1%' is not a symlink", showPath(path));
-}
 
 [[gnu::cold, gnu::noinline]]
 static unsigned getGlobalDirFdCacheLimit()
