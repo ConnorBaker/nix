@@ -252,6 +252,69 @@ TEST(Callback, deliversOwnedValuesAndOriginalExceptions)
     RecordProperty("finite_cases", cells);
 }
 
+TEST(Callback, borrowingAvoidsAnExtraPayloadMove)
+{
+    struct Value
+    {
+        unsigned & moves;
+        int payload = 42;
+        explicit Value(unsigned & moves)
+            : moves(moves)
+        {
+        }
+        Value(const Value &) = delete;
+        Value(Value && other) noexcept
+            : moves(other.moves)
+            , payload(other.payload)
+        {
+            ++moves;
+        }
+    };
+    using Result = Callback<Value>::Result;
+    unsigned cells = 0;
+    for (bool moved : {false, true})
+        for (bool error : {false, true}) {
+            unsigned entered[2]{};
+            for (bool ownsParameter : {false, true}) {
+                SCOPED_TRACE(fmt("moved=%d error=%d owned=%d", moved, error, ownsParameter));
+                unsigned moves = 0, calls = 0;
+                auto exception = std::make_exception_ptr(std::runtime_error("borrowed error"));
+                auto observe = [&](Result && result) {
+                    entered[ownsParameter] = moves;
+                    ++calls;
+                    if (error) {
+                        try {
+                            std::move(result).value();
+                            ADD_FAILURE() << "callback lost its exception";
+                        } catch (...) {
+                            EXPECT_EQ(std::current_exception(), exception);
+                        }
+                    } else
+                        EXPECT_EQ(std::move(result).value().payload, 42);
+                };
+                Callback<Value> callback{ownsParameter
+                    ? fun<void(Result &&)>{[&](Result result) { observe(std::move(result)); }}
+                    : fun<void(Result &&)>{observe}};
+                auto deliver = [&](Callback<Value> & target) {
+                    if (error)
+                        target.rethrow(exception);
+                    else
+                        target(Value{moves});
+                };
+                if (moved) {
+                    auto destination = std::move(callback);
+                    deliver(destination);
+                } else
+                    deliver(callback);
+                EXPECT_EQ(calls, 1u);
+                ++cells;
+            }
+            EXPECT_EQ(entered[1], entered[0] + (error ? 0u : 1u));
+        }
+    EXPECT_EQ(cells, 8u);
+    RecordProperty("finite_cases", cells);
+}
+
 TEST(CallbackToAwaitable, completionAndCancellationPreserveFirstOutcome)
 {
     using Result = Callback<int>::Result;

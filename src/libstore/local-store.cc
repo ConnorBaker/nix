@@ -2034,13 +2034,12 @@ void LocalStore::addToStore(
             repair,
             rootContents);
 
-        /* The info to register: `info` with the object hash and NAR
-           size the sink computed, and without the sender's NAR-hash
-           assertion, which is checked against the tee below. */
+        /* Preserve the sender's identity through signature checking.
+           Install the verified object hash and clear its NAR assertion
+           only when the description is ready for registration. */
         ValidPathInfo toRegister{info};
-        toRegister.objectHash = ObjectHash::of(restored.root);
+        auto objectHash = ObjectHash::of(restored.root);
         toRegister.narSize = restored.narSize.value();
-        toRegister.assertedNarHash = std::nullopt;
 
         /* The content address first, then the sender's object hash,
            NAR hash and size (01 section 9.10, "The content address
@@ -2072,7 +2071,7 @@ void LocalStore::addToStore(
                             specified.render(),
                             printHashAlgo(specified.hash.algo));
                     }
-                    return toRegister.objectHash->hash;
+                    return objectHash.hash;
                 }
                 unreachable();
             }();
@@ -2085,12 +2084,12 @@ void LocalStore::addToStore(
             }
         }
 
-        if (info.objectHash && *info.objectHash != *toRegister.objectHash)
+        if (info.objectHash && *info.objectHash != objectHash)
             throw Error(
                 "object hash mismatch importing path '%s';\n  specified: %s\n  got:       %s",
                 printStorePath(info.path),
                 info.objectHash->render(),
-                toRegister.objectHash->render());
+                objectHash.render());
 
         std::optional<Hash> streamNarHash;
         if (narHashSink)
@@ -2116,10 +2115,8 @@ void LocalStore::addToStore(
            stream's NAR hash and size in place of the assertion it
            lacked, under the same rule as before the stream. */
         if (checkSigsAfterRestore) {
-            ValidPathInfo described{info};
-            described.assertedNarHash = streamNarHash;
-            described.narSize = restored.narSize.value();
-            if (pathInfoIsUntrusted(described)) {
+            toRegister.assertedNarHash = streamNarHash;
+            if (pathInfoIsUntrusted(toRegister)) {
                 deletePath(realPath);
                 throw Error(
                     "cannot add path '%s' because it lacks a signature by a trusted key",
@@ -2127,6 +2124,8 @@ void LocalStore::addToStore(
             }
         }
 
+        toRegister.objectHash = std::move(objectHash);
+        toRegister.assertedNarHash = std::nullopt;
         registerValidPath(toRegister, hold);
     });
 }

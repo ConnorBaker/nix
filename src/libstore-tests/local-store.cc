@@ -13462,6 +13462,87 @@ TEST_F(TempLocalStoreTest, overlayAccessorListsLowerVisibleObjectsWithoutClaimin
     EXPECT_EQ(view->readFile(CanonPath(lowerPath.to_string())), contents);
 }
 
+TEST_F(LocalStoreObjectsTest, liveFilesystemViewsDeclineRegistrationIdentityAcrossRepair)
+{
+    unsigned cells = 0, repairWindows = 0;
+    for (bool perObject : {false, true})
+        for (auto mode :
+             {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory})
+            for (bool requireValid : {false, true}) {
+                SCOPED_TRACE(fmt("per-object=%d mode=%d require-valid=%d", perObject, int(mode), requireValid));
+                auto tree = make_ref<MemorySourceAccessor>();
+                MemorySink sink{*tree};
+                if (mode == merkle::Mode::Symlink)
+                    sink.createSymlink(CanonPath::root, "target");
+                else {
+                    if (mode == merkle::Mode::Directory)
+                        sink.createDirectory(CanonPath::root);
+                    sink.createRegularFile(
+                        mode == merkle::Mode::Directory ? CanonPath("child") : CanonPath::root,
+                        [&](CreateRegularFileSink & file) {
+                            if (mode == merkle::Mode::Executable)
+                                file.isExecutable();
+                            file("retained bytes");
+                        });
+                }
+                StringSink original;
+                tree->dumpPath(CanonPath::root, original);
+                auto path = store->Store::addToStore(
+                    fmt("live-view-%u", cells++), SourcePath{tree}, ContentAddressMethod::Raw::Git);
+                auto info = store->queryPathInfo(path);
+                auto view = perObject ? store->getFSAccessor(path, requireValid)
+                                      : store->getFSAccessor(requireValid).get_ptr();
+                ASSERT_TRUE(view);
+                auto coordinate = perObject ? CanonPath::root : CanonPath(path.to_string());
+                EXPECT_FALSE(view->isFixed());
+                EXPECT_FALSE(view->getFingerprint(coordinate));
+                EXPECT_FALSE(view->getKnownEntry(coordinate));
+                StringSink before;
+                view->dumpPath(coordinate, before);
+                EXPECT_EQ(before.s, original.s);
+                if (mode != merkle::Mode::Directory)
+                    continue;
+                unsigned callbacks = 0;
+                view->readDirectoryWithEntries(
+                    coordinate,
+                    [&](SourceAccessor & scoped,
+                        const CanonPath & relative,
+                        SourceAccessor::DirectoryListing && listing) {
+                        ++callbacks;
+                        EXPECT_TRUE(listing.entries().contains("child"));
+                        bool observed = false;
+                        StringSource bytes{original.s};
+                        LambdaSource replacement{[&](char * data, size_t length) -> size_t {
+                            if (!observed) {
+                                observed = true;
+                                EXPECT_FALSE(pathExists(store->toRealPath(path)));
+                                EXPECT_TRUE(store->isValidPath(path));
+                                EXPECT_TRUE(scoped.readDirectory(relative).empty());
+                                EXPECT_FALSE(view->getFingerprint(coordinate));
+                            }
+                            return bytes.read(data, length);
+                        }};
+                        store->addToStore(*info, replacement, Repair, NoCheckSigs);
+                        EXPECT_TRUE(observed);
+                        EXPECT_TRUE(scoped.readDirectory(relative).empty());
+                        StringSink retained;
+                        scoped.dumpPath(relative, retained);
+                        EXPECT_NE(retained.s, original.s);
+                        EXPECT_TRUE(listing.entries().contains("child"));
+                    });
+                EXPECT_EQ(callbacks, 1u);
+                StringSink repaired;
+                store->requireStoreObjectAccessor(path)->dumpPath(CanonPath::root, repaired);
+                EXPECT_EQ(repaired.s, original.s);
+                EXPECT_EQ(store->queryPathInfo(path)->objectHash, info->objectHash);
+                ++repairWindows;
+            }
+    EXPECT_EQ(cells, 16u);
+    EXPECT_EQ(repairWindows, 4u);
+    RecordProperty("finite_cases", cells);
+    RecordProperty("repair_windows", repairWindows);
+}
+
 /* Public callback behavior when the caller releases the store-wide wrapper.
    Its physical child is private, so this is behavior coverage, not a weak
    ownership observation or a deterministic negative control for the child.

@@ -164,13 +164,7 @@ struct PathInputScheme : InputScheme
                 return acquired;
             }
 
-            auto accessor = store.requireStoreObjectAccessor(*storePath);
-            auto info = store.queryPathInfo(*storePath);
-            auto objectHash = info->objectHash ? info->objectHash->hash
-                                               : merkle::objectHash(objectHashOf(*accessor, CanonPath::root).root);
-            accessor->fingerprint = fmt("path:%s", objectHash.to_string(HashFormat::SRI, true));
-            recordRootEntry(settings, SourcePath(accessor), objectHash);
-            return accessor;
+            return store.requireStoreObjectAccessor(*storePath);
         }();
 
         /* Trust the lastModified value supplied by the user, if

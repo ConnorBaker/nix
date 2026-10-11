@@ -12,7 +12,10 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/associated_cancellation_slot.hpp>
 
+#include <atomic>
 #include <concepts>
+#include <tuple>
+#include <utility>
 
 namespace nix {
 
@@ -24,45 +27,41 @@ auto callbackToAwaitable(F && initiate, CompletionToken && token)
     return asio::async_initiate<CompletionToken, void(typename Callback<T>::Result)>(
         [initiate = std::forward<F>(initiate)](auto handler) mutable {
             auto executor = asio::get_associated_executor(handler);
-            auto done = std::make_shared<std::atomic<bool>>(false);
-            auto h = std::make_shared<decltype(handler)>(std::move(handler));
+            auto h = std::make_shared<std::pair<decltype(handler), std::atomic<bool>>>(
+                std::piecewise_construct, std::forward_as_tuple(std::move(handler)), std::tuple{false});
 
-            if (auto slot = asio::get_associated_cancellation_slot(*h); slot.is_connected()) {
+            if (auto slot = asio::get_associated_cancellation_slot(h->first); slot.is_connected()) {
                 std::weak_ptr wh = h; /* To handle the cyclic ownership. */
-                std::weak_ptr wdone = done;
-                slot.assign([executor, wh, wdone](asio::cancellation_type /*don't care*/) {
+                slot.assign([executor, wh](asio::cancellation_type /*don't care*/) {
                     auto h = wh.lock();
-                    auto done = wdone.lock();
-                    if (!h || !done || done->exchange(true))
+                    if (!h || h->second.exchange(true))
                         return; /* Gracefully die. */
                     typename Callback<T>::Result result(
                         std::in_place_type<std::exception_ptr>,
                         std::make_exception_ptr(Interrupted("interrupted by user")));
                     asio::post(executor, [h, result = std::move(result)]() mutable {
-                        std::move (*h)(std::move(result));
+                        std::move(h->first)(std::move(result));
                     });
                 });
             }
 
             initiate(
                 Callback<T>([executor,
-                             done,
                              h,
                              /* Ugly, but we need a work guard for the actual executor to ensure that the io_context
                                 stays alive until the callback has finished on possibly another thread. */
                              guard = asio::make_work_guard(
                                  static_cast<asio::io_context &>(asio::query(executor, asio::execution::context)))](
-                                typename Callback<T>::Result fut) mutable {
+                                typename Callback<T>::Result && fut) mutable {
                     auto releaseOwnership = [&]() {
                         /* Release our ownership. If the callback is owned by another thread, we don't want to be
                            responsible for tearing down the last reference to any of the captured objects. */
                         executor = {};
                         h.reset();
-                        done.reset();
                         guard.reset();
                     };
 
-                    if (done->exchange(true)) {
+                    if (h->second.exchange(true)) {
                         releaseOwnership();
                         /* Early return for cooperative cancellation. The callback has been called
                            later than we've been cancelled. In practice we'll get an error, the handler
@@ -70,7 +69,7 @@ auto callbackToAwaitable(F && initiate, CompletionToken && token)
                         return;
                     }
 
-                    asio::post(executor, [h, fut = std::move(fut)]() mutable { std::move (*h)(std::move(fut)); });
+                    asio::post(executor, [h, fut = std::move(fut)]() mutable { std::move(h->first)(std::move(fut)); });
                     releaseOwnership();
                 }));
         },

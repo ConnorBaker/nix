@@ -159,29 +159,6 @@ public:
         return accessor->getPhysicalPath(path);
     }
 
-    std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
-    {
-        auto object = maybeGetStoreObjectPath(path);
-        if (!requireValidPath || !object)
-            return std::nullopt;
-        auto info = store->queryPathInfo(*object);
-        if (!info->objectHash)
-            return std::nullopt;
-        return std::pair{path.removePrefix(CanonPath(object->to_string())), info->objectHash->render()};
-    }
-
-    std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
-    {
-        auto object = maybeGetStoreObjectPath(path);
-        if (!requireValidPath || !object || path != CanonPath(object->to_string()))
-            return std::nullopt;
-        auto info = store->queryPathInfo(*object);
-        if (!info->objectHash)
-            return std::nullopt;
-        return accessor->lstat(path).directObjectMode().transform(
-            [&](merkle::Mode mode) { return merkle::TreeEntry{.mode = mode, .hash = info->objectHash->hash}; });
-    }
-
     std::optional<time_t> getLastModified() override
     {
         return accessor->getLastModified();
@@ -210,16 +187,7 @@ std::shared_ptr<SourceAccessor> LocalFSStore::getFSAccessor(const StorePath & pa
         if (!pathExists(absPath))
             return nullptr;
     }
-    auto accessor = makeFSSourceAccessor(std::move(absPath));
-    if (requireValidPath) {
-        auto info = queryPathInfo(path);
-        if (info->objectHash) {
-            accessor->fingerprint = info->objectHash->render();
-            if (auto mode = accessor->lstat(CanonPath::root).directObjectMode())
-                accessor->knownRoot.emplace(*mode, info->objectHash->hash);
-        }
-    }
-    return accessor;
+    return makeFSSourceAccessor(std::move(absPath));
 }
 
 const std::filesystem::path LocalFSStore::drvsLogDir = "drvs";

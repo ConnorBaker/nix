@@ -104,7 +104,7 @@ void BinaryCacheStore::getFile(const std::string & path, Callback<std::optional<
 void BinaryCacheStore::getFile(const std::string & path, Sink & sink)
 {
     std::promise<Callback<std::optional<std::string>>::Result> promise;
-    getFile(path, {[&](Callback<std::optional<std::string>>::Result result) {
+    getFile(path, {[&](Callback<std::optional<std::string>>::Result && result) {
                 promise.set_value(std::move(result));
             }});
     sink(*promise.get_future().get().value());
@@ -570,7 +570,7 @@ void BinaryCacheStore::queryPathInfoUncached(
 
         auto narInfoFile = narInfoFileFor(storePath);
 
-        getFile(narInfoFile, {[=, this](Callback<std::optional<std::string>>::Result fut) {
+        getFile(narInfoFile, {[=, this](Callback<std::optional<std::string>>::Result && fut) {
                     try {
                         auto data = std::move(fut).value();
 
@@ -648,7 +648,7 @@ void BinaryCacheStore::queryRealisationUncached(
 
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
-    Callback<std::optional<std::string>> newCallback = {[=](Callback<std::optional<std::string>>::Result fut) {
+    Callback<std::optional<std::string>> newCallback = {[=](Callback<std::optional<std::string>>::Result && fut) {
         try {
             auto data = std::move(fut).value();
             if (!data)

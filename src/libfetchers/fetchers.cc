@@ -368,23 +368,6 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
                 auto accessor = store.requireStoreObjectAccessor(storePath);
 
-                if (auto fingerprint = getFingerprint(store))
-                    accessor->fingerprint = std::move(fingerprint);
-
-                // Store a cache entry for the substituted tree so later fetches
-                // can reuse the existing object instead of copying the unpacked
-                // input back into the store on every evaluation.  The object's
-                // own hash seeds the tree's name; record the hash correspondence
-                // only when the info carries an asserted NAR hash, which it may not.
-                if (accessor->fingerprint) {
-                    auto info = store.queryPathInfo(storePath);
-                    if (info->objectHash) {
-                        recordRootEntry(settings, SourcePath(accessor), info->objectHash->hash);
-                        if (info->assertedNarHash)
-                            recordTreeAddress(settings, *info->assertedNarHash, info->objectHash->hash);
-                    }
-                }
-
                 accessor->setPathDisplay("«" + to_string() + "»");
 
                 return {accessor, *this};
@@ -411,9 +394,7 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorUnchecked(const Settings
 
     auto [accessor, result] = scheme->getAccessor(settings, store, *this);
 
-    if (!accessor->fingerprint)
-        accessor->fingerprint = result.getFingerprint(store);
-    else
+    if (accessor->fingerprint)
         result.cachedFingerprint = accessor->fingerprint;
 
     return {std::move(accessor), std::move(result)};

@@ -40,7 +40,7 @@ makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod 
         attrs.insert_or_assign("version", uint64_t(2));
     if (method.getFileSerialisationMethod() == FileSerialisationMethod::NixArchive)
         attrs.insert_or_assign("caseHack", uint64_t(isCaseHackEnabled()));
-    return fetchers::Cache::Key{"sourcePathToHash", std::move(attrs)};
+    return fetchers::Cache::Key{"sourcePathToHash-v2", std::move(attrs)};
 }
 
 /* A git row: the node's entry, mode and hash. */
@@ -60,7 +60,7 @@ static merkle::TreeEntry rowEntry(const fetchers::Attrs & row)
 
 static fetchers::Cache::Key makeTreeAddressCacheKey(const Hash & narHash)
 {
-    return fetchers::Cache::Key{"treeAddress", {{"narHash", narHash.to_string(HashFormat::SRI, true)}}};
+    return fetchers::Cache::Key{"treeAddress-v2", {{"narHash", narHash.to_string(HashFormat::SRI, true)}}};
 }
 
 std::shared_ptr<fetchers::Cache> cacheIfAvailable(const fetchers::Settings & settings)
@@ -104,17 +104,6 @@ static void recordRootEntry(
 {
     if (auto mode = root.lstat().directObjectMode())
         cache.upsert(key, entryRow({.mode = *mode, .hash = objectHash}));
-}
-
-void recordRootEntry(const fetchers::Settings & settings, const SourcePath & root, const Hash & objectHash)
-{
-    auto identity = root.accessor->getFingerprint(root.path);
-    if (auto cache = identity ? cacheIfAvailable(settings) : nullptr)
-        recordRootEntry(
-            *cache,
-            makeSourcePathToHashCacheKey(identity->second, ContentAddressMethod::Raw::Git, identity->first),
-            root,
-            objectHash);
 }
 
 Hash narHashOf(const fetchers::Settings & settings, Store & store, const SourcePath & tree, const Hash & treeHash)

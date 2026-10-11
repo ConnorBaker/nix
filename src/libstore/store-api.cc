@@ -672,7 +672,7 @@ ref<const ValidPathInfo> Store::queryPathInfoAfterCacheMiss(const StorePath & st
 {
     std::promise<Callback<ref<const ValidPathInfo>>::Result> promise;
 
-    queryPathInfoAfterCacheMiss(storePath, {[&](Callback<ref<const ValidPathInfo>>::Result result) {
+    queryPathInfoAfterCacheMiss(storePath, {[&](Callback<ref<const ValidPathInfo>>::Result && result) {
                                     promise.set_value(std::move(result));
                                 }});
 
@@ -728,7 +728,7 @@ void Store::queryPathInfoAfterCacheMiss(
     auto callbackPtr = std::make_shared<Callback<ref<const ValidPathInfo>>>(std::move(callback));
 
     queryPathInfoUncached(
-        storePath, {[this, storePath, callbackPtr](Callback<std::shared_ptr<const ValidPathInfo>>::Result fut) {
+        storePath, {[this, storePath, callbackPtr](Callback<std::shared_ptr<const ValidPathInfo>>::Result && fut) {
             try {
                 auto info = std::move(fut).value();
                 bool valid = info && goodStorePath(storePath, info->path);
@@ -790,7 +790,7 @@ void Store::queryRealisation(
 
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
-    queryRealisationUncached(id, {[this, id, callbackPtr](Callback<std::shared_ptr<const UnkeyedRealisation>>::Result fut) {
+    queryRealisationUncached(id, {[this, id, callbackPtr](Callback<std::shared_ptr<const UnkeyedRealisation>>::Result && fut) {
                                  try {
                                      auto info = std::move(fut).value();
 
@@ -816,7 +816,7 @@ std::shared_ptr<const UnkeyedRealisation> Store::queryRealisation(const DrvOutpu
     using RealPtr = std::shared_ptr<const UnkeyedRealisation>;
     std::promise<Callback<RealPtr>::Result> promise;
 
-    queryRealisation(id, {[&](Callback<RealPtr>::Result result) { promise.set_value(std::move(result)); }});
+    queryRealisation(id, {[&](Callback<RealPtr>::Result && result) { promise.set_value(std::move(result)); }});
 
     return promise.get_future().get().value();
 }
@@ -856,7 +856,7 @@ StorePathSet Store::queryValidPaths(const StorePathSet & paths, SubstituteFlag m
 
     auto doQuery = [&](const StorePath & path) {
         checkInterrupt();
-        queryPathInfo(path, {[path, &state_, &wakeup](Callback<ref<const ValidPathInfo>>::Result fut) {
+        queryPathInfo(path, {[path, &state_, &wakeup](Callback<ref<const ValidPathInfo>>::Result && fut) {
                           bool exists = false;
                           std::exception_ptr newExc{};
 

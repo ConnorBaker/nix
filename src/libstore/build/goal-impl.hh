@@ -24,7 +24,7 @@ auto Goal::promise_type::await_transform(AsyncCallback<T> && ac)
 
             fn(Callback<T>([promise = promise,
                             maybeWaker = goal->worker.getCrossThreadWaker(),
-                            goalWeak = goal->weak_from_this()](typename Callback<T>::Result res) {
+                            goalWeak = goal->weak_from_this()](typename Callback<T>::Result && res) {
                 promise->set_value(std::move(res));
 
                 /* The Worker might have already died (and the waker with it) by

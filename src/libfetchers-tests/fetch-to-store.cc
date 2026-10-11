@@ -13,6 +13,7 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
+#include "nix/util/terminal.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/globals.hh"
 #include "nix/store/local-store.hh"
@@ -687,6 +688,35 @@ TEST_F(FetchToStoreTest, gitSubtreeMemoRespectsFilters)
     EXPECT_NE(h3, objectHashOf(*t1.accessor, t1.path, dropDrop).root.hash);
 }
 
+TEST_F(FetchToStoreTest, legacyUnownedIdentityCachesCannotSupplyCurrentHashes)
+{
+    auto store = openStore("dummy://?read-only=false");
+    auto tree = namedTree("legacy-live-identity");
+    auto narHash = tree->hashPath(CanonPath::root);
+    auto treeHash = merkle::objectHash(objectHashOf(*tree, CanonPath::root).root);
+    auto wrong = hashString(HashAlgorithm::SHA256, "stale live-view bytes");
+    ASSERT_NE(wrong, narHash);
+    ASSERT_NE(wrong, treeHash);
+    fetchers::Settings settings;
+    auto current = makeSourcePathToHashCacheKey(
+        *tree->fingerprint, ContentAddressMethod::Raw::NixArchive, CanonPath::root);
+    auto legacy = current;
+    legacy.first = "sourcePathToHash";
+    settings.getCache()->upsert(legacy, {{"hash", wrong.to_string(HashFormat::SRI, true)}});
+    settings.getCache()->upsert(
+        {"treeAddress", {{"narHash", narHash.to_string(HashFormat::SRI, true)}}},
+        {{"hash", wrong.to_string(HashFormat::SRI, true)}});
+    EXPECT_FALSE(lookupTreeAddress(settings, narHash));
+    auto named = fetchToStore2(
+        settings, *store, SourcePath{tree}, FetchMode::DryRun, "source", ContentAddressMethod::Raw::NixArchive);
+    EXPECT_EQ(named.second, narHash);
+    auto row = settings.getCache()->lookup(current);
+    ASSERT_TRUE(row);
+    EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), narHash);
+    recordTreeAddress(settings, narHash, treeHash);
+    EXPECT_EQ(lookupTreeAddress(settings, narHash), std::optional{treeHash});
+}
+
 /* A bare root is addressed by the object hash (doc/lazy-store/
    01-specification.md, section 9.11): the blob id for a plain file, and for
    an executable file or a symlink the id of the one-entry tree `{"." ->
@@ -710,13 +740,9 @@ TEST_F(FetchToStoreTest, oldFormGitRowIsAMissAndTheRowIsTheEntry)
 
     fetchers::Settings settings;
     auto wrong = merkle::treeId("");
-    settings.getCache()->upsert(
-        fetchers::Cache::Key{
-            "sourcePathToHash",
-            {{"fingerprint", name},
-             {"method", std::string{ContentAddressMethod(git).render()}},
-             {"path", subpath.abs()}}},
-        {{"hash", wrong.to_string(HashFormat::SRI, true)}});
+    auto oldKey = makeSourcePathToHashCacheKey(name, git, subpath);
+    oldKey.second.erase("version");
+    settings.getCache()->upsert(oldKey, {{"hash", wrong.to_string(HashFormat::SRI, true)}});
     auto [p, h] = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::DryRun, "src");
     EXPECT_EQ(h, expected.hash);
     EXPECT_NE(h, wrong);
@@ -1305,7 +1331,8 @@ TEST_F(FetchToStoreLocalTest, knownEntriesPreserveEveryRootKindAndRepairReadsThe
         auto copied = fetchToStore2(settings, *store, SourcePath(tree), FetchMode::Copy, "known");
         EXPECT_EQ(copied, named);
         auto stored = store->requireStoreObjectAccessor(copied.first);
-        EXPECT_TRUE(stored->getFingerprint(CanonPath::root));
+        EXPECT_FALSE(stored->getFingerprint(CanonPath::root));
+        EXPECT_FALSE(stored->getKnownEntry(CanonPath::root));
         EXPECT_EQ(objectHashOf(*stored, CanonPath::root).root, entry);
 
         /* The final input has no name for its source, but substitution
@@ -2795,6 +2822,8 @@ TEST_F(FetchToStoreLocalTest, pathInputsShareTheAcquiredValueWithTheirRegistered
                     }();
                     EXPECT_EQ(backend->copies, registered ? 0u : 1u);
                     EXPECT_EQ(accessor->isFixed(), !registered || evaluator);
+                    EXPECT_EQ(bool(accessor->getFingerprint(CanonPath::root)), !registered || evaluator);
+                    EXPECT_EQ(bool(accessor->getKnownEntry(CanonPath::root)), !registered || evaluator);
                     EXPECT_EQ(bool(accessor->getPhysicalPath(CanonPath::root)), registered && !evaluator);
                     EXPECT_EQ(fetched.getLastModified(), std::optional<uint64_t>{suppliedMtime ? 123u : registered ? 0u : 1000u});
                     if (!registered) {
@@ -2827,6 +2856,7 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
     {
         std::shared_ptr<const ValidPathInfo> description;
         std::string nar;
+        std::shared_ptr<SourceAccessor> fixedSource;
         size_t acquisitions = 0;
         bool returnNullAccessor = false;
 
@@ -2851,6 +2881,8 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
             EXPECT_EQ(path, description->path);
             if (returnNullAccessor)
                 return nullptr;
+            if (fixedSource)
+                return fixedSource;
             return make_ref<RemoteFSAccessor>(ref<Store>{shared_from_this()}, requireValidPath)->accessObject(path);
         }
 
@@ -2862,6 +2894,10 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
         }
     };
 
+    struct FixedMemory : MemorySourceAccessor
+    {
+        bool isFixed() override { return true; }
+    };
     EnableExperimentalFeature enableFlakes("flakes");
     using File = MemorySourceAccessor::File;
     const std::string bytes("raw\0bytes", 9);
@@ -2873,10 +2909,10 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
         {"exec", {.mode = merkle::Mode::Executable, .hash = blob}},
         {"link", {.mode = merkle::Mode::Symlink, .hash = link}},
         {"plain", {.mode = merkle::Mode::Regular, .hash = blob}}};
-    size_t cases = 0;
+    size_t cases = 0, fixedCases = 0, inputNameCases = 0;
     for (auto mode :
          {merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink, merkle::Mode::Directory}) {
-        auto tree = make_ref<MemorySourceAccessor>();
+        auto tree = make_ref<FixedMemory>();
         if (mode == merkle::Mode::Directory)
             tree->root = File::Directory{
                 .entries = {
@@ -2944,8 +2980,7 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
                 if (fileInput)
                     EXPECT_EQ(fetched.getTreeHash(), expectedHash);
                 else
-                    EXPECT_EQ(
-                        accessor->fingerprint, std::optional("path:" + expectedHash.to_string(HashFormat::SRI, true)));
+                    EXPECT_FALSE(accessor->getFingerprint(CanonPath::root));
                 EXPECT_EQ(observed->acquisitions, acquired);
                 EXPECT_EQ(acquired, 1u);
                 if (fileInput) {
@@ -2957,8 +2992,87 @@ TEST_F(FetchToStoreLocalTest, storedInputsReuseTheAcquiredNar)
                 }
                 ++cases;
             }
+        /* Fixed source bytes and separately declared metadata are distinct facts. */
+        auto fixedPath = store->Store::addToStore("source", SourcePath{tree}, ContentAddressMethod::Raw::Git);
+        auto fixedInfo = store->queryPathInfo(fixedPath);
+        ASSERT_TRUE(fixedInfo->objectHash);
+        auto wrong = hashString(HashAlgorithm::SHA256, "unverified declared metadata");
+        ASSERT_NE(wrong, expectedHash);
+        ASSERT_NE(wrong, hashString(HashAlgorithm::SHA256, nar.s));
+        tree->fingerprint = fmt("fixed-observed-root-%d", static_cast<RawMode>(mode));
+        for (bool wrongObject : {false, true}) {
+            SCOPED_TRACE(fmt("fixed mode=%d wrong-object=%d", static_cast<RawMode>(mode), wrongObject));
+            auto description = std::make_shared<ValidPathInfo>(*fixedInfo);
+            if (wrongObject)
+                description->objectHash->hash = wrong;
+            else
+                description->assertedNarHash = wrong;
+            auto observed = make_ref<ObservedStore>(ref<const LocalStore::Config>{config}, description, nar.s);
+            observed->fixedSource = tree.get_ptr();
+            fetchers::Settings settings;
+            fetchers::Attrs attrs{
+                {"type", "git"}, {"url", (tempStoreDir.path() / "absent-fixed-git").string()},
+                {"name", "source"}, {"__final", Explicit{true}},
+                {"treeHash", expectedHash.to_string(HashFormat::SRI, true)}};
+            if (!wrongObject)
+                attrs.insert_or_assign("narHash", wrong.to_string(HashFormat::SRI, true));
+            auto input = fetchers::Input::fromAttrs(std::move(attrs));
+            ASSERT_FALSE(input.getFingerprint(*observed));
+            if (wrongObject) {
+                std::shared_ptr<SourceAccessor> acquired;
+                EXPECT_NO_THROW(acquired = input.getAccessor(settings, *observed).first.get_ptr());
+                if (acquired) {
+                    EXPECT_EQ(acquired.get(), tree.get_ptr().get());
+                    StringSink actual;
+                    acquired->dumpPath(CanonPath::root, actual);
+                    EXPECT_EQ(actual.s, nar.s);
+                }
+            } else {
+                try {
+                    input.getAccessor(settings, *observed);
+                    ADD_FAILURE() << "unverified NAR assertion was accepted";
+                } catch (Error & e) {
+                    EXPECT_EQ(e.info().status, 102u);
+                    EXPECT_NE(filterANSIEscapes(e.msg(), true).find("NAR hash mismatch"), std::string::npos) << e.msg();
+                }
+            }
+            EXPECT_EQ(observed->acquisitions, 0u);
+            ++fixedCases;
+        }
+        /* A truthful memo for A cannot authenticate a different fixed, unnamed B. */
+        auto other = make_ref<FixedMemory>();
+        other->root = File::Regular{.contents = "different fixed source"};
+        ASSERT_NE(merkle::objectHash(objectHashOf(*other, CanonPath::root).root), expectedHash);
+        auto observed = make_ref<ObservedStore>(ref<const LocalStore::Config>{config}, fixedInfo.get_ptr(), nar.s);
+        observed->fixedSource = other.get_ptr();
+        fetchers::Settings settings;
+        auto input = fetchers::Input::fromAttrs({
+            {"type", "git"}, {"url", (tempStoreDir.path() / "absent-fixed-git").string()},
+            {"name", "source"}, {"__final", Explicit{true}},
+            {"treeHash", expectedHash.to_string(HashFormat::SRI, true)},
+            {"rev", hashString(HashAlgorithm::SHA1, fmt("declared-%d", static_cast<RawMode>(mode))).gitRev()}});
+        auto declaredName = input.getFingerprint(*observed);
+        ASSERT_TRUE(declaredName);
+        auto entry = objectHashOf(*tree, CanonPath::root).root;
+        settings.getCache()->upsert(
+            makeSourcePathToHashCacheKey(*declaredName, ContentAddressMethod::Raw::Git, CanonPath::root),
+            {{"hash", entry.hash.to_string(HashFormat::SRI, true)}, {"mode", uint64_t(entry.mode)}});
+        try {
+            input.getAccessor(settings, *observed);
+            ADD_FAILURE() << "declared input name authenticated different source bytes";
+        } catch (Error & e) {
+            EXPECT_EQ(e.info().status, 102u);
+            EXPECT_NE(filterANSIEscapes(e.msg(), true).find("tree hash mismatch"), std::string::npos) << e.msg();
+        }
+        EXPECT_FALSE(other->getFingerprint(CanonPath::root));
+        EXPECT_EQ(observed->acquisitions, 0u);
+        ++inputNameCases;
     }
     EXPECT_EQ(cases, 10u);
+    EXPECT_EQ(fixedCases, 8u);
+    EXPECT_EQ(inputNameCases, 4u);
+    RecordProperty("fixed_metadata_cases", fixedCases);
+    RecordProperty("input_name_cases", inputNameCases);
 }
 
 } // namespace nix

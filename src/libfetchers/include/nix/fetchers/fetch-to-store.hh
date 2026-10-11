@@ -55,16 +55,6 @@ makeSourcePathToHashCacheKey(std::string_view fingerprint, ContentAddressMethod 
 StorePath gitTreePath(const StoreDirConfig & store, std::string_view name, const Hash & treeHash);
 
 /**
- * Seed the git memo row of the named tree at `root` from a store object's
- * hash: for a directory or a plain file the object hash is the root's
- * entry hash, and the row is written; for a bare executable or symlink it
- * is the synthetic tree's id, which does not give the blob's back, so
- * nothing is written and the next naming hashes the one file.  A memo: an
- * unnamed root or a cache that cannot be opened records nothing.
- */
-void recordRootEntry(const fetchers::Settings & settings, const SourcePath & root, const Hash & objectHash);
-
-/**
  * The fetcher cache when it can be opened, else null: every memo is an
  * optimisation, so a cache that cannot be created (a read-only home) is a
  * miss, not an error.  The naming memos go through this rather than

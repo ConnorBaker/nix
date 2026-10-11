@@ -1321,7 +1321,7 @@ void FileTransferRequest::setupForS3()
 std::future<FileTransferResult> FileTransfer::enqueueFileTransfer(const FileTransferRequest & request)
 {
     auto promise = std::make_shared<std::promise<FileTransferResult>>();
-    enqueueFileTransfer(request, {[promise](Callback<FileTransferResult>::Result fut) {
+    enqueueFileTransfer(request, {[promise](Callback<FileTransferResult>::Result && fut) {
                             try {
                                 promise->set_value(std::move(fut).value());
                             } catch (...) {
@@ -1408,7 +1408,7 @@ void FileTransfer::download(
     };
 
     auto handle = enqueueFileTransfer(
-        request, {[_state, resultCallback{std::move(resultCallback)}](Callback<FileTransferResult>::Result fut) {
+        request, {[_state, resultCallback{std::move(resultCallback)}](Callback<FileTransferResult>::Result && fut) {
             auto state(_state->lock());
             state->quit = true;
             try {
