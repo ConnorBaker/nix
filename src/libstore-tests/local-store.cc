@@ -4347,24 +4347,24 @@ TEST_F(LocalStoreObjectsTest, publicationRetryStillRequiresParentDurability)
 
 TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
 {
+    enum class Publication { ActiveRegister, CompletedRegister, ActiveEnd };
     unsigned cases = 0;
     for (bool executable : {false, true})
         for (bool refusePin : {false, true})
             for (bool partial : {false, true})
                 for (unsigned failure = 0; failure < 3; ++failure)
-                    for (bool completed : {false, true}) {
-                        /* An escaping error consumes an active local projection;
-                           only a Busy retry retains that existing local owner. */
-                        if (!completed && failure != 2)
-                            continue;
+                    for (auto publication : {Publication::ActiveRegister, Publication::CompletedRegister, Publication::ActiveEnd}) {
+                        bool completed = publication == Publication::CompletedRegister;
+                        bool end = publication == Publication::ActiveEnd;
                         auto tag = fmt("physical-publication-retry-%d", cases++);
                         SCOPED_TRACE(
-                            fmt("exec=%d pin=%d partial=%d failure=%d completed=%d",
+                            fmt("exec=%d pin=%d partial=%d failure=%d completed=%d end=%d",
                                 executable,
                                 refusePin,
                                 partial,
                                 failure,
-                                completed));
+                                completed,
+                                end));
                         std::array<std::string, 3> bytes{tag + "-0", tag + "-1", tag + "-2"};
                         std::ranges::sort(
                             bytes, {}, [](const std::string & value) { return merkle::blobId(value).gitRev(); });
@@ -4381,6 +4381,8 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                             infos.push_back(restoreOutput(StorePath::random(tag + fmt("-%d", i)), nar, holds[i]));
                         if (completed)
                             store->endIngestion(holds[0], infos[0].path);
+                        if (end)
+                            store->registerValidPath(infos[0]);
                         store->registerValidPath(infos[1], holds[1]);
                         auto target = store->toRealPath(infos[0].path), donor = store->toRealPath(infos[1].path);
                         auto beforeA = st(target / "a"), beforeC = st(target / "c");
@@ -4448,13 +4450,19 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                                 ++refusals;
                             return refuse;
                         };
+                        auto publish = [&] {
+                            if (end)
+                                store->endIngestion(holds[0], infos[0].path);
+                            else
+                                store->registerValidPath(infos[0], holds[0]);
+                        };
                         if (failure == 0)
-                            EXPECT_THROW(store->registerValidPath(infos[0], holds[0]), Error);
+                            EXPECT_THROW(publish(), Error);
                         else if (failure == 1)
-                            EXPECT_THROW(store->registerValidPath(infos[0], holds[0]), Interrupted);
+                            EXPECT_THROW(publish(), Interrupted);
                         if (failure != 2)
                             store->objects.failPlaceWithNoSpace = {};
-                        ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                        ASSERT_NO_THROW(publish());
                         EXPECT_EQ(throws, 1u);
                         EXPECT_GT(refusals, 0u);
                         EXPECT_EQ(retry.begins, 2u);
@@ -4469,7 +4477,7 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                                 EXPECT_EQ(readFile(target / (std::string(prefix) + char('a' + i))), bytes[i]);
                         }
                         EXPECT_EQ(changedB, partial ? 1u : 0u);
-                        for (unsigned i : {0u, 2u}) {
+                        for (unsigned i : {0u, 1u, 2u}) {
                             SQLiteStmt count{
                                 other,
                                 "select count(*) from Blobs b join Ingestions i on i.id=b.ingestion where i.path=? and b.id=? and b.exec=?;"};
@@ -4479,11 +4487,18 @@ TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
                                 .apply(key.hash, key.hashSize)
                                 .apply(int64_t(executable));
                             ASSERT_TRUE(use.next());
-                            EXPECT_EQ(use.getInt(0), i == 0 ? 0 : 1);
+                            EXPECT_EQ(use.getInt(0), i == 0 || (i == 1 && partial) ? 0 : 1);
                         }
+                        SQLiteStmt auxiliary{
+                            other,
+                            "select count(*) from AuxValues a join Ingestions i on i.id=a.ingestion where i.path=?;"};
+                        auto use = auxiliary.use();
+                        use.apply(store->printStorePath(infos[0].path));
+                        ASSERT_TRUE(use.next());
+                        EXPECT_EQ(use.getInt(0), 2);
                     }
     RecordProperty("finite_cases", cases);
-    EXPECT_EQ(cases, 32u);
+    EXPECT_EQ(cases, 72u);
 }
 #  endif
 
@@ -6709,6 +6724,30 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
                 id.hash[position] = byte;
                 hold.addAuxiliary({{mode, id}, "rejected tail duplicate"});
             }
+    /* A publication borrower may return without consuming its rewritten relation.
+       Both producer kinds must reopen that owner without losing either projection. */
+    GitObjectStore::Hold::Row retained{.id = Hash{HashAlgorithm::SHA256}};
+    merkle::TreeEntry retainedAuxiliary{merkle::Mode::Directory, Hash{HashAlgorithm::SHA256}};
+    {
+        auto & pending = hold.projection();
+        ASSERT_FALSE(pending.regular.empty());
+        ASSERT_FALSE(pending.auxiliary.empty());
+        pending.regular.front().aliases.push_back("retained-alias");
+        retained = pending.regular.front();
+        auto & value = pending.auxiliary.front();
+        value.body += "-retained";
+        retainedAuxiliary = value.entry;
+        expected.at(Key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode}) += "-retained";
+    }
+    auto rejected = retained;
+    rejected.name = "rejected-after-borrow";
+    EXPECT_EQ(hold.addRow(std::move(rejected)), (std::filesystem::path("/typed-pending") / retained.name).string());
+    {
+        auto & pending = hold.projection();
+        EXPECT_EQ(pending.regular.size(), expected.size());
+        EXPECT_EQ(pending.auxiliary.size(), expected.size());
+    }
+    hold.addAuxiliary({retainedAuxiliary, "rejected-after-borrow"});
     auto privateAttempt = hold.ownRows();
     EXPECT_TRUE(privateAttempt.takeProjection().auxiliary.empty());
     EXPECT_TRUE(privateAttempt.takeProjection().regular.empty());
@@ -6718,6 +6757,15 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     ASSERT_EQ(projection.auxiliary.size(), 2u * (1 + 32 * 255));
     ASSERT_EQ(projection.regular.size(), projection.auxiliary.size());
     ASSERT_EQ(projection.auxiliary.size(), expected.size());
+    auto row = std::ranges::find_if(projection.regular, [&](const auto & value) {
+        return value.id == retained.id && value.executable == retained.executable;
+    });
+    ASSERT_NE(row, projection.regular.end());
+    EXPECT_EQ(row->name, retained.name);
+    EXPECT_EQ(row->aliases, retained.aliases);
+    EXPECT_EQ(row->ino, retained.ino);
+    EXPECT_EQ(row->dev, retained.dev);
+    EXPECT_EQ(row->size, retained.size);
     auto remaining = expected;
     for (auto & value : projection.auxiliary) {
         Key key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode};

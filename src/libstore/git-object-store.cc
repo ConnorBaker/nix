@@ -52,7 +52,7 @@ static void checkAuxiliaryEntry(const merkle::TreeEntry & entry)
 
 /* The finite pending map associates each typed (mode, id) with its first
    completed regular witness or owned auxiliary body. Its disjoint key domains
-   are independent maps; values stay private until the completed-path handoff. */
+   own either map values or one projection; empty maps retain their capacity. */
 struct GitObjectStore::Hold::Pending
 {
     /* Borrow the value's existing identity. Like the old binary key, Hash
@@ -87,8 +87,52 @@ struct GitObjectStore::Hold::Pending
         using is_transparent = void;
     };
 
-    Sync<boost::unordered_flat_set<Row, KeyHash, KeyEqual>> regular;
-    Sync<boost::unordered_flat_set<Auxiliary, KeyHash, KeyEqual>> auxiliary;
+    struct Maps
+    {
+        boost::unordered_flat_set<Row, KeyHash, KeyEqual> regular;
+        boost::unordered_flat_set<Auxiliary, KeyHash, KeyEqual> auxiliary;
+    };
+
+    struct Values
+    {
+        Maps maps;
+        std::optional<Projection> projected;
+    };
+    Sync<Values> values;
+
+    static Maps & writable(Values & values)
+    {
+        if (values.projected) {
+            auto & projection = *values.projected;
+            static_assert(std::is_nothrow_move_assignable_v<Maps>);
+            values.maps = Maps{
+                {projection.regular.begin(), projection.regular.end()},
+                {projection.auxiliary.begin(), projection.auxiliary.end()}};
+            values.projected.reset();
+        }
+        return values.maps;
+    }
+    static Projection & project(Values & values)
+    {
+        static_assert(std::is_trivially_move_constructible_v<Hash>);
+        static_assert(std::is_nothrow_move_constructible_v<Row>);
+        static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
+        if (values.projected)
+            return *values.projected;
+        auto & maps = values.maps;
+        Projection projection;
+        /* Reserve both before extracting: failure leaves the complete relation intact. */
+        projection.regular.reserve(maps.regular.size());
+        projection.auxiliary.reserve(maps.auxiliary.size());
+        /* Moving preserves each fixed hash/mode key; only owned strings change. */
+        for (const auto & row : maps.regular)
+            projection.regular.push_back(std::move(const_cast<Row &>(row)));
+        for (const auto & object : maps.auxiliary)
+            projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
+        maps.regular.clear();
+        maps.auxiliary.clear();
+        return values.projected.emplace(std::move(projection));
+    }
     std::filesystem::path root;
 };
 
@@ -102,10 +146,10 @@ void GitObjectStore::Hold::setRoot(std::filesystem::path root) const
     /* A reused hold starts a new path projection. Its previous completed
        rows have already been handed to the store; abandoned rows need no
        publication. No walking worker may outlive this boundary. */
-    auto regular = pending->regular.lock();
-    auto auxiliary = pending->auxiliary.lock();
-    regular->clear();
-    auxiliary->clear();
+    auto values = pending->values.lock();
+    values->maps.regular.clear();
+    values->maps.auxiliary.clear();
+    values->projected.reset();
     pending->root = std::move(root);
 }
 
@@ -116,8 +160,9 @@ const std::filesystem::path & GitObjectStore::Hold::root() const
 
 std::optional<std::string> GitObjectStore::Hold::addRow(Row && row) const
 {
-    auto regular = pending->regular.lock();
-    auto [i, inserted] = regular->insert(std::move(row));
+    auto values = pending->values.lock();
+    auto & regular = Pending::writable(*values).regular;
+    auto [i, inserted] = regular.insert(std::move(row));
     if (inserted)
         return std::nullopt;
     auto & name = i->name;
@@ -126,47 +171,50 @@ std::optional<std::string> GitObjectStore::Hold::addRow(Row && row) const
 
 void GitObjectStore::Hold::appendNames(Row && row) const
 {
-    auto regular = pending->regular.lock();
-    auto i = regular->find(Pending::Key{row});
-    assert(i != regular->end());
+    auto values = pending->values.lock();
+    auto & regular = Pending::writable(*values).regular;
+    auto i = regular.find(Pending::Key{row});
+    assert(i != regular.end());
     i->aliases.append_range(row.names() | std::views::as_rvalue);
 }
 
 void GitObjectStore::Hold::addAuxiliary(Auxiliary object) const
 {
     checkAuxiliaryEntry(object.entry);
-    pending->auxiliary.lock()->insert(std::move(object));
+    auto values = pending->values.lock();
+    Pending::writable(*values).auxiliary.insert(std::move(object));
+}
+
+GitObjectStore::Hold::Projection & GitObjectStore::Hold::projection() const
+{
+    auto values = pending->values.lock();
+    return Pending::project(*values);
 }
 
 GitObjectStore::Hold::Projection GitObjectStore::Hold::takeProjection() const
 {
-    static_assert(std::is_trivially_move_constructible_v<Hash>);
-    static_assert(std::is_nothrow_move_constructible_v<Row>);
-    static_assert(std::is_nothrow_move_constructible_v<Auxiliary>);
-    auto regular = pending->regular.lock();
-    auto auxiliary = pending->auxiliary.lock();
-    Projection projection;
-    /* Reserve both before extracting: failure leaves the complete relation intact. */
-    projection.regular.reserve(regular->size());
-    projection.auxiliary.reserve(auxiliary->size());
-    /* Moving preserves each fixed hash/mode key; only owned strings change. */
-    for (const auto & row : *regular)
-        projection.regular.push_back(std::move(const_cast<Row &>(row)));
-    regular->clear();
-    for (const auto & object : *auxiliary)
-        projection.auxiliary.push_back(std::move(const_cast<Auxiliary &>(object)));
-    auxiliary->clear();
-    return projection;
+    auto values = pending->values.lock();
+    Pending::project(*values);
+    return *std::exchange(values->projected, std::nullopt);
 }
 
 std::optional<std::string> GitObjectStore::Hold::pendingHolder(const Hash & id, bool executable) const
 {
-    auto regular = pending->regular.lock();
-    auto i = regular->find(Pending::Key{executable ? merkle::Mode::Executable : merkle::Mode::Regular, id});
-    if (i == regular->end())
-        return std::nullopt;
-    auto & name = i->name;
-    return name.empty() ? pending->root.string() : (pending->root / name).string();
+    auto values = pending->values.lock();
+    Pending::Key key{executable ? merkle::Mode::Executable : merkle::Mode::Regular, id};
+    auto holder = [&](auto i, auto end) -> std::optional<std::string> {
+        if (i == end)
+            return std::nullopt;
+        auto & name = i->name;
+        return name.empty() ? pending->root.string() : (pending->root / name).string();
+    };
+    if (values->projected) {
+        auto & regular = values->projected->regular;
+        return holder(
+            std::ranges::find(regular, key, [](const Row & row) { return Pending::Key{row}; }), regular.end());
+    }
+    auto & regular = values->maps.regular;
+    return holder(regular.find(key), regular.end());
 }
 
 /* Preserve existing directory permissions, including directory symlinks.

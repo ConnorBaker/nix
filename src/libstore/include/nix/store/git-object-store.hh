@@ -359,6 +359,11 @@ public:
             std::vector<Auxiliary> auxiliary;
         };
 
+        /** All walking workers have joined. Retain the owned projection across
+         * publication failure. While borrowing it, no producer, root reset or
+         * consuming handoff may run; commit consumes its values. */
+        Projection & projection() const;
+
         /** All walking workers have joined. Reserve both result vectors before
          * consuming the pending relation; allocation failure leaves it intact.
          * Each vector contains one owned value per typed key; order is unspecified. */

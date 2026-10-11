@@ -910,7 +910,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         return;
     /* An already-valid repair/optimisation path must not expose its new
        candidates before reconciling the complete projection. */
-    auto projection = hold.takeProjection();
+    auto & projection = hold.projection();
     sortProjectionForPublication(projection);
     auto & rows = projection.regular;
     auto logical = printStorePath(path);
@@ -942,6 +942,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         txn.commit();
         completed.insert_or_assign(std::move(logical), std::pair{id, std::move(rows)});
         hold.ingesting = false;
+        hold.takeProjection();
     });
 }
 
@@ -1753,7 +1754,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
     /* Take the completed ingestion before locking the database. Its rows
        and validity are published through one connection and transaction. */
     bool active = hold && hold->ingesting;
-    auto projection = active ? hold->takeProjection() : GitObjectStore::Hold::Projection{};
+    GitObjectStore::Hold::Projection empty;
+    auto & projection = active ? hold->projection() : empty;
 
     struct Publication
     {
@@ -1895,6 +1897,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             hold->completedIngestions.insert_or_assign(
                 std::move(publication.logical), std::pair{publication.id, std::move(projection.regular)});
             hold->ingesting = false;
+            hold->takeProjection();
         }
         /* A description becomes cacheable only with the committed path
            and references. A rejected reference or cycle rolls the SQL
