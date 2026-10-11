@@ -276,19 +276,9 @@ public:
                 break;
             offset += sizeof(a);
         }
-        auto i = path.begin() + offset;
-        auto j = x.path.begin() + offset;
-        for (; i != path.end() && j != x.path.end(); ++i, ++j) {
-            auto c_i = static_cast<unsigned char>(*i);
-            if (c_i == '/')
-                c_i = 0;
-            auto c_j = static_cast<unsigned char>(*j);
-            if (c_j == '/')
-                c_j = 0;
-            if (auto cmp = c_i <=> c_j; cmp != 0)
-                return cmp;
-        }
-        return (i != path.end()) <=> (j != x.path.end());
+        return std::lexicographical_compare_three_way(
+            path.begin() + offset, path.end(), x.path.begin() + offset, x.path.end(),
+            [](unsigned char a, unsigned char b) { return (a == '/' ? 0 : a) <=> (b == '/' ? 0 : b); });
     }
 
     /**

@@ -2261,10 +2261,9 @@ void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & 
 // always force this to be separate, otherwise forceValue may inline it and take
 // a massive perf hit
 [[gnu::noinline]]
-void EvalState::handleEvalException(Value & v, const Value & saved, const PosIdx pos)
+void EvalState::handleEvalException(Env * env, Expr * expr, const Value * savedApp, Value & v, const PosIdx pos)
 {
-    auto env = saved.isThunk() ? saved.thunk().env : nullptr;
-    if (saved.isThunk() && !env)
+    if (!savedApp && !env)
         tryFixupBlackHolePos(v, pos);
 
     auto e = std::current_exception();
@@ -2289,7 +2288,10 @@ void EvalState::handleEvalException(Value & v, const Value & saved, const PosIdx
     } catch (...) {
     }
     if (recovery) {
-        *recovery = saved;
+        if (savedApp)
+            *recovery = *savedApp;
+        else
+            recovery->mkThunk(env, expr);
     }
     v.mkFailed(e, recovery, mem);
 }

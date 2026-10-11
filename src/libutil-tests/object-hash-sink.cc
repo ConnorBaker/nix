@@ -1549,8 +1549,9 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
     struct Hooks : RestoreSinkHooks
     {
         std::vector<std::pair<Descriptor, bool>> files;
+        size_t directories = 0;
 
-        void directoryDone(Descriptor) override {}
+        void directoryDone(Descriptor) override { ++directories; }
 
         void regularFileCreated(Descriptor fd, bool executable) override
         {
@@ -1612,8 +1613,7 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
         sink.dstPath = tmpDir / "dir";
         sink.createDirectory(CanonPath::root, [&](FileSystemObjectSink & root, const CanonPath & rel) {
             EXPECT_EQ(rel, CanonPath::root);
-            sink.createSubdirectory(CanonPath("/sub"), [&](RestoreSink & sub, const CanonPath & subRel) {
-                EXPECT_EQ(subRel, CanonPath::root);
+            sink.createSubdirectory(CanonPath("/sub"), [&](RestoreSink & sub) {
                 EXPECT_TRUE(sub.dirFd);
                 EXPECT_EQ(sub.dstPath, tmpDir / "dir" / "sub");
                 auto writer = sub.beginRegularFile(CanonPath("/f"));
@@ -1624,6 +1624,7 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
                 EXPECT_THROW(getFileSize(fd), SystemError);
                 EXPECT_EQ(writer.written, 5u);
                 sub.createRegularFile(CanonPath("/g"), [](CreateRegularFileSink & crf) { crf("plain"); });
+                return true;
             });
         });
         ASSERT_EQ(hooks.files.size(), 2u);
@@ -1634,6 +1635,36 @@ TEST(RestoreSink, beginRegularFile_then_finish_equals_createRegularFile)
     EXPECT_EQ(readFile(tmpDir / "dir/sub/g"), "plain");
     EXPECT_EQ(modeOf(tmpDir / "dir/sub/f"), modeOf(tmpDir / "dir/sub/g"));
     EXPECT_FALSE(modeOf(tmpDir / "dir/sub/f") & S_IXUSR);
+
+#ifndef _WIN32
+    /* Incomplete descendants retain completed files, but neither the child
+       nor its incomplete ancestor is announced as a completed directory. */
+    {
+        Hooks hooks;
+        Descriptor rootFd = INVALID_DESCRIPTOR, childFd = INVALID_DESCRIPTOR;
+        {
+            RestoreSink sink(/*startFsync=*/false, &hooks);
+            sink.dstPath = tmpDir / "incomplete";
+            EXPECT_FALSE(sink.createSubdirectory(CanonPath::root, [&](RestoreSink & root) {
+                rootFd = root.dirFd.get();
+                bool completed = root.createSubdirectory(CanonPath("/sub"), [&](RestoreSink & sub) {
+                    childFd = sub.dirFd.get();
+                    sub.createRegularFile(CanonPath("/f"), [](CreateRegularFileSink & crf) { crf("plain"); });
+                    EXPECT_NO_THROW(getFileSize(childFd));
+                    return false;
+                });
+                EXPECT_THROW(getFileSize(childFd), SystemError);
+                return completed;
+            }));
+            EXPECT_NO_THROW(getFileSize(rootFd));
+        }
+        EXPECT_THROW(getFileSize(rootFd), SystemError);
+        EXPECT_EQ(hooks.directories, 0u);
+        ASSERT_EQ(hooks.files.size(), 1u);
+        EXPECT_FALSE(hooks.files[0].second);
+        EXPECT_EQ(readFile(tmpDir / "incomplete/sub/f"), "plain");
+    }
+#endif
 }
 
 /* Failure preserves the original exception and closes the writer. Bytes

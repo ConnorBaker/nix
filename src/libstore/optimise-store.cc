@@ -488,8 +488,7 @@ struct LinkingVisitor : HashingVisitor
         auto target = at(path);
         std::optional<HashedNode> result;
         std::string body;
-        auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
-            assert(rel.isRoot());
+        auto populate = [&](RestoreSink & sub) {
             LinkingVisitor child{*this, sub};
 #ifndef _WIN32
             if (naming && isCaseHackEnabled()) {
@@ -507,6 +506,7 @@ struct LinkingVisitor : HashingVisitor
             } else
 #endif
                 result = hashDirectory(path, children, body, child);
+            return true;
         };
         target.sink.createSubdirectory(target.name, std::ref(populate));
         assert(result);
@@ -597,8 +597,6 @@ struct LinkingVisitor : HashingVisitor
         return std::move(file.node);
     }
 #ifndef _WIN32
-    struct ObjectUnavailable {};
-
     HashedNode node(
         SourceAccessor & accessor,
         const CanonPath & from,
@@ -682,19 +680,20 @@ struct LinkingVisitor : HashingVisitor
                 throw Error("synthetic root object cannot be used as a directory");
 
             merkle::nar::Directory size;
-            auto populate = [&](RestoreSink & sub, const CanonPath & rel) {
-                assert(rel.isRoot());
+            auto populate = [&](RestoreSink & sub) {
                 CaseHackNames hack;
                 for (auto & [name, child] : tree) {
                     auto diskName = hack.diskName(name);
                     auto childSize = materialise(
                         child, path / name, depth + 1, attemptHold, {sub, CanonPath::root / diskName});
                     if (!childSize)
-                        throw ObjectUnavailable{};
+                        return false;
                     size.add(name.size(), *childSize);
                 }
+                return true;
             };
-            target.sink.createSubdirectory(target.name, std::ref(populate));
+            if (!target.sink.createSubdirectory(target.name, std::ref(populate)))
+                return std::nullopt;
             /* Acquisition checked the hash; parsing checked canonical encoding.
                Every successful child preserves its typed entry. */
             attemptHold.addAuxiliary({entry, std::move(*body)});
@@ -776,7 +775,6 @@ struct LinkingVisitor : HashingVisitor
                 }
             }};
             narSize = materialise(*entry, path, std::ranges::distance(path), attempt ? *attempt : hold, target);
-        } catch (ObjectUnavailable &) {
         } catch (Error & e) {
             warn(
                 "could not materialise %s from the object store: %s; copying it from the source instead",

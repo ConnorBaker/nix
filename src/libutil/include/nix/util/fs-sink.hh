@@ -167,15 +167,14 @@ public:
 
     void createDirectory(const CanonPath & path, DirectoryCreatedCallback callback) override;
 
-    using SubdirectoryCallback = fun<void(RestoreSink & subSink, const CanonPath & dirRelPath)>;
-
     /**
      * The typed form of the callback `createDirectory`: the callback is
      * handed the subdirectory's own `RestoreSink` (its `dirFd` open on the
      * directory, `dstPath` the directory's) under the name `/`, so that a
-     * composer can hold it without a cast.  The generic override calls this.
+     * composer can hold it without a cast. False suppresses directory completion;
+     * the generic void override always completes after its callback returns.
      */
-    void createSubdirectory(const CanonPath & path, SubdirectoryCallback callback);
+    bool createSubdirectory(const CanonPath & path, fun<bool(RestoreSink &)> callback);
 
     void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)>) override;
 

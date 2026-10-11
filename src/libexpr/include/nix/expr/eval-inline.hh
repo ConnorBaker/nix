@@ -115,9 +115,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             else
                 ExprBlackHole::throwInfiniteRecursionError(*this, v);
         } catch (...) {
-            Value saved;
-            saved.mkThunk(env, expr);
-            handleEvalException(v, saved, pos);
+            handleEvalException(env, expr, nullptr, v, pos);
             throw;
         }
     } else if (v.isApp()) {
@@ -125,7 +123,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
         } catch (...) {
-            handleEvalException(v, savedApp, pos);
+            handleEvalException(nullptr, nullptr, &savedApp, v, pos);
             throw;
         }
     } else if (v.isFailed()) {

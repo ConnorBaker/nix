@@ -107,46 +107,46 @@ std::tuple<AutoCloseFD, Descriptor, CanonPath> RestoreSink::parentOf(const Canon
 
 void RestoreSink::createDirectory(const CanonPath & path, DirectoryCreatedCallback callback)
 {
-    createSubdirectory(
-        path, SubdirectoryCallback{[&](RestoreSink & subSink, const CanonPath & rel) { callback(subSink, rel); }});
+    createSubdirectory(path, [&](RestoreSink & subSink) {
+        callback(subSink, &subSink == this ? path : CanonPath::root);
+        return true;
+    });
 }
 
-void RestoreSink::createSubdirectory(const CanonPath & path, SubdirectoryCallback callback)
+bool RestoreSink::createSubdirectory(const CanonPath & path, fun<bool(RestoreSink &)> callback)
 {
-    if (path.isRoot()) {
-        createDirectory(path);
-        callback(*this, path);
-#ifndef _WIN32 /* TODO: Have dirFd equivalent for the root directory. */
-        assert(dirFd);
-        if (hooks)
-            hooks->directoryDone(dirFd.get());
-#endif
-        return;
-    }
-
+    bool root = path.isRoot();
     createDirectory(path);
-    assert(dirFd); // If that's not true the above call must have thrown an exception.
-
-    RestoreSink dirSink{startFsync, hooks};
-    dirSink.dstPath = append(dstPath, path);
-    dirSink.dirFd = openFileEnsureBeneathNoSymlinks(
-        dirFd.get(),
-        path,
+    RestoreSink child{startFsync, hooks};
+    auto & sub = root ? *this : child;
+    if (!root) {
+        assert(dirFd); // If that's not true the above call must have thrown an exception.
+        sub.dstPath = append(dstPath, path);
+        sub.dirFd = openFileEnsureBeneathNoSymlinks(
+            dirFd.get(),
+            path,
 #ifdef _WIN32
-        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        FILE_DIRECTORY_FILE
+            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_DIRECTORY_FILE
 #else
-        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-        0
+            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+            0
 #endif
-    );
-
-    if (!dirSink.dirFd)
-        throw SysError("opening directory %s", PathFmt(dirSink.dstPath));
-
-    callback(dirSink, CanonPath::root);
-    if (hooks)
-        hooks->directoryDone(dirSink.dirFd.get());
+        );
+        if (!sub.dirFd)
+            throw SysError("opening directory %s", PathFmt(sub.dstPath));
+    }
+    bool completed = callback(sub);
+#ifndef _WIN32 /* TODO: Have dirFd equivalent for the root directory. */
+    assert(!root || !completed || dirFd);
+#endif
+    if (completed && hooks
+#ifdef _WIN32
+        && !root
+#endif
+    )
+        hooks->directoryDone(sub.dirFd.get());
+    return completed;
 }
 
 void RestoreSink::createDirectory(const CanonPath & path)

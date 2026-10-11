@@ -71,18 +71,8 @@ static NarListing parseNarListing(Source & source, FileSystemObjectSink * also)
 
         void createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func) override
         {
-            auto & nm = createMember(
-                path,
-                NarListing::Regular{
-                    .executable = false,
-                    .contents =
-                        NarListingRegularFile{
-                            .fileSize = 0,
-                            .narOffset = pos,
-                        },
-                });
-            /* We know the downcast will succeed because we just added this */
-            auto & reg = std::get<NarListing::Regular>(nm.raw);
+            auto & reg = std::get<NarListing::Regular>(
+                createMember(path, NarListing::Regular{.contents = {0, pos}}).raw);
             NarMemberConstructor nmc{reg, pos};
             nmc.skipContents = true; /* Don't care about contents. */
             func(nmc);

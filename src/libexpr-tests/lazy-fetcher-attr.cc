@@ -229,7 +229,36 @@ TEST_F(LazyFetcherAttrTest, failuresRetryOnlyWhenRecoverable)
             ++cells;
         }
     }
-    EXPECT_EQ(cells, 6);
+    {
+        SCOPED_TRACE("interrupted application");
+        int calls = 0;
+        Value function, argument, application;
+        PrimOp primOp{
+            .name = "retryInterruptedApplication",
+            .arity = 1,
+            .impl = [&](EvalState &, CallSite, Value * const * args, Value & result) {
+                ASSERT_EQ(args[0], &argument);
+                ASSERT_THAT(*args[0], IsIntEq(41));
+                if (++calls == 1) {
+                    // The primop receives an intermediate result; mutate the application itself.
+                    application.mkInt(-1);
+                    throw Interrupted("interrupted application after partial result");
+                }
+                result.mkInt(args[0]->integer().value + 1);
+            },
+        };
+        function.mkPrimOp(&primOp);
+        argument.mkInt(41);
+        application.mkApp(&function, &argument);
+        EXPECT_THROW(state.forceValue(application, noPos), Interrupted);
+        EXPECT_EQ(calls, 1);
+        state.forceValue(application, noPos);
+        EXPECT_THAT(application, IsIntEq(42));
+        state.forceValue(application, noPos);
+        EXPECT_EQ(calls, 2);
+        ++cells;
+    }
+    EXPECT_EQ(cells, 7);
     RecordProperty("finite_cells", cells);
 }
 

@@ -735,7 +735,8 @@ private:
      *
      * This code is factored out so that it's not in the heavily inlined hot path.
      */
-    void handleEvalException(Value & v, const Value & saved, const PosIdx pos);
+    // Thunk recovery uses env/expr; app recovery uses savedApp with null env/expr.
+    void handleEvalException(Env * env, Expr * expr, const Value * savedApp, Value & v, const PosIdx pos);
 
     void handleEvalFailed(Value & v, PosIdx pos);
 

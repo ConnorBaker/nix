@@ -181,12 +181,13 @@ static void _deletePath(
                 throw;
             }
 
-        int fd = openat(parentfd, name.rel_c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-        if (fd == -1)
+        AutoCloseFD fd{openat(parentfd, name.rel_c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)};
+        if (!fd)
             throw SysError("opening directory %1%", PathFmt(path));
-        AutoCloseDir dir(fdopendir(fd));
+        AutoCloseDir dir(fdopendir(fd.get()));
         if (!dir)
             throw SysError("opening directory %1%", PathFmt(path));
+        fd.release();
 
         struct dirent * dirent;
         while (errno = 0, dirent = readdir(dir.get())) { /* sic */
