@@ -278,6 +278,14 @@ TEST(SQLite, borrowedBindingsPreserveEmptyNullAndFailureReuse)
     auto rows = count.use();
     ASSERT_TRUE(rows.next());
     EXPECT_EQ(rows.getInt(0), 6);
+    SQLiteStmt explicitNull{db, "insert into item values (?1)"};
+    explicitNull.exec(std::nullopt);
+    EXPECT_THROW(explicitNull.exec(std::nullopt, std::nullopt), SQLiteError);
+    SQLiteStmt nullRow{db, "select typeof(value) from item where rowid = ?"};
+    auto nullValue = nullRow.use();
+    nullValue.apply(db.getLastInsertedRowId());
+    ASSERT_TRUE(nullValue.next());
+    EXPECT_EQ(nullValue.getStr(0), "null");
 }
 
 TEST(SQLite, busyBorrowedInsertionCanBeRetriedAfterItsOwnerChanges)

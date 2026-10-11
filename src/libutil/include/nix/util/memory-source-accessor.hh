@@ -204,13 +204,18 @@ protected:
     void deliverRegular(const typename File::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
     {
         sizeCallback(regular.contents.size());
-        if constexpr (std::is_same_v<decltype(regular.contents), std::string_view>) {
-            if (!regular.contents.empty())
-                sink(regular.contents);
-        } else {
-            StringSource source{regular.contents};
-            source.drainInto(sink);
+        if constexpr (
+            std::is_same_v<decltype(regular.contents), std::string_view>
+            || std::is_same_v<decltype(regular.contents), std::string>) {
+            if (std::is_same_v<decltype(regular.contents), std::string_view>
+                || static_cast<SourceAccessor &>(*this).isFixed()) {
+                if (!regular.contents.empty())
+                    sink(regular.contents);
+                return;
+            }
         }
+        StringSource source{regular.contents};
+        source.drainInto(sink);
     }
 
 public:

@@ -150,12 +150,7 @@ struct AttrDb
 
             // Insert children as placeholders, but don't replace existing entries
             for (auto & attr : attrs)
-                state->insertAttributeIfNotExists.use()
-                    .apply(rowId)
-                    .apply(symbols[attr])
-                    .apply(AttrType::Placeholder)
-                    .apply(0, false)
-                    .exec();
+                state->insertAttributeIfNotExists.exec(rowId, symbols[attr], AttrType::Placeholder, std::nullopt);
 
             return rowId;
         });
@@ -226,12 +221,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Placeholder)
-                .apply(0, false)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Placeholder, std::nullopt);
 
             return state->db.getLastInsertedRowId();
         });
@@ -242,12 +232,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Missing)
-                .apply(0, false)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Missing, std::nullopt);
 
             return state->db.getLastInsertedRowId();
         });
@@ -258,12 +243,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Misc)
-                .apply(0, false)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Misc, std::nullopt);
 
             return state->db.getLastInsertedRowId();
         });
@@ -274,12 +254,7 @@ struct AttrDb
         return doSQLite([&]() {
             auto state(_state->lock());
 
-            state->insertAttribute.use()
-                .apply(key.first)
-                .apply(symbols[key.second])
-                .apply(AttrType::Failed)
-                .apply(0, false)
-                .exec();
+            state->insertAttribute.exec(key.first, symbols[key.second], AttrType::Failed, std::nullopt);
 
             return state->db.getLastInsertedRowId();
         });

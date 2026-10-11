@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -138,6 +139,11 @@ struct SQLiteStmt
         Use & apply(int64_t value, bool notNull = true);
         Use & apply(const sqlite3_value & value);
         Use & bind(); // null
+
+        Use & apply(std::nullopt_t)
+        {
+            return bind();
+        }
 
         /** Restart parameter binding/execution, retaining current bound values. */
         void reset();

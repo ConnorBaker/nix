@@ -921,7 +921,7 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
-        state->stmts->NewIngestion.use(SQLiteStmt::Bindings::Borrow).apply("", false).apply(holdName).exec();
+        state->stmts->NewIngestion.exec(std::nullopt, holdName);
         auto id = static_cast<uint64_t>(sqlite3_last_insert_rowid(state->db));
         insertBlobRows(*state, id, rows);
         insertAuxiliaryRows(*state, id, projection.auxiliary);

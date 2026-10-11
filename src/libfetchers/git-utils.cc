@@ -1756,12 +1756,6 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
         const File root;
         friend struct FsoSourceAccessor<Accessor, File>;
         void anchor() override {}
-        void deliverRegular(const File::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
-        {
-            sizeCallback(regular.contents.size());
-            if (!regular.contents.empty())
-                sink(regular.contents);
-        }
         Accessor(File value) : root(std::move(value))
         {
             knownRoot = root.metadata;

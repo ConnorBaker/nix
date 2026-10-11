@@ -2,25 +2,25 @@
 
 ## Latest matched comparison
 
-The latest closed matched cohort, **c9r17**, measures **760b215854e766ad0e6793e5f9be5d09e0295217** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**. Wall and CPU medians each improve in **six of nine cases**. Cold path and both warm-Git cases regress in all six pairs. Peak RSS medians rise in seven cases. **The all-nine performance and substantial source-contraction goals remain unmet.** These whole-endpoint measurements do not isolate individual changes; pending SQLite edits are not measured here. Historical `/tmp` links below no longer resolve after cleanup and are not current validation receipts.
+The latest closed matched cohort, **c9r18**, measures **cf7ef61580033449bc603c01ee683a272e6bb535** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Six wall and CPU medians improve; cold path and both warm-Git cases lose all six pairs. Eight RSS medians rise. **The all-nine performance and substantial source-contraction goals remain unmet.** Whole-endpoint measurements do not isolate individual changes. Historical `/tmp` links no longer resolve and are not current validation receipts.
 
 Ratios are medians of six adjacent candidate/base ratios; below one is lower. Each case retains three AB and three BA pairs.
 
 | Case | Wall / base | CPU / base | RSS / base | Wall wins | CPU wins |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| cold 32 path | 1.125552 | 1.137389 | 1.508505 | 0/6 | 0/6 |
-| cold 32 git | 0.919318 | 0.936922 | 1.414007 | 6/6 | 6/6 |
-| cold 32 github | 0.672651 | 0.319908 | 0.761363 | 6/6 | 6/6 |
-| warm 8 path | 0.253369 | 0.254579 | 1.836952 | 6/6 | 6/6 |
-| warm 8 git | 1.404815 | 1.581005 | 1.784545 | 0/6 | 0/6 |
-| warm 8 github | 0.864020 | 0.852941 | 1.009680 | 5/6 | 6/6 |
-| warm 32 path | 0.360856 | 0.370015 | 1.444968 | 6/6 | 6/6 |
-| warm 32 git | 1.198494 | 1.279964 | 1.422468 | 0/6 | 0/6 |
-| warm 32 github | 0.904442 | 0.923882 | 0.999308 | 6/6 | 6/6 |
+| cold 32 path | 1.083759 | 1.140351 | 1.548702 | 0/6 | 0/6 |
+| cold 32 git | 0.925557 | 0.939529 | 1.439473 | 6/6 | 6/6 |
+| cold 32 github | 0.617531 | 0.351505 | 0.883857 | 6/6 | 6/6 |
+| warm 8 path | 0.253844 | 0.259448 | 1.837213 | 6/6 | 6/6 |
+| warm 8 git | 1.488027 | 1.605818 | 1.784794 | 0/6 | 0/6 |
+| warm 8 github | 0.931636 | 0.887500 | 1.022670 | 4/6 | 6/6 |
+| warm 32 path | 0.365122 | 0.375063 | 1.449331 | 6/6 | 6/6 |
+| warm 32 git | 1.266890 | 1.311104 | 1.422611 | 0/6 | 0/6 |
+| warm 32 github | 0.896054 | 0.932909 | 1.010625 | 5/6 | 6/6 |
 
-The [complete readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/READOUT.json), [independent seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/INDEPENDENT-SEAL.json) and [actual closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/ACTUAL-FINAL-JOB-CLOSURE.json) retain **114 outputs, 54 balanced pairs and 21 complete graphs**, with no exclusions or target retries. All 42 physical states remain; graphs match after address rewriting. Full source and all 98 runtime-provider guards pass. A [post-seal selector qualification](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/native-selector-postseal-mutation/QUALIFICATION.json) preserves the exact native input used before its live selector changed; benchmark inputs were unaffected and targets were not replayed. The entire artifact set is not pristine. Cold means fresh application state with host page caches intact; warm reuses the original roots. Shared-host pressure remains retained without exclusions and establishes no causal time fraction. CPU uses the existing timer resolution; ties are not speedups. The [source/correctness binding](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/CORRECTNESS-BINDING.json) distinguishes normal and real-overlay validation from optimized measurements.
+The [readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/READOUT.json), [seal](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/INDEPENDENT-SEAL.json) and [actual closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/ACTUAL-FINAL-JOB-CLOSURE.json) retain **114 outputs, 54 balanced pairs, 21 complete graphs and 42 states**, without exclusions or target retries. Graphs match after address rewriting; source and all 98 provider guards pass. The [closer transition](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/CLOSER-ADMINISTRATIVE-TRANSITION/TRANSITION.json) and [actual-use inventory](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/CLOSER-ADMINISTRATIVE-TRANSITION/ACTUAL-USE-INVENTORY.json) distinguish the readiness-sealed archived helper from its changed live version: only final receipt failure accounting changed, not the benchmark execution helper. The live readiness pin is not pristine. Both the native output-parent failure and first aggregate-readback schema failure remain; corrections repeated no targets. Cold means fresh application state, with host page cache intact; warm reuses original roots. All pressure samples remain; they establish no causal time fraction. CPU timer ties are not speedups. [QA binding](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-sqlite-exec-borrow-oct11/CORRECTNESS-BINDING.json) separates normal/real-overlay validation from optimized measurements.
 
-The [c9r15/efc readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-shared-reader-v9-oct11/READOUT.json) and [closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-shared-reader-v9-oct11/ACTUAL-FINAL-JOB-CLOSURE.json) preserve the preceding full table and observations: six lower wall and CPU medians, all-six losses in the same three cases, and eight higher RSS medians. Its 1,518 pressure samples, including 958 timed, and its source/provider guards remain historical. The [c9r14 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/READOUT.json) likewise describes its own endpoint.
+The [760 results](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/READOUT.json) and [selector qualification](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-getdents-registration-oct11/native-selector-postseal-mutation/QUALIFICATION.json) remain historical: the exact consumed native selector is archived, its live path changed after native sealing, and benchmark inputs were unaffected with no replay. The preceding [efc/c9r15](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-shared-reader-v9-oct11/READOUT.json) and [193397/c9r14](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/READOUT.json) receipts retain their complete observations and adverse results; they do not attribute cf7 costs.
 
 ### Historical efc counter and filesystem diagnostics
 
