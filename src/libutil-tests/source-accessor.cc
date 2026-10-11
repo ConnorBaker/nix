@@ -89,6 +89,83 @@ TEST_F(FSSourceAccessorTest, works)
     }
 }
 
+TEST_F(FSSourceAccessorTest, regularRootKeepsCapturedMetadataAndBounds)
+{
+#ifdef _WIN32
+    GTEST_SKIP() << "POSIX opened regular root";
+#else
+    enum class Change { None, Replace, Grow, Shrink };
+    const std::string contents("cap\0tured", 9);
+    unsigned cases = 0;
+    for (auto change : {Change::None, Change::Replace, Change::Grow, Change::Shrink})
+        for (bool executable : {false, true})
+            for (bool track : {false, true}) {
+                SCOPED_TRACE(::testing::Message() << int(change) << ' ' << executable << ' ' << track);
+                auto path = tmpDir / std::to_string(cases++);
+                writeFile(path, contents);
+                ASSERT_EQ(::chmod(path.c_str(), executable ? 0755 : 0644), 0);
+                setWriteTime(path, 1000, 1000);
+                auto captured = nix::lstat(path);
+                ASSERT_EQ(captured.st_mtime, time_t{1000});
+                auto accessor = makeFSSourceAccessor(path, track);
+                if (change == Change::Replace) {
+                    std::filesystem::rename(path, path.string() + "-opened");
+                    writeFile(path, "replacement");
+                } else if (change == Change::Grow)
+                    writeFile(path, contents + "extra");
+                else if (change == Change::Shrink)
+                    writeFile(path, contents.substr(0, 3));
+                if (change != Change::None) {
+                    ASSERT_EQ(::chmod(path.c_str(), executable ? 0644 : 0755), 0);
+                    setWriteTime(path, 2000, 2000);
+                    ASSERT_EQ(nix::lstat(path).st_mtime, time_t{2000});
+                }
+                auto st = accessor->lstat(CanonPath::root);
+                EXPECT_EQ(st.type, SourceAccessor::tRegular);
+                EXPECT_EQ(st.fileSize, contents.size());
+                EXPECT_EQ(st.isExecutable, executable);
+                EXPECT_FALSE(st.narOffset);
+                EXPECT_EQ(accessor->getLastModified(), track ? std::optional<time_t>{1000} : std::nullopt);
+                EXPECT_EQ(accessor->getPhysicalPath(CanonPath::root), path);
+                EXPECT_FALSE(accessor->getPhysicalPath(CanonPath("child")));
+                EXPECT_EQ(accessor->showPath(CanonPath::root), path.generic_string());
+                EXPECT_EQ(accessor->showPath(CanonPath("child")), path.generic_string() + "/child");
+                EXPECT_FALSE(accessor->maybeLstat(CanonPath("child")));
+                EXPECT_TRUE(accessor->pathExists(CanonPath::root));
+                EXPECT_FALSE(accessor->pathExists(CanonPath("child")));
+                StringSink sink;
+                unsigned announcements = 0;
+                auto read = [&] {
+                    accessor->readFile(CanonPath::root, sink, [&](uint64_t size) {
+                        ++announcements;
+                        EXPECT_EQ(size, contents.size());
+                    });
+                };
+                if (change == Change::Shrink) {
+                    EXPECT_THROW(read(), EndOfFile);
+                    EXPECT_EQ(sink.s, contents.substr(0, 3));
+                } else {
+                    EXPECT_NO_THROW(read());
+                    EXPECT_EQ(sink.s, contents);
+                }
+                EXPECT_EQ(announcements, 1u);
+                EXPECT_EQ(accessor->getLastModified(), track ? std::optional<time_t>{1000} : std::nullopt);
+                unsigned directoryCallbacks = 0;
+                for (const auto & query : {CanonPath::root, CanonPath("child")})
+                    EXPECT_THROW(
+                        accessor->readDirectoryWithEntries(
+                            query,
+                            [&](SourceAccessor &, const CanonPath &, SourceAccessor::DirectoryListing &&) {
+                                ++directoryCallbacks;
+                            }),
+                        NotADirectory);
+                EXPECT_EQ(directoryCallbacks, 0u);
+            }
+    EXPECT_EQ(cases, 16u);
+    RecordProperty("finite_cases", cases);
+#endif
+}
+
 /* The sentinel stops an unfixed implementation before it can return into a
    receiver destroyed by its own callback. It is distinct from the intended
    callback exception, so an early ownership failure cannot satisfy the test. */
