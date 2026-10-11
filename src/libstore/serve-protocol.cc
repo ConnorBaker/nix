@@ -198,12 +198,9 @@ UnkeyedRealisation ServeProto::Serialise<UnkeyedRealisation>::read(const StoreDi
             conn.version.minor);
     }
 
-    auto outPath = ServeProto::Serialise<StorePath>::read(store, conn);
-    auto signatures = ServeProto::Serialise<std::set<Signature>>::read(store, conn);
-
     return UnkeyedRealisation{
-        .outPath = std::move(outPath),
-        .signatures = std::move(signatures),
+        .outPath = ServeProto::Serialise<StorePath>::read(store, conn),
+        .signatures = ServeProto::Serialise<std::set<Signature>>::read(store, conn),
     };
 }
 
@@ -229,12 +226,9 @@ DrvOutput ServeProto::Serialise<DrvOutput>::read(const StoreDirConfig & store, R
             conn.version.minor);
     }
 
-    auto drvPath = ServeProto::Serialise<StorePath>::read(store, conn);
-    auto outputName = ServeProto::Serialise<std::string>::read(store, conn);
-
     return DrvOutput{
-        .drvPath = std::move(drvPath),
-        .outputName = std::move(outputName),
+        .drvPath = ServeProto::Serialise<StorePath>::read(store, conn),
+        .outputName = ServeProto::Serialise<std::string>::read(store, conn),
     };
 }
 

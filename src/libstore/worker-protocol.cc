@@ -508,12 +508,9 @@ UnkeyedRealisation WorkerProto::Serialise<UnkeyedRealisation>::read(const StoreD
             WorkerProto::featureRealisationWithPath);
     }
 
-    auto outPath = WorkerProto::Serialise<StorePath>::read(store, conn);
-    auto signatures = WorkerProto::Serialise<std::set<Signature>>::read(store, conn);
-
     return UnkeyedRealisation{
-        .outPath = std::move(outPath),
-        .signatures = std::move(signatures),
+        .outPath = WorkerProto::Serialise<StorePath>::read(store, conn),
+        .signatures = WorkerProto::Serialise<std::set<Signature>>::read(store, conn),
     };
 }
 
@@ -568,12 +565,9 @@ DrvOutput WorkerProto::Serialise<DrvOutput>::read(const StoreDirConfig & store, 
             WorkerProto::featureRealisationWithPath);
     }
 
-    auto drvPath = WorkerProto::Serialise<StorePath>::read(store, conn);
-    auto outputName = WorkerProto::Serialise<std::string>::read(store, conn);
-
     return DrvOutput{
-        .drvPath = std::move(drvPath),
-        .outputName = std::move(outputName),
+        .drvPath = WorkerProto::Serialise<StorePath>::read(store, conn),
+        .outputName = WorkerProto::Serialise<std::string>::read(store, conn),
     };
 }
 

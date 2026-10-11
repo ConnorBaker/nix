@@ -521,7 +521,7 @@ LocalStore::LocalStore(ref<const Config> config)
         state->stmts->QueryRealisedOutput.create(
             state->db,
             R"(
-                select id, outputPath, signatures from BuildTraceV3
+                select outputPath, signatures from BuildTraceV3
                     where drvPath = ? and outputName = ?
                     ;
             )");
@@ -1294,10 +1294,9 @@ void LocalStore::registerDrvOutputUnchecked(const Realisation & info)
         auto state(_state->lock());
         if (auto oldR = queryRealisation_(*state, info.id)) {
             if (info.isCompatibleWith(*oldR)) {
-                auto combinedSignatures = oldR->signatures;
-                combinedSignatures.insert(info.signatures.begin(), info.signatures.end());
+                oldR->signatures.insert(info.signatures.begin(), info.signatures.end());
                 state->stmts->UpdateRealisedOutput.use()
-                    .apply(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))
+                    .apply(concatStringsSep(" ", Signature::toStrings(oldR->signatures)))
                     .apply(info.id.drvPath.to_string())
                     .apply(info.id.outputName)
                     .exec();
@@ -2664,43 +2663,26 @@ void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signa
     });
 }
 
-std::optional<std::pair<int64_t, UnkeyedRealisation>>
-LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & id)
+std::optional<UnkeyedRealisation> LocalStore::queryRealisation_(LocalStore::State & state, const DrvOutput & id)
 {
     auto useQueryRealisedOutput(state.stmts->QueryRealisedOutput.use());
     useQueryRealisedOutput.apply(id.drvPath.to_string()).apply(id.outputName);
     if (!useQueryRealisedOutput.next())
         return std::nullopt;
-    auto realisationDbId = useQueryRealisedOutput.getInt(0);
-    auto outputPath = parseStorePath(useQueryRealisedOutput.getStr(1));
-    auto signatures = tokenizeString<StringSet>(useQueryRealisedOutput.getStr(2));
-
-    return {
-        {realisationDbId,
-         UnkeyedRealisation{
-             .outPath = outputPath,
-             .signatures = Signature::parseMany(signatures),
-         }}};
-}
-
-std::optional<const UnkeyedRealisation> LocalStore::queryRealisation_(LocalStore::State & state, const DrvOutput & id)
-{
-    auto maybeCore = queryRealisationCore_(state, id);
-    if (!maybeCore)
-        return std::nullopt;
-    auto [realisationDbId, res] = *maybeCore;
-
-    return {res};
+    return UnkeyedRealisation{
+        .outPath = parseStorePath(useQueryRealisedOutput.getStr(0)),
+        .signatures = Signature::parseMany(tokenizeString<StringSet>(useQueryRealisedOutput.getStr(1))),
+    };
 }
 
 void LocalStore::queryRealisationUncached(
     const DrvOutput & id, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept
 {
     try {
-        auto maybeRealisation = retrySQLite<std::optional<const UnkeyedRealisation>>(
+        auto maybeRealisation = retrySQLite<std::optional<UnkeyedRealisation>>(
             [&]() { return queryRealisation_(*_state->lock(), id); });
         if (maybeRealisation)
-            callback(std::make_shared<const UnkeyedRealisation>(maybeRealisation.value()));
+            callback(std::make_shared<const UnkeyedRealisation>(std::move(*maybeRealisation)));
         else
             callback(nullptr);
 

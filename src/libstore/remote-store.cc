@@ -599,7 +599,7 @@ void RemoteStore::queryRealisationUncached(
             auto realisation = WorkerProto::Serialise<std::optional<UnkeyedRealisation>>::read(*this, *conn);
             if (!realisation)
                 return nullptr;
-            return std::make_shared<const UnkeyedRealisation>(*realisation);
+            return std::make_shared<const UnkeyedRealisation>(std::move(*realisation));
         }());
     } catch (...) {
         return callback.rethrow();

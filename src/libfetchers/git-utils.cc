@@ -395,6 +395,14 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             packBackend->refresh = nullptr;
     }
 
+    git_oid writeRawObject(std::string_view body, git_object_t type, const char * action)
+    {
+        git_oid oid;
+        if (git_odb_write(&oid, odb.get(), body.data(), body.size(), type))
+            throw GitError(action);
+        return oid;
+    }
+
     GitRepoImpl(std::filesystem::path _path, Options _options)
         : path(std::move(_path))
         , options(_options)
@@ -1603,8 +1611,7 @@ struct GitRegularFileSinkImpl : merkle::RegularFileSinkWithFinalize
         } else {
             /* Small file: get a repo and create blob from buffer. */
             auto handle = getRepo();
-            if (git_odb_write(&oid, handle->odb.get(), contents.data(), contents.size(), GIT_OBJECT_BLOB))
-                throw GitError("creating blob from buffer");
+            oid = handle->writeRawObject(contents, GIT_OBJECT_BLOB, "creating blob from buffer");
         }
 
         return toHash(oid);
@@ -1643,10 +1650,7 @@ struct GitDirectorySinkImpl : merkle::DirectorySinkWithFinalize
     Hash finalize() && override
     {
         auto body = merkle::serialiseTree(entries);
-        git_oid oid;
-        if (git_odb_write(&oid, repo.odb.get(), body.data(), body.size(), GIT_OBJECT_TREE))
-            throw GitError("writing a tree object");
-        return toHash(oid);
+        return toHash(repo.writeRawObject(body, GIT_OBJECT_TREE, "writing a tree object"));
     }
 };
 
@@ -1715,17 +1719,13 @@ ref<SourceAccessor> GitRepo::acquire(const std::filesystem::path & path, const S
             File file{failure};
             read(file);
             if (failure) std::rethrow_exception(failure);
-            git_oid oid;
-            if (git_odb_write(&oid, repo->odb.get(), file.contents.data(), file.contents.size(), GIT_OBJECT_BLOB))
-                throw GitError("creating an acquired regular blob");
-            return {file.mode, toHash(oid)};
+            return {file.mode, toHash(repo->writeRawObject(
+                file.contents, GIT_OBJECT_BLOB, "creating an acquired regular blob"))};
         }
         merkle::TreeEntry symlink(const CanonPath &, const std::string & target) override
         {
-            git_oid oid;
-            if (git_odb_write(&oid, repo->odb.get(), target.data(), target.size(), GIT_OBJECT_BLOB))
-                throw GitError("creating an acquired symlink blob");
-            return {merkle::Mode::Symlink, toHash(oid)};
+            return {merkle::Mode::Symlink, toHash(repo->writeRawObject(
+                target, GIT_OBJECT_BLOB, "creating an acquired symlink blob"))};
         }
         merkle::TreeEntry directory(const CanonPath &, Children children) override
         {
@@ -1762,7 +1762,7 @@ ref<SourceAccessor> GitRepo::acquire(const std::filesystem::path & path, const S
         .rootMode = root.mode,
     });
     accessor->setPathDisplay(std::move(display));
-    return accessor;
+    return ref<SourceAccessor>{std::move(accessor).get_ptr()};
 }
 
 ref<SourceAccessor> GitRepoImpl::getAccessor(
@@ -1988,9 +1988,8 @@ struct GitRepoPoolImpl : GitRepoPool
     merkle::TreeEntry makeSymlink(const std::string & target) override
     {
         auto handle = getRepo();
-        git_oid oid;
-        if (git_odb_write(&oid, handle->odb.get(), requireCString(target), target.size(), GIT_OBJECT_BLOB))
-            throw GitError("creating a blob object for symlink");
+        auto oid = handle->writeRawObject(
+            {requireCString(target), target.size()}, GIT_OBJECT_BLOB, "creating a blob object for symlink");
         return merkle::TreeEntry{.mode = merkle::Mode::Symlink, .hash = toHash(oid)};
     }
 

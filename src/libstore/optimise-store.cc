@@ -913,9 +913,11 @@ StorePath LocalStore::materialise(
         /* Collection precedes every write; a buffered, already valid
            root needs neither collection nor an ingestion's hold. */
         autoGC();
-        hold.emplace(objects.hold());
-        tempDir.emplace(createTempDirInStore());
-        restore.dstPath = tempDir->second.path() / "x";
+        auto preparedHold = objects.hold();
+        auto preparedDir = createTempDirInStore();
+        restore.dstPath = preparedDir.second.path() / "x";
+        tempDir.emplace(std::move(preparedDir));
+        hold.emplace(std::move(preparedHold));
     };
 
     std::optional<BufferedRegularFile> buffered;

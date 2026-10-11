@@ -11810,6 +11810,99 @@ struct UnnamedRegularSource : MemorySourceAccessor
     }
 };
 
+TEST_F(LocalStoreObjectsTest, unnamedRegularCopyCanRecoverStagingPreparation)
+{
+    if (!store->materialisesFromObjects())
+        GTEST_SKIP();
+    auto & gc = settings.getLocalSettings().getGCSettings();
+    auto savedMinFree = gc.minFree.get();
+    gc.minFree = 0;
+    Finally resetMinFree{[&] { gc.minFree.assign(savedMinFree); }};
+    struct Source : UnnamedRegularSource
+    {
+        std::filesystem::path storeDir;
+        bool recover;
+        bool intercepted = false;
+
+        Source(std::string bytes, bool executable, bool sizeKnown, std::filesystem::path storeDir, bool recover)
+            : UnnamedRegularSource(std::move(bytes), executable, sizeKnown, std::nullopt)
+            , storeDir(std::move(storeDir)), recover(recover)
+        {}
+
+        void readFile(const CanonPath &, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+        {
+            ++reads;
+            auto & bytes = std::get<File::Regular>(root->raw).contents;
+            auto saved = storeDir.parent_path() / (storeDir.filename().string() + "-prepare-backup");
+            std::filesystem::rename(storeDir, saved);
+            bool restored = false;
+            auto restore = [&] {
+                if (!restored) {
+                    deletePath(storeDir);
+                    std::filesystem::rename(saved, storeDir);
+                    restored = true;
+                }
+            };
+            Finally restoreNamespace{restore};
+            /* A real ENOTDIR, before creating or writing a staging file. */
+            writeFile(storeDir, "temporarily unavailable staging namespace");
+            try {
+                sizeCallback(bytes.size());
+            } catch (SystemError & e) {
+                if (!e.is(std::errc::not_a_directory))
+                    throw;
+                intercepted = true;
+                if (!recover)
+                    throw;
+            }
+            restore();
+            /* The size was announced once, before all bytes delivered once. */
+            sink(bytes);
+        }
+    };
+    unsigned cells = 0;
+    for (bool executable : {false, true})
+        for (bool sizeKnown : {false, true})
+            for (bool recover : {false, true}) {
+                auto name = fmt("prepare-recovery-%d", cells++);
+                SCOPED_TRACE(name);
+                std::string bytes((1 << 20) + 1, 'a' + cells);
+                auto source = make_ref<Source>(bytes, executable, sizeKnown, config->realStoreDir.get(), recover);
+                auto expectedRoot = merkle::TreeEntry{
+                    .mode = executable ? merkle::Mode::Executable : merkle::Mode::Regular,
+                    .hash = merkle::blobId(bytes)};
+                auto expected = store->makeFixedOutputPathFromCA(
+                    name, ContentAddressWithReferences::fromParts(
+                              ContentAddressMethod::Raw::Git, merkle::objectHash(expectedRoot), {}));
+                auto before = store->queryAllValidPaths();
+                auto copy = [&] {
+                    return store->materialise(name, SourcePath(source), defaultPathFilter, NoRepair, noNode());
+                };
+                if (recover) {
+                    std::optional<StorePath> copied;
+                    EXPECT_NO_THROW(copied = copy());
+                    if (copied) {
+                        EXPECT_EQ(*copied, expected);
+                        EXPECT_TRUE(store->isValidPath(expected));
+                        EXPECT_EQ(readFile(store->toRealPath(expected)), bytes);
+                        EXPECT_EQ(st(store->toRealPath(expected)).st_mode & 0777, executable ? 0555u : 0444u);
+                    }
+                } else {
+                    EXPECT_THROW(copy(), SystemError);
+                    EXPECT_EQ(store->queryAllValidPaths(), before);
+                }
+                EXPECT_TRUE(source->intercepted);
+                EXPECT_EQ(source->reads, 1u);
+                EXPECT_TRUE(S_ISDIR(st(config->realStoreDir.get()).st_mode));
+                EXPECT_FALSE(pathExists(std::filesystem::path(config->realStoreDir.get()).parent_path()
+                                        / (std::filesystem::path(config->realStoreDir.get()).filename().string()
+                                           + "-prepare-backup")));
+                EXPECT_EQ(count("tmp"), 0u);
+            }
+    EXPECT_EQ(cells, 8u);
+    RecordProperty("finite_cases", cells);
+}
+
 TEST_F(LocalStoreObjectsTest, unnamedRegularCopyStagesOnlyWhenItsDestinationNeedsWriting)
 {
     constexpr size_t limit = 1 << 20;
@@ -12931,6 +13024,89 @@ TEST_F(TempLocalStoreTest, invalidationAfterValidityBackendCannotBeUndoneByItsRe
     EXPECT_FALSE(observed->cached(path).has_value());
     EXPECT_THROW(observed->queryPathInfo(path), InvalidPath);
 }
+
+#ifndef _WIN32
+TEST_F(TempLocalStoreTest, overlayDeletionSelectsItsOwnedNamespaceAndDefinesAccounting)
+{
+    auto lowerReference = config->getReference();
+    lowerReference.params.insert_or_assign("root", tempStoreDir.path().string());
+    auto root = tempStoreDir.path() / "delete-overlay";
+    auto overlayConfig = std::make_shared<LocalOverlayStoreConfig>(
+        root, StoreConfig::Params{{"lower-store", lowerReference.render(true)},
+            {"upper-layer", (root / "upper").string()}, {"check-mount", "false"}});
+    std::shared_ptr<LocalStore> overlay = std::make_shared<LocalOverlayStore>(ref{overlayConfig});
+    overlay->init();
+    createDirs(root / "upper");
+    auto mergedRoot = std::filesystem::path{overlay->config->realStoreDir.get()};
+    createDirs(mergedRoot);
+    unsigned cases = 0;
+    auto check = [&](std::string name, bool known, bool upper, bool lower) {
+        SCOPED_TRACE(fmt("overlay-delete-cell=%u known=%d upper=%d lower=%d name=%s", cases, known, upper, lower, name));
+        auto upperPath = root / "upper" / name;
+        auto lowerPath = config->realStoreDir.get() / name;
+        auto mergedPath = mergedRoot / name;
+        const std::string bytes = "owned deletion witness";
+        if (upper)
+            writeFile(upperPath, bytes);
+        writeFile(mergedPath, bytes);
+        if (!lower)
+            deletePath(lowerPath);
+        uint64_t freed = 999;
+        bool admitted = false;
+        EXPECT_NO_THROW({
+            overlay->deleteStorePath(mergedPath, freed, known);
+            admitted = true;
+        });
+        ++cases;
+        if (admitted) {
+            EXPECT_EQ(freed, upper ? bytes.size() : 0u);
+            EXPECT_EQ(pathExists(lowerPath), lower);
+            if (lower)
+                EXPECT_EQ(readFile(lowerPath), bytes);
+            EXPECT_EQ(pathExists(upperPath), false);
+            EXPECT_EQ(pathExists(mergedPath), true);
+        }
+        deletePath(upperPath);
+        deletePath(mergedPath);
+    };
+    for (bool known : {false, true})
+        for (bool upper : {false, true})
+            for (bool lower : {false, true})
+                for (bool valid : {false, true}) {
+                    StringSource input{std::string_view{"owned deletion witness"}};
+                    auto path = store->addToStoreFromDump(
+                        input, fmt("owned-delete-%u", cases), FileSerialisationMethod::Flat,
+                        ContentAddressMethod::Raw::Flat, HashAlgorithm::SHA256, {}, NoRepair);
+                    if (!valid)
+                        store->invalidatePathChecked(path);
+                    check(std::string(path.to_string()), known, upper, lower);
+                }
+    for (bool known : {false, true})
+        for (bool upper : {false, true})
+            for (bool lower : {false, true}) {
+                auto name = fmt("not-a-store-object-%u", cases);
+                if (lower)
+                    writeFile(config->realStoreDir.get() / name, "owned deletion witness");
+                check(name, known, upper, lower);
+            }
+    uint64_t freed = 999;
+    {
+        SCOPED_TRACE(fmt("overlay-delete-cell=%u family=wrong-parent", cases));
+        EXPECT_NO_THROW(overlay->deleteStorePath(root / "outside", freed, false));
+        ++cases;
+        EXPECT_EQ(freed, 0u);
+    }
+    for (auto name : {".", "..", ""}) {
+        SCOPED_TRACE(fmt("overlay-delete-cell=%u family=invalid-name name=%s", cases, name));
+        freed = 999;
+        EXPECT_THROW(overlay->deleteStorePath(std::filesystem::path{mergedRoot.string() + "/" + name}, freed, false), BadCanonPath);
+        EXPECT_EQ(freed, 0u);
+        ++cases;
+    }
+    EXPECT_EQ(cases, 28u);
+    RecordProperty("finite_cases", cases);
+}
+#endif
 
 TEST_F(TempLocalStoreTest, overlayAccessorListsLowerVisibleObjectsWithoutClaimingOwnership)
 {

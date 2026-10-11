@@ -695,8 +695,7 @@ public:
     void cacheDrvOutputMapping(
         State & state, const uint64_t deriver, const std::string & outputName, const StorePath & output);
 
-    std::optional<const UnkeyedRealisation> queryRealisation_(State & state, const DrvOutput & id);
-    std::optional<std::pair<int64_t, UnkeyedRealisation>> queryRealisationCore_(State & state, const DrvOutput & id);
+    std::optional<UnkeyedRealisation> queryRealisation_(State & state, const DrvOutput & id);
     void queryRealisationUncached(
         const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
 
