@@ -1,6 +1,7 @@
 #include "nix/util/source-accessor.hh"
 
 #include <nlohmann/json.hpp>
+#include <tuple>
 
 namespace nix {
 
@@ -31,10 +32,10 @@ public:
      * A child's node at `path`, or nothing.  A path that passes through a
      * symlink has no node in a tree, whatever the accessor does about it.
      */
-    static std::optional<Stat> node(SourceAccessor & accessor, const CanonPath & path)
+    static std::optional<Stat> node(const ref<SourceAccessor> & accessor, const CanonPath & path)
     {
         try {
-            return accessor.maybeLstat(path);
+            return accessor->maybeLstat(path);
         } catch (SymlinkNotAllowed &) {
             return std::nullopt;
         }
@@ -53,7 +54,7 @@ public:
         while (before && !p.isRoot()) {
             p.pop();
             for (size_t j = 0; j < before; ++j)
-                if (auto st = node(*accessors[j], p)) {
+                if (auto st = node(ref<SourceAccessor>{accessors[j]}, p)) {
                     if (st->type != tDirectory)
                         return true;
                     before = j;
@@ -64,16 +65,17 @@ public:
     }
 
     /**
-     * The child whose node `path` denotes in the union, with that node; or
+     * The layer index, child and node `path` denotes in the union; or
      * nothing if `path` is not in the union.
      */
-    std::optional<std::pair<ref<SourceAccessor>, Stat>> owner(const CanonPath & path)
+    std::optional<std::tuple<size_t, ref<SourceAccessor>, Stat>> owner(const CanonPath & path)
     {
         for (size_t i = 0; i < accessors.size(); ++i) {
-            if (auto st = node(*accessors[i], path)) {
+            auto accessor = accessors[i];
+            if (auto st = node(accessor, path)) {
                 if (hides(i, path))
                     return std::nullopt;
-                return std::pair{accessors[i], *st};
+                return std::tuple{i, std::move(accessor), *st};
             }
         }
         return std::nullopt;
@@ -85,7 +87,7 @@ public:
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
-        return std::move(o->first);
+        return std::move(std::get<1>(*o));
     }
 
     /**
@@ -95,17 +97,14 @@ public:
      * own it; a later child's non-directory at `path` or at an ancestor is
      * hidden by `own`'s directories.
      */
-    std::vector<ref<SourceAccessor>> laterDirectories(const CanonPath & path, const SourceAccessor & own)
+    std::vector<ref<SourceAccessor>> laterDirectories(const CanonPath & path, size_t own)
     {
         std::vector<ref<SourceAccessor>> res;
-        bool after = false;
-        for (auto & accessor : accessors) {
-            if (after) {
-                auto st = node(*accessor, path);
-                if (st && st->type == tDirectory)
-                    res.push_back(accessor);
-            } else if (*accessor == own)
-                after = true;
+        for (size_t i = own + 1; i < accessors.size(); ++i) {
+            auto accessor = accessors[i];
+            auto st = node(accessor, path);
+            if (st && st->type == tDirectory)
+                res.push_back(std::move(accessor));
         }
         return res;
     }
@@ -119,7 +118,7 @@ public:
     {
         auto keepAlive = weak_from_this().lock();
         auto o = owner(path);
-        return o ? std::optional{o->second} : std::nullopt;
+        return o ? std::optional{std::get<2>(*o)} : std::nullopt;
     }
 
     DirEntries readDirectory(const CanonPath & path) override
@@ -128,12 +127,12 @@ public:
         auto o = owner(path);
         if (!o)
             throw FileNotFound("path '%s' does not exist", showPath(path));
-        auto & [own, st] = *o;
+        auto & [index, own, st] = *o;
         if (st.type != tDirectory)
             /* Let the owner raise its usual error for a non-directory. */
             return own->readDirectory(path);
         DirEntries result = own->readDirectory(path);
-        for (auto & accessor : laterDirectories(path, *own))
+        for (auto & accessor : laterDirectories(path, index))
             /* Transfer owned entries; earlier children win name collisions. */
             result.merge(accessor->readDirectory(path));
         return result;
@@ -165,8 +164,8 @@ public:
         auto selected = owner(path);
         if (!selected)
             return std::nullopt;
-        auto & [own, st] = *selected;
-        if (st.type == tDirectory && !laterDirectories(path, *own).empty())
+        auto & [index, own, st] = *selected;
+        if (st.type == tDirectory && !laterDirectories(path, index).empty())
             return std::nullopt;
         return own->getPhysicalPath(path);
     }
@@ -180,8 +179,8 @@ public:
         auto o = owner(path);
         if (!o)
             return std::nullopt;
-        auto & [own, st] = *o;
-        auto later = st.type == tDirectory ? laterDirectories(path, *own) : std::vector<ref<SourceAccessor>>{};
+        auto & [index, own, st] = *o;
+        auto later = st.type == tDirectory ? laterDirectories(path, index) : std::vector<ref<SourceAccessor>>{};
         /* Selection borrows the layers; naming now owns every part. */
         keepAlive.reset();
         if (later.empty())

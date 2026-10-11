@@ -589,6 +589,95 @@ struct UnionCallbackStopped
 
 } // namespace
 
+TEST(UnionSourceAccessor, selectedOccurrenceKeepsItsObservedReceiver)
+{
+    enum class ReplaceAt { Owner, Ancestor, Later };
+    const CanonPath path("shared");
+    size_t cases = 0;
+    for (auto at : {ReplaceAt::Owner, ReplaceAt::Ancestor, ReplaceAt::Later})
+        for (bool naming : {false, true})
+            for (bool stop : {false, true}) {
+                SCOPED_TRACE(fmt("at=%d naming=%d stop=%d", unsigned(at), naming, stop));
+                bool sawOwner = false, replaced = false;
+                ref<SourceAccessor> * slot = nullptr;
+                auto replacement = memoryTree({{"shared/replacement", "replacement"}});
+                std::function<void(unsigned, UnionCall)> observe = [&](unsigned layer, UnionCall call) {
+                    if (!slot || call != UnionCall::Stat || replaced)
+                        return;
+                    if (layer == 1)
+                        sawOwner = true;
+                    bool selected = at == ReplaceAt::Owner ? layer == 1
+                                  : at == ReplaceAt::Ancestor ? layer == 0 && sawOwner
+                                  : layer == 2;
+                    if (selected) {
+                        *slot = replacement;
+                        replaced = true;
+                        if (stop)
+                            throw UnionCallbackStopped{};
+                    }
+                };
+                /* These independent owners keep the old implementation's
+                   wrong routing defined even after its vector slot changes. */
+                auto upper = make_ref<UnionOwnershipProbe>(0, observe);
+                auto owner = make_ref<UnionOwnershipProbe>(1, observe);
+                auto later = make_ref<UnionOwnershipProbe>(2, observe);
+                owner->addFile(CanonPath("shared/kept"), "kept");
+                later->addFile(CanonPath("shared/later"), "later");
+                std::vector<ref<SourceAccessor>> layers{upper, owner, later};
+                slot = &layers[at == ReplaceAt::Later ? 2 : 1];
+                auto view = makeUnionSourceAccessor(std::move(layers));
+                auto read = [&] {
+                    if (naming) {
+                        auto name = view->getFingerprint(path);
+                        ASSERT_TRUE(name);
+                        EXPECT_EQ(name->first, CanonPath::root);
+                        EXPECT_EQ(name->second, R"(["union",[["layer-1","/shared"],["layer-2","/shared"]]])");
+                    } else
+                        EXPECT_EQ(view->readDirectory(path),
+                            (SourceAccessor::DirEntries{{"kept", SourceAccessor::tRegular},
+                                {"later", SourceAccessor::tRegular}}));
+                };
+                if (stop)
+                    EXPECT_THROW(read(), UnionCallbackStopped);
+                else
+                    EXPECT_NO_THROW(read());
+                EXPECT_TRUE(replaced);
+                EXPECT_EQ(view->readDirectory(path),
+                    (SourceAccessor::DirEntries{{at == ReplaceAt::Later ? "kept" : "later", SourceAccessor::tRegular},
+                        {"replacement", SourceAccessor::tRegular}}));
+                ++cases;
+            }
+    /* A live child may acquire a node between occurrences. Only occurrences
+       strictly after the successful observation contribute later directories. */
+    for (bool naming : {false, true}) {
+        SCOPED_TRACE(fmt("duplicate naming=%d", naming));
+        std::shared_ptr<UnionOwnershipProbe> first, middle;
+        unsigned firstCalls = 0, middleCalls = 0;
+        std::function<void(unsigned, UnionCall)> observe = [&](unsigned layer, UnionCall call) {
+            if (call != UnionCall::Stat)
+                return;
+            if (layer == 0 && ++firstCalls == 1)
+                first->addFile(CanonPath("shared/selected"), "selected");
+            if (layer == 1 && ++middleCalls == 1)
+                middle->addFile(CanonPath("shared/earlier"), "earlier");
+        };
+        first = std::make_shared<UnionOwnershipProbe>(0, observe);
+        middle = std::make_shared<UnionOwnershipProbe>(1, observe);
+        auto view = makeUnionSourceAccessor({ref{first}, ref{middle}, ref{first}});
+        if (naming) {
+            auto name = view->getFingerprint(path);
+            ASSERT_TRUE(name);
+            EXPECT_EQ(name->first, path);
+            EXPECT_EQ(name->second, "layer-0");
+        } else
+            EXPECT_EQ(view->readDirectory(path),
+                (SourceAccessor::DirEntries{{"selected", SourceAccessor::tRegular}}));
+        ++cases;
+    }
+    EXPECT_EQ(cases, 14u);
+    RecordProperty("finite_cases", cases);
+}
+
 TEST(UnionSourceAccessor, everyDelegatedBoundaryPreservesItsRequiredOwners)
 {
     enum class Operation { Exists, MaybeStat, Stat, File, Link, Directory, Name, Physical, Invalidate, Display };
