@@ -1,4 +1,5 @@
 #include "nix/util/nar-accessor.hh"
+#include "nix/util/memory-source-accessor.hh"
 #include "nix/util/file-descriptor.hh"
 #include "nix/util/error.hh"
 
@@ -6,10 +7,11 @@ namespace nix {
 
 namespace {
 
-struct NarAccessorImpl : NarAccessor
+struct NarAccessorImpl : FsoSourceAccessor<NarAccessorImpl, NarListing, NarAccessor>
 {
 private:
     void anchor() override {};
+    friend struct FsoSourceAccessor<NarAccessorImpl, NarListing, NarAccessor>;
 
 public:
     NarListing root;
@@ -50,24 +52,7 @@ public:
     {
     }
 
-    NarListing * find(const CanonPath & path)
-    {
-        NarListing * current = &root;
-
-        for (const auto & i : path) {
-            auto * dir = std::get_if<NarListing::Directory>(&current->raw);
-            if (!dir)
-                return nullptr;
-            auto * child = nix::get(dir->entries, i);
-            if (!child)
-                return nullptr;
-            current = child;
-        }
-
-        return current;
-    }
-
-    NarListing & get(const CanonPath & path)
+    NarListing & require(const CanonPath & path)
     {
         auto result = find(path);
         if (!result)
@@ -75,48 +60,22 @@ public:
         return *result;
     }
 
-    std::optional<Stat> maybeLstat(const CanonPath & path) override
+    template<typename Part>
+    [[noreturn]] void wrongKind(const CanonPath & path, const NarListing &)
     {
-        auto i = find(path);
-        return i ? std::optional{i->lstat()} : std::nullopt;
+        constexpr auto kind = std::is_same_v<Part, NarListing::Regular> ? "a regular file"
+                              : std::is_same_v<Part, NarListing::Directory> ? "a directory"
+                                                                         : "a symlink";
+        throw Error("path '%1%' inside NAR file is not %2%", path, kind);
     }
 
-    DirEntries readDirectory(const CanonPath & path) override
+    void deliverRegular(const NarListing::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
     {
-        auto & i = get(path);
-
-        auto * dir = std::get_if<NarListing::Directory>(&i.raw);
-        if (!dir)
-            throw Error("path '%1%' inside NAR file is not a directory", path);
-
-        DirEntries res;
-        for (const auto & [name, child] : dir->entries)
-            res.emplace_hint(res.end(), name, child.lstat().type);
-
-        return res;
-    }
-
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
-    {
-        auto keepAlive = weak_from_this().lock();
-        auto & i = get(path);
-        auto * reg = std::get_if<NarListing::Regular>(&i.raw);
-        if (!reg)
-            throw Error("path '%1%' inside NAR file is not a regular file", path);
-
         assert(getNarBytes);
-        sizeCallback(reg->contents.fileSize.value());
-        return getNarBytes(reg->contents.narOffset.value(), reg->contents.fileSize.value(), sink);
+        sizeCallback(regular.contents.fileSize.value());
+        getNarBytes(regular.contents.narOffset.value(), regular.contents.fileSize.value(), sink);
     }
 
-    std::string readLink(const CanonPath & path) override
-    {
-        auto & i = get(path);
-        auto * sym = std::get_if<NarListing::Symlink>(&i.raw);
-        if (!sym)
-            throw Error("path '%1%' inside NAR file is not a symlink", path);
-        return sym->target;
-    }
 };
 
 } // namespace

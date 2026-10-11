@@ -2,6 +2,7 @@
 ///@file
 
 #include "nix/util/source-path.hh"
+#include "nix/util/serialise.hh"
 #include "nix/util/fs-sink.hh"
 #include "nix/util/variant-wrapper.hh"
 #include "nix/util/util.hh"
@@ -40,12 +41,15 @@ struct DirectoryT
     inline std::strong_ordering operator<=>(const DirectoryT &) const noexcept;
 };
 
-struct Symlink
+template<typename Contents>
+struct SymlinkT
 {
-    std::string target;
+    Contents target;
 
-    auto operator<=>(const Symlink &) const = default;
+    auto operator<=>(const SymlinkT &) const = default;
 };
+
+using Symlink = SymlinkT<std::string>;
 
 /**
  * For when we know there is child, but don't know anything about it.
@@ -65,7 +69,8 @@ struct Opaque
  * With a different type arugment, it is also can be a "skeletal"
  * version is that abstract syntax for a "NAR listing".
  */
-template<typename RegularContents, bool recur>
+template<typename RegularContents, bool recur, typename Metadata = std::monostate,
+         typename SymlinkContents = std::string>
 struct VariantT
 {
     bool operator==(const VariantT &) const noexcept;
@@ -78,12 +83,18 @@ struct VariantT
      */
     using Directory = nix::fso::DirectoryT<std::conditional_t<recur, VariantT, Opaque>>;
 
-    using Symlink = nix::fso::Symlink;
+    using Symlink = nix::fso::SymlinkT<SymlinkContents>;
 
     using Raw = std::variant<Regular, Directory, Symlink>;
     Raw raw;
+    [[no_unique_address]] Metadata metadata{};
 
     MAKE_WRAPPER_CONSTRUCTOR(VariantT);
+
+    VariantT(std::pair<Raw, Metadata> value)
+        : raw(std::move(value.first)), metadata(std::move(value.second))
+    {
+    }
 
     SourceAccessor::Stat lstat() const;
 };
@@ -94,16 +105,18 @@ inline bool DirectoryT<Child>::operator==(const DirectoryT &) const noexcept = d
 template<typename Child>
 inline std::strong_ordering DirectoryT<Child>::operator<=>(const DirectoryT &) const noexcept = default;
 
-template<typename RegularContents, bool recur>
+template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
 inline bool
-VariantT<RegularContents, recur>::operator==(const VariantT<RegularContents, recur> &) const noexcept = default;
+VariantT<RegularContents, recur, Metadata, SymlinkContents>::operator==(
+    const VariantT<RegularContents, recur, Metadata, SymlinkContents> &) const noexcept = default;
 
-template<typename RegularContents, bool recur>
+template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
 inline std::strong_ordering
-VariantT<RegularContents, recur>::operator<=>(const VariantT<RegularContents, recur> &) const noexcept = default;
+VariantT<RegularContents, recur, Metadata, SymlinkContents>::operator<=>(
+    const VariantT<RegularContents, recur, Metadata, SymlinkContents> &) const noexcept = default;
 
-template<typename RegularContents, bool recur>
-SourceAccessor::Stat VariantT<RegularContents, recur>::lstat() const
+template<typename RegularContents, bool recur, typename Metadata, typename SymlinkContents>
+SourceAccessor::Stat VariantT<RegularContents, recur, Metadata, SymlinkContents>::lstat() const
 {
     return std::visit(
         overloaded{
@@ -124,13 +137,119 @@ SourceAccessor::Stat VariantT<RegularContents, recur>::lstat() const
 
 } // namespace fso
 
+struct FsoVirtualSourceAccessor : virtual SourceAccessor
+{
+    bool operator==(const FsoVirtualSourceAccessor &) const noexcept = default;
+};
+
+template<typename Derived, typename Node = fso::VariantT<std::string, true>,
+         typename Base = FsoVirtualSourceAccessor>
+struct FsoSourceAccessor : Base
+{
+    using File = Node;
+    bool operator==(const FsoSourceAccessor &) const noexcept = default;
+    using Base::readFile;
+
+protected:
+    Derived & self() { return static_cast<Derived &>(*this); }
+
+    auto find(const CanonPath & path)
+    {
+        auto * current = &self().root;
+        for (auto name : path) {
+            auto directory = std::get_if<typename File::Directory>(&current->raw);
+            if (!directory)
+                return decltype(current){};
+            auto child = nix::get(directory->entries, name);
+            if (!child)
+                return decltype(current){};
+            current = child;
+        }
+        return current;
+    }
+
+    decltype(auto) require(const CanonPath & path)
+    {
+        if (auto file = self().find(path))
+            return *file;
+        throw FileNotFound("file '%s' does not exist", this->showPath(path));
+    }
+
+    template<typename Part, typename Value>
+    [[noreturn]] void wrongKind(const CanonPath & path, const Value & value)
+    {
+        if constexpr (!std::is_same_v<Part, typename File::Symlink>)
+            if (value.raw.valueless_by_exception())
+                std::visit([](const auto &) {}, value.raw);
+        if constexpr (!std::is_same_v<Part, typename File::Symlink>)
+            if (std::holds_alternative<typename File::Symlink>(value.raw))
+                throw SymlinkNotAllowed(path, "file '%s' is a symlink", this->showPath(path));
+        if constexpr (std::is_same_v<Part, typename File::Regular>)
+            throw NotARegularFile("file '%s' is not a regular file", this->showPath(path));
+        else if constexpr (std::is_same_v<Part, typename File::Directory>)
+            throw NotADirectory("file '%s' is not a directory", this->showPath(path));
+        else
+            throw NotASymlink("file '%s' is not a symbolic link", this->showPath(path));
+    }
+
+    template<typename Part>
+    auto & part(const CanonPath & path)
+    {
+        auto & file = self().require(path);
+        if (auto value = std::get_if<Part>(&file.raw))
+            return *value;
+        self().template wrongKind<Part>(path, file);
+    }
+
+    void deliverRegular(const typename File::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
+    {
+        sizeCallback(regular.contents.size());
+        if constexpr (std::is_same_v<decltype(regular.contents), std::string_view>) {
+            if (!regular.contents.empty())
+                sink(regular.contents);
+        } else {
+            StringSource source{regular.contents};
+            source.drainInto(sink);
+        }
+    }
+
+public:
+    std::optional<SourceAccessor::Stat> maybeLstat(const CanonPath & path) override
+    {
+        auto file = self().find(path);
+        return file ? std::optional{file->lstat()} : std::nullopt;
+    }
+
+    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
+    {
+        auto keepAlive = this->weak_from_this().lock();
+        self().deliverRegular(part<typename File::Regular>(path), sink, sizeCallback);
+    }
+
+    SourceAccessor::DirEntries readDirectory(const CanonPath & path) override
+    {
+        auto & directory = part<typename File::Directory>(path);
+        SourceAccessor::DirEntries result;
+        for (auto & [name, file] : directory.entries)
+            result.emplace_hint(result.end(), name, file.lstat().type);
+        return result;
+    }
+
+    std::string readLink(const CanonPath & path) override
+    {
+        return std::string(part<typename File::Symlink>(path).target);
+    }
+};
+
 /**
  * An source accessor for an in-memory file system.
  */
-struct MemorySourceAccessor : virtual SourceAccessor
+struct MemorySourceAccessor : FsoSourceAccessor<MemorySourceAccessor>
 {
 private:
     void anchor() override;
+    friend struct FsoSourceAccessor<MemorySourceAccessor>;
+    File * find(const CanonPath & path) { return open(path, std::nullopt); }
 
 public:
     using File = fso::VariantT<std::string, true>;
@@ -144,13 +263,8 @@ public:
         return root < other.root;
     }
 
-    void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override;
-    using SourceAccessor::readFile;
-
+    using FsoSourceAccessor<MemorySourceAccessor>::readFile;
     bool pathExists(const CanonPath & path) override;
-    std::optional<Stat> maybeLstat(const CanonPath & path) override;
-    DirEntries readDirectory(const CanonPath & path) override;
-    std::string readLink(const CanonPath & path) override;
 
     /**
      * @param create If present, create this file and any parent directories

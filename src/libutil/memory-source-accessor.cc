@@ -61,69 +61,11 @@ MemorySourceAccessor::File * MemorySourceAccessor::open(const CanonPath & path, 
     return cur;
 }
 
-void MemorySourceAccessor::readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback)
-{
-    auto keepAlive = weak_from_this().lock();
-    auto * f = open(path, std::nullopt);
-    if (!f)
-        throw FileNotFound("file '%s' does not exist", showPath(path));
-    std::visit(
-        overloaded{
-            [&](const File::Regular & r) {
-                sizeCallback(r.contents.size());
-                StringSource source{r.contents};
-                source.drainInto(sink);
-            },
-            [&](const File::Directory &) { throw NotARegularFile("file '%s' is not a regular file", showPath(path)); },
-            [&](const File::Symlink &) { throw SymlinkNotAllowed(path, "file '%s' is a symlink", showPath(path)); },
-        },
-        f->raw);
-}
-
 bool MemorySourceAccessor::pathExists(const CanonPath & path)
 {
     return open(path, std::nullopt);
 }
 
-std::optional<MemorySourceAccessor::Stat> MemorySourceAccessor::maybeLstat(const CanonPath & path)
-{
-    const auto * f = open(path, std::nullopt);
-    return f ? std::optional{f->lstat()} : std::nullopt;
-}
-
-MemorySourceAccessor::DirEntries MemorySourceAccessor::readDirectory(const CanonPath & path)
-{
-    auto * f = open(path, std::nullopt);
-    if (!f)
-        throw FileNotFound("file '%s' does not exist", showPath(path));
-    return std::visit(
-        overloaded{
-            [&](const File::Directory & d) {
-                DirEntries res;
-                for (auto & [name, file] : d.entries)
-                    res.emplace_hint(res.end(), name, file.lstat().type);
-                return res;
-            },
-            [&](const File::Regular &) -> DirEntries {
-                throw NotADirectory("file '%s' is not a directory", showPath(path));
-            },
-            [&](const File::Symlink &) -> DirEntries {
-                throw SymlinkNotAllowed(path, "file '%s' is a symlink", showPath(path));
-            },
-        },
-        f->raw);
-}
-
-std::string MemorySourceAccessor::readLink(const CanonPath & path)
-{
-    auto * f = open(path, std::nullopt);
-    if (!f)
-        throw FileNotFound("file '%s' does not exist", showPath(path));
-    if (auto * s = std::get_if<File::Symlink>(&f->raw))
-        return s->target;
-    else
-        throw NotASymlink("file '%s' is not a symbolic link", showPath(path));
-}
 
 MemorySourceAccessor::File & MemorySourceAccessor::create(
     const CanonPath & path, File && initial, std::string_view noun, std::string_view description)

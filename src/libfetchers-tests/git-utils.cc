@@ -3056,7 +3056,7 @@ TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
     auto repo = openRepo();
     repo->setRemote("origin", "https://example.invalid/immutable-byte-delivery");
     const CanonPath file("file");
-    enum class Producer { Nar, Git, GitLfsUnselected };
+    enum class Producer { Nar, Git, GitLfsUnselected, Captured };
     enum class Release { Never, Size, Sink };
     enum class Failure { None, SizeError, SizeEof, SinkError, SinkEof };
 
@@ -3078,7 +3078,7 @@ TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
         StringSink nar;
         memory->dumpPath(CanonPath::root, nar);
 
-        for (auto producer : {Producer::Nar, Producer::Git, Producer::GitLfsUnselected})
+        for (auto producer : {Producer::Nar, Producer::Git, Producer::GitLfsUnselected, Producer::Captured})
             for (auto release : {Release::Never, Release::Size, Release::Sink})
                 for (auto failure :
                      {Failure::None, Failure::SizeError, Failure::SizeEof, Failure::SinkError, Failure::SinkEof}) {
@@ -3088,8 +3088,10 @@ TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
                     std::shared_ptr<SourceAccessor> accessor =
                         producer == Producer::Nar
                             ? makeNarAccessor(std::string(nar.s)).get_ptr()
-                            : repo->getAccessor(rev, {.smudgeLfs = producer == Producer::GitLfsUnselected}, "")
-                                  .get_ptr();
+                            : producer == Producer::Captured
+                                ? GitRepo::acquire(SourcePath{memory}).get_ptr()
+                                : repo->getAccessor(rev, {.smudgeLfs = producer == Producer::GitLfsUnselected}, "")
+                                      .get_ptr();
                     std::weak_ptr<SourceAccessor> weak = accessor;
                     bool released = false, sawSize = false;
                     size_t sinkCalls = 0;
@@ -3142,7 +3144,8 @@ TEST_F(GitUtilsTest, immutableReadsPreserveBytesFailuresAndCallbackLifetime)
                     ++cases;
                 }
     }
-    EXPECT_EQ(cases, 270u);
+    EXPECT_EQ(cases, 360u);
+    RecordProperty("finite_cases", cases);
 
     auto pool = openWriterPool();
     auto links = pool->makeDirectorySink();

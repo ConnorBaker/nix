@@ -15,6 +15,7 @@
 #include "nix/util/environment-variables.hh"
 #include "nix/util/git.hh"
 #include "nix/util/merkle-hash.hh"
+#include "nix/util/memory-source-accessor.hh"
 #include "nix/util/tree-traversal.hh"
 #include "nix/util/util.hh"
 #include "nix/util/thread-pool.hh"
@@ -55,6 +56,7 @@
 #include <regex>
 #include <ranges>
 #include <future>
+#include <unordered_map>
 
 namespace std {
 
@@ -412,23 +414,6 @@ struct GitRepoImpl : GitRepo, std::enable_shared_from_this<GitRepoImpl>
             Finally freeBackend{[&] { mempackBackend->free(mempackBackend); }};
             throw GitError("adding mempack backend to Git object database");
         }
-    }
-
-    GitRepoImpl()
-        : options{.oidType = HashAlgorithm::SHA256, .canonicalObjects = true}
-    {
-        initLibGit2();
-#if LIBGIT2_VERSION_CHECK(2, 0, 0)
-        git_odb_options odbOpts = GIT_ODB_OPTIONS_INIT;
-        odbOpts.oid_type = GIT_OID_SHA256;
-        if (git_odb_new_ext(std::out_ptr(odb), &odbOpts))
-            throw GitError("creating Git object database");
-        addMempackBackend();
-        if (git_repository_wrap_odb(std::out_ptr(repo), odb.get()))
-            throw GitError("wrapping acquired Git object database");
-#else
-        throw Error("raw tree acquisition requires libgit2 2.0");
-#endif
     }
 
     GitRepoImpl(std::filesystem::path _path, Options _options)
@@ -948,6 +933,25 @@ static std::string_view blobContents(const Blob & blob)
     return std::string_view((const char *) git_blob_rawcontent(blob.get()), git_blob_rawsize(blob.get()));
 }
 
+/* The version tags the rendering of a Git object as a NAR; a
+   change to that rendering must change it.  Built by appending, not
+   by `fmt`: this runs once per node of a naming walk, and the
+   formatter and the hexadecimal string it is handed are two thirds
+   of what naming a node costs (`05` section 6). */
+static std::string gitObjectFingerprint(merkle::Mode mode, const Hash & hash)
+{
+    std::string_view kind = mode == merkle::Mode::Directory ? "tree"
+                         : mode == merkle::Mode::Regular ? "blob"
+                         : mode == merkle::Mode::Executable ? "blob-executable" : "symlink";
+    std::string s;
+    s.reserve(sizeof("git-object-v2:") + kind.size() + base16::encodedLength(hash.hashSize));
+    s += "git-object-v2:";
+    s += kind;
+    s += ':';
+    base16::encodeTo(s, std::as_bytes(std::span{hash.bytes()}));
+    return s;
+}
+
 /**
  * Raw git tree input accessor.
  */
@@ -1129,29 +1133,11 @@ public:
             return std::nullopt;
         }
 
-        /* The version tags the rendering of a Git object as a NAR; a
-           change to that rendering must change it.  Built by appending, not
-           by `fmt`: this runs once per node of a naming walk, and the
-           formatter and the hexadecimal string it is handed are two thirds
-           of what naming a node costs (`05` section 6). */
-        auto name = [](merkle::Mode mode, const git_oid & oid) -> std::string {
-            std::string_view kind = mode == merkle::Mode::Directory ? "tree"
-                                 : mode == merkle::Mode::Regular ? "blob"
-                                 : mode == merkle::Mode::Executable ? "blob-executable" : "symlink";
-            auto hash = toHash(oid);
-            std::string s;
-            s.reserve(sizeof("git-object-v2:") + kind.size() + base16::encodedLength(hash.hashSize));
-            s += "git-object-v2:";
-            s += kind;
-            s += ':';
-            base16::encodeTo(s, std::as_bytes(std::span{hash.bytes()}));
-            return s;
-        };
 
         if (path.isRoot())
             return std::pair{
                 CanonPath::root,
-                name(state->rootMode, *git_object_id(state->root.get()))};
+                gitObjectFingerprint(state->rootMode, toHash(*git_object_id(state->root.get())))};
 
         auto entry = lookup(*state, path);
         if (!entry)
@@ -1164,7 +1150,7 @@ public:
         auto mode = merkle::decodeMode(rawMode);
         if (!mode)
             return std::nullopt;
-        return std::pair{CanonPath::root, name(*mode, *git_tree_entry_id(entry))};
+        return std::pair{CanonPath::root, gitObjectFingerprint(*mode, toHash(*git_tree_entry_id(entry)))};
     }
 
     /**
@@ -1710,65 +1696,98 @@ static GitRepo::Options tarballCacheOptions()
 
 ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
 {
-    struct Acquire : NodeVisitor<merkle::TreeEntry>
+    using File = fso::VariantT<std::string_view, true, merkle::TreeEntry, std::string_view>;
+    using Bodies = std::unordered_map<Hash, std::string>;
+    struct Acquire : NodeVisitor<File>
     {
-        ref<GitRepoImpl> repo;
+        Bodies bodies;
         std::exception_ptr failure;
-        explicit Acquire(ref<GitRepoImpl> repo) : repo(std::move(repo)) {}
-        merkle::TreeEntry regular(const CanonPath &, function_ref<void(CreateRegularFileSink &)> read) override
+        File regular(const CanonPath &, function_ref<void(CreateRegularFileSink &)> read) override
         {
-            struct File : CreateRegularFileSink
+            struct Contents : CreateRegularFileSink
             {
                 std::string contents;
-                merkle::Mode mode = merkle::Mode::Regular;
+                bool executable = false;
                 std::exception_ptr & failure;
-                File(std::exception_ptr & failure) : failure(failure) {}
+                Contents(std::exception_ptr & failure) : failure(failure) {}
                 void operator()(std::string_view bytes) override
                 {
                     if (failure) std::rethrow_exception(failure);
                     try { contents.append(bytes); }
                     catch (...) { if (!failure) failure = std::current_exception(); throw; }
                 }
-                void isExecutable() override { mode = merkle::Mode::Executable; }
-            };
-            File file{failure};
+                void isExecutable() override { executable = true; }
+            } file{failure};
             read(file);
             if (failure) std::rethrow_exception(failure);
-            return {file.mode, repo->writeRawObject(
-                file.contents, GIT_OBJECT_BLOB, "creating an acquired regular blob")};
+            merkle::TreeEntry entry{
+                file.executable ? merkle::Mode::Executable : merkle::Mode::Regular,
+                merkle::blobId(file.contents)};
+            auto body = bodies.try_emplace(entry.hash, std::move(file.contents)).first;
+            return File{std::pair{
+                File::Raw{File::Regular{file.executable, std::string_view(body->second)}}, entry}};
         }
-        merkle::TreeEntry symlink(const CanonPath &, const std::string & target) override
+        File symlink(const CanonPath &, const std::string & target) override
         {
-            return {merkle::Mode::Symlink, repo->writeRawObject(
-                target, GIT_OBJECT_BLOB, "creating an acquired symlink blob")};
+            auto hash = merkle::blobId(target);
+            auto body = bodies.try_emplace(hash, target).first;
+            return File{std::pair{
+                File::Raw{File::Symlink{std::string_view(body->second)}},
+                merkle::TreeEntry{merkle::Mode::Symlink, hash}}};
         }
-        merkle::TreeEntry directory(const CanonPath &, Children children) override
+        File directory(const CanonPath &, Children children) override
         {
             if (failure) std::rethrow_exception(failure);
             try {
-                GitDirectorySinkImpl sink{*repo};
+                File::Directory directory;
+                merkle::Tree tree;
                 children.each([&](std::string_view name, bool, Visit visit) {
                     if (failure) std::rethrow_exception(failure);
-                    sink.insertChild(name, visit(*this, false));
+                    auto file = visit(*this, false);
+                    merkle::insertEntry(tree, std::string(name), file.metadata);
+                    directory.entries.emplace(std::string(name), std::move(file));
                 });
                 if (failure) std::rethrow_exception(failure);
-                return {merkle::Mode::Directory, std::move(sink).finalize()};
+                return File{std::pair{
+                    File::Raw{std::move(directory)},
+                    merkle::TreeEntry{merkle::Mode::Directory, merkle::treeId(merkle::serialiseTree(tree))}}};
             } catch (...) {
                 if (!failure) failure = std::current_exception();
                 throw;
             }
         }
-    } acquire{make_ref<GitRepoImpl>()};
-    auto root = traverse(*source.accessor, source.path, defaultPathFilter, acquire);
+    } acquire;
+    struct Accessor final : FsoSourceAccessor<Accessor, File>
+    {
+        const Bodies bodies;
+        const File root;
+        friend struct FsoSourceAccessor<Accessor, File>;
+        void anchor() override {}
+        Accessor(File value, Bodies bodies) : bodies(std::move(bodies)), root(std::move(value))
+        {
+            knownRoot = root.metadata;
+            fingerprint = gitObjectFingerprint(root.metadata.mode, root.metadata.hash);
+        }
+        bool isFixed() override { return true; }
+        bool allowsConcurrentTraversal() override { return true; }
+        std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
+        {
+            auto file = find(path);
+            if (!file)
+                return std::nullopt;
+            return std::pair{CanonPath::root, gitObjectFingerprint(file->metadata.mode, file->metadata.hash)};
+        }
+        std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
+        {
+            auto file = find(path);
+            return file ? std::optional{file->metadata} : std::nullopt;
+        }
+    };
+    auto value = traverse(*source.accessor, source.path, defaultPathFilter, acquire);
     if (acquire.failure)
         std::rethrow_exception(acquire.failure);
     auto display = source.to_string();
-    auto accessor = make_ref<GitSourceAccessor>(GitSourceAccessor::State{
-        .repo = acquire.repo,
-        .root = lookupObject(*acquire.repo, hashToOID(root.hash),
-                             root.mode == merkle::Mode::Directory ? GIT_OBJECT_TREE : GIT_OBJECT_BLOB),
-        .rootMode = root.mode,
-    });
+    auto accessor = make_ref<Accessor>(std::move(value), std::move(acquire.bodies));
     accessor->setPathDisplay(std::move(display));
     return ref<SourceAccessor>{std::move(accessor).get_ptr()};
 }
