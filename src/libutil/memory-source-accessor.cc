@@ -10,20 +10,12 @@ void MemorySourceAccessor::anchor() {}
 
 MemorySourceAccessor::File * MemorySourceAccessor::open(const CanonPath & path, std::optional<File> create)
 {
-    bool hasRoot = root.has_value();
-
-    // Special handling of root directory.
-    if (path.isRoot() && !hasRoot) {
-        if (create) {
-            root = std::move(*create);
-            return &root.value();
-        }
-        return nullptr;
+    if (!root) {
+        if (!path.isRoot() || !create)
+            return nullptr;
+        root = std::move(*create);
+        return &root.value();
     }
-
-    // Root does not exist.
-    if (!hasRoot)
-        return nullptr;
 
     File * cur = &root.value();
 
@@ -133,22 +125,31 @@ std::string MemorySourceAccessor::readLink(const CanonPath & path)
         throw NotASymlink("file '%s' is not a symbolic link", showPath(path));
 }
 
+MemorySourceAccessor::File & MemorySourceAccessor::create(
+    const CanonPath & path, File && initial, std::string_view noun, std::string_view description)
+{
+    File * file = nullptr;
+    try {
+        file = open(path, std::move(initial));
+        if (!file)
+            throw Error(
+                "%s '%s' cannot be created because some parent directories don't exist",
+                Uncolored(noun), showPath(path));
+    } catch (SourceAccessorError & e) {
+        e.addTrace({}, "while creating %s '%s'", Uncolored(description), showPath(path));
+        throw;
+    }
+    return *file;
+}
+
 SourcePath MemorySourceAccessor::addFile(CanonPath path, std::string && contents)
 {
     // Create root directory automatically if necessary as a convenience.
     if (!root && !path.isRoot())
         open(CanonPath::root, File::Directory{});
 
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = open(path, File{File::Regular{}});
-        if (!f)
-            throw Error("file '%s' cannot be created because some parent directories don't exist", showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating file '%s'", showPath(path));
-        throw;
-    }
-    if (auto * r = std::get_if<File::Regular>(&f->raw))
+    auto & file = create(path, File{File::Regular{}}, "file", "file");
+    if (auto * r = std::get_if<File::Regular>(&file.raw))
         r->contents = std::move(contents);
     else
         throw NotARegularFile("file '%s' is not a regular file", showPath(path));
@@ -160,17 +161,8 @@ using File = MemorySourceAccessor::File;
 
 void MemorySink::createDirectory(const CanonPath & path)
 {
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = dst.open(path, File{File::Directory{}});
-        if (!f)
-            throw Error(
-                "directory '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating directory '%s'", dst.showPath(path));
-        throw;
-    }
-    if (!std::holds_alternative<File::Directory>(f->raw))
+    auto & file = dst.create(path, File{File::Directory{}}, "directory", "directory");
+    if (!std::holds_alternative<File::Directory>(file.raw))
         throw NotADirectory("file '%s' is not a directory", dst.showPath(path));
 };
 
@@ -190,17 +182,9 @@ struct CreateMemoryRegularFile : CreateRegularFileSink
 
 void MemorySink::createRegularFile(const CanonPath & path, fun<void(CreateRegularFileSink &)> func)
 {
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = dst.open(path, File{File::Regular{}});
-        if (!f)
-            throw Error("file '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating regular file '%s'", dst.showPath(path));
-        throw;
-    }
-    if (auto * rp = std::get_if<File::Regular>(&f->raw)) {
-        CreateMemoryRegularFile crf{*rp};
+    auto & file = dst.create(path, File{File::Regular{}}, "file", "regular file");
+    if (auto * regular = std::get_if<File::Regular>(&file.raw)) {
+        CreateMemoryRegularFile crf{*regular};
         func(crf);
     } else
         throw NotARegularFile("file '%s' is not a regular file", dst.showPath(path));
@@ -225,18 +209,9 @@ void CreateMemoryRegularFile::operator()(std::string_view data)
 
 void MemorySink::createSymlink(const CanonPath & path, const std::string & target)
 {
-    MemorySourceAccessor::File * f = nullptr;
-    try {
-        f = dst.open(path, File{File::Symlink{}});
-        if (!f)
-            throw Error(
-                "symlink '%s' cannot be created because some parent directories don't exist", dst.showPath(path));
-    } catch (SourceAccessorError & e) {
-        e.addTrace({}, "while creating symlink '%s'", dst.showPath(path));
-        throw;
-    }
-    if (auto * s = std::get_if<File::Symlink>(&f->raw))
-        s->target = target;
+    auto & file = dst.create(path, File{File::Symlink{}}, "symlink", "symlink");
+    if (auto * symlink = std::get_if<File::Symlink>(&file.raw))
+        symlink->target = target;
     else
         throw NotASymlink("file '%s' is not a symbolic link", dst.showPath(path));
 }

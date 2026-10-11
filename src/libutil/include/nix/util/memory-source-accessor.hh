@@ -170,6 +170,10 @@ public:
      * @todo Have a way to insert "borrowed" std::string_view without copying.
      */
     SourcePath addFile(CanonPath path, std::string && contents);
+
+private:
+    friend struct MemorySink;
+    File & create(const CanonPath & path, File && initial, std::string_view noun, std::string_view description);
 };
 
 /**

@@ -3269,7 +3269,6 @@ TEST_F(GitUtilsTest, acquiredTreeRejectsSuppressedDirectoryFailures)
     for (auto shape : {Shape::Root, Shape::NestedLast, Shape::NestedWithSibling})
         for (auto history : {History::Escape, History::Return, History::Retry, History::Zero, History::Once, History::Twice, History::SuccessThenReturn}) {
             SCOPED_TRACE(fmt("shape=%d history=%d", int(shape), int(history)));
-            auto repoPath = tmpDir / fmt("directory-result-%d-%d", int(shape), int(history));
             auto target = shape == Shape::Root ? CanonPath::root : CanonPath("/nested");
             auto file = target / "payload";
             auto source = make_ref<Source>(history, target);
@@ -3277,7 +3276,7 @@ TEST_F(GitUtilsTest, acquiredTreeRejectsSuppressedDirectoryFailures)
             if (shape == Shape::NestedWithSibling)
                 source->addFile(CanonPath("/z"), "late sibling");
             if (history == History::Once || history == History::Twice) {
-                auto acquired = GitRepo::acquire(repoPath, SourcePath{source});
+                auto acquired = GitRepo::acquire(SourcePath{source});
                 auto expected = history == History::Twice ? "BBB" : "AAA";
                 EXPECT_EQ(acquired->readFile(file), expected);
                 auto reference = make_ref<MemorySourceAccessor>();
@@ -3289,7 +3288,7 @@ TEST_F(GitUtilsTest, acquiredTreeRejectsSuppressedDirectoryFailures)
                 ++completed;
             } else {
                 try {
-                    GitRepo::acquire(repoPath, SourcePath{source});
+                    GitRepo::acquire(SourcePath{source});
                     ADD_FAILURE() << "failed or absent directory callback produced a root";
                 } catch (Error & error) {
                     auto message = filterANSIEscapes(error.what(), true);
@@ -3342,16 +3341,17 @@ TEST_F(GitUtilsTest, acquiredTreeDoesNotSpillToTheObjectsDirectory)
         SCOPED_TRACE(fmt("directory=%d", directory));
         auto path = tmpDir / fmt("acquire-unspilled-%d", directory);
         auto source = make_ref<Source>(path / "objects");
+        createDirs(path / "objects");
         auto file = directory ? CanonPath("/payload") : CanonPath::root;
         auto bytes = std::string(1024 * 1024 + 1, 'x');
         bytes[bytes.size() / 2] = '\0';
         source->addFile(file, std::string(bytes));
-        auto unspilled = GitRepo::acquire(path, SourcePath{source});
+        auto unspilled = GitRepo::acquire(SourcePath{source});
         EXPECT_TRUE(std::filesystem::is_directory(path / "objects"));
         EXPECT_FALSE(std::filesystem::exists(path / "objects.saved"));
         source->obstruct = false;
         auto expected = objectHashOf(*source, CanonPath::root).root;
-        auto restored = GitRepo::acquire(path, SourcePath{source});
+        auto restored = GitRepo::acquire(SourcePath{source});
         source->root.reset();
         for (auto acquired : {unspilled, restored}) {
             EXPECT_EQ(acquired->getKnownEntry(CanonPath::root), std::optional{expected});
@@ -3566,7 +3566,7 @@ TEST_F(GitUtilsTest, acquiredRootModesRetainTheRenderedValue)
 {
     using File = MemorySourceAccessor::File;
     enum class Repository { Missing, SHA1, SHA256 };
-    unsigned cases = 0, rejected = 0;
+    unsigned cases = 0;
     for (auto repository : {Repository::Missing, Repository::SHA1, Repository::SHA256})
         for (auto mode : {merkle::Mode::Directory, merkle::Mode::Regular, merkle::Mode::Executable, merkle::Mode::Symlink}) {
             SCOPED_TRACE(fmt("repository=%d mode=%d", int(repository), int(mode)));
@@ -3582,19 +3582,14 @@ TEST_F(GitUtilsTest, acquiredRootModesRetainTheRenderedValue)
             auto stat = source->lstat(CanonPath::root);
             StringSink before;
             source->dumpPath(CanonPath::root, before);
-            auto repoPath = tmpDir / fmt("acquired-mode-%d-%d", int(repository), int(mode));
+            auto repoPath = getCacheDir() / "tarball-cache-v4";
+            if (pathExists(repoPath))
+                deletePath(repoPath);
             if (repository != Repository::Missing)
                 GitRepo::openRepo(repoPath, {.create = true, .bare = true, .packfilesOnly = true,
                     .oidType = repository == Repository::SHA1 ? HashAlgorithm::SHA1 : HashAlgorithm::SHA256});
-            if (repository == Repository::SHA1) {
-                EXPECT_THAT(
-                    [&] { GitRepo::acquire(repoPath, SourcePath{source}); },
-                    ::testing::ThrowsMessage<Error>(testing::HasSubstrIgnoreANSIMatcher(
-                        "raw tree acquisition requires a SHA-256 Git repository")));
-                ++rejected;
-                continue;
-            }
-            auto acquired = GitRepo::acquire(repoPath, SourcePath{source});
+            auto acquired = GitRepo::acquire(SourcePath{source});
+            EXPECT_EQ(pathExists(repoPath), repository != Repository::Missing);
             source->root.reset();
             EXPECT_TRUE(acquired->isFixed());
             EXPECT_EQ(acquired->getKnownEntry(CanonPath::root), std::optional{expected});
@@ -3610,10 +3605,9 @@ TEST_F(GitUtilsTest, acquiredRootModesRetainTheRenderedValue)
             EXPECT_EQ(after.s, before.s);
             ++cases;
         }
-    EXPECT_EQ(cases, 8u);
-    EXPECT_EQ(rejected, 4u);
+    EXPECT_EQ(cases, 12u);
     RecordProperty("root_modes", cases);
-    RecordProperty("rejected_repository_types", rejected);
+    RecordProperty("ignored_cache_states", 3u);
 }
 
 } // namespace nix::fetchers

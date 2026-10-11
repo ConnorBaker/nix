@@ -113,8 +113,7 @@ struct GitRepo
         std::string displayPrefix,
         std::shared_ptr<fetchers::Cache> cache = nullptr) = 0;
 
-    /** Acquire the rendered value into a fresh, private canonical SHA-256 ODB. */
-    static ref<SourceAccessor> acquire(const std::filesystem::path & path, const SourcePath & source);
+    /** Acquire the rendered value into a private in-memory canonical SHA-256 ODB. */
     static ref<SourceAccessor> acquire(const SourcePath & source);
 
     /** Retains a fixed workdir observation; callers must not mutate it through another alias. */
