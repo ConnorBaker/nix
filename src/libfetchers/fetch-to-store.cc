@@ -51,9 +51,10 @@ static fetchers::Attrs entryRow(const merkle::TreeEntry & entry)
 
 static merkle::TreeEntry rowEntry(const fetchers::Attrs & row)
 {
-    auto mode = merkle::decodeMode(fetchers::getIntAttr(row, "mode"));
-    if (!mode)
-        throw Error("memo row holds an unknown mode %o", fetchers::getIntAttr(row, "mode"));
+    auto rawMode = fetchers::getIntAttr(row, "mode");
+    auto mode = merkle::decodeMode(rawMode);
+    if (!mode || rawMode != static_cast<uint64_t>(*mode))
+        throw Error("memo row holds an unknown mode %o", rawMode);
     return {.mode = *mode, .hash = Hash::parseSRI(fetchers::getStrAttr(row, "hash"))};
 }
 

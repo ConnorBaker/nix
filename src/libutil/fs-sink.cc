@@ -117,36 +117,37 @@ bool RestoreSink::createSubdirectory(const CanonPath & path, fun<bool(RestoreSin
 {
     bool root = path.isRoot();
     createDirectory(path);
-    RestoreSink child{startFsync, hooks};
-    auto & sub = root ? *this : child;
-    if (!root) {
-        assert(dirFd); // If that's not true the above call must have thrown an exception.
-        sub.dstPath = append(dstPath, path);
-        sub.dirFd = openFileEnsureBeneathNoSymlinks(
-            dirFd.get(),
-            path,
-#ifdef _WIN32
-            FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-            FILE_DIRECTORY_FILE
-#else
-            O_RDONLY | O_DIRECTORY | O_CLOEXEC,
-            0
-#endif
-        );
-        if (!sub.dirFd)
-            throw SysError("opening directory %s", PathFmt(sub.dstPath));
-    }
-    bool completed = callback(sub);
+    auto finish = [&](RestoreSink & sub) {
+        bool completed = callback(sub);
 #ifndef _WIN32 /* TODO: Have dirFd equivalent for the root directory. */
-    assert(!root || !completed || dirFd);
+        assert(!root || !completed || dirFd);
+#else
+        if (root)
+            return completed;
 #endif
-    if (completed && hooks
+        if (completed && hooks)
+            hooks->directoryDone(sub.dirFd.get());
+        return completed;
+    };
+    if (root)
+        return finish(*this);
+    assert(dirFd); // If that's not true the above call must have thrown an exception.
+    RestoreSink child{startFsync, hooks};
+    child.dstPath = append(dstPath, path);
+    child.dirFd = openFileEnsureBeneathNoSymlinks(
+        dirFd.get(),
+        path,
 #ifdef _WIN32
-        && !root
+        FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        FILE_DIRECTORY_FILE
+#else
+        O_RDONLY | O_DIRECTORY | O_CLOEXEC,
+        0
 #endif
-    )
-        hooks->directoryDone(sub.dirFd.get());
-    return completed;
+    );
+    if (!child.dirFd)
+        throw SysError("opening directory %s", PathFmt(child.dstPath));
+    return finish(child);
 }
 
 void RestoreSink::createDirectory(const CanonPath & path)

@@ -7,6 +7,8 @@
 
 #include <boost/unordered/concurrent_flat_map.hpp>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 
 #ifndef _WIN32
@@ -510,6 +512,19 @@ PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
         throw SysError("reading directory '%s'", showPath(path));
     dirFdOwning.release();
 
+    static constexpr auto types = [] {
+        std::array<Type, std::max({DT_REG, DT_DIR, DT_LNK, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK}) + 1> table{};
+        table.fill(tUnknown);
+        table[DT_REG] = tRegular;
+        table[DT_DIR] = tDirectory;
+        table[DT_LNK] = tSymlink;
+        table[DT_CHR] = tChar;
+        table[DT_BLK] = tBlock;
+        table[DT_FIFO] = tFifo;
+        table[DT_SOCK] = tSocket;
+        return table;
+    }();
+
     const ::dirent * dirent = nullptr;
 
     while (errno = 0, dirent = ::readdir(dir.get())) {
@@ -518,34 +533,8 @@ PosixDirectorySourceAccessor::openDirectoryWithEntries(const CanonPath & path)
         if (name == "." || name == "..")
             continue;
 
-        std::optional<Type> type;
-        switch (dirent->d_type) {
-        case DT_REG:
-            type = tRegular;
-            break;
-        case DT_DIR:
-            type = tDirectory;
-            break;
-        case DT_LNK:
-            type = tSymlink;
-            break;
-        case DT_CHR:
-            type = tChar;
-            break;
-        case DT_BLK:
-            type = tBlock;
-            break;
-        case DT_FIFO:
-            type = tFifo;
-            break;
-        case DT_SOCK:
-            type = tSocket;
-            break;
-        default:
-            type = std::nullopt;
-            break;
-        }
-        entries.emplace(name, type);
+        auto type = dirent->d_type < types.size() ? types[dirent->d_type] : tUnknown;
+        entries.emplace(name, type == tUnknown ? std::nullopt : std::optional{type});
     }
 
     if (errno)

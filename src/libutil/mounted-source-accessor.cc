@@ -135,7 +135,7 @@ public:
     {
         ref<SourceAccessor> accessor;
         CanonPath subpath;
-        std::vector<std::pair<CanonPath, ref<SourceAccessor>>> below;
+        std::vector<std::pair<const CanonPath &, ref<SourceAccessor>>> below;
         enum Shape : uint8_t { Available, Hidden, Promoted } shape = Available;
     };
 

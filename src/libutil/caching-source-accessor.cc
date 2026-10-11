@@ -69,8 +69,7 @@ public:
 
     void readFile(const CanonPath & path, Sink & sink, fun<void(uint64_t)> sizeCallback) override
     {
-        auto inner = next;
-        inner->readFile(path, sink, std::move(sizeCallback));
+        next.get_ptr()->readFile(path, sink, std::move(sizeCallback));
     }
 
     std::optional<Stat> maybeLstat(const CanonPath & path) override
@@ -85,8 +84,7 @@ public:
 
     DirEntries readDirectory(const CanonPath & path) override
     {
-        auto inner = next;
-        return inner->readDirectory(path);
+        return next.get_ptr()->readDirectory(path);
     }
 
     std::string readLink(const CanonPath & path) override
@@ -96,14 +94,12 @@ public:
 
     void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
     {
-        auto inner = next;
-        inner->readDirectoryWithEntries(path, std::move(callback));
+        next.get_ptr()->readDirectoryWithEntries(path, std::move(callback));
     }
 
     std::string showPath(const CanonPath & path) override
     {
-        auto inner = next;
-        return inner->showPath(path);
+        return next.get_ptr()->showPath(path);
     }
 
     void invalidateCache() override
@@ -122,8 +118,7 @@ public:
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
-        auto inner = next;
-        return inner->getPhysicalPath(path);
+        return next.get_ptr()->getPhysicalPath(path);
     }
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
@@ -133,8 +128,7 @@ public:
 
     std::optional<merkle::TreeEntry> getKnownEntry(const CanonPath & path) override
     {
-        auto inner = next;
-        return inner->getKnownEntry(path);
+        return next.get_ptr()->getKnownEntry(path);
     }
 };
 

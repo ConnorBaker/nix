@@ -1099,7 +1099,10 @@ public:
            by `fmt`: this runs once per node of a naming walk, and the
            formatter and the hexadecimal string it is handed are two thirds
            of what naming a node costs (`05` section 6). */
-        auto name = [](std::string_view kind, const git_oid & oid) -> std::string {
+        auto name = [](merkle::Mode mode, const git_oid & oid) -> std::string {
+            std::string_view kind = mode == merkle::Mode::Directory ? "tree"
+                                 : mode == merkle::Mode::Regular ? "blob"
+                                 : mode == merkle::Mode::Executable ? "blob-executable" : "symlink";
             auto hash = toHash(oid);
             std::string s;
             s.reserve(sizeof("git-object-v2:") + kind.size() + base16::encodedLength(hash.hashSize));
@@ -1113,11 +1116,7 @@ public:
         if (path.isRoot())
             return std::pair{
                 CanonPath::root,
-                name(
-                    state->rootMode == merkle::Mode::Directory ? "tree"
-                    : state->rootMode == merkle::Mode::Regular ? "blob"
-                    : state->rootMode == merkle::Mode::Executable ? "blob-executable" : "symlink",
-                    *git_object_id(state->root.get()))};
+                name(state->rootMode, *git_object_id(state->root.get()))};
 
         auto entry = lookup(*state, path);
         if (!entry)
@@ -1130,10 +1129,7 @@ public:
         auto mode = merkle::decodeMode(rawMode);
         if (!mode)
             return std::nullopt;
-        auto kind = *mode == merkle::Mode::Directory ? "tree"
-                  : *mode == merkle::Mode::Regular ? "blob"
-                  : *mode == merkle::Mode::Executable ? "blob-executable" : "symlink";
-        return std::pair{CanonPath::root, name(kind, *git_tree_entry_id(entry))};
+        return std::pair{CanonPath::root, name(*mode, *git_tree_entry_id(entry))};
     }
 
     /**
@@ -1826,8 +1822,7 @@ ref<SourceAccessor> GitRepoImpl::getAccessor(
 
         bool allowsConcurrentTraversal() override
         {
-            auto inner = next;
-            return inner->allowsConcurrentTraversal();
+            return next.get_ptr()->allowsConcurrentTraversal();
         }
 
         void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override

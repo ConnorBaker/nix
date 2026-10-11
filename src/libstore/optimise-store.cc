@@ -665,17 +665,10 @@ struct LinkingVisitor : HashingVisitor
             return size;
         }
         case merkle::Mode::Directory: {
-            std::optional<std::string> body;
-            std::map<std::string, merkle::TreeEntry> tree;
-            try {
-                body = objects.readAuxiliary(entry);
-                if (!body)
-                    return std::nullopt;
-                tree = GitObjectStore::parseTreeBody(entry.hash, *body);
-            } catch (Error & e) {
-                warn("%s; not used\nYou should run `nix-store --verify --check-contents --repair` to fix it", e.msg());
+            auto body = objects.readAuxiliary(entry);
+            if (!body)
                 return std::nullopt;
-            }
+            auto tree = GitObjectStore::parseTreeBody(entry.hash, *body);
             if (tree.contains("."))
                 throw Error("synthetic root object cannot be used as a directory");
 
@@ -777,7 +770,8 @@ struct LinkingVisitor : HashingVisitor
             narSize = materialise(*entry, path, std::ranges::distance(path), attempt ? *attempt : hold, target);
         } catch (Error & e) {
             warn(
-                "could not materialise %s from the object store: %s; copying it from the source instead",
+                "could not materialise %s from the object store: %s; copying it from the source instead\n"
+                "To check the object store for damage, run `nix-store --verify --check-contents --repair`",
                 PathFmt(where),
                 e.msg());
         }

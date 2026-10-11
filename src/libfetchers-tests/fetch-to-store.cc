@@ -778,6 +778,79 @@ ref<NamedCountingAccessor> dirtyTree(std::string_view b, std::string_view dName)
 
 } // namespace
 
+TEST_F(FetchToStoreTest, memoRowsRejectModeTruncationAtBothReaders)
+{
+    auto store = openStore("dummy://?read-only=false");
+    const auto git = ContentAddressMethod::Raw::Git;
+    const uint64_t high = uint64_t(1) << 32;
+    using Mode = merkle::Mode;
+    const std::vector<Mode> modes{Mode::Directory, Mode::Regular, Mode::Executable, Mode::Symlink};
+    size_t cases = 0;
+    auto check = [&](bool subtree, Mode actualMode, uint64_t encodedMode, bool rejected) {
+        SCOPED_TRACE(fmt("subtree=%d actual=%o encoded=%u", subtree, uint64_t(actualMode), encodedMode));
+        fetchers::Settings settings;
+        auto source = make_ref<NamedCountingAccessor>();
+        const CanonPath node("node");
+        MemorySink sink{*source};
+        sink.createDirectory(CanonPath::root);
+        if (actualMode == Mode::Directory)
+            sink.createDirectory(node);
+        else if (actualMode == Mode::Symlink)
+            sink.createSymlink(node, "target");
+        else
+            sink.createRegularFile(node, [&](CreateRegularFileSink & file) {
+                if (actualMode == Mode::Executable)
+                    file.isExecutable();
+                file("contents");
+            });
+        const auto entry = objectHashOf(*source, node).root;
+        ASSERT_EQ(entry.mode, actualMode);
+        const SourcePath requested(source, subtree ? CanonPath::root : node);
+        const auto expected = merkle::objectHash(objectHashOf(*source, requested.path).root);
+        source->reads = 0;
+        source->names.emplace(node, fmt("mode-admission-%d", cases));
+        const auto key = makeSourcePathToHashCacheKey(source->names.at(node), git, CanonPath::root);
+        auto put = [&](uint64_t mode) {
+            settings.getCache()->upsert(
+                key, {{"hash", entry.hash.to_string(HashFormat::SRI, true)}, {"mode", mode}});
+        };
+        auto fetch = [&] { return fetchToStore2(settings, *store, requested, FetchMode::DryRun, "source", git); };
+        put(encodedMode);
+        if (rejected) {
+            try {
+                fetch();
+                ADD_FAILURE() << "malformed cached mode was accepted";
+            } catch (const Error & error) {
+                EXPECT_NE(error.msg().find("memo row holds an unknown mode"), std::string::npos);
+            }
+            /* The same operation cache must permit a corrected row to be read. */
+            put(uint64_t(entry.mode));
+        }
+        const auto actual = fetch();
+        EXPECT_EQ(actual.second, expected);
+        EXPECT_EQ(actual.first, gitTreePath(*store, "source", expected));
+        EXPECT_EQ(source->reads.load(), 0u);
+        const auto row = settings.getCache()->lookup(key);
+        ASSERT_TRUE(row);
+        EXPECT_EQ(fetchers::getIntAttr(*row, "mode"), uint64_t(entry.mode));
+        EXPECT_EQ(Hash::parseSRI(fetchers::getStrAttr(*row, "hash")), entry.hash);
+        ++cases;
+    };
+    for (bool subtree : {false, true}) {
+        for (auto mode : modes) {
+            check(subtree, mode, uint64_t(mode), false);
+            /* A malformed entry is rejected before its low mode is trusted. */
+            check(subtree, Mode::Regular, high | uint64_t(mode), true);
+        }
+        check(subtree, Mode::Regular, uint64_t(1), true);
+        check(subtree, Mode::Regular, high, true);
+    }
+    /* Actual symlinks bypass subtree lookups and replace even a malformed row. */
+    check(true, Mode::Symlink, high | uint64_t(Mode::Symlink), false);
+    EXPECT_EQ(cases, 21u);
+    RecordProperty("finite_cases", int(cases));
+}
+
 TEST_F(FetchToStoreTest, subtreeNamingIsObservedOnceAndRecordedForTheSameNode)
 {
     struct ObservedNames : NamedCountingAccessor

@@ -154,8 +154,7 @@ struct AllowListSourceAccessorImpl final : AllowListSourceAccessor
 {
     bool allowsConcurrentTraversal() override
     {
-        auto inner = next;
-        return inner->allowsConcurrentTraversal();
+        return next.get_ptr()->allowsConcurrentTraversal();
     }
 
     void readDirectoryWithEntries(const CanonPath & path, ReadDirectoryCallback callback) override
@@ -227,8 +226,7 @@ public:
             return FilteringSourceAccessor::getPhysicalPath(path);
         /* Admission only grows; release the policy lock before calling
            the child, which may reenter or release this wrapper. */
-        auto inner = next;
-        return inner->getPhysicalPath(prefix / path);
+        return next.get_ptr()->getPhysicalPath(prefix / path);
     }
 
     std::optional<std::pair<CanonPath, std::string>> getFingerprint(const CanonPath & path) override
@@ -244,8 +242,7 @@ public:
         /* Admission only grows, so this subtree remains fully admitted
            after unlocking. The child may reenter allowPrefix, or release
            the last owner of this wrapper, while providing its name. */
-        auto inner = next;
-        return inner->getFingerprint(prefix / path);
+        return next.get_ptr()->getFingerprint(prefix / path);
     }
 };
 
