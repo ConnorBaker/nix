@@ -863,26 +863,13 @@ void LocalStore::coalesceBlobRows(
     }
     if (collisions.empty())
         return;
-    auto result = coalesceBlobs(toRealPath(path), hold, collisions);
-    /* SQL borrows stable keys; refused physical claims disappear even when SQL retries. */
+    /* Refused physical claims disappear even when a later physical or SQL operation fails. */
     Finally prune{[&] {
         for (auto & collision : collisions | std::views::reverse)
             if (!collision.eligible)
                 rows.erase(rows.begin() + (&collision.row - rows.data()));
     }};
-    auto & rejected = result.rejected;
-    /* Preserve the physical facts first, then finish their durability
-       before any SQL can retry. A retry may already see the winning inode
-       and therefore make no further filesystem changes. */
-    if (result.modified) {
-        if (config->getLocalSettings().fsyncStorePaths) {
-            auto realPath = toRealPath(path);
-            recursiveSync(realPath);
-            syncParent(realPath);
-        }
-        if (config->getLocalSettings().syncBeforeRegistering)
-            sync();
-    }
+    auto rejected = coalesceBlobs(toRealPath(path), hold, collisions);
     for (auto & collision : collisions)
         if (collision.eligible)
             writeBlobRow(state.stmts->InsertBlob.use(), ingestion, collision.row);
@@ -910,6 +897,13 @@ static void sortProjectionForPublication(GitObjectStore::Hold::Projection & proj
     });
 }
 
+void LocalStore::syncStorePath(const StorePath & path)
+{
+    auto realPath = toRealPath(path);
+    recursiveSync(realPath);
+    syncParent(realPath);
+}
+
 void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath & path)
 {
     if (config->readOnly || !hold.ingesting)
@@ -933,8 +927,15 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
         insertAuxiliaryRows(*state, id, projection.auxiliary);
         /* This naming is itself publication for a path already valid.
            Builder outputs are reconciled when their validity is committed. */
-        if (isValidPath_(*state, logical))
+        if (isValidPath_(*state, logical)) {
             coalesceBlobRows(*state, path, hold, id, rows);
+            if (config->getLocalSettings().fsyncStorePaths)
+                syncStorePath(path);
+#ifndef _WIN32
+            if (config->getLocalSettings().syncBeforeRegistering)
+                sync();
+#endif
+        }
 
         state->stmts->DeletePathIngestions.use().apply(logical).exec();
         state->stmts->SetIngestionPath.use().apply(logical).apply(static_cast<int64_t>(id)).exec();
@@ -1779,15 +1780,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             }
         }
     }
-#ifndef _WIN32
-    /* SQLite will fsync by default, but the new valid paths may not
-       be fsync-ed.  So some may want to fsync them before registering
-       the validity, at the expense of some speed of the path
-       registering operation. */
-    if (config->getLocalSettings().syncBeforeRegistering)
-        sync();
-#endif
-
     return retrySQLite<void>([&]() {
         auto state(_state->lock());
 
@@ -1883,6 +1875,20 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
             for (auto & reference : info.references)
                 state->stmts->AddReference.use().apply(referrer).apply(pathIds.at(reference).first).exec();
         }
+        /* Physical publication must finish durability on every attempt, even
+           when an earlier attempt changed aliases and its SQL rolled back. */
+        if (hold && config->getLocalSettings().fsyncStorePaths)
+            for (auto & [path, _] : infos)
+                if (active || hold->completedIngestions.contains(printStorePath(path)))
+                    syncStorePath(path);
+#ifndef _WIN32
+        /* SQLite will fsync by default, but the new valid paths may not
+           be fsync-ed.  So some may want to fsync them before registering
+           the validity, at the expense of some speed of the path
+           registering operation. */
+        if (config->getLocalSettings().syncBeforeRegistering)
+            sync();
+#endif
         txn.commit();
         if (active) {
             auto & publication = publications.front();
@@ -2118,11 +2124,6 @@ void LocalStore::addToStore(
             }
         }
 
-        if (config->getLocalSettings().fsyncStorePaths) {
-            recursiveSync(realPath);
-            syncParent(realPath);
-        }
-
         registerValidPath(toRegister, hold);
     });
 }
@@ -2160,10 +2161,6 @@ StorePath LocalStore::addToStorePrepared(
         if (!needsWrite)
             return;
         auto [result, hold] = populate(realPath);
-        if (config->getLocalSettings().fsyncStorePaths) {
-            recursiveSync(realPath);
-            syncParent(realPath);
-        }
         auto info = ValidPathInfo::makeFromCA(*this, name, std::move(desc), ObjectHash::of(result.root));
         info.narSize = result.narSize.value();
         registerValidPath(info, hold);

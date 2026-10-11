@@ -863,8 +863,8 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
            inode. Reconcile all of them before returning, using the same
            physical walk as publication; replacing one row is insufficient. */
         if (!collisions.empty()) {
-            auto result = coalesceBlobs(hold.root(), hold, collisions);
-            if (!result.rejected.empty())
+            auto rejected = coalesceBlobs(hold.root(), hold, collisions);
+            if (!rejected.empty())
                 throw Error("a completed ingestion holder changed while materialising %s", PathFmt(subtree));
             for (auto & collision : collisions)
                 hold.appendNames(std::move(collision.row));
@@ -1005,27 +1005,28 @@ LocalStore::verifyObjects(const std::filesystem::path & realPath)
     return {result, std::move(verify.missing)};
 }
 
-LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
+LocalStore::RejectedBlobHolders LocalStore::coalesceBlobs(
     const std::filesystem::path & root,
     const GitObjectStore::Hold & hold,
     std::vector<BlobCoalescing> & collisions)
 {
 #ifdef _WIN32
+    for (auto & collision : collisions)
+        collision.eligible = false;
     return {};
 #else
     /* Publication holds the database writer; speculative completion owns its names.
        Pin and verify without index calls, temp roots or auxiliary-object locks. */
-    BlobCoalescingResult result;
+    RejectedBlobHolders rejected;
     auto temporary = [&] { return hold.tempPath("coalesce"); };
 
     for (auto & collision : collisions) {
         auto & row = collision.row;
         /* No usable donor means this file can become the holder. A file
            refused sharing is an exception, not a new canonical donor. */
-        collision.eligible = true;
         for (auto & candidate : collision.candidates) {
             if (candidate.size != row.size) {
-                result.rejected.emplace_back(row, candidate);
+                rejected.emplace_back(row, candidate);
                 continue;
             }
             if (candidate.ino == row.ino && candidate.dev == row.dev) {
@@ -1047,7 +1048,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             }
             auto source = candidate.parentOf();
             if (!source) {
-                result.rejected.emplace_back(row, candidate);
+                rejected.emplace_back(row, candidate);
                 continue;
             }
             auto & [owned, parent, name] = *source;
@@ -1064,7 +1065,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                                ? std::nullopt
                                : maybeLstat(name, parent);
                 if (!now || !GitObjectStore::validHolderMetadata(candidate, row.executable, *now)) {
-                    result.rejected.emplace_back(row, candidate);
+                    rejected.emplace_back(row, candidate);
                     continue;
                 }
                 if (ec == std::errc::too_many_links || ec == std::errc::no_space_on_device) {
@@ -1081,7 +1082,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             auto pinned = lstat(pin);
             if (!GitObjectStore::validHolderMetadata(candidate, row.executable, pinned)
                 || GitObjectStore::blobIdOfFile(pin, candidate.size) != row.id) {
-                result.rejected.emplace_back(row, candidate);
+                rejected.emplace_back(row, candidate);
                 continue;
             }
             collision.eligible = false;
@@ -1121,7 +1122,6 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
                         dir.fd.get(), name, where, before,
                         [](auto &, const auto &) { return true; }, &candidate))
                     continue;
-                result.modified = true;
                 if (!representative)
                     representative = &recorded;
             }
@@ -1139,7 +1139,7 @@ LocalStore::BlobCoalescingResult LocalStore::coalesceBlobs(
             break;
         }
     }
-    return result;
+    return rejected;
 #endif
 }
 

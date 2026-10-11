@@ -4256,6 +4256,237 @@ TEST_F(LocalStoreObjectsTest, refusedAliasesArePrunedBeforeSQLRetry)
     EXPECT_EQ(cases, 8u);
 }
 
+#  ifndef _WIN32
+TEST_F(LocalStoreObjectsTest, publicationRetryStillRequiresParentDurability)
+{
+    if (geteuid() == 0)
+        GTEST_SKIP() << "directory-read denial requires an unprivileged test process";
+    bool saved = settings.getLocalSettings().fsyncStorePaths;
+    Finally restoreSetting{[&] { settings.getLocalSettings().fsyncStorePaths = saved; }};
+    settings.getLocalSettings().fsyncStorePaths = true;
+    unsigned cases = 0;
+    for (bool completed : {false, true})
+        for (bool retireDonor : {false, true})
+            for (bool executable : {false, true}) {
+                auto bytes = fmt("publication-sync-retry-%d", cases++);
+                SCOPED_TRACE(fmt("completed=%d retire=%d executable=%d", completed, retireDonor, executable));
+                auto nar =
+                    treeNar({{"a", bytes, executable ? 'x' : 'f'}, {"nested/alias", bytes, executable ? 'x' : 'f'}});
+                std::array holds{store->objects.hold(), store->objects.hold()};
+                std::vector<ValidPathInfo> infos;
+                for (unsigned i = 0; i < holds.size(); ++i)
+                    infos.push_back(restoreOutput(StorePath::random(bytes + fmt("-%d", i)), nar, holds[i]));
+                if (completed)
+                    store->endIngestion(holds[0], infos[0].path);
+                store->registerValidPath(infos[1], holds[1]);
+                auto target = store->toRealPath(infos[0].path);
+                auto donor = store->toRealPath(infos[1].path) / "a";
+                auto winning = st(donor);
+                ASSERT_NE(st(target / "a").st_ino, winning.st_ino);
+                auto storeRoot = std::filesystem::path(config->realStoreDir.get());
+                auto mode = st(storeRoot).st_mode & 07777;
+                SQLite other{
+                    store->dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                Finally clear{[&] {
+                    store->objects.failPlaceWithNoSpace = {};
+                    chmod(storeRoot, mode);
+                }};
+                unsigned aliases = 0;
+                store->objects.failPlaceWithNoSpace = [&](const std::filesystem::path & where) {
+                    if (where == target / "a" || where == target / "nested/alias") {
+                        ++aliases;
+                        /* Nested alias parents remain readable; only the final
+                           syncParent(target) loses directory-read permission. */
+                        chmod(storeRoot, 0111);
+                    }
+                    return false;
+                };
+                auto expectParentFailure = [&] {
+                    try {
+                        store->registerValidPath(infos[0], holds[0]);
+                        ADD_FAILURE() << "publication bypassed its unreadable durability parent";
+                    } catch (const SysError & error) {
+                        EXPECT_TRUE(error.is(std::errc::permission_denied));
+                        EXPECT_THAT(error.what(), ::testing::HasSubstr("opening file"));
+                    }
+                };
+                expectParentFailure();
+                store->objects.failPlaceWithNoSpace = {};
+                ASSERT_EQ(aliases, 2u);
+                for (auto name : {"a", "nested/alias"}) {
+                    EXPECT_EQ(st(target / name).st_ino, winning.st_ino);
+                    EXPECT_EQ(st(target / name).st_dev, winning.st_dev);
+                    EXPECT_EQ(readFile(target / name), bytes);
+                }
+                auto denied = openDirectory(storeRoot);
+                auto error = errno;
+                ASSERT_FALSE(denied);
+                ASSERT_EQ(error, EACCES);
+                if (retireDonor)
+                    other.exec(fmt(
+                        "delete from Ingestions where id = %d;", holds[1].completedIngestions.begin()->second.first));
+                expectParentFailure();
+                {
+                    SQLiteStmt valid{other, "select count(*) from ValidPaths where path = ?;"};
+                    auto use = valid.use();
+                    use.apply(store->printStorePath(infos[0].path));
+                    ASSERT_TRUE(use.next());
+                    EXPECT_EQ(use.getInt(0), 0);
+                }
+                chmod(storeRoot, mode);
+                ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                EXPECT_TRUE(store->isValidPath(infos[0].path));
+                for (auto name : {"a", "nested/alias"}) {
+                    EXPECT_EQ(st(target / name).st_ino, winning.st_ino);
+                    EXPECT_EQ(readFile(target / name), bytes);
+                }
+            }
+    RecordProperty("finite_cases", cases);
+    EXPECT_EQ(cases, 8u);
+}
+
+TEST_F(LocalStoreObjectsTest, physicalFailurePreservesRefusalAndUntouchedClaims)
+{
+    unsigned cases = 0;
+    for (bool executable : {false, true})
+        for (bool refusePin : {false, true})
+            for (bool partial : {false, true})
+                for (unsigned failure = 0; failure < 3; ++failure)
+                    for (bool completed : {false, true}) {
+                        /* An escaping error consumes an active local projection;
+                           only a Busy retry retains that existing local owner. */
+                        if (!completed && failure != 2)
+                            continue;
+                        auto tag = fmt("physical-publication-retry-%d", cases++);
+                        SCOPED_TRACE(
+                            fmt("exec=%d pin=%d partial=%d failure=%d completed=%d",
+                                executable,
+                                refusePin,
+                                partial,
+                                failure,
+                                completed));
+                        std::array<std::string, 3> bytes{tag + "-0", tag + "-1", tag + "-2"};
+                        std::ranges::sort(
+                            bytes, {}, [](const std::string & value) { return merkle::blobId(value).gitRev(); });
+                        auto nar = treeNar(
+                            {{"a", bytes[0], executable ? 'x' : 'f'},
+                             {"nested/a", bytes[0], executable ? 'x' : 'f'},
+                             {"b", bytes[1], executable ? 'x' : 'f'},
+                             {"nested/b", bytes[1], executable ? 'x' : 'f'},
+                             {"c", bytes[2], executable ? 'x' : 'f'},
+                             {"nested/c", bytes[2], executable ? 'x' : 'f'}});
+                        std::array holds{store->objects.hold(), store->objects.hold()};
+                        std::vector<ValidPathInfo> infos;
+                        for (unsigned i = 0; i < holds.size(); ++i)
+                            infos.push_back(restoreOutput(StorePath::random(tag + fmt("-%d", i)), nar, holds[i]));
+                        if (completed)
+                            store->endIngestion(holds[0], infos[0].path);
+                        store->registerValidPath(infos[1], holds[1]);
+                        auto target = store->toRealPath(infos[0].path), donor = store->toRealPath(infos[1].path);
+                        auto beforeA = st(target / "a"), beforeC = st(target / "c");
+                        ASSERT_NE(st(target / "b").st_ino, st(donor / "b").st_ino);
+                        SQLite other{
+                            store->dbDir / "db.sqlite",
+                            {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                        auto retire =
+                            fmt("delete from Ingestions where id = %d;",
+                                holds[1].completedIngestions.begin()->second.first);
+
+                        struct Retry
+                        {
+                            sqlite3 * db;
+                            const char * sql;
+                            unsigned begins = 0;
+                            int rc = SQLITE_ERROR;
+                        } retry{other, retire.c_str()};
+
+                        unsigned pins = 0, bAliases = 0, refusals = 0, throws = 0;
+                        Finally clear{[&] {
+                            store->objects.failPlaceWithNoSpace = {};
+                            auto state = lockStoreState();
+                            sqlite3_trace_v2(state->db, 0, nullptr, nullptr);
+                        }};
+                        {
+                            auto state = lockStoreState();
+                            ASSERT_EQ(
+                                sqlite3_trace_v2(
+                                    state->db,
+                                    SQLITE_TRACE_STMT,
+                                    [](unsigned, void * context, void * statement, void *) -> int {
+                                        auto & r = *static_cast<Retry *>(context);
+                                        auto sql = sqlite3_sql(static_cast<sqlite3_stmt *>(statement));
+                                        if (sql && std::string_view(sql) == "begin;" && ++r.begins == 2)
+                                            r.rc = sqlite3_exec(r.db, r.sql, nullptr, nullptr, nullptr);
+                                        return 0;
+                                    },
+                                    &retry),
+                                SQLITE_OK);
+                        }
+                        store->objects.failPlaceWithNoSpace = [&](const std::filesystem::path & where) {
+                            bool pin = where.parent_path() == holds[0].directory();
+                            if (pin)
+                                ++pins;
+                            bool stop = partial
+                                            ? (where == target / "b" || where == target / "nested/b") && ++bAliases == 2
+                                            : pin && pins == 2;
+                            if (stop && throws++ == 0) {
+                                if (failure == 0)
+                                    throw Error("physical publication failure");
+                                if (failure == 1)
+                                    throw Interrupted("physical publication interruption");
+                                throw SQLiteBusy(
+                                    "test",
+                                    "injected busy",
+                                    SQLITE_BUSY,
+                                    SQLITE_BUSY,
+                                    -1,
+                                    HintFmt("physical publication busy"));
+                            }
+                            bool refuse =
+                                refusePin ? pin && pins == 1 : where == target / "a" || where == target / "nested/a";
+                            if (refuse)
+                                ++refusals;
+                            return refuse;
+                        };
+                        if (failure == 0)
+                            EXPECT_THROW(store->registerValidPath(infos[0], holds[0]), Error);
+                        else if (failure == 1)
+                            EXPECT_THROW(store->registerValidPath(infos[0], holds[0]), Interrupted);
+                        if (failure != 2)
+                            store->objects.failPlaceWithNoSpace = {};
+                        ASSERT_NO_THROW(store->registerValidPath(infos[0], holds[0]));
+                        EXPECT_EQ(throws, 1u);
+                        EXPECT_GT(refusals, 0u);
+                        EXPECT_EQ(retry.begins, 2u);
+                        EXPECT_EQ(retry.rc, SQLITE_OK);
+                        EXPECT_TRUE(store->isValidPath(infos[0].path));
+                        unsigned changedB = 0;
+                        for (auto prefix : {"", "nested/"}) {
+                            EXPECT_EQ(st(target / (std::string(prefix) + "a")).st_ino, beforeA.st_ino);
+                            EXPECT_EQ(st(target / (std::string(prefix) + "c")).st_ino, beforeC.st_ino);
+                            changedB += st(target / (std::string(prefix) + "b")).st_ino == st(donor / "b").st_ino;
+                            for (unsigned i = 0; i < bytes.size(); ++i)
+                                EXPECT_EQ(readFile(target / (std::string(prefix) + char('a' + i))), bytes[i]);
+                        }
+                        EXPECT_EQ(changedB, partial ? 1u : 0u);
+                        for (unsigned i : {0u, 2u}) {
+                            SQLiteStmt count{
+                                other,
+                                "select count(*) from Blobs b join Ingestions i on i.id=b.ingestion where i.path=? and b.id=? and b.exec=?;"};
+                            auto key = merkle::blobId(bytes[i]);
+                            auto use = count.use();
+                            use.apply(store->printStorePath(infos[0].path))
+                                .apply(key.hash, key.hashSize)
+                                .apply(int64_t(executable));
+                            ASSERT_TRUE(use.next());
+                            EXPECT_EQ(use.getInt(0), i == 0 ? 0 : 1);
+                        }
+                    }
+    RecordProperty("finite_cases", cases);
+    EXPECT_EQ(cases, 32u);
+}
+#  endif
+
 /* SQL rollback can restore a refused cache key after its last donor retires.
    The retained physical relation, including absence, governs the next attempt. */
 TEST_F(LocalStoreObjectsTest, publicationRetryRetainsAbsenceAfterTheLastDonorRetires)
