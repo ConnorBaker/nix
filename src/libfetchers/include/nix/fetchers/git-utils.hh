@@ -116,7 +116,7 @@ struct GitRepo
     /** Acquire the rendered value into a private in-memory canonical SHA-256 ODB. */
     static ref<SourceAccessor> acquire(const SourcePath & source);
 
-    /** Retains a fixed workdir observation; callers must not mutate it through another alias. */
+    /** A live filesystem view with retained tracked membership. */
     virtual ref<SourceAccessor> getAccessor(
         ref<const WorkdirInfo> wd, const GitAccessorOptions & options, MakeNotAllowedError makeNotAllowedError) = 0;
 
