@@ -2,29 +2,35 @@
 
 ## Latest matched comparison
 
-The latest closed matched cohort, **c9r14**, measures **193397f3a3fb250de392ef49709e5407035fe84c** against fixed base **8aad447f0bace6be413963e897ad690247ad6aa2**. Wall and CPU medians each improve in **six of nine cases**. Cold path and both warm-Git cases regress in wall and CPU in all six pairs. Cold Git improves in five pairs for each metric. Peak RSS medians are higher in seven cases; cold GitHub has four lower-RSS pairs and warm-32 GitHub six. **The performance goal remains unmet.** These whole-endpoint measurements do not isolate individual changes.
+The latest closed matched cohort, **c9r15**, measures **efc76c1d841669f5c80814999f91b7f088640d39** against fixed branch base **8aad447f0bace6be413963e897ad690247ad6aa2**. Wall and CPU medians each improve in **six of nine cases**. Cold path and both warm-Git cases regress in all six pairs. Cold Git wins five wall pairs and three CPU pairs; warm-8 GitHub's wall ratio is only slightly below one. Peak RSS medians rise in eight cases. **The performance and substantial source-contraction goals remain unmet.** These whole-endpoint measurements do not isolate individual changes.
 
 Ratios are medians of six adjacent candidate/base ratios; below one is lower. Each case retains three AB and three BA pairs.
 
 | Case | Wall / base | CPU / base | RSS / base | Wall wins | CPU wins |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| cold 32 path | 1.145156 | 1.205133 | 1.713345 | 0/6 | 0/6 |
-| cold 32 git | 0.962980 | 0.970565 | 1.350983 | 5/6 | 5/6 |
-| cold 32 github | 0.640639 | 0.340715 | 0.888236 | 6/6 | 6/6 |
-| warm 8 path | 0.255712 | 0.265488 | 1.731211 | 6/6 | 6/6 |
-| warm 8 git | 1.589190 | 1.666700 | 1.617317 | 0/6 | 0/6 |
-| warm 8 github | 0.862634 | 0.901613 | 1.004387 | 6/6 | 6/6 |
-| warm 32 path | 0.364484 | 0.373567 | 1.378093 | 6/6 | 6/6 |
-| warm 32 git | 1.300608 | 1.342736 | 1.338257 | 0/6 | 0/6 |
-| warm 32 github | 0.852566 | 0.900445 | 0.999091 | 6/6 | 6/6 |
+| cold 32 path | 1.136001 | 1.192738 | 1.575441 | 0/6 | 0/6 |
+| cold 32 git | 0.982616 | 0.983456 | 1.452037 | 5/6 | 3/6 |
+| cold 32 github | 0.628563 | 0.345138 | 0.889418 | 6/6 | 6/6 |
+| warm 8 path | 0.272976 | 0.280244 | 1.872985 | 6/6 | 6/6 |
+| warm 8 git | 1.555989 | 1.622555 | 1.808364 | 0/6 | 0/6 |
+| warm 8 github | 0.998375 | 0.870968 | 1.005168 | 5/6 | 6/6 |
+| warm 32 path | 0.388555 | 0.399403 | 1.463356 | 6/6 | 6/6 |
+| warm 32 git | 1.290212 | 1.336155 | 1.439476 | 0/6 | 0/6 |
+| warm 32 github | 0.945492 | 0.932942 | 1.000314 | 6/6 | 6/6 |
 
-The [complete readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/READOUT.json) and [actual closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/ACTUAL-FINAL-JOB-CLOSURE.json) retain **114 outputs, 54 balanced pairs and 21 complete graphs**, with no exclusions or target retries. The wrapper and corrected readback closed zero and were reaped; source, fixture and 98 runtime-provider checks pass. All 42 states were retained. Graphs match after address rewriting. Cold uses fresh application state with host page caches intact; warm reuses physical roots. CPU is user plus system time at the existing timer resolution.
-
-Wrapper sources were recorded before launch. A [final-reporting helper changed after readiness](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/FINAL-CLOSER-TRANSITION.json), outside measured targets. The [failed first readback](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/READBACK01-JOB.json) and [corrected closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/COHORT-JOB-FINAL-CLOSURE-v2.json) remain, without target replay or benchmark source/provider changes. All **1,578 pressure samples**, including **1,014 timed**, remain: timed CPU some avg10 peaks at **6.12%**, I/O some/full at **33.33%/33.33%**, and memory some/full at **3.00%/2.67%**. Timed counter differences include intervening guards and establish no causal time fraction.
+The [complete readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-shared-reader-v9-oct11/READOUT.json) and [actual closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-shared-reader-v9-oct11/ACTUAL-FINAL-JOB-CLOSURE.json) retain **114 outputs, 54 balanced pairs and 21 complete graphs**, with no exclusions or target retries. All 42 physical states remain; graphs match after address rewriting. Full source and all 98 runtime-provider guards pass. Cold means fresh application state with host page caches intact; warm reuses the original roots. All **1,518 pressure samples**, including **958 timed**, remain: timed CPU some avg10 peaks at **6.18%**, I/O some/full at **40.39%/40.39%**, and memory at **0.02%**. Intervening guards are included in timed spans; pressure establishes no causal time fraction. The [c9r14 readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/READOUT.json) remains historical.
 
 The six-file batch removes 20 production and six test lines. Its [whole validation](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/owned-endpoint-normal-oct10/memory-odb-normal-v12/WHOLE-VERIFICATION-CLOSURE.json) and [lane closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/owned-endpoint-normal-oct10/memory-odb-normal-v12/LANE-FINAL-CLOSURE.json) retain **26 normal commands including three content-addressing checks, plus twelve real-overlay passes**. The [five selected native writer sites](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/successor-odb-owned-oct11/native-source/WRITER-READOUT.json) shrink against 5deefd; two remain larger than 11f956. This establishes neither CPU causality nor removal of hashing.
 
-### Current endpoint diagnostics
+### efc counter and filesystem diagnostics
+
+The separate [current PMU/native readout](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/workdir-observation-domain-oct10/CURRENT-EFC-PMU-NATIVE-READOUT-OCT11.md) retains twelve counter captures and twelve user PC/LR captures, with two balanced pairs per regression case. All 132 counter readings reconcile with equal enabled/running times. Candidate/base median user-instruction, kernel-instruction and task-clock ratios are **1.185047 / 1.112346 / 1.223394** for cold path, **1.103679 / 1.899797 / 1.539361** for warm-8 Git and **1.033723 / 1.719374 / 1.332924** for warm-32 Git. The complete native census conserves 10,868 samples and checks 3,944 distinct ELF instruction anchors. Warm Git observes SHA-256 and flat-set path admission; exact admission instructions include midpoint shifts, byte comparisons and slash handling. PC/LR samples establish neither caller ancestry nor causal CPU fractions; allocator and ready-future attribution remain unresolved.
+
+The [current five-family filesystem closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/current-efc-filesystem-caller-source-oct11/FILESYSTEM-CAPTURE-ACTUAL-CLOSURE.json) reproduces the earlier route counts exactly. Libgit2's directory iteration is unchanged. Base-to-branch totals are **225,545→402,690 readdir**, **38,528→128,213 fstat**, and **92,701→180,119 fstatat** calls. Branch acquisition contributes 52,856 regular opens, 37,119 subdirectory opens and 201,339 POSIX listing calls. These are libc-entry counts, not kernel syscall totals or per-path causal timings. Root independently checked all 547 artifact pins, 50 aliases and absence of the owned processes/probes.
+
+Root's first independent PMU closure check found exactly one self-output drift, preserved in the original closure. The [post-reap successor](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/currentefc-native-pmu-source-oct11-held/ACTUAL-PIPELINE-POSTREAP-CLOSURE.json) binds all 912 artifacts, 30 aliases and absence of 281 retained PIDs and 222 groups. Metadata-only corrections replayed no targets. The tested normal SDK, optimized cohort and diagnostic captures remain distinct authorities; subsequent source edits inherit no timing result.
+
+### Historical 193397 endpoint diagnostics
 
 The separate [p14 closure](/home/connorbaker/Benchmarks/nix-performance-fixes/resume-60067-oct9/CURRENT193397-PROFILE-REAP-RECEIPT.json) binds **193397 against 8aad**: twelve counter captures, twelve user native profiles and twelve TID syscall captures, all reaped with source/provider guards closed. [All eleven counters in every capture](/home/connorbaker/Benchmarks/p14s/COUNTERS-ALL11-PAIRED.json) have equal enabled/running time. Each case has an AB and a BA pair. Instruction ratios below are candidate/base for those two trials; syscall totals are ranges from separate [complete request/outcome records](/home/connorbaker/Benchmarks/p14i/PAIRED-REQUESTS-OUTCOMES-ALL-DOMAINS.json), including the selected process's loader/helper phases.
 

@@ -1,7 +1,16 @@
 #include <gtest/gtest.h>
 #include <type_traits>
+#include <optional>
+#include <string>
 
 #include "nix/util/fun.hh"
+#include "nix/util/callback.hh"
+#include "nix/util/signals.hh"
+
+#include "nix/util/async.hh"
+#include <boost/asio/bind_cancellation_slot.hpp>
+#include <boost/asio/bind_executor.hpp>
+#include <boost/asio/cancellation_signal.hpp>
 
 namespace nix {
 
@@ -175,6 +184,127 @@ TEST(fun, perfectForwardingZeroCost)
     f(t1, t2);
     EXPECT_EQ(copies, baseline_copies);
     EXPECT_EQ(moves, baseline_moves);
+}
+
+TEST(Callback, deliversOwnedValuesAndOriginalExceptions)
+{
+    using Value = std::optional<std::string>;
+    using Result = Callback<Value>::Result;
+    unsigned cells = 0;
+    for (bool moved : {false, true}) {
+        for (const auto & expected : {Value{}, Value{std::string{}}, Value{std::string("a\0b", 3)}}) {
+            SCOPED_TRACE(fmt("moved=%d cell=%d", moved, cells));
+            std::optional<Result> received;
+            unsigned calls = 0;
+            Callback<Value> callback{[&](Result result) {
+                ++calls;
+                received.emplace(std::move(result));
+            }};
+            if (moved) {
+                auto destination = std::move(callback);
+                destination(Value{expected});
+            } else
+                callback(Value{expected});
+            EXPECT_EQ(calls, 1u);
+            ASSERT_TRUE(received);
+            EXPECT_EQ(std::move(*received).value(), expected);
+            ++cells;
+        }
+        for (auto exception : {
+                 std::make_exception_ptr(std::runtime_error("callback error")),
+                 std::make_exception_ptr(Interrupted("callback interruption"))})
+            for (bool explicitException : {false, true}) {
+                SCOPED_TRACE(fmt("moved=%d explicit=%d cell=%d", moved, explicitException, cells));
+                std::optional<Result> received;
+                unsigned calls = 0;
+                Callback<Value> callback{[&](Result result) {
+                    ++calls;
+                    received.emplace(std::move(result));
+                }};
+                auto deliver = [&](Callback<Value> & target) {
+                    if (explicitException)
+                        target.rethrow(exception);
+                    else {
+                        try {
+                            std::rethrow_exception(exception);
+                        } catch (...) {
+                            target.rethrow();
+                        }
+                    }
+                };
+                if (moved) {
+                    auto destination = std::move(callback);
+                    deliver(destination);
+                } else
+                    deliver(callback);
+                EXPECT_EQ(calls, 1u);
+                ASSERT_TRUE(received);
+                try {
+                    std::move(*received).value();
+                    ADD_FAILURE() << "callback lost its exception";
+                } catch (...) {
+                    EXPECT_EQ(std::current_exception(), exception);
+                }
+                ++cells;
+            }
+    }
+    EXPECT_EQ(cells, 14u);
+    RecordProperty("finite_cases", cells);
+}
+
+TEST(CallbackToAwaitable, completionAndCancellationPreserveFirstOutcome)
+{
+    using Result = Callback<int>::Result;
+    unsigned cells = 0;
+    for (bool cancelFirst : {false, true})
+        for (bool producerError : {false, true}) {
+            SCOPED_TRACE(fmt("cancelFirst=%d producerError=%d", cancelFirst, producerError));
+            asio::io_context context;
+            asio::cancellation_signal cancellation;
+            std::optional<Callback<int>> pending;
+            std::optional<Result> received;
+            unsigned deliveries = 0;
+            auto exception = std::make_exception_ptr(std::runtime_error("producer failure"));
+            auto token = asio::bind_executor(asio::any_io_executor(context.get_executor()),
+                asio::bind_cancellation_slot(cancellation.slot(), [&](Result result) {
+                    ++deliveries;
+                    received.emplace(std::move(result));
+                }));
+            callbackToAwaitable<int>(
+                [&](Callback<int> callback) { pending.emplace(std::move(callback)); }, token);
+            ASSERT_TRUE(pending);
+            if (cancelFirst) {
+                cancellation.emit(asio::cancellation_type::all);
+                cancellation.emit(asio::cancellation_type::all);
+            }
+            if (producerError)
+                pending->rethrow(exception);
+            else
+                (*pending)(42);
+            pending.reset();
+            if (!cancelFirst) {
+                cancellation.emit(asio::cancellation_type::all);
+                cancellation.emit(asio::cancellation_type::all);
+            }
+            EXPECT_EQ(deliveries, 0u); // Completion is marshalled onto the executor.
+            context.run();
+            EXPECT_EQ(deliveries, 1u);
+            ASSERT_TRUE(received);
+            if (cancelFirst)
+                EXPECT_THROW(std::move(*received).value(), Interrupted);
+            else if (producerError) {
+                try {
+                    std::move(*received).value();
+                    ADD_FAILURE() << "producer exception was lost";
+                } catch (...) {
+                    EXPECT_EQ(std::current_exception(), exception);
+                }
+            } else
+                EXPECT_EQ(std::move(*received).value(), 42);
+            ++cells;
+        }
+    EXPECT_EQ(cells, 4u);
+    RecordProperty("finite_cases", cells);
 }
 
 } // namespace nix

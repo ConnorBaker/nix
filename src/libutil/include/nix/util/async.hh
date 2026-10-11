@@ -21,7 +21,7 @@ namespace asio = boost::asio;
 template<typename T, std::invocable<Callback<T>> F, typename CompletionToken>
 auto callbackToAwaitable(F && initiate, CompletionToken && token)
 {
-    return asio::async_initiate<CompletionToken, void(std::future<T>)>(
+    return asio::async_initiate<CompletionToken, void(typename Callback<T>::Result)>(
         [initiate = std::forward<F>(initiate)](auto handler) mutable {
             auto executor = asio::get_associated_executor(handler);
             auto done = std::make_shared<std::atomic<bool>>(false);
@@ -35,10 +35,12 @@ auto callbackToAwaitable(F && initiate, CompletionToken && token)
                     auto done = wdone.lock();
                     if (!h || !done || done->exchange(true))
                         return; /* Gracefully die. */
-                    /* Doesn't need to be kept alive for get_future() since it shares the ownership. */
-                    std::promise<T> p;
-                    p.set_exception(std::make_exception_ptr(Interrupted("interrupted by user")));
-                    asio::post(executor, [h, fut = p.get_future()]() mutable { std::move (*h)(std::move(fut)); });
+                    typename Callback<T>::Result result(
+                        std::in_place_type<std::exception_ptr>,
+                        std::make_exception_ptr(Interrupted("interrupted by user")));
+                    asio::post(executor, [h, result = std::move(result)]() mutable {
+                        std::move (*h)(std::move(result));
+                    });
                 });
             }
 
@@ -50,7 +52,7 @@ auto callbackToAwaitable(F && initiate, CompletionToken && token)
                                 stays alive until the callback has finished on possibly another thread. */
                              guard = asio::make_work_guard(
                                  static_cast<asio::io_context &>(asio::query(executor, asio::execution::context)))](
-                                std::future<T> fut) mutable {
+                                typename Callback<T>::Result fut) mutable {
                     auto releaseOwnership = [&]() {
                         /* Release our ownership. If the callback is owned by another thread, we don't want to be
                            responsible for tearing down the last reference to any of the captured objects. */
@@ -84,7 +86,7 @@ template<typename T, std::invocable<Callback<T>> F>
 asio::awaitable<T> callbackToAwaitable(F && initiate)
 {
     auto fut = co_await callbackToAwaitable<T>(std::forward<F>(initiate), asio::use_awaitable);
-    co_return fut.get();
+    co_return std::move(fut).value();
 }
 
 template<typename Range, typename F>

@@ -97,9 +97,9 @@ void LocalOverlayStore::queryPathInfoUncached(
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
     LocalStore::queryPathInfoUncached(
-        path, {[this, path, callbackPtr](std::future<std::shared_ptr<const ValidPathInfo>> fut) {
+        path, {[this, path, callbackPtr](Callback<std::shared_ptr<const ValidPathInfo>>::Result fut) {
             try {
-                auto info = fut.get();
+                auto info = std::move(fut).value();
                 if (info)
                     return (*callbackPtr)(std::move(info));
             } catch (...) {
@@ -108,9 +108,9 @@ void LocalOverlayStore::queryPathInfoUncached(
             // If we don't have it, check lower store.  Its info arrives with
             // its object hash: the lower store migrates an old row on read,
             // in memory when it is read-only.
-            lowerStore->queryPathInfo(path, {[path, callbackPtr](std::future<ref<const ValidPathInfo>> fut) {
+            lowerStore->queryPathInfo(path, {[path, callbackPtr](Callback<ref<const ValidPathInfo>>::Result fut) {
                                           try {
-                                              (*callbackPtr)(fut.get().get_ptr());
+                                              (*callbackPtr)(std::move(fut).value().get_ptr());
                                           } catch (...) {
                                               return callbackPtr->rethrow();
                                           }
@@ -124,23 +124,16 @@ void LocalOverlayStore::queryRealisationUncached(
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
     LocalStore::queryRealisationUncached(
-        drvOutput, {[this, drvOutput, callbackPtr](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) {
+        drvOutput, {[this, drvOutput, callbackPtr](Callback<std::shared_ptr<const UnkeyedRealisation>>::Result fut) {
             try {
-                auto info = fut.get();
+                auto info = std::move(fut).value();
                 if (info)
                     return (*callbackPtr)(std::move(info));
             } catch (...) {
                 return callbackPtr->rethrow();
             }
             // If we don't have it, check lower store
-            lowerStore->queryRealisation(
-                drvOutput, {[callbackPtr](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) {
-                    try {
-                        (*callbackPtr)(fut.get());
-                    } catch (...) {
-                        return callbackPtr->rethrow();
-                    }
-                }});
+            lowerStore->queryRealisation(drvOutput, std::move(*callbackPtr));
         }});
 }
 

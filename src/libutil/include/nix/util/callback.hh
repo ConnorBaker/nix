@@ -3,6 +3,7 @@
 
 #include <cassert>
 #include <future>
+#include <boost/outcome/result.hpp>
 #include <functional>
 
 #include "nix/util/fun.hh"
@@ -10,48 +11,45 @@
 namespace nix {
 
 /**
- * A callback is a wrapper around a lambda that accepts a valid of
- * type T or an exception. (We abuse std::future<T> to pass the value or
- * exception.)
+ * A callback delivers one ready value of type T or an exception.
+ * Invocation and ownership transfer require sequencing or external synchronization; invoke at most once.
  */
 template<typename T>
 class Callback
 {
-    nix::fun<void(std::future<T>)> fun;
-    std::atomic_flag done = ATOMIC_FLAG_INIT;
+public:
+    using Result = boost::outcome_v2::result<T, std::exception_ptr>;
+
+private:
+    nix::fun<void(Result &&)> fun;
+    bool done = false;
 
 public:
 
-    Callback(nix::fun<void(std::future<T>)> fun)
-        : fun(fun)
+    Callback(nix::fun<void(Result &&)> fun)
+        : fun(std::move(fun))
     {
     }
 
     // NOTE: std::function is noexcept move-constructible since C++20.
     Callback(Callback && callback) noexcept(std::is_nothrow_move_constructible_v<decltype(fun)>)
         : fun(std::move(callback.fun))
+        , done(std::exchange(callback.done, true))
     {
-        auto prev = callback.done.test_and_set();
-        if (prev)
-            done.test_and_set();
     }
 
     void operator()(T && t) noexcept
     {
-        auto prev = done.test_and_set();
+        auto prev = std::exchange(done, true);
         assert(!prev);
-        std::promise<T> promise;
-        promise.set_value(std::move(t));
-        fun(promise.get_future());
+        fun(Result(std::in_place_type<T>, std::move(t)));
     }
 
     void rethrow(const std::exception_ptr & exc = std::current_exception()) noexcept
     {
-        auto prev = done.test_and_set();
+        auto prev = std::exchange(done, true);
         assert(!prev);
-        std::promise<T> promise;
-        promise.set_exception(exc);
-        fun(promise.get_future());
+        fun(Result(std::in_place_type<std::exception_ptr>, exc));
     }
 };
 

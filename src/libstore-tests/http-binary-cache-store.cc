@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 #include <regex>
+#include <thread>
 
 #include "nix/store/http-binary-cache-store.hh"
+#include "nix/util/callback.hh"
 #include "nix/store/tests/https-store.hh"
 
 namespace nix {
@@ -119,6 +121,73 @@ TEST_F(HttpsBinaryCacheStoreMtlsTest, doesNotSendCertOnRedirectToDifferentAuthor
     auto info = store->queryPathInfo(path);
     NullSink null;
     EXPECT_THROW(store->narFromPath(path, null), Error);
+}
+
+/* Call the base sink adapter explicitly: Http's own sink override must not
+   hide the callback-to-synchronous handoff being checked. No request/init. */
+TEST(HttpBinaryCacheStore, baseSinkAdapterPreservesCompletedBytesAndErrors)
+{
+    initLibStore(false);
+    enum class Result { Empty, Bytes, Error };
+    struct Probe : HttpBinaryCacheStore
+    {
+        Result result;
+        bool asynchronous;
+        unsigned calls = 0;
+        std::jthread delivery;
+
+        Probe(ref<Config> config, Result result, bool asynchronous)
+            : Store{*config}, BinaryCacheStore{*config}, HttpBinaryCacheStore{config}
+            , result(result), asynchronous(asynchronous)
+        {
+            diskCache = nullptr;
+        }
+
+        void getFile(const std::string & path, Callback<std::optional<std::string>> callback) noexcept override
+        {
+            EXPECT_EQ(path, "payload");
+            ++calls;
+            auto complete = [result = result, callback = std::move(callback)]() mutable {
+                try {
+                    if (result == Result::Error)
+                        throw Error("completed cache read failed");
+                    callback(std::optional<std::string>{result == Result::Empty ? "" : std::string("a\0b", 3)});
+                } catch (...) {
+                    callback.rethrow();
+                }
+            };
+            if (asynchronous)
+                delivery = std::jthread(std::move(complete));
+            else
+                complete();
+        }
+    };
+    unsigned cells = 0;
+    for (bool asynchronous : {false, true})
+        for (auto result : {Result::Empty, Result::Bytes, Result::Error}) {
+            SCOPED_TRACE(fmt("sink-adapter-cell=%u async=%d result=%d", cells++, asynchronous, int(result)));
+            auto config = make_ref<HttpBinaryCacheStoreConfig>(parseURL("https://example.invalid"), StoreConfig::Params{});
+            Probe probe{config, result, asynchronous};
+            StringSink sink;
+            sink.s = "prefix";
+            if (result == Result::Error) {
+                try {
+                    probe.BinaryCacheStore::getFile("payload", sink);
+                    FAIL() << "the completed read error must propagate";
+                } catch (Error & e) {
+                    EXPECT_THAT(e.what(), ::testing::HasSubstr("completed cache read failed"));
+                }
+                EXPECT_EQ(sink.s, "prefix");
+            } else {
+                EXPECT_NO_THROW(probe.BinaryCacheStore::getFile("payload", sink));
+                EXPECT_EQ(sink.s, result == Result::Empty ? "prefix" : std::string("prefixa\0b", 9));
+            }
+            if (probe.delivery.joinable())
+                probe.delivery.join();
+            EXPECT_EQ(probe.calls, 1u);
+        }
+    EXPECT_EQ(cells, 6u);
+    RecordProperty("finite_cases", int(cells));
 }
 
 } // namespace nix

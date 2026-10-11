@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <iterator>
 #include <stdexcept>
@@ -66,31 +67,30 @@ Hash blobId(std::string_view bytes)
 std::string serialiseTree(const Tree & tree)
 {
     std::string body;
+    size_t size = 0;
     for (auto & [key, entry] : tree) {
-        std::string_view name = key;
-        if (entry.mode == Mode::Directory) {
-            assert(!name.empty());
-            assert(name.back() == '/');
-            name.remove_suffix(1);
-        }
-        char mode[12];
-        auto [end, ec] = std::to_chars(mode, mode + 11, static_cast<RawMode>(entry.mode), 8);
-        assert(ec == std::errc{});
-        *end++ = ' ';
-        const auto hash = entry.hash.bytes();
-        const auto modeSize = static_cast<size_t>(end - mode);
-        const auto previousSize = body.size();
-        const auto suffixSize = modeSize + 1 + hash.size();
-        if (name.size() > body.max_size() - suffixSize || previousSize > body.max_size() - name.size() - suffixSize)
+        const auto isDir = entry.mode == Mode::Directory;
+        assert(!isDir || (!key.empty() && key.back() == '/'));
+        const auto nameSize = key.size() - isDir;
+        const auto suffixSize = std::max(1, (std::bit_width(static_cast<RawMode>(entry.mode)) + 2) / 3)
+                                + 2 + entry.hash.bytes().size();
+        if (nameSize > body.max_size() - suffixSize || size > body.max_size() - nameSize - suffixSize)
             throw std::length_error("tree body exceeds string capacity");
-        body.resize_and_overwrite(previousSize + name.size() + suffixSize, [&](char * begin, size_t) {
-            auto * out = std::char_traits<char>::copy(begin + previousSize, mode, modeSize) + modeSize;
-            out = std::char_traits<char>::copy(out, name.data(), name.size()) + name.size();
-            *out++ = '\0';
-            out = std::char_traits<char>::copy(out, hash.data(), hash.size()) + hash.size();
-            return static_cast<size_t>(out - begin);
-        });
+        size += nameSize + suffixSize;
     }
+    body.resize_and_overwrite(size, [&](char * begin, size_t) {
+        auto * out = begin;
+        for (auto & [key, entry] : tree) {
+            out = std::to_chars(out, begin + size, static_cast<RawMode>(entry.mode), 8).ptr;
+            *out++ = ' ';
+            const auto nameSize = key.size() - (entry.mode == Mode::Directory);
+            out = std::char_traits<char>::copy(out, key.data(), nameSize) + nameSize;
+            *out++ = '\0';
+            const auto hash = entry.hash.bytes();
+            out = std::char_traits<char>::copy(out, hash.data(), hash.size()) + hash.size();
+        }
+        return static_cast<size_t>(out - begin);
+    });
     return body;
 }
 

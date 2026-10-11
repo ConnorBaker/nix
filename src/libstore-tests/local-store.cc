@@ -6,6 +6,7 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/build-result.hh"
 #include "nix/store/local-overlay-store.hh"
+#include "nix/store/realisation.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/sqlite.hh"
 #include "nix/store/globals.hh"
@@ -14,6 +15,7 @@
 #include "nix/store/nar-info-disk-cache.hh"
 #include "nix/store/nar-info.hh"
 #include "nix/store/tests/temp-local-store.hh"
+#include "nix/store/tests/libstore.hh"
 
 #include "nix/util/archive.hh"
 #include "nix/util/callback.hh"
@@ -12855,9 +12857,9 @@ TEST_F(TempLocalStoreTest, pathInfoCacheAdmitsOnlyTheRequestedIdentity)
                             if (query == Query::Synchronous)
                                 return observed->queryPathInfo(requested);
                             std::promise<ref<const ValidPathInfo>> promise;
-                            observed->queryPathInfo(requested, {[&](std::future<ref<const ValidPathInfo>> result) {
+                            observed->queryPathInfo(requested, {[&](Callback<ref<const ValidPathInfo>>::Result result) {
                                                         try {
-                                                            promise.set_value(result.get());
+                                                            promise.set_value(std::move(result).value());
                                                         } catch (...) {
                                                             promise.set_exception(std::current_exception());
                                                         }
@@ -12933,9 +12935,9 @@ TEST_F(TempLocalStoreTest, exactPathAbsenceDoesNotInvalidateAnotherNameAtTheSame
                     if (query == 0)
                         return observed->queryPathInfo(requested);
                     std::promise<ref<const ValidPathInfo>> promise;
-                    observed->queryPathInfo(requested, {[&](std::future<ref<const ValidPathInfo>> result) {
+                    observed->queryPathInfo(requested, {[&](Callback<ref<const ValidPathInfo>>::Result result) {
                                                 try {
-                                                    promise.set_value(result.get());
+                                                    promise.set_value(std::move(result).value());
                                                 } catch (...) {
                                                     promise.set_exception(std::current_exception());
                                                 }
@@ -13730,5 +13732,82 @@ TEST_F(LocalStoreObjectsTest, registeredHolderAcquisitionFamiliesCannotEscapeThe
     EXPECT_EQ(cells, 48u);
 }
 #endif
+
+/* Enable CA before the inherited fixture opens its lower DB/prepares queries. */
+class OverlayRealisationTransportTest : public TempLocalStoreTest
+{
+    EnableExperimentalFeature ca{"ca-derivations"};
+
+public:
+    static void SetUpTestSuite()
+    {
+        initLibStore(false);
+    }
+};
+
+TEST_F(OverlayRealisationTransportTest, lowerCompletionAndUpperPriorityPreserveRealisationResults)
+{
+    enum class Row { Missing, Present, Corrupt };
+    unsigned cells = 0;
+    for (auto upper : {Row::Missing, Row::Present, Row::Corrupt})
+        for (auto lower : {Row::Missing, Row::Present, Row::Corrupt}) {
+            auto cell = cells++;
+            SCOPED_TRACE(fmt("overlay-realisation-cell=%u upper=%d lower=%d", cell, int(upper), int(lower)));
+            DrvOutput id{StorePath{"00000000000000000000000000000000-transport.drv"}, fmt("out%u", cell)};
+            const StorePath lowerPath{"11111111111111111111111111111111-lower"};
+            const StorePath upperPath{"22222222222222222222222222222222-upper"};
+            auto root = tempStoreDir.path() / fmt("overlay-realisation-%u", cell);
+            auto reference = config->getReference();
+            reference.params.insert_or_assign("root", tempStoreDir.path().string());
+            auto overlayConfig = make_ref<LocalOverlayStoreConfig>(
+                root, StoreConfig::Params{{"lower-store", reference.render(true)},
+                                         {"upper-layer", (root / "upper").string()}, {"check-mount", "false"}});
+            std::shared_ptr<LocalStore> overlay = std::make_shared<LocalOverlayStore>(overlayConfig);
+            auto seed = [&](LocalStore & target, Row row, const StorePath & path) {
+                if (row == Row::Missing)
+                    return;
+                /* Qualified LocalStore avoids overlay's write-side copy-up;
+                   the two independent stored rows are the priority oracle. */
+                target.LocalStore::registerDrvOutputUnchecked(Realisation{{.outPath = path}, id});
+                if (row == Row::Corrupt) {
+                    SQLite db{target.dbDir / "db.sqlite", {.mode = SQLiteOpenMode::NoCreate, .useWAL = settings.useSQLiteWAL}};
+                    SQLiteStmt corrupt{db, "update BuildTraceV3 set signatures = ? where drvPath = ? and outputName = ?"};
+                    corrupt.use().apply(std::string("not-a-signature")).apply(id.drvPath.to_string()).apply(id.outputName).exec();
+                }
+            };
+            seed(*store, lower, lowerPath);
+            seed(*overlay, upper, upperPath);
+            bool expectedError = upper == Row::Corrupt || (upper == Row::Missing && lower == Row::Corrupt);
+            bool expectedValue = upper == Row::Present || (upper == Row::Missing && lower == Row::Present);
+            unsigned deliveries = 0;
+            std::shared_ptr<const UnkeyedRealisation> observed;
+            std::exception_ptr error;
+            overlay->queryRealisationUncached(id, {[&](Callback<std::shared_ptr<const UnkeyedRealisation>>::Result result) {
+                ++deliveries;
+                try { observed = std::move(result).value(); }
+                catch (...) { error = std::current_exception(); }
+            }});
+            EXPECT_EQ(deliveries, 1u);
+            EXPECT_EQ(bool(error), expectedError);
+            EXPECT_EQ(bool(observed), expectedValue);
+            if (expectedError) {
+                ASSERT_TRUE(error);
+                EXPECT_THROW(std::rethrow_exception(error), FormatError);
+                EXPECT_THROW(overlay->queryRealisation(id), FormatError);
+            } else {
+                auto synchronous = overlay->queryRealisation(id);
+                EXPECT_EQ(bool(synchronous), expectedValue);
+                if (expectedValue) {
+                    ASSERT_TRUE(observed);
+                    ASSERT_TRUE(synchronous);
+                    const auto & expected = upper == Row::Present ? upperPath : lowerPath;
+                    EXPECT_EQ(observed->outPath, expected);
+                    EXPECT_EQ(synchronous->outPath, expected);
+                }
+            }
+        }
+    EXPECT_EQ(cells, 9u);
+    RecordProperty("finite_cases", int(cells));
+}
 
 } // namespace nix

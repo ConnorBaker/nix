@@ -670,17 +670,13 @@ ref<const ValidPathInfo> Store::queryPathInfo(const StorePath & storePath)
 
 ref<const ValidPathInfo> Store::queryPathInfoAfterCacheMiss(const StorePath & storePath)
 {
-    std::promise<ref<const ValidPathInfo>> promise;
+    std::promise<Callback<ref<const ValidPathInfo>>::Result> promise;
 
-    queryPathInfoAfterCacheMiss(storePath, {[&](std::future<ref<const ValidPathInfo>> result) {
-                                    try {
-                                        promise.set_value(result.get());
-                                    } catch (...) {
-                                        promise.set_exception(std::current_exception());
-                                    }
+    queryPathInfoAfterCacheMiss(storePath, {[&](Callback<ref<const ValidPathInfo>>::Result result) {
+                                    promise.set_value(std::move(result));
                                 }});
 
-    return promise.get_future().get();
+    return promise.get_future().get().value();
 }
 
 std::optional<std::shared_ptr<const ValidPathInfo>> Store::queryPathInfoFromClientCache(const StorePath & storePath)
@@ -732,9 +728,9 @@ void Store::queryPathInfoAfterCacheMiss(
     auto callbackPtr = std::make_shared<Callback<ref<const ValidPathInfo>>>(std::move(callback));
 
     queryPathInfoUncached(
-        storePath, {[this, storePath, callbackPtr](std::future<std::shared_ptr<const ValidPathInfo>> fut) {
+        storePath, {[this, storePath, callbackPtr](Callback<std::shared_ptr<const ValidPathInfo>>::Result fut) {
             try {
-                auto info = fut.get();
+                auto info = std::move(fut).value();
                 bool valid = info && goodStorePath(storePath, info->path);
 
                 /* A matching hash describes its canonical name even if this
@@ -794,9 +790,9 @@ void Store::queryRealisation(
 
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
-    queryRealisationUncached(id, {[this, id, callbackPtr](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) {
+    queryRealisationUncached(id, {[this, id, callbackPtr](Callback<std::shared_ptr<const UnkeyedRealisation>>::Result fut) {
                                  try {
-                                     auto info = fut.get();
+                                     auto info = std::move(fut).value();
 
                                      if (diskCache) {
                                          if (info)
@@ -818,17 +814,11 @@ void Store::queryRealisation(
 std::shared_ptr<const UnkeyedRealisation> Store::queryRealisation(const DrvOutput & id)
 {
     using RealPtr = std::shared_ptr<const UnkeyedRealisation>;
-    std::promise<RealPtr> promise;
+    std::promise<Callback<RealPtr>::Result> promise;
 
-    queryRealisation(id, {[&](std::future<RealPtr> result) {
-                         try {
-                             promise.set_value(result.get());
-                         } catch (...) {
-                             promise.set_exception(std::current_exception());
-                         }
-                     }});
+    queryRealisation(id, {[&](Callback<RealPtr>::Result result) { promise.set_value(std::move(result)); }});
 
-    return promise.get_future().get();
+    return promise.get_future().get().value();
 }
 
 void Store::substitutePaths(const StorePathSet & paths)
@@ -866,12 +856,12 @@ StorePathSet Store::queryValidPaths(const StorePathSet & paths, SubstituteFlag m
 
     auto doQuery = [&](const StorePath & path) {
         checkInterrupt();
-        queryPathInfo(path, {[path, &state_, &wakeup](std::future<ref<const ValidPathInfo>> fut) {
+        queryPathInfo(path, {[path, &state_, &wakeup](Callback<ref<const ValidPathInfo>>::Result fut) {
                           bool exists = false;
                           std::exception_ptr newExc{};
 
                           try {
-                              auto info = fut.get();
+                              auto info = std::move(fut).value();
                               exists = true;
                           } catch (InvalidPath &) {
                           } catch (...) {

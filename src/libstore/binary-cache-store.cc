@@ -103,15 +103,11 @@ void BinaryCacheStore::getFile(const std::string & path, Callback<std::optional<
 
 void BinaryCacheStore::getFile(const std::string & path, Sink & sink)
 {
-    std::promise<std::optional<std::string>> promise;
-    getFile(path, {[&](std::future<std::optional<std::string>> result) {
-                try {
-                    promise.set_value(result.get());
-                } catch (...) {
-                    promise.set_exception(std::current_exception());
-                }
+    std::promise<Callback<std::optional<std::string>>::Result> promise;
+    getFile(path, {[&](Callback<std::optional<std::string>>::Result result) {
+                promise.set_value(std::move(result));
             }});
-    sink(*promise.get_future().get());
+    sink(*promise.get_future().get().value());
 }
 
 std::optional<std::string> BinaryCacheStore::getFile(const std::string & path)
@@ -574,9 +570,9 @@ void BinaryCacheStore::queryPathInfoUncached(
 
         auto narInfoFile = narInfoFileFor(storePath);
 
-        getFile(narInfoFile, {[=, this](std::future<std::optional<std::string>> fut) {
+        getFile(narInfoFile, {[=, this](Callback<std::optional<std::string>>::Result fut) {
                     try {
-                        auto data = fut.get();
+                        auto data = std::move(fut).value();
 
                         if (!data) {
                             /* This lookup addressed hash.narinfo, so absence
@@ -652,9 +648,9 @@ void BinaryCacheStore::queryRealisationUncached(
 
     auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
 
-    Callback<std::optional<std::string>> newCallback = {[=](std::future<std::optional<std::string>> fut) {
+    Callback<std::optional<std::string>> newCallback = {[=](Callback<std::optional<std::string>>::Result fut) {
         try {
-            auto data = fut.get();
+            auto data = std::move(fut).value();
             if (!data)
                 return (*callbackPtr)({});
 

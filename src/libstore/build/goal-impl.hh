@@ -10,7 +10,7 @@ auto Goal::promise_type::await_transform(AsyncCallback<T> && ac)
     struct Awaiter
     {
         fun<void(Callback<T>)> fn;
-        std::shared_ptr<std::promise<T>> promise;
+        std::shared_ptr<std::promise<typename Callback<T>::Result>> promise;
 
         bool await_ready()
         {
@@ -20,16 +20,12 @@ auto Goal::promise_type::await_transform(AsyncCallback<T> && ac)
         void await_suspend(handle_type h)
         {
             auto goal = h.promise().goal;
-            promise = std::make_shared<std::promise<T>>();
+            promise = std::make_shared<std::promise<typename Callback<T>::Result>>();
 
             fn(Callback<T>([promise = promise,
                             maybeWaker = goal->worker.getCrossThreadWaker(),
-                            goalWeak = goal->weak_from_this()](std::future<T> res) {
-                try {
-                    promise->set_value(res.get());
-                } catch (...) {
-                    promise->set_exception(std::current_exception());
-                }
+                            goalWeak = goal->weak_from_this()](typename Callback<T>::Result res) {
+                promise->set_value(std::move(res));
 
                 /* The Worker might have already died (and the waker with it) by
                    the time the callback fired. */
@@ -42,7 +38,7 @@ auto Goal::promise_type::await_transform(AsyncCallback<T> && ac)
 
         T await_resume()
         {
-            return promise->get_future().get();
+            return promise->get_future().get().value();
         }
     };
 
