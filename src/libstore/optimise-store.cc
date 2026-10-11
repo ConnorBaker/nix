@@ -844,9 +844,11 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
     size_t workers = callbacksPermitParallelism ? HashingVisitor::workerCountFor(*path.accessor, filter) : 1;
     auto commitAttempt = [&](const std::filesystem::path & subtree, const GitObjectStore::Hold & attempt) {
         auto projection = attempt.takeProjection();
+        static_assert(std::is_trivially_move_constructible_v<Hash>);
+        static_assert(std::is_nothrow_move_constructible_v<GitObjectStore::Hold::Row>);
         std::vector<BlobCoalescing> collisions;
-        for (auto & row : projection.regular) {
-            auto other = hold.addRow(std::move(row));
+        for (const auto & row : projection.regular) {
+            auto other = hold.addRow(std::move(const_cast<GitObjectStore::Hold::Row &>(row)));
             if (!other)
                 continue;
             auto current = lstat(std::filesystem::path(*other));
@@ -869,8 +871,9 @@ ObjectHashSink::Result LocalStore::materialiseThroughObjects(
             for (auto & collision : collisions)
                 hold.appendNames(std::move(collision.row));
         }
-        for (auto & auxiliary : projection.auxiliary)
-            hold.addAuxiliary(std::move(auxiliary));
+        static_assert(std::is_nothrow_move_constructible_v<GitObjectStore::Auxiliary>);
+        for (const auto & auxiliary : projection.auxiliary)
+            hold.addAuxiliary(std::move(const_cast<GitObjectStore::Auxiliary &>(auxiliary)));
     };
     LinkingVisitor::Naming naming{std::move(namer), commitAttempt};
     beginIngestion(hold, dst);

@@ -1751,10 +1751,10 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
             }
         }
     } acquire;
-    struct Accessor final : FsoSourceAccessor<Accessor, File>
+    struct Accessor final : FsoSourceAccessor<Accessor, File, FsoVirtualSourceAccessor, true>
     {
         const File root;
-        friend struct FsoSourceAccessor<Accessor, File>;
+        friend struct FsoSourceAccessor<Accessor, File, FsoVirtualSourceAccessor, true>;
         void anchor() override {}
         Accessor(File value) : root(std::move(value))
         {

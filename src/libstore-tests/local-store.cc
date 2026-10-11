@@ -617,6 +617,11 @@ protected:
         return store->_state->lock();
     }
 
+    auto & pendingProjection(const GitObjectStore::Hold & hold)
+    {
+        return hold.projection();
+    }
+
     /* Older or concurrent writers may have persisted an unnamed projection.
        Construct that compatibility state explicitly: current ingestion keeps
        these rows in memory until its completed-path boundary. */
@@ -6074,7 +6079,7 @@ TEST_F(LocalStoreObjectsTest, completedIngestionsResetTheirHolderNames)
             .size = 3 * ordinal,
             .name = std::string(generation) + "/" + std::to_string(ordinal) + "-" + std::string(64, 'n')};
     };
-    auto relation = [](const std::vector<Row> & rows) {
+    auto relation = [](const auto & rows) {
         std::map<Key, Fields> result;
         for (auto & row : rows)
             EXPECT_TRUE(
@@ -6356,8 +6361,8 @@ TEST_F(LocalStoreObjectsTest, optimiserInodeHintsRequireACurrentHolder)
                     EXPECT_TRUE(rows.empty());
                 else {
                     ASSERT_EQ(rows.size(), 1u);
-                    EXPECT_EQ(rows.front().id, merkle::blobId(readFile(file)));
-                    EXPECT_EQ(rows.front().name, bare ? "" : "file");
+                    EXPECT_EQ((*rows.begin()).id, merkle::blobId(readFile(file)));
+                    EXPECT_EQ((*rows.begin()).name, bare ? "" : "file");
                 }
                 if (hint == Hint::Valid) {
                     EXPECT_EQ(queries, 1u) << "the validated shortcut does not fall through to hash and place";
@@ -6644,12 +6649,12 @@ TEST_F(LocalStoreObjectsTest, auxiliaryLeaseSurvivesEveryViewReleaseOrder)
                 }
                 auto values = views[order[2]]->takeProjection();
                 ASSERT_EQ(values.auxiliary.size(), 1u);
-                EXPECT_EQ(values.auxiliary[0].entry, (merkle::TreeEntry{mode, id}));
-                EXPECT_EQ(values.auxiliary[0].body, bytes);
+                EXPECT_EQ((*values.auxiliary.begin()).entry, (merkle::TreeEntry{mode, id}));
+                EXPECT_EQ((*values.auxiliary.begin()).body, bytes);
                 views[order[2]].reset();
                 EXPECT_FALSE(pathExists(directory));
                 EXPECT_EQ(objects.sweep(), 0u);
-                EXPECT_EQ(values.auxiliary[0].body, bytes) << "projection ownership survives every lease";
+                EXPECT_EQ((*values.auxiliary.begin()).body, bytes) << "projection ownership survives every lease";
                 ++cases;
             } while (std::next_permutation(order.begin(), order.end()));
         }
@@ -6754,12 +6759,14 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     GitObjectStore::Hold::Row retained{.id = Hash{HashAlgorithm::SHA256}};
     merkle::TreeEntry retainedAuxiliary{merkle::Mode::Directory, Hash{HashAlgorithm::SHA256}};
     {
-        auto & pending = hold.projection();
+        auto & pending = pendingProjection(hold);
         ASSERT_FALSE(pending.regular.empty());
         ASSERT_FALSE(pending.auxiliary.empty());
-        pending.regular.front().aliases.push_back("retained-alias");
-        retained = pending.regular.front();
-        auto & value = pending.auxiliary.front();
+        static_assert(!std::is_assignable_v<decltype((pending.regular.begin()->id)), Hash>);
+        static_assert(!std::is_assignable_v<decltype((pending.auxiliary.begin()->entry)), merkle::TreeEntry>);
+        (*pending.regular.begin()).aliases.push_back("retained-alias");
+        retained = (*pending.regular.begin());
+        auto & value = const_cast<GitObjectStore::Auxiliary &>(*pending.auxiliary.begin());
         value.body += "-retained";
         retainedAuxiliary = value.entry;
         expected.at(Key{std::string(reinterpret_cast<const char *>(value.entry.hash.hash), 32), value.entry.mode}) += "-retained";
@@ -6768,7 +6775,7 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     rejected.name = "rejected-after-borrow";
     EXPECT_EQ(hold.addRow(std::move(rejected)), (std::filesystem::path("/typed-pending") / retained.name).string());
     {
-        auto & pending = hold.projection();
+        auto & pending = pendingProjection(hold);
         EXPECT_EQ(pending.regular.size(), expected.size());
         EXPECT_EQ(pending.auxiliary.size(), expected.size());
     }
@@ -6801,7 +6808,7 @@ TEST_F(LocalStoreObjectsTest, pendingAuxiliaryAndRegularValuesKeepAllTypedKeys)
     EXPECT_TRUE(remaining.empty());
     auto isolated = privateAttempt.takeProjection();
     ASSERT_EQ(isolated.auxiliary.size(), 1u);
-    EXPECT_EQ(isolated.auxiliary[0].entry, (merkle::TreeEntry{merkle::Mode::Symlink, extra}));
+    EXPECT_EQ((*isolated.auxiliary.begin()).entry, (merkle::TreeEntry{merkle::Mode::Symlink, extra}));
     EXPECT_TRUE(hold.takeProjection().auxiliary.empty());
     EXPECT_TRUE(hold.takeProjection().regular.empty());
     EXPECT_EQ(auxiliaryRowCount(), 0u);
@@ -7825,7 +7832,7 @@ TEST_F(LocalStoreObjectsTest, completedPendingWitnessKeepsItsIdentityAcrossPlace
                 auto projection = hold.takeProjection();
                 ASSERT_EQ(projection.regular.size(), 1u);
                 EXPECT_TRUE(projection.auxiliary.empty());
-                const auto & row = projection.regular.front();
+                const auto & row = (*projection.regular.begin());
                 EXPECT_EQ(row.id, id);
                 EXPECT_EQ(row.executable, executable);
                 EXPECT_EQ(row.ino, witness.st_ino);
@@ -7874,11 +7881,11 @@ TEST_F(LocalStoreObjectsTest, directAndStreamedFirstClaimsRecordTheirOwnedWitnes
         EXPECT_EQ(std::filesystem::path(*holder), where);
         auto rows = hold.takeProjection().regular;
         ASSERT_EQ(rows.size(), 1u);
-        EXPECT_EQ(rows.front().id, id);
-        EXPECT_EQ(rows.front().executable, executable);
-        EXPECT_EQ(rows.front().ino, before.st_ino);
-        EXPECT_EQ(rows.front().dev, before.st_dev);
-        EXPECT_EQ(rows.front().size, bytes.size());
+        EXPECT_EQ((*rows.begin()).id, id);
+        EXPECT_EQ((*rows.begin()).executable, executable);
+        EXPECT_EQ((*rows.begin()).ino, before.st_ino);
+        EXPECT_EQ((*rows.begin()).dev, before.st_dev);
+        EXPECT_EQ((*rows.begin()).size, bytes.size());
         EXPECT_EQ(readFile(where), bytes);
     }
 }
@@ -7945,7 +7952,7 @@ TEST_F(LocalStoreObjectsTest, completedHoldersPreserveRootSpelling)
                 auto projection = hold.takeProjection();
                 ASSERT_EQ(projection.regular.size(), 1u);
                 EXPECT_TRUE(projection.auxiliary.empty());
-                const auto & row = projection.regular.front();
+                const auto & row = (*projection.regular.begin());
                 EXPECT_EQ(row.name, spelling.expectedName);
                 EXPECT_EQ(row.id, id);
                 EXPECT_EQ(row.executable, executable);
@@ -13092,7 +13099,7 @@ TEST_F(TempLocalStoreTest, registrationRejectsEveryMismatchedKeyBeforeEffects)
                 auto rows = hold.takeProjection().regular;
                 EXPECT_EQ(rows.size(), 1u);
                 if (rows.size() == 1)
-                    EXPECT_EQ(rows.front().id, id);
+                    EXPECT_EQ((*rows.begin()).id, id);
                 EXPECT_TRUE(hold.completedIngestions.empty());
             }
         }

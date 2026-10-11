@@ -142,8 +142,10 @@ struct FsoVirtualSourceAccessor : virtual SourceAccessor
     bool operator==(const FsoVirtualSourceAccessor &) const noexcept = default;
 };
 
+/** immutableContents promises byte storage and contents remain stable through
+ * sizeCallback and sink calls; it does not classify the whole accessor. */
 template<typename Derived, typename Node = fso::VariantT<std::string, true>,
-         typename Base = FsoVirtualSourceAccessor>
+         typename Base = FsoVirtualSourceAccessor, bool immutableContents = false>
 struct FsoSourceAccessor : Base
 {
     using File = Node;
@@ -204,18 +206,13 @@ protected:
     void deliverRegular(const typename File::Regular & regular, Sink & sink, const fun<void(uint64_t)> & sizeCallback)
     {
         sizeCallback(regular.contents.size());
-        if constexpr (
-            std::is_same_v<decltype(regular.contents), std::string_view>
-            || std::is_same_v<decltype(regular.contents), std::string>) {
-            if (std::is_same_v<decltype(regular.contents), std::string_view>
-                || static_cast<SourceAccessor &>(*this).isFixed()) {
-                if (!regular.contents.empty())
-                    sink(regular.contents);
-                return;
-            }
+        if constexpr (std::is_same_v<decltype(regular.contents), std::string_view> || immutableContents) {
+            if (!regular.contents.empty())
+                sink(regular.contents);
+        } else {
+            StringSource source{regular.contents};
+            source.drainInto(sink);
         }
-        StringSource source{regular.contents};
-        source.drainInto(sink);
     }
 
 public:

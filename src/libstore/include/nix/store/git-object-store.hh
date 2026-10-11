@@ -14,6 +14,7 @@
 
 #include <boost/container/flat_map.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <filesystem>
 #include <functional>
@@ -277,6 +278,7 @@ public:
     class Hold
     {
         friend struct GitObjectStore;
+        friend class LocalStore;
         /* Drops the lock as a crash would (src/libstore-tests/local-store.cc). */
         friend class LocalStoreObjectsTest;
 
@@ -317,9 +319,9 @@ public:
         {
             Hash id;
             bool executable;
-            ino_t ino;
-            dev_t dev;
-            uint64_t size;
+            mutable ino_t ino;
+            mutable dev_t dev;
+            mutable uint64_t size;
             /**
              * The physical names under the ingestion's root -- the store
              * path's representative is empty for a regular-file root. Each is
@@ -352,21 +354,55 @@ public:
         /** The root, for turning a row's name back into a path to link from. */
         const std::filesystem::path & root() const;
 
-        /** The complete projection transferred to one publication transaction. */
-        struct Projection
+    private:
+        struct Key : std::pair<merkle::Mode, std::string_view>
         {
-            std::vector<Row> regular;
-            std::vector<Auxiliary> auxiliary;
+            using std::pair<merkle::Mode, std::string_view>::pair;
+
+            Key(const Row & row) noexcept
+                : Key(row.executable ? merkle::Mode::Executable : merkle::Mode::Regular, row.id.bytes())
+            {
+            }
+
+            Key(const Auxiliary & object) noexcept
+                : Key(object.entry.mode, object.entry.hash.bytes())
+            {
+            }
         };
 
-        /** All walking workers have joined. Retain the owned projection across
-         * publication failure. While borrowing it, no producer, root reset or
-         * consuming handoff may run; commit consumes its values. */
+        struct KeyHash
+        {
+            using is_transparent = void;
+
+            size_t operator()(Key key) const noexcept
+            {
+                return std::hash<std::string_view>{}(key.second) ^ static_cast<size_t>(key.first);
+            }
+        };
+
+        struct KeyEqual : std::equal_to<Key>
+        {
+            using is_transparent = void;
+        };
+
+    public:
+        template<typename Value>
+        using Values = boost::unordered_flat_set<Value, KeyHash, KeyEqual>;
+
+        /** The complete relation transferred to one publication transaction. */
+        struct Projection
+        {
+            Values<Row> regular;
+            Values<Auxiliary> auxiliary;
+        };
+
+    private:
+        /** Workers have joined. Publication may update non-key observations or
+         * erase refusals; producers and root reset cannot overlap this borrow. */
         Projection & projection() const;
 
-        /** All walking workers have joined. Reserve both result vectors before
-         * consuming the pending relation; allocation failure leaves it intact.
-         * Each vector contains one owned value per typed key; order is unspecified. */
+    public:
+        /** Consume both owned relations without allocation; order is unspecified. */
         Projection takeProjection() const;
 
         /** Stage an owned directory body or symlink target. Concurrent duplicate
@@ -379,7 +415,7 @@ public:
         /** EMPTY applies only to this provider; known-source availability remains live. */
         mutable const Index * emptyRegistered = nullptr;
         /** Completed outputs retain their database identity across the next beginIngestion. */
-        mutable boost::container::flat_map<std::string, std::pair<uint64_t, std::vector<Row>>> completedIngestions;
+        mutable boost::container::flat_map<std::string, std::pair<uint64_t, Values<Row>>> completedIngestions;
 
         /** The hold's own directory under `tmp/`: its name is what says this ingestion is in flight. */
         const std::filesystem::path & directory() const;
@@ -393,7 +429,7 @@ public:
         std::optional<std::string> addRow(Row && row) const;
 
         /** Transfer distinct completed physical names into their already claimed key. */
-        void appendNames(Row && row) const;
+        void appendNames(const Row & row) const;
 
         /**
          * The completed file this ingestion owns for (id, mode), if any:

@@ -749,7 +749,7 @@ private:
 
     struct BlobCoalescing
     {
-        GitObjectStore::Hold::Row & row;
+        const GitObjectStore::Hold::Row & row;
         std::vector<GitObjectStore::Holder> candidates;
         /** An untouched own witness remains eligible; a physical refusal may remove it. */
         bool eligible = true;
@@ -766,9 +766,11 @@ private:
 
     void syncStorePath(const StorePath & path);
 
-    void insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows);
+    void insertBlobRows(
+        State & state, uint64_t ingestion, const GitObjectStore::Hold::Values<GitObjectStore::Hold::Row> & rows);
 
-    void insertAuxiliaryRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Auxiliary> values);
+    void insertAuxiliaryRows(
+        State & state, uint64_t ingestion, const GitObjectStore::Hold::Values<GitObjectStore::Auxiliary> & values);
 
     /** Own one complete, framed-hash-verified body before leaving the provider. */
     std::optional<std::string> readAuxiliary(const merkle::TreeEntry & entry);
@@ -782,7 +784,7 @@ private:
         const StorePath & path,
         const GitObjectStore::Hold & hold,
         uint64_t ingestion,
-        std::vector<GitObjectStore::Hold::Row> & rows);
+        GitObjectStore::Hold::Values<GitObjectStore::Hold::Row> & rows);
 
     /**
      * A newly owned row snapshot under the lock: `objectHash` set when the

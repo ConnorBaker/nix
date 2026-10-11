@@ -618,15 +618,34 @@ void LocalStore::beginIngestion(const GitObjectStore::Hold & hold, const std::fi
     hold.ingesting = true;
 }
 
-void LocalStore::insertBlobRows(State & state, uint64_t ingestion, std::span<const GitObjectStore::Hold::Row> rows)
+static auto blobRowKey(const GitObjectStore::Hold::Row & row) noexcept
+{
+    return std::pair{row.id.bytes(), row.executable};
+}
+
+/* Borrowed publication order follows SQLite primary keys without moving payloads. */
+template<typename Values, typename Key>
+static auto publicationOrder(const Values & values, Key key)
+{
+    std::vector<const typename Values::value_type *> order;
+    order.reserve(values.size());
+    for (const auto & value : values)
+        order.push_back(&value);
+    std::ranges::sort(order, {}, [&](auto value) { return key(*value); });
+    return order;
+}
+
+void LocalStore::insertBlobRows(
+    State & state, uint64_t ingestion, const GitObjectStore::Hold::Values<GitObjectStore::Hold::Row> & rows)
 {
     if (rows.empty())
         return;
+    auto order = publicationOrder(rows, blobRowKey);
     auto use = state.stmts->InsertBlob.use(SQLiteStmt::Bindings::Borrow);
-    for (auto & row : rows) {
-        if (&row != rows.data())
+    for (auto row : order) {
+        if (row != order.front())
             use.reset();
-        writeBlobRow(use, ingestion, row);
+        writeBlobRow(use, ingestion, *row);
     }
 }
 
@@ -700,12 +719,16 @@ std::optional<std::string> LocalStore::readAuxiliary(const merkle::TreeEntry & e
 }
 
 void LocalStore::insertAuxiliaryRows(
-    State & state, uint64_t ingestion, std::span<const GitObjectStore::Auxiliary> values)
+    State & state, uint64_t ingestion, const GitObjectStore::Hold::Values<GitObjectStore::Auxiliary> & values)
 {
     if (values.empty())
         return;
+    auto order = publicationOrder(values, [](const auto & value) noexcept {
+        return std::pair{value.entry.mode, value.entry.hash.bytes()};
+    });
     auto use = state.stmts->InsertAuxiliary.use(SQLiteStmt::Bindings::Borrow);
-    for (auto & value : values) {
+    for (auto pointer : order) {
+        const auto & value = *pointer;
         auto & entry = value.entry;
         /* Hold::addAuxiliary validated these keys before staging. Nonempty
            production projections belong to a fresh ingestion; a retry rolled
@@ -713,7 +736,7 @@ void LocalStore::insertAuxiliaryRows(
         size_t offset = 0;
         do {
             auto size = std::min(auxiliaryChunkSize, value.body.size() - offset);
-            if (offset || &value != values.data())
+            if (offset || pointer != order.front())
                 use.reset();
             use.apply(static_cast<int64_t>(entry.mode))
                 .apply(entry.hash.hash, entry.hash.hashSize)
@@ -821,17 +844,13 @@ bool LocalStore::verifyAuxiliary(RepairFlag repair)
 }
 
 /* The SQL key is the active digest bytes and mode, not the Hash algorithm tag. */
-static auto blobRowKey(const GitObjectStore::Hold::Row & row) noexcept
-{
-    return std::pair{row.id.bytes(), row.executable};
-}
 
 void LocalStore::coalesceBlobRows(
     State & state,
     const StorePath & path,
     const GitObjectStore::Hold & hold,
     uint64_t ingestion,
-    std::vector<GitObjectStore::Hold::Row> & rows)
+    GitObjectStore::Hold::Values<GitObjectStore::Hold::Row> & rows)
 {
     /* The caller has already written and keeps this ingestion unnamed.
        Therefore every donor is published, and GC cannot invalidate one
@@ -849,7 +868,8 @@ void LocalStore::coalesceBlobRows(
             auto id = use.getBlobView(0);
             bool executable = use.getInt(1) != 0;
             if (collisions.empty() || blobRowKey(collisions.back().row) != std::pair{id, executable}) {
-                auto own = std::ranges::lower_bound(rows, std::pair{id, executable}, {}, blobRowKey);
+                auto own = rows.find(GitObjectStore::Hold::Key{
+                    executable ? merkle::Mode::Executable : merkle::Mode::Regular, id});
                 assert((own != rows.end() && blobRowKey(*own) == std::pair{id, executable}));
                 collisions.push_back({*own, {}});
             }
@@ -867,7 +887,7 @@ void LocalStore::coalesceBlobRows(
     Finally prune{[&] {
         for (auto & collision : collisions | std::views::reverse)
             if (!collision.eligible)
-                rows.erase(rows.begin() + (&collision.row - rows.data()));
+                rows.erase(collision.row);
     }};
     auto rejected = coalesceBlobs(toRealPath(path), hold, collisions);
     for (auto & collision : collisions)
@@ -885,17 +905,6 @@ void LocalStore::coalesceBlobRows(
     }
 }
 
-/* Order each initial publication by its SQLite primary key. Ingestion is
-   constant; auxiliary chunks are already emitted in increasing ordinal order. */
-static void sortProjectionForPublication(GitObjectStore::Hold::Projection & projection)
-{
-    static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Hold::Row>);
-    static_assert(std::is_nothrow_move_assignable_v<GitObjectStore::Auxiliary>);
-    std::ranges::sort(projection.regular, {}, blobRowKey);
-    std::ranges::sort(projection.auxiliary, {}, [&](const auto & value) noexcept {
-        return std::pair{value.entry.mode, value.entry.hash.bytes()};
-    });
-}
 
 void LocalStore::syncStorePath(const StorePath & path)
 {
@@ -911,7 +920,6 @@ void LocalStore::endIngestion(const GitObjectStore::Hold & hold, const StorePath
     /* An already-valid repair/optimisation path must not expose its new
        candidates before reconciling the complete projection. */
     auto & projection = hold.projection();
-    sortProjectionForPublication(projection);
     auto & rows = projection.regular;
     auto logical = printStorePath(path);
     auto & completed = hold.completedIngestions;
@@ -1750,7 +1758,7 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         const ValidPathInfo * info;
         uint64_t id;
         std::string logical;
-        std::vector<GitObjectStore::Hold::Row> * rows;
+        GitObjectStore::Hold::Values<GitObjectStore::Hold::Row> * rows;
     };
 
     std::vector<Publication> publications;
@@ -1758,7 +1766,6 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
         if (active) {
             assert(infos.size() == 1);
             publications.push_back({&infos.begin()->second, 0, printStorePath(infos.begin()->second.path), &projection.regular});
-            sortProjectionForPublication(projection);
             auto & completed = hold->completedIngestions;
             completed.reserve(completed.size() + !completed.contains(publications.front().logical));
         } else {
@@ -1766,7 +1773,8 @@ void LocalStore::registerValidPaths(const ValidPathInfos & infos, const GitObjec
                 auto logical = printStorePath(path);
                 if (auto completed = hold->completedIngestions.find(logical);
                     completed != hold->completedIngestions.end())
-                    publications.push_back({&info, completed->second.first, std::move(logical), &completed->second.second});
+                    publications.push_back(
+                        {&info, completed->second.first, std::move(logical), &completed->second.second});
             }
         }
     }
