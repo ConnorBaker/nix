@@ -372,6 +372,13 @@ public:
     template<typename T, std::size_t N = 0>
     inline void * allocBytes(size_t count);
 
+    /**
+     * Allocates @p n bytes for data that holds no pointers, such as
+     * string contents. Unlike `allocBytes`, the garbage collector does not
+     * scan this memory, and it is not zeroed.
+     */
+    inline void * allocAtomicBytes(size_t n);
+
     inline Value * allocValue();
     inline Env & allocEnv(size_t size);
 

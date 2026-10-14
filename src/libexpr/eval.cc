@@ -87,7 +87,12 @@ static const char * makeImmutableString(std::string_view s)
 
 StringData & StringData::alloc(EvalMemory & mem, size_t size)
 {
-    void * t = mem.allocBytes<char, sizeof(StringData) + 1>(size);
+    size_t bytes;
+    if (__builtin_add_overflow(size, sizeof(StringData) + 1, &bytes)) [[unlikely]]
+        throw std::bad_alloc();
+    /* The contents are characters, so the collector has nothing to scan.
+       Every caller writes all `size` characters and the terminator. */
+    void * t = mem.allocAtomicBytes(bytes);
     auto res = new (t) StringData(size);
     return *res;
 }

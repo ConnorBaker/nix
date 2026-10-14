@@ -26,6 +26,20 @@ inline void * EvalMemory::allocBytes(size_t n)
     return p;
 }
 
+[[gnu::always_inline]]
+inline void * EvalMemory::allocAtomicBytes(size_t n)
+{
+    void * p;
+#if NIX_USE_BOEHMGC
+    p = GC_MALLOC_ATOMIC(n);
+#else
+    p = malloc(n);
+#endif
+    if (!p)
+        throw std::bad_alloc();
+    return p;
+}
+
 template<typename T, std::size_t N>
 [[gnu::always_inline]]
 inline void * EvalMemory::allocBytes(size_t count)
