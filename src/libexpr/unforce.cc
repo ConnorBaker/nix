@@ -23,6 +23,7 @@
 #include <functional>
 #include <optional>
 #include <algorithm>
+#include <atomic>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -2252,8 +2253,24 @@ void EvalState::endLoggedForce(size_t marker)
     }
 }
 
+/* The EvalState whose job is open. The per-job state above is per thread,
+   but the region (`evalRegion`, the mimalloc frames, `lastReleased`) is
+   process-wide, so at most one job may be open in the process, and every
+   scope opened while it is must belong to its EvalState: another
+   EvalState's job would take over the region, and the first job's
+   decision would then see none of what it allocated (review of markers
+   v2, N2). Nothing opens jobs that way today (only the CLI's traversals
+   open jobs, on one thread with one EvalState); this checks it. */
+static std::atomic<const EvalState *> jobOwner = nullptr;
+
 size_t EvalState::beginUnforceScope(const void * stackMark)
 {
+    if (!isolationDepth) {
+        const EvalState * none = nullptr;
+        if (!jobOwner.compare_exchange_strong(none, this))
+            panic("unforce: a job was opened while another EvalState's job is open");
+    } else
+        assert(jobOwner.load() == this);
     /* The canonical frame address is the caller's stack pointer at the call:
        frames the caller enters from now on lie below it, its own locals at
        or above. */
@@ -2277,12 +2294,15 @@ void EvalState::endUnforceScope(size_t mark)
     if (nested()) {
         isolationDepth--;
         endHeapScope(*this, mark);
+        if (!isolationDepth)
+            jobOwner = nullptr;
         return;
     }
 #endif
     /* Only the outermost scope is a job. */
     if (--isolationDepth)
         return;
+    jobOwner = nullptr;
 
     auto & cfg = unforceSettings();
     stats.jobs++;
