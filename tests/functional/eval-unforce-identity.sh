@@ -158,9 +158,9 @@ segs=$(ownerStat ownerSegsPeak "$expr")
 changes=$(NIX_UNFORCE_IDENTITY=markers ownerStat ownerChanges "$expr")
 (( changes == 0 )) || fail "NIX_UNFORCE_IDENTITY=markers still tracks owners: $changes owner changes"
 
-# A job whose timeline outgrows what is kept between jobs (64 Ki segments):
-# the driver alternates between young cells of two targets, and every force
-# allocates. The stacks are freed at the job's end, and the output is base's.
+# A job with a long timeline (160 001 segments, 1.2 MiB, within the 4 MiB
+# budget of batch size 0): the driver alternates between young cells of two
+# targets, and every force allocates. The output is base's.
 expr='let
   n = 40000;
   a = builtins.listToAttrs [ { name = "x"; value = builtins.genList (i: { v = [ i ]; }) n; } ];
@@ -172,3 +172,30 @@ nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 --
     > "$TEST_ROOT/alternate-on.json"
 nix-instantiate --option eval-unforce false --eval --strict --json -E "$expr" > "$TEST_ROOT/alternate-off.json"
 cmp -s "$TEST_ROOT/alternate-on.json" "$TEST_ROOT/alternate-off.json" || fail "the alternating job's output differs from base"
+
+# The timeline's budget (review identity-owners-v1, SF1). With 4 KiB, the
+# same job runs out: it stops tracking owners and is kept whole, and the
+# output is still base's.
+overflowStats=$(NIX_UNFORCE_OWNER_BUDGET=4096 NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout nix-instantiate \
+    --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict --json -E "$expr" 2> /dev/null \
+    | tr -d ' \n')
+[[ $overflowStats =~ \"ownerOverflowJobs\":([0-9]+) ]] && (( BASH_REMATCH[1] >= 1 )) \
+    || fail "a 4 KiB owner budget did not overflow"
+[[ $overflowStats =~ \"keptJobs\":([0-9]+) ]] && (( BASH_REMATCH[1] >= 1 )) \
+    || fail "the job whose timeline overflowed was not kept whole"
+NIX_UNFORCE_OWNER_BUDGET=4096 nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 \
+    --eval --strict --json -E "$expr" > "$TEST_ROOT/alternate-budget.json"
+cmp -s "$TEST_ROOT/alternate-budget.json" "$TEST_ROOT/alternate-off.json" \
+    || fail "the job whose timeline overflowed differs from base"
+
+# Consumer pairs are recorded once each: a target that alternates between
+# young cells of two others, 100 000 times, records two pairs.
+expr='let
+  n = 100000;
+  xs = builtins.genList (i: i) n;
+  a = { x = map (builtins.mul 2) xs; };
+  b = { x = map (builtins.mul 3) xs; };
+  c = builtins.foldl'"'"' (acc: i: acc + builtins.elemAt a.x i + builtins.elemAt b.x i) 0 xs;
+in [ c ]'
+pairs=$(ownerStat ownerConsumerPairsPeak "$expr")
+[[ -n $pairs ]] && (( pairs <= 4 )) || fail "an alternating consumer recorded ${pairs:-no} consumer pairs"
