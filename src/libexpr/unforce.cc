@@ -161,8 +161,11 @@ struct Stats
     size_t innerScopeReverts = 0;
 } stats;
 
-/* Whether client code ran in the open job (`unforceNoteClientCode`). */
-bool clientCodeInJob = false;
+/* Whether client code ran in the open job (`unforceNoteClientCode`). Per
+   thread, like the scope marks that `unforceNoteClientCode` tests: a C-API
+   host may call client code on several threads, none of which has a job
+   open. */
+thread_local bool clientCodeInJob = false;
 
 bool nested()
 {
@@ -271,7 +274,7 @@ static uint64_t unforceClock()
 }
 
 /* Log indices of the logged forces that are running, innermost last. */
-static std::vector<size_t> activeForces;
+static thread_local std::vector<size_t> activeForces;
 
 /* Forget running forces logged at or after `mark` (none should be). */
 static void dropActiveForces(size_t mark)
