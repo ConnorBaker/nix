@@ -152,6 +152,9 @@ struct Stats
     /* The force counts: the most entries they held, and how often they
        were dropped for outgrowing their cap. */
     size_t countsPeak = 0, countsResets = 0;
+    /* Counted targets on the thread's stack (stack slots the job restores),
+       whose addresses a later job may reuse for another cell (P5). */
+    size_t stackTargets = 0;
     size_t markerLogBytes = 0, markerPeakBytes = 0;
     /* Jobs that promoted nothing because client code ran in them, and the
        cells reverted at their ends. */
@@ -160,6 +163,23 @@ struct Stats
        promote (so these are reverted whatever the promotion threshold). */
     size_t innerScopeReverts = 0;
 } stats;
+
+/* This thread's stack, [low, high). */
+static thread_local const std::pair<const char *, const char *> threadStack = [] {
+    pthread_attr_t attr;
+    void * addr = nullptr;
+    size_t size = 0;
+    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+        pthread_attr_getstack(&attr, &addr, &size);
+        pthread_attr_destroy(&attr);
+    }
+    return std::pair{(const char *) addr, (const char *) addr + size};
+}();
+
+static bool onThreadStack(const void * p)
+{
+    return threadStack.first && (const char *) p >= threadStack.first && (const char *) p < threadStack.second;
+}
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). Per
    thread, like the scope marks that `unforceNoteClientCode` tests: a C-API
@@ -182,7 +202,7 @@ static void printStatsAtExit()
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
-                 "max steps per KiB %d; counts peak %d, counts resets %d; client-code jobs %d, reverted in client-code jobs %d, "
+                 "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
                  "inner-scope reverts %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
@@ -208,6 +228,7 @@ static void printStatsAtExit()
                  stats.maxStepsPerKiB,
                  stats.countsPeak,
                  stats.countsResets,
+                 stats.stackTargets,
                  stats.clientJobs,
                  stats.revertedInClientJobs,
                  stats.innerScopeReverts);
@@ -1419,6 +1440,8 @@ std::vector<bool> decideJob(
     for (size_t i = 0; i < targets.size(); ++i) {
         if (!counting)
             continue;
+        if (onThreadStack(targets.cells[i]))
+            stats.stackTargets++;
         auto before = counts[targets.cells[i]]++;
         if (before)
             stats.reforced++;
@@ -1624,7 +1647,7 @@ std::string unforceStatsJSON()
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,)"
         R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,)"
         R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,)"
-        R"("countsPeak":%d,"countsResets":%d,"clientJobs":%d,)"
+        R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
         R"("revertedInClientJobs":%d,"innerScopeReverts":%d})",
         stats.jobs,
         stats.logged,
@@ -1650,6 +1673,7 @@ std::string unforceStatsJSON()
         stats.maxStepsPerKiB,
         stats.countsPeak,
         stats.countsResets,
+        stats.stackTargets,
         stats.clientJobs,
         stats.revertedInClientJobs,
         stats.innerScopeReverts);
