@@ -116,7 +116,7 @@ struct Settings
     /* What a job whose closure runs out of budget does: "promote" every
        target, or "revert" every target. Both keep identity. */
     std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
-    /* Most entries the force counts may hold (`pruneCounts`); 0: the
+    /* Most entries the force counts may hold (`countTargets`); 0: the
        default, max(256 Ki, eval-unforce-batch-size / 256). Dev override. */
     uint64_t countsCap = std::stoull(getEnv("NIX_UNFORCE_COUNTS_CAP").value_or("0"));
 };
@@ -153,7 +153,7 @@ struct Stats
        steps per KiB of job memory one job took. */
     size_t budgetJobs = 0, maxJobSteps = 0, maxStepsPerKiB = 0;
     /* The force counts: the most entries they held, and how often they
-       were dropped for outgrowing their cap. */
+       were rebuilt from one job's targets for outgrowing their cap. */
     size_t countsPeak = 0, countsResets = 0;
     /* Counted targets on the thread's stack (stack slots the job restores),
        whose addresses a later job may reuse for another cell (P5). */
@@ -1556,6 +1556,50 @@ size_t closePromotions(
     return added;
 }
 
+/* Count a job's forces of its targets; returns whether each reached K.
+
+   The map's cap. So that the counts do not grow with the length of a
+   traversal (epoch v3 review S3: about 50 bytes per distinct target, never
+   erased), when counting this job's targets would take the map past
+   max(256 Ki, batch size / 256) entries (NIX_UNFORCE_COUNTS_CAP), it is
+   first rebuilt from this job's targets: the counts of cells this job did
+   not force are forgotten, so it never holds more than max(cap, this job's
+   targets). Dropping the whole map instead would drop this job's counts as
+   well, and if every job outgrew the cap, a cell forced in every job would
+   never reach K and would be recomputed in every job (review of markers
+   v2, S2). A cell forced only in jobs that are not consecutive can still
+   lose its count that way; the closure does not depend on the counts. The
+   old counts are read out before the old map is freed and the new one
+   built, so the two never coexist. */
+static std::vector<bool>
+countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTargets & targets, uint64_t batchSize)
+{
+    auto & cfg = unforceSettings();
+    auto cap = cfg.countsCap ? cfg.countsCap : std::max<uint64_t>(256 << 10, batchSize / 256);
+    if (counts.size() + targets.size() > cap) {
+        std::vector<uint32_t> prior(targets.size());
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (auto c = counts.find(targets.cells[i]); c != counts.end())
+                prior[i] = c->second;
+        std::unordered_map<const Value *, uint32_t>().swap(counts);
+        counts.reserve(targets.size());
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (prior[i])
+                counts.emplace(targets.cells[i], prior[i]);
+        stats.countsResets++;
+    }
+    std::vector<bool> reached(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (onThreadStack(targets.cells[i]))
+            stats.stackTargets++;
+        auto before = counts[targets.cells[i]]++;
+        if (before)
+            stats.reforced++;
+        reached[i] = before + 1 >= cfg.promoteAfter;
+    }
+    return reached;
+}
+
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
    `counts` nominate, and the producer closure adds what identity needs (see
@@ -1616,17 +1660,8 @@ std::vector<bool> decideJob(
                 copy(i);
     };
 
-    bool counting = canCopy && cfg.promoteAfter;
-    for (size_t i = 0; i < targets.size(); ++i) {
-        if (!counting)
-            continue;
-        if (onThreadStack(targets.cells[i]))
-            stats.stackTargets++;
-        auto before = counts[targets.cells[i]]++;
-        if (before)
-            stats.reforced++;
-        promote[i] = before + 1 >= cfg.promoteAfter;
-    }
+    if (canCopy && cfg.promoteAfter)
+        promote = countTargets(counts, targets, state.settings.unforceBatchSize);
 
     /* Objects that client code built in this job were allocated outside the
        region: the closure cannot see them, and re-forcing the cell that
@@ -1718,28 +1753,17 @@ std::vector<bool> decideJob(
 }
 
 /* The force counts only nominate promotions; the closure keeps identity
-   whatever they say, so forgetting a count is always sound (it only delays
-   a promotion). A promoted cell holds a value from now on and is not
-   logged again, so its count goes. And the map is replaced by an empty one
-   when it outgrows its cap, so that it does not grow with the length of a
-   traversal (epoch v3 review S3: about 50 bytes per distinct target, never
-   erased). Runs in the pre-release step; erasing does not allocate. */
+   whatever they say, so forgetting a count is always sound. A promoted cell
+   holds a value from now on and is not logged again, so its count goes.
+   Runs in the pre-release step; erasing does not allocate. (The map's cap
+   is applied before a job's targets are counted: `countTargets`.) */
 void pruneCounts(
-    std::unordered_map<const Value *, uint32_t> & counts,
-    const JobTargets & targets,
-    const std::vector<bool> & promoted,
-    uint64_t batchSize)
+    std::unordered_map<const Value *, uint32_t> & counts, const JobTargets & targets, const std::vector<bool> & promoted)
 {
     stats.countsPeak = std::max(stats.countsPeak, counts.size());
     for (size_t i = 0; i < targets.size(); ++i)
         if (promoted[i])
             counts.erase(targets.cells[i]);
-    auto & cfg = unforceSettings();
-    auto cap = cfg.countsCap ? cfg.countsCap : std::max<uint64_t>(256 << 10, batchSize / 256);
-    if (counts.size() > cap) {
-        std::unordered_map<const Value *, uint32_t>().swap(counts);
-        stats.countsResets++;
-    }
 }
 
 /* An allocation failed at the end of a job. Nothing can be released
@@ -2127,7 +2151,7 @@ static void endHeapScope(EvalState & state, size_t mark)
                 f.bytes,
                 evacuator,
                 copies);
-            pruneCounts(state.forceCounts, *jt, promoted, state.settings.unforceBatchSize);
+            pruneCounts(state.forceCounts, *jt, promoted);
         }
     } catch (std::bad_alloc &) {
         unforceFatal("deciding which values to keep at the end of an unforce scope, and copying them");
@@ -2290,7 +2314,7 @@ void EvalState::endUnforceScope(size_t mark)
                 evalRegion.cur - evalRegion.base,
                 evacuator,
                 copies);
-            pruneCounts(forceCounts, *jt, promoted, settings.unforceBatchSize);
+            pruneCounts(forceCounts, *jt, promoted);
         } catch (std::bad_alloc &) {
             unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");
         }

@@ -111,3 +111,22 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}"
 (( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
     || fail "rounds.nix: wrong output"
+
+# Rebuilding the force counts when they outgrow their cap keeps this job's
+# counts (review of markers v2, S2): each job here forces 3 000 fresh cells,
+# more than the cap of 1 000, and P. Dropping the whole map after every job
+# would keep P's count at 1, so P would never be promoted.
+expr='let
+  fib = n: if n < 2 then n else fib (n - 1) + fib (n - 2);
+  P = fib 15;
+  bigs = builtins.genList (k: builtins.genList (i: i) 3000) 10;
+  el = k: builtins.seq P (builtins.foldl'"'"' (a: x: builtins.seq x a) true (builtins.elemAt bigs k));
+in builtins.deepSeq (map builtins.length bigs) (builtins.genList el 10)'
+expected=$(nix-instantiate "${off[@]}" --eval --strict -E "$expr")
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr" 2>&1 >/dev/null)
+[[ $stats =~ jobs\ [0-9]+,\ logged\ [0-9]+,\ reverted\ [0-9]+,\ stubbed\ [0-9]+,\ promoted\ ([0-9]+).*counts\ resets\ ([0-9]+) ]] \
+    || fail "no unforce stats: $stats"
+(( BASH_REMATCH[2] >= 5 )) || fail "the force counts never outgrew their cap: $stats"
+(( BASH_REMATCH[1] >= 1 )) || fail "a cell forced in every job was never promoted: $stats"
+[[ $(NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr") == "$expected" ]] \
+    || fail "counts rebuilt: wrong output"
