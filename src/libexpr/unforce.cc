@@ -108,9 +108,11 @@ struct Settings
        old behaviour; for negative controls). */
     std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
     /* The closure's step budget per job (`decideJob`): a fixed allowance
-       plus a number of steps per KiB the job allocated. Dev overrides. */
+       plus a number of steps per KiB the job allocated. Dev overrides. The
+       comparison's realistic workloads take at most 57 steps per KiB in a
+       job (`nix search`), and 1 M steps is under 0.2 G instructions. */
     uint64_t walkBudgetBase = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_BASE").value_or("1000000"));
-    uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("64"));
+    uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("256"));
     /* What a job whose closure runs out of budget does: "promote" every
        target, or "revert" every target. Both keep identity. */
     std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
