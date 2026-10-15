@@ -43,6 +43,7 @@
 namespace nix {
 
 EvalRegion evalRegion;
+const Value * unforceOpenTop = nullptr;
 BumpArena evalBaseArena;
 
 /* The address range freed by the last region release. */
@@ -125,6 +126,20 @@ struct Settings
        (`UnforceSeen`). Dev override, for measurements and as a negative
        control: "0" restores forgetting them. */
     bool keepSeen = getEnv("NIX_UNFORCE_SEEN").value_or("1") != "0";
+    /* How the closure finds a young object's producer (bump backend):
+       "owners" (the owner timeline: exact, no walk) or "markers" (the
+       interval-pruned walks). The mimalloc backend always uses markers. */
+    std::string identity = getEnv("NIX_UNFORCE_IDENTITY").value_or("owners");
+    /* Dev: with "owners", also compute the markers closure and report
+       targets that the owner closure promotes and markers does not (there
+       must be none: markers' candidates include every true owner). */
+    bool ownerCheck = getEnv("NIX_UNFORCE_OWNER_CHECK").value_or("0") != "0";
+    /* With "owners": also nominate the consumers of promoted targets (a
+       target that forced a young cell another target owns), as markers'
+       candidate test does as a side effect. A heuristic for CPU (a consumer
+       of a hot producer is usually forced again); the closure keeps
+       identity either way. "0" turns it off. */
+    bool ownerConsumers = getEnv("NIX_UNFORCE_OWNER_CONSUMERS").value_or("1") != "0";
 };
 
 const Settings & unforceSettings()
@@ -178,6 +193,16 @@ struct Stats
        bytes those jobs used, `keptJobBytes`, which is what they retain:
        kept jobs share one mapping). */
     size_t seenNominated = 0, seenKept = 0, keptJobs = 0, keptJobBytes = 0;
+    /* Owner timeline: forces of young cells outside the current segment
+       (each looks up its owner), those that changed the owner, the most
+       segments one job had, owner lookups at job ends (one per copied or
+       marked identity-bearing object), jobs whose closure added promotions,
+       and consumers nominated. `ownerCheckExtra`: targets the owner closure
+       promoted that the markers closure did not (NIX_UNFORCE_OWNER_CHECK;
+       must stay 0), and `ownerCheckFewer`, the converse (the markers walk's
+       false positives). */
+    size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
+           ownerConsumerNominated = 0, ownerCheckExtra = 0, ownerCheckFewer = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -317,11 +342,154 @@ static uint64_t unforceClock()
 /* Log indices of the logged forces that are running, innermost last. */
 static thread_local std::vector<size_t> activeForces;
 
+/* ---------------------------------------------------------------------------
+   The owner timeline (bump backend, NIX_UNFORCE_IDENTITY=owners).
+
+   owner(x) of a young object x (MARKERS.md §1.1, the policy comment below)
+   is the first old cell on its creator chain: the target whose re-force is
+   the only thing that can build x again, or none (the driver). It is a
+   function of allocation time: at any moment one force is the innermost
+   *owner activation*, and everything allocated then has its owner.
+   - A logged force of an old cell t makes t the current owner until it
+     returns or throws.
+   - A force of a young cell c makes owner(c) the current owner until it
+     returns or throws: what c's evaluation builds is built again only by
+     re-forcing the target that rebuilds c.
+   - Any other force (a stack slot, a cell of the current segment) keeps the
+     owner.
+   Owner changes cut the job's bump range [base, cur) into segments
+   [start, next start) with one owner each, appended in address order,
+   because the bump cursor is the allocation clock. A young cell of the
+   current segment [seg, cur) has the current owner, so its force changes
+   nothing, and `logPreImage` does not leave the inline path for it. Only a
+   young cell of an earlier segment looks its owner up (binary search).
+   Zero-length segments are overwritten and equal neighbours merged, so a
+   force that allocates nothing leaves no trace.
+
+   The hooks keep nothing across the evaluation (STACK-PARITY.md, R1): a
+   force that pushes something (a logged force, or a young force that
+   changed the owner) pushes `v` on `opens`, and `endLoggedForce` leaves the
+   inline path only when `unforceOpenTop` is `v`.
+
+   At the job's end owner(x) is exact for every copied object, so the
+   closure needs no walk: promote S0, look up the owner of every
+   identity-bearing object the Evacuator copies, promote it if it is a
+   reverted target, until nothing changes (`closeByOwners`).
+   --------------------------------------------------------------------------- */
+struct OwnerSeg
+{
+    uintptr_t start;
+    const Value * owner;
+};
+
+/* Process-wide, like `evalRegion` (one job per process: `jobOwner`). Not
+   thread_local: libnixexpr's thread_local variables use the general dynamic
+   TLS model, a __tls_get_addr call per access, and a force by the driver of
+   a young cell of a target changes the owner twice (about 300 instructions
+   with these thread_local; rss-indep-3000 does it 90 M times). */
+static std::vector<OwnerSeg> ownerSegs;
+/* Forces that pushed something, innermost last: a logged force (`logged`;
+   the owner changed iff `changed`), or a young force that changed the
+   owner. `saved` is the owner to restore. */
+struct OpenForce
+{
+    const Value * cell;
+    const Value * saved;
+    bool logged, changed;
+    /* A logged force's log index. */
+    size_t logIndex;
+};
+
+static std::vector<OpenForce> opens;
+static const Value * curOwner = nullptr;
+static bool ownersOn = false;
+static bool ownerConsumersOn = false;
+/* (consumer, producer): the target that was the owner when a young cell of
+   another target was forced (`NIX_UNFORCE_OWNER_CONSUMERS`). */
+static std::vector<std::pair<const Value *, const Value *>> ownerConsumers;
+
+
+static void setOwner(const Value * o)
+{
+    auto c = (uintptr_t) evalRegion.cur;
+    if (ownerSegs.back().start == c) {
+        /* Nothing was allocated under the previous owner since it began. */
+        ownerSegs.back().owner = o;
+        if (ownerSegs.size() > 1 && ownerSegs[ownerSegs.size() - 2].owner == o)
+            ownerSegs.pop_back();
+    } else if (ownerSegs.back().owner != o) {
+        ownerSegs.push_back({c, o});
+        stats.ownerSegsPeak = std::max(stats.ownerSegsPeak, ownerSegs.size());
+    }
+    curOwner = o;
+    evalRegion.seg = (char *) ownerSegs.back().start;
+}
+
+/* The owner of the young object at `p` (an address in [base, cur)). */
+static size_t ownerHint = 0;
+
+static const Value * ownerOf(const void * p)
+{
+    auto a = (uintptr_t) p;
+    /* Lookups come in runs (the Evacuator copies depth first). */
+    if (auto h = ownerHint; h < ownerSegs.size() && ownerSegs[h].start <= a
+                             && (h + 1 == ownerSegs.size() || a < ownerSegs[h + 1].start))
+        return ownerSegs[h].owner;
+    auto i = std::upper_bound(
+        ownerSegs.begin(), ownerSegs.end(), a, [](uintptr_t a, const OwnerSeg & s) { return a < s.start; });
+    assert(i != ownerSegs.begin());
+    ownerHint = i - ownerSegs.begin() - 1;
+    return std::prev(i)->owner;
+}
+
+/* A job opens: everything is the driver's until a force says otherwise. */
+static void openOwners()
+{
+    auto & cfg = unforceSettings();
+    ownersOn = cfg.identity == "owners" && cfg.markers != "off" && evalRegion.cur && !nested();
+    ownerConsumersOn = cfg.ownerConsumers;
+    ownerSegs.clear();
+    ownerConsumers.clear();
+    curOwner = nullptr;
+    if (ownersOn)
+        ownerSegs.push_back({(uintptr_t) evalRegion.base, nullptr});
+    evalRegion.seg = evalRegion.base;
+}
+
+static void setOpenTop()
+{
+    unforceOpenTop = opens.empty() ? nullptr : opens.back().cell;
+}
+
+static void pushOpen(const Value * cell, bool logged, bool changed, const Value * owner, size_t logIndex = 0)
+{
+    opens.push_back({cell, curOwner, logged, changed, logIndex});
+    if (changed)
+        setOwner(owner);
+    unforceOpenTop = cell;
+}
+
+static void closeOwners()
+{
+    ownersOn = false;
+    ownerConsumers.clear();
+    ownerSegs.clear();
+    opens.clear();
+    unforceOpenTop = nullptr;
+    curOwner = nullptr;
+}
+
+
 /* Forget running forces logged at or after `mark` (none should be). */
 static void dropActiveForces(size_t mark)
 {
     while (!activeForces.empty() && activeForces.back() >= mark)
         activeForces.pop_back();
+    /* Their `opens` entries (logged ones are pushed whatever the identity
+       mode, so that `endLoggedForce` finds them). */
+    while (!opens.empty() && (!opens.back().logged || opens.back().logIndex >= mark))
+        opens.pop_back();
+    setOpenTop();
 }
 
 #if NIX_USE_BOEHMGC
@@ -683,6 +851,11 @@ struct Evacuator
     /* If set, called for every young object as it is copied. */
     std::function<void(const void *)> onForward;
 
+    /* If set, called with every identity-bearing young object as it is
+       copied (cells, Bindings layers, element arrays): the owner closure. */
+    void (*onIdentity)(void *, const void *) = nullptr;
+    void * onIdentityCtx = nullptr;
+
     void note(const void * p, void * n)
     {
         forward.emplace(p, n);
@@ -724,6 +897,8 @@ struct Evacuator
         stats.copiedBytes += sizeof(Value);
         *n = *v;
         note(v, n);
+        if (onIdentity)
+            onIdentity(onIdentityCtx, v);
         values.push_back(n);
         return n;
     }
@@ -767,6 +942,8 @@ struct Evacuator
         auto n = (Value **) state.mem.allocBytes(size * sizeof(Value *));
         stats.copiedBytes += size * sizeof(Value *);
         note(elems, n);
+        if (onIdentity)
+            onIdentity(onIdentityCtx, elems);
         for (size_t i = 0; i < size; ++i)
             n[i] = value(elems[i]);
         return n;
@@ -802,6 +979,8 @@ struct Evacuator
             [&](Value * v) { return value(v); },
             [&](const Bindings * base) { return bindings(base); });
         note(b, (void *) n);
+        if (onIdentity)
+            onIdentity(onIdentityCtx, b);
         return n;
     }
 
@@ -1486,6 +1665,10 @@ struct Closure
     bool memos = true;
     /* Steps taken in this job, and how many it may take. */
     uint64_t steps = 0, budget = UINT64_MAX;
+    /* If set, `mark` calls it with every identity-bearing object it adds
+       (the owner closure, when it marks before copying). */
+    void (*onMark)(void *, const void *) = nullptr;
+    void * onMarkCtx = nullptr;
     /* What `mark` added to Evac(S), in bytes (string data, which it does
        not walk, excluded). */
     size_t markedBytes = 0;
@@ -1611,6 +1794,8 @@ struct Closure
                 markedBytes += k == kValue ? sizeof(Value)
                                : k == kEnv ? sizeof(Env) + width(p, k) * sizeof(Value *)
                                            : sizeof(Bindings) + width(p, k) * sizeof(Attr);
+                if (onMark && k != kEnv)
+                    onMark(onMarkCtx, p);
                 stack.emplace_back(p, k);
             }
         };
@@ -1619,6 +1804,8 @@ struct Closure
             if (!(old & inEvac)) {
                 reachedNew |= old & reached;
                 markedBytes += size * sizeof(Value *);
+                if (onMark)
+                    onMark(onMarkCtx, elems);
                 if (size)
                     arrays.emplace_back(elems, size);
             }
@@ -1856,6 +2043,82 @@ static std::vector<bool> countTargets(
     return reached;
 }
 
+/* The owner closure: S is the least superset of the nominated set such that
+   every identity-bearing young object in Evac(S) has its owner in S or no
+   owner (OC of the policy comment), with owners read off the timeline. S
+   only grows, so each target is joined (copied, or marked when the job may
+   be kept whole) once, when it joins, and the objects that join visits are
+   Evac(S): the work is one owner lookup per identity-bearing object, which
+   promotion copies anyway. No walk, no budget. */
+struct OwnerClosure
+{
+    const JobTargets & targets;
+    std::vector<bool> & promote;
+    std::vector<bool> joined;
+    /* (cell, target index), sorted by cell. */
+    std::vector<std::pair<const Value *, uint32_t>> byCell;
+    std::vector<size_t> work;
+    size_t added = 0;
+    const Value * last = nullptr;
+
+    OwnerClosure(const JobTargets & targets, std::vector<bool> & promote)
+        : targets(targets)
+        , promote(promote)
+        , joined(targets.size())
+    {
+        byCell.reserve(targets.size());
+        for (size_t i = 0; i < targets.size(); ++i)
+            byCell.emplace_back(targets.cells[i], i);
+        std::sort(byCell.begin(), byCell.end());
+    }
+
+    std::optional<size_t> indexOf(const Value * c) const
+    {
+        auto i = std::lower_bound(
+            byCell.begin(), byCell.end(), c, [](const auto & e, const Value * c) { return std::less<const Value *>{}(e.first, c); });
+        if (i == byCell.end() || i->first != c)
+            return std::nullopt;
+        return i->second;
+    }
+
+    /* An identity-bearing object joined Evac(S): its owner must be in S. */
+    static void note(void * ctx, const void * p)
+    {
+        auto & x = *(OwnerClosure *) ctx;
+        stats.ownerJobLookups++;
+        auto o = ownerOf(p);
+        /* Consecutive objects mostly share an owner. */
+        if (!o || o == x.last)
+            return;
+        x.last = o;
+        auto t = x.indexOf(o);
+        /* Every owner is a cell logged in this job. */
+        assert(t);
+        if (t && !x.promote[*t]) {
+            x.promote[*t] = true;
+            x.added++;
+            x.work.push_back(*t);
+        }
+    }
+
+    /* Join every promoted target not joined yet, and what they bring. */
+    template<typename Join>
+    void run(Join && join)
+    {
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (promote[i] && !joined[i])
+                work.push_back(i);
+        while (!work.empty()) {
+            auto i = work.back();
+            work.pop_back();
+            if (joined[i])
+                continue;
+            joined[i] = true;
+            join(i);
+        }
+    }
+};
+
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
    `counts` nominate, as do the targets `printed` marks (`UnforceSeen`; null
@@ -1954,6 +2217,75 @@ std::vector<bool> decideJob(
 
     if (failDecide)
         throw std::bad_alloc();
+
+    if (ownersOn && !young.heap) {
+        auto nominated = promote;
+        OwnerClosure oc(targets, promote);
+        /* As below: a printing job that may be kept whole marks Evac(S)
+           first, and copies only if it keeps less than half its memory. */
+        bool markFirst = keepWhole && printed;
+        std::optional<Closure<RegionMarks>> marker;
+        if (markFirst) {
+            marker.emplace(young, clock, RegionMarks(evalRegion.base, evalRegion.cur));
+            marker->onMark = &OwnerClosure::note;
+            marker->onMarkCtx = &oc;
+        } else {
+            evacuator.onIdentity = &OwnerClosure::note;
+            evacuator.onIdentityCtx = &oc;
+        }
+        auto join = [&](size_t i) {
+            if (markFirst)
+                marker->mark(*targets.cells[i]);
+            else
+                copy(i);
+        };
+        oc.run(join);
+        auto closed = promote;
+        /* Consumers of promoted targets (a heuristic, see the setting):
+           nominate them and close again, until nothing changes. */
+        for (bool more = ownerConsumersOn && !ownerConsumers.empty(); more;) {
+            more = false;
+            for (auto [c, p] : ownerConsumers) {
+                auto ci = oc.indexOf(c), pi = oc.indexOf(p);
+                if (ci && pi && promote[*pi] && !promote[*ci]) {
+                    promote[*ci] = true;
+                    stats.ownerConsumerNominated++;
+                    oc.added++;
+                    more = true;
+                }
+            }
+            if (more)
+                oc.run(join);
+        }
+        evacuator.onIdentity = nullptr;
+        stats.markerPromoted += oc.added;
+        if (oc.added)
+            stats.markerJobs++, stats.ownerJobs++;
+        if (cfg.ownerCheck) {
+            ForceMarkers fm(state.undoLog, mark, jobEnd, targets);
+            Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
+            plain.memos = false;
+            auto o = nominated;
+            closePromotions(plain, targets, fm, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
+            /* The closure proper, before consumer nominations. */
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (closed[i] && !o[i]) {
+                    stats.ownerCheckExtra++;
+                    std::cerr << fmt(
+                        "unforce owner check: job %d target %d: owner closure promotes, markers does not\n",
+                        stats.jobs,
+                        i);
+                }
+                if (!closed[i] && o[i])
+                    stats.ownerCheckFewer++;
+            }
+        }
+        if (markFirst && 2 * marker->markedBytes >= youngBytes)
+            *keepWhole = true;
+        if (!keepWhole || !*keepWhole)
+            copyPromoted();
+        return promote;
+    }
 
     /* When every target is promoted (a printing job often nominates them
        all), the closure has nothing to decide: only Evac(S) is needed. */
@@ -2198,7 +2530,8 @@ std::string unforceStatsJSON()
         R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,)"
         R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
         R"("revertedInClientJobs":%d,"innerScopeReverts":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
-        R"("keptJobBytes":%d})",
+        R"("keptJobBytes":%d,"identity":"%s","ownerLookups":%d,"ownerChanges":%d,"ownerSegsPeak":%d,)"
+        R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,"ownerCheckExtra":%d,"ownerCheckFewer":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -2230,7 +2563,16 @@ std::string unforceStatsJSON()
         stats.seenNominated,
         stats.seenKept,
         stats.keptJobs,
-        stats.keptJobBytes);
+        stats.keptJobBytes,
+        unforceSettings().identity,
+        stats.ownerLookups,
+        stats.ownerChanges,
+        stats.ownerSegsPeak,
+        stats.ownerJobLookups,
+        stats.ownerJobs,
+        stats.ownerConsumerNominated,
+        stats.ownerCheckExtra,
+        stats.ownerCheckFewer);
 }
 
 static size_t allocatorErrors = 0;
@@ -2688,9 +3030,29 @@ bool unforceIsScopeStackSlot(const void * p)
     return (const char *) p >= stackLow && (const char *) p < mark;
 }
 
+/* A force of a young cell outside the current segment: its owner becomes
+   the current one while it runs. */
+static void youngForce(const Value & v)
+{
+    stats.ownerLookups++;
+    auto o = ownerOf(&v);
+    if (o == curOwner)
+        return;
+    stats.ownerChanges++;
+    if (curOwner && o && ownerConsumersOn)
+        ownerConsumers.emplace_back(curOwner, o);
+    pushOpen(&v, false, true, o);
+}
+
 void EvalState::logPreImageSlow(Value & v)
 {
-    if (evalRegion.contains(&v) || unforceIsScopeStackSlot(&v))
+    if (evalRegion.contains(&v)) {
+        /* Young, but not of the current owner segment. */
+        if (ownersOn)
+            youngForce(v);
+        return;
+    }
+    if (unforceIsScopeStackSlot(&v))
         return;
     UndoEntry e{&v, v};
     e.start = unforceClock();
@@ -2698,10 +3060,21 @@ void EvalState::logPreImageSlow(Value & v)
     undoLog.push_back(e);
     stats.markerLogBytes += sizeof(UndoEntry) - offsetof(UndoEntry, start);
     activeForces.push_back(undoLog.size() - 1);
+    pushOpen(&v, true, ownersOn, &v, undoLog.size() - 1);
 }
 
 void EvalState::endLoggedForceSlow(Value & v)
 {
+    /* Called when `v` is the innermost open force (`unforceOpenTop`). */
+    if (opens.empty() || opens.back().cell != &v)
+        return;
+    auto open = opens.back();
+    opens.pop_back();
+    if (open.changed && ownersOn)
+        setOwner(open.saved);
+    setOpenTop();
+    if (!open.logged)
+        return;
     /* Every logged force ends here, innermost first, so the innermost open
        one is `v`'s if `v`'s start was logged. One that a job's end dropped
        (`dropActiveForces`) is not found. */
@@ -2747,8 +3120,10 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
         return undoLog.size();
     }
 #endif
-    if (!isolationDepth++ && !unforceSettings().region.empty())
+    if (!isolationDepth++ && !unforceSettings().region.empty()) {
         openRegion(unforceSettings().region == "all");
+        openOwners();
+    }
     return undoLog.size();
 }
 
@@ -2823,6 +3198,7 @@ void EvalState::endUnforceScope(size_t mark)
         } catch (std::bad_alloc &) {
             unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");
         }
+        closeOwners();
 
         /* The release: assigns, reverts and frees. Only derivation stubs
            (NIX_UNFORCE_STUB, a dev mode) allocate here. */
