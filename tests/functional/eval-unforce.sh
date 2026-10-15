@@ -55,17 +55,17 @@ for opts in on batch0; do
 done
 
 # A trace in a value shared between elements is printed once.
-expr='let s = builtins.trace "forced" { v = 1; }; in [ s.v s.v ]'
+traceExpr='let s = builtins.trace "forced" { v = 1; }; in [ s.v s.v ]'
+# Base's stderr is exactly the one trace line; the count is what is printed
+# if it is not.
 countTraces() {
-    nix-instantiate "$@" --eval --strict -E "$expr" 2>&1 >/dev/null | grep -c 'trace: forced' || true
+    local err=$TEST_ROOT/trace.err
+    nix-instantiate "$@" --eval --strict -E "$traceExpr" 2> "$err" >/dev/null
+    printf 'trace: forced\n' | cmp -s - "$err" || fail "nix-instantiate --strict $* (trace) stderr: $(< "$err")"
+    grep -c 'trace: forced' "$err" || true
 }
 [[ $(countTraces "${off[@]}") == 1 ]] || fail "trace printed more than once without unforcing"
 [[ $(countTraces "${on[@]}") == 1 ]] || fail "trace printed more than once with the default batch size"
-# KNOWN BUG (see notes/port/PORT.md): with a batch per element, the end of
-# the first element's batch unforces `s`, which the second element forces
-# again, so the trace is printed twice. Flip this to `== 1` once fixed.
-[[ $(countTraces "${batch0[@]}") == 2 ]] \
-    || fail "trace count with eval-unforce-batch-size = 0 changed: update this test (known bug fixed?)"
 
 # Nothing is printed to stdout when forcing fails part-way, as without
 # unforcing (which forces deeply before printing).
@@ -137,3 +137,8 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch
 (( BASH_REMATCH[1] >= 1 )) || fail "a cell forced in every job was never promoted: $stats"
 [[ $(NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr") == "$expected" ]] \
     || fail "counts rebuilt: wrong output"
+
+# Output equals base: the trace above is printed exactly once with a batch
+# per element too. Fails until replays are silent (effects design R); last,
+# so that it does not hide the checks above.
+[[ $(countTraces "${batch0[@]}") == 1 ]] || fail "trace printed more than once with eval-unforce-batch-size = 0"
