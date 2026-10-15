@@ -1169,6 +1169,24 @@ public:
         return toHash(*git_tree_entry_id(entry));
     }
 
+    /**
+     * Drop the parsed trees and looked-up entries; `lookup` reloads them
+     * from the object database on demand. The trees are immutable, so
+     * `invalidateCache` (a mounted view's refresh) keeps them; this
+     * releases what a traversal retained for a producer kept only to
+     * explain misses.
+     */
+    void releaseCaches() override
+    {
+        /* Every reader and writer of these maps holds state_, and entries
+           borrow from the trees, so both go in one critical section, the
+           borrowers first. Swapping with empty maps also frees their
+           tables, which clear() would keep. */
+        auto state(state_.lock());
+        decltype(lookupCache)().swap(lookupCache);
+        decltype(treeCache)().swap(treeCache);
+    }
+
 private:
     /* Entries borrow from the immutable trees retained here (or root).
        Listing a directory retains its parsed tree, not a duplicate of
@@ -1430,6 +1448,25 @@ private:
     Repository commitAttributesRepo;
     Index emptyIndex;
 
+    /* Under attributeMutex. */
+    void openCommitAttributesRepo()
+    {
+        Repository handle;
+        Index index;
+        if (git_repository_open(std::out_ptr(handle), repo->path.string().c_str()))
+            throw GitError("opening Git repository %s to read its attributes", PathFmt(repo->path));
+        /* The repository's object database, so that this handle reads every
+           object that one does, the unflushed ones included. */
+        if (git_repository_set_odb(handle.get(), repo->odb.get()))
+            throw GitError("setting the Git object database for attribute lookups");
+        if (git_index_new(std::out_ptr(index)))
+            throw GitError("creating an empty Git index");
+        if (git_repository_set_index(handle.get(), index.get()))
+            throw GitError("setting the empty Git index for attribute lookups");
+        commitAttributesRepo = std::move(handle);
+        emptyIndex = std::move(index);
+    }
+
 public:
     ref<GitRepoImpl> repo;
     git_attr_options attributes = GIT_ATTR_OPTIONS_INIT;
@@ -1448,16 +1485,24 @@ public:
             return;
         attributes.flags |= GIT_ATTR_CHECK_INCLUDE_COMMIT;
         attributes.attr_commit_id = hashToOID(*rev);
-        if (git_repository_open(std::out_ptr(commitAttributesRepo), repo->path.string().c_str()))
-            throw GitError("opening Git repository %s to read its attributes", PathFmt(repo->path));
-        /* The repository's object database, so that this handle reads every
-           object that one does, the unflushed ones included. */
-        if (git_repository_set_odb(commitAttributesRepo.get(), repo->odb.get()))
-            throw GitError("setting the Git object database for attribute lookups");
-        if (git_index_new(std::out_ptr(emptyIndex)))
-            throw GitError("creating an empty Git index");
-        if (git_repository_set_index(commitAttributesRepo.get(), emptyIndex.get()))
-            throw GitError("setting the empty Git index for attribute lookups");
+        std::lock_guard attributeLock(repo->attributeMutex);
+        openCommitAttributesRepo();
+    }
+
+    /**
+     * Also release the commit's private handle, with the attribute files
+     * and trees it cached; the next lookup opens it again from the
+     * repository's path, so `isAllowedUncached` can still decide. The
+     * decisions go too (`CachingFilteringSourceAccessor`).
+     */
+    void releaseCaches() override
+    {
+        {
+            std::lock_guard attributeLock(repo->attributeMutex);
+            commitAttributesRepo.reset();
+            emptyIndex.reset();
+        }
+        CachingFilteringSourceAccessor::releaseCaches();
     }
 
     bool isExportIgnored(const CanonPath & path)
@@ -1471,9 +1516,12 @@ public:
         // > It will use index only for creating archives or for a bare repo
         // > (if an index has been specified for the bare repo).
         // -- https://github.com/libgit2/libgit2/blob/HEAD/include/git2/attr.h#L113C62-L115C48
+        bool forCommit = attributes.flags & GIT_ATTR_CHECK_INCLUDE_COMMIT;
+        if (forCommit && !commitAttributesRepo)
+            openCommitAttributesRepo();
         if (git_attr_get_ext(
                 &exportIgnoreEntry,
-                commitAttributesRepo ? commitAttributesRepo.get() : repo->repo.get(),
+                forCommit ? commitAttributesRepo.get() : repo->repo.get(),
                 &attributes,
                 path.rel_c_str(),
                 "export-ignore")) {
@@ -1822,9 +1870,10 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source, bool explainMiss
         std::rethrow_exception(acquire.failure);
     /* A retained producer only explains misses, which reopen what they
        need. Drop what the traversal cached: a filesystem tree's directory
-       fds and an export-ignore decision per path. */
+       fds, an export-ignore decision per path, a commit's parsed trees and
+       its private attribute handle. */
     if (explainMisses)
-        source.accessor->invalidateCache();
+        source.accessor->releaseCaches();
     auto display = source.to_string();
     auto accessor = make_ref<Accessor>(std::move(value), explainMisses ? std::optional{source} : std::nullopt);
     accessor->setPathDisplay(std::move(display));

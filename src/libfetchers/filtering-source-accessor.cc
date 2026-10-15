@@ -324,7 +324,7 @@ bool CachingFilteringSourceAccessor::isAllowed(const CanonPath & path)
     return res;
 }
 
-void CachingFilteringSourceAccessor::invalidateCache()
+void CachingFilteringSourceAccessor::forgetDecisions(fun<void()> forward)
 {
     auto owner = weak_from_this().lock();
     auto replacement = std::make_shared<Decisions>();
@@ -333,7 +333,17 @@ void CachingFilteringSourceAccessor::invalidateCache()
        completion; the old one is freed here, outside the lock, unless a
        decision in flight still holds it. */
     Finally publish{[&] { decisions.lock()->swap(replacement); }};
-    FilteringSourceAccessor::invalidateCache();
+    forward();
+}
+
+void CachingFilteringSourceAccessor::invalidateCache()
+{
+    forgetDecisions([&] { FilteringSourceAccessor::invalidateCache(); });
+}
+
+void CachingFilteringSourceAccessor::releaseCaches()
+{
+    forgetDecisions([&] { FilteringSourceAccessor::releaseCaches(); });
 }
 
 } // namespace nix

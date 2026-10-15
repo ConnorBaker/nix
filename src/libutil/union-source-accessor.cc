@@ -154,6 +154,13 @@ public:
             accessor->invalidateCache();
     }
 
+    void releaseCaches() override
+    {
+        auto keepAlive = weak_from_this().lock();
+        for (auto & accessor : accessors)
+            accessor->releaseCaches();
+    }
+
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();

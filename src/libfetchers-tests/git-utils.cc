@@ -3814,4 +3814,108 @@ TEST_F(GitUtilsTest, acquiredTreeReleasesProducerCaches)
     }
 }
 
+/* A commit producer retained to explain misses (`fetchGit` by revision of a
+   tree that mentions export-ignore) keeps no traversal caches: neither its
+   parsed trees nor its export-ignore decisions. The export-ignore error is
+   still produced, recomputed from the object database. `invalidateCache`,
+   which a mounted tree gets, keeps a raw view's immutable trees. */
+TEST_F(GitUtilsTest, acquiredCommitProducerReleasesItsCaches)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo = [&]() { git_repository_free(rawRepo); };
+    write(".gitattributes", "ignored export-ignore\n");
+    write("ignored", "i");
+    write("d/e/f", "f");
+    auto rev = commitPaths(rawRepo, {".gitattributes", "ignored", "d/e/f"}, "one");
+
+    /* The loose object of tree d/e. Hiding it shows whether a view still
+       answers from a tree it parsed during the traversal. */
+    std::filesystem::path treeObject;
+    {
+        git_oid oid;
+        ASSERT_EQ(git_oid_fromstr(&oid, rev.gitRev().c_str()), 0);
+        git_commit * commit = nullptr;
+        ASSERT_EQ(git_commit_lookup(&commit, rawRepo, &oid), 0);
+        git_tree * tree = nullptr;
+        ASSERT_EQ(git_commit_tree(&tree, commit), 0);
+        git_tree_entry * entry = nullptr;
+        ASSERT_EQ(git_tree_entry_bypath(&entry, tree, "d/e"), 0);
+        std::string hex = git_oid_tostr_s(git_tree_entry_id(entry));
+        treeObject = tmpDir / ".git" / "objects" / hex.substr(0, 2) / hex.substr(2);
+        git_tree_entry_free(entry);
+        git_tree_free(tree);
+        git_commit_free(commit);
+    }
+    ASSERT_TRUE(std::filesystem::exists(treeObject));
+    auto hidden = treeObject.string() + ".hidden";
+    auto hide = [&] { std::filesystem::rename(treeObject, hidden); };
+    auto unhide = [&] { std::filesystem::rename(hidden, treeObject); };
+
+    /* Otherwise libgit2's own object cache would answer for the object. */
+    ASSERT_EQ(git_libgit2_opts(GIT_OPT_ENABLE_CACHING, 0), 0);
+    Finally enableCaching = [&]() { git_libgit2_opts(GIT_OPT_ENABLE_CACHING, 1); };
+
+    auto exportIgnored = [](SourceAccessor & accessor) {
+        try {
+            accessor.lstat(CanonPath("/ignored"));
+        } catch (RestrictedPathError & e) {
+            return std::string(e.what()).find("fetched with exportIgnore enabled") != std::string::npos;
+        }
+        return false;
+    };
+
+    for (bool explain : {false, true}) {
+        SCOPED_TRACE(fmt("explain=%d", explain));
+        auto producer = openRepo()->getAccessor(rev, {.exportIgnore = true}, "");
+        ASSERT_FALSE(producer->isFixed());
+        auto acquired = GitRepo::acquire(SourcePath{producer}, explain);
+        EXPECT_EQ(acquired->readFile(CanonPath("/d/e/f")), "f");
+
+        /* Decide /d/e/f now, while every object is there, so that the
+           lookup below needs the object only for the tree. */
+        auto filter = std::dynamic_pointer_cast<CachingFilteringSourceAccessor>(producer.get_ptr());
+        ASSERT_TRUE(filter);
+        EXPECT_TRUE(filter->isAllowed(CanonPath("/d/e/f")));
+
+        hide();
+        {
+            Finally restore = unhide;
+            if (explain)
+                /* The tree was released through the filter and must be
+                   read again. */
+                EXPECT_THROW(producer->lstat(CanonPath("/d/e/f")), Error);
+            else
+                /* Control: an unretained producer is left as the caller has
+                   it, answering from its decision and its parsed tree. */
+                EXPECT_EQ(producer->lstat(CanonPath("/d/e/f")).type, SourceAccessor::tRegular);
+            /* The acquired value owns its bytes. */
+            EXPECT_EQ(acquired->readFile(CanonPath("/d/e/f")), "f");
+        }
+
+        /* The explanation is recomputed: the export-ignore error, through
+           a reopened attribute handle when it was released. */
+        if (explain) {
+            EXPECT_TRUE(exportIgnored(*acquired));
+            EXPECT_EQ(producer->lstat(CanonPath("/d/e/f")).type, SourceAccessor::tRegular);
+        } else
+            EXPECT_THROW(acquired->lstat(CanonPath("/ignored")), FileNotFound);
+        EXPECT_FALSE(acquired->pathExists(CanonPath("/ignored")));
+    }
+
+    /* The raw view alone: releasing drops its trees; invalidating, which a
+       mounted view gets on every mount, keeps them. */
+    auto released = openRepo()->getAccessor(rev, {}, "");
+    auto invalidated = openRepo()->getAccessor(rev, {}, "");
+    ASSERT_TRUE(released->isFixed());
+    for (auto & view : {released, invalidated})
+        EXPECT_EQ(view->lstat(CanonPath("/d/e/f")).type, SourceAccessor::tRegular);
+    released->releaseCaches();
+    invalidated->invalidateCache();
+    hide();
+    Finally restore = unhide;
+    EXPECT_THROW(released->lstat(CanonPath("/d/e/f")), Error);
+    EXPECT_EQ(invalidated->lstat(CanonPath("/d/e/f")).type, SourceAccessor::tRegular);
+}
+
 } // namespace nix::fetchers

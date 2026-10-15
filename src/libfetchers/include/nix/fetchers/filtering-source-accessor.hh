@@ -68,6 +68,12 @@ struct FilteringSourceAccessor : ForwardingSourceAccessor<FilteringSourceAccesso
         inner->invalidateCache();
     }
 
+    void releaseCaches() override
+    {
+        auto inner = next;
+        inner->releaseCaches();
+    }
+
     /**
      * Call `makeNotAllowedError` to throw a `RestrictedPathError`
      * exception if `isAllowed()` returns `false` for `path`.
@@ -128,6 +134,9 @@ private:
      */
     SharedSync<std::shared_ptr<Decisions>> decisions;
 
+    /* Publish an empty map once `forward` has dropped the child's state. */
+    void forgetDecisions(fun<void()> forward);
+
 public:
     CachingFilteringSourceAccessor(const SourcePath & src, MakeNotAllowedError && makeNotAllowedError);
 
@@ -139,6 +148,9 @@ public:
      * as `makeCachingSourceAccessor`'s view does.
      */
     void invalidateCache() override;
+
+    /** Forget the decisions and release the child's caches. */
+    void releaseCaches() override;
 
     virtual bool isAllowedUncached(const CanonPath & path) = 0;
 };

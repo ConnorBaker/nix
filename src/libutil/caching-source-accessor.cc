@@ -98,7 +98,8 @@ public:
         return next.get_ptr()->showPath(path);
     }
 
-    void invalidateCache() override
+    template<typename Forward>
+    void forget(Forward && forward)
     {
         auto owner = weak_from_this().lock();
         auto replacement = std::make_shared<Caches>();
@@ -109,7 +110,17 @@ public:
             auto state = caches.lock();
             state->swap(replacement);
         }};
-        next->invalidateCache();
+        forward();
+    }
+
+    void invalidateCache() override
+    {
+        forget([&] { next->invalidateCache(); });
+    }
+
+    void releaseCaches() override
+    {
+        forget([&] { next->releaseCaches(); });
     }
 
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override

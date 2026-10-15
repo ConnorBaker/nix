@@ -118,8 +118,8 @@ struct GitRepo
      * its lack of a trailing slash. With
      * `explainMisses`, a failed lookup of a path the value lacks first lets
      * `source` report that path, e.g. a worktree's "not tracked by Git"
-     * hint; `source` is then retained for these diagnostics only, with
-     * its caches invalidated after the traversal. */
+     * hint; `source` is then retained for these diagnostics only, after
+     * releasing what the traversal cached (`releaseCaches`). */
     static ref<SourceAccessor> acquire(const SourcePath & source, bool explainMisses = false);
 
     /** A live filesystem view with retained tracked membership. */

@@ -340,6 +340,20 @@ public:
      * mutation (e.g. cached directory fds).
      */
     virtual void invalidateCache() {}
+
+    /**
+     * Drop everything cached that can be recomputed, including state that
+     * cannot go stale (e.g. parsed immutable Git trees), for an accessor
+     * that is kept only for rare later use (`GitRepo::acquire` retaining a
+     * producer to explain misses). This includes `invalidateCache()`. A
+     * wrapper forwards this, rather than `invalidateCache()`, to what it
+     * wraps. Unlike `invalidateCache()`, the evaluator never calls it on a
+     * mounted tree.
+     */
+    virtual void releaseCaches()
+    {
+        invalidateCache();
+    }
 };
 
 /** Forward ordinary reads through a derived, callback-scoped source route.

@@ -183,6 +183,13 @@ public:
             child->invalidateCache();
     }
 
+    void releaseCaches() override
+    {
+        auto children = *mounts.readLock() | std::views::values | std::ranges::to<std::vector<ref<SourceAccessor>>>();
+        for (auto & child : children)
+            child->releaseCaches();
+    }
+
     std::optional<std::filesystem::path> getPhysicalPath(const CanonPath & path) override
     {
         auto keepAlive = weak_from_this().lock();
