@@ -113,6 +113,9 @@ struct Settings
     /* What a job whose closure runs out of budget does: "promote" every
        target, or "revert" every target. Both keep identity. */
     std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
+    /* Most entries the force counts may hold (`pruneCounts`); 0: the
+       default, max(256 Ki, eval-unforce-batch-size / 256). Dev override. */
+    uint64_t countsCap = std::stoull(getEnv("NIX_UNFORCE_COUNTS_CAP").value_or("0"));
 };
 
 const Settings & unforceSettings()
@@ -146,6 +149,9 @@ struct Stats
        reverted, every target), the most steps one job took, and the most
        steps per KiB of job memory one job took. */
     size_t budgetJobs = 0, maxJobSteps = 0, maxStepsPerKiB = 0;
+    /* The force counts: the most entries they held, and how often they
+       were dropped for outgrowing their cap. */
+    size_t countsPeak = 0, countsResets = 0;
     size_t markerLogBytes = 0, markerPeakBytes = 0;
     /* Jobs that promoted nothing because client code ran in them, and the
        cells reverted at their ends. */
@@ -173,7 +179,7 @@ static void printStatsAtExit()
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
-                 "max steps per KiB %d; client-code jobs %d, reverted in client-code jobs %d, "
+                 "max steps per KiB %d; counts peak %d, counts resets %d; client-code jobs %d, reverted in client-code jobs %d, "
                  "inner-scope reverts %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
@@ -197,6 +203,8 @@ static void printStatsAtExit()
                  unforceSettings().walkFallback,
                  stats.maxJobSteps,
                  stats.maxStepsPerKiB,
+                 stats.countsPeak,
+                 stats.countsResets,
                  stats.clientJobs,
                  stats.revertedInClientJobs,
                  stats.innerScopeReverts);
@@ -1466,6 +1474,31 @@ std::vector<bool> decideJob(
     return promote;
 }
 
+/* The force counts only nominate promotions; the closure keeps identity
+   whatever they say, so forgetting a count is always sound (it only delays
+   a promotion). A promoted cell holds a value from now on and is not
+   logged again, so its count goes. And the map is replaced by an empty one
+   when it outgrows its cap, so that it does not grow with the length of a
+   traversal (epoch v3 review S3: about 50 bytes per distinct target, never
+   erased). Runs in the pre-release step; erasing does not allocate. */
+void pruneCounts(
+    std::unordered_map<const Value *, uint32_t> & counts,
+    const JobTargets & targets,
+    const std::vector<bool> & promoted,
+    uint64_t batchSize)
+{
+    stats.countsPeak = std::max(stats.countsPeak, counts.size());
+    for (size_t i = 0; i < targets.size(); ++i)
+        if (promoted[i])
+            counts.erase(targets.cells[i]);
+    auto & cfg = unforceSettings();
+    auto cap = cfg.countsCap ? cfg.countsCap : std::max<uint64_t>(256 << 10, batchSize / 256);
+    if (counts.size() > cap) {
+        std::unordered_map<const Value *, uint32_t>().swap(counts);
+        stats.countsResets++;
+    }
+}
+
 /* An allocation failed at the end of a job. Nothing can be released
    partially, so this is fatal (REDESIGN-memory L7). */
 [[noreturn]] void unforceFatal(const char * what) noexcept
@@ -1587,7 +1620,8 @@ std::string unforceStatsJSON()
         R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,)"
         R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,)"
-        R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,"clientJobs":%d,)"
+        R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,)"
+        R"("countsPeak":%d,"countsResets":%d,"clientJobs":%d,)"
         R"("revertedInClientJobs":%d,"innerScopeReverts":%d})",
         stats.jobs,
         stats.logged,
@@ -1611,6 +1645,8 @@ std::string unforceStatsJSON()
         unforceSettings().walkFallback,
         stats.maxJobSteps,
         stats.maxStepsPerKiB,
+        stats.countsPeak,
+        stats.countsResets,
         stats.clientJobs,
         stats.revertedInClientJobs,
         stats.innerScopeReverts);
@@ -1830,6 +1866,7 @@ static void endHeapScope(EvalState & state, size_t mark)
                 clock.chunks.emplace_back((uintptr_t) f.chunks[i], i * cellsPerChunk);
             std::sort(clock.chunks.begin(), clock.chunks.end());
             promoted = decideJob(state, mark, *jt, true, state.forceCounts, YoungSpace{f.heap}, clock, jobEnd, f.bytes);
+            pruneCounts(state.forceCounts, *jt, promoted, state.settings.unforceBatchSize);
         }
     } catch (std::bad_alloc &) {
         unforceFatal("deciding which values to keep at the end of an unforce scope");
@@ -1991,6 +2028,7 @@ void EvalState::endUnforceScope(size_t mark)
             CellClock{},
             jobEnd,
             evalRegion.cur - evalRegion.base);
+        pruneCounts(forceCounts, *jt, promoted, settings.unforceBatchSize);
     } catch (std::bad_alloc &) {
         unforceFatal("deciding which values to keep at the end of an unforce batch");
     }
