@@ -48,8 +48,10 @@ for f in rep*.nix e-*.nix attr*.nix ae-*.nix; do
             [[ $out == "$expected" ]] \
                 || fail "$f ($mode, promotion after $k forces): got '$out', expected '$expected'"
         done
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_CLOSURE_CHECK=1 run "$mode" "$f" "${on[@]}")
+        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_CLOSURE_CHECK=1 run "$mode" "$f" "${on[@]}")
         [[ $out != *"unforce check"* ]] || fail "$f ($mode): $out"
+        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_OWNER_CHECK=1 run "$mode" "$f" "${on[@]}")
+        [[ $out != *"unforce owner check"* ]] || fail "$f ($mode): $out"
     done
 done
 
@@ -67,12 +69,12 @@ done
 for f in rep.nix attr-desc.nix e-X01-00000.nix; do
     expected=$(run instantiate "$f" --option eval-unforce false)
     for k in 0 2; do
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_PROMOTE=$k NIX_UNFORCE_WALK_BUDGET_BASE=0 \
+        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_PROMOTE=$k NIX_UNFORCE_WALK_BUDGET_BASE=0 \
             NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert run instantiate "$f" "${on[@]}")
         [[ $out == "$expected" ]] || fail "$f (revert fallback, promotion after $k forces): got '$out', expected '$expected'"
     done
 done
-stats=$(NIX_UNFORCE_BACKEND=bump NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout NIX_UNFORCE_WALK_BUDGET_BASE=0 \
+stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout NIX_UNFORCE_WALK_BUDGET_BASE=0 \
     NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert nix-instantiate "${on[@]}" --eval --strict rep.nix 2>/dev/null)
 [[ $stats =~ \"keptJobs\":\ *([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "rep.nix (revert fallback): no job was kept whole: $stats"

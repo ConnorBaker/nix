@@ -113,12 +113,22 @@ out=$(NIX_UNFORCE_FAIL_DECIDE=1 nix-instantiate "${batch0[@]}" --eval --strict \
     echo '];'
     echo 'in builtins.seq zs [ (builtins.seq t600 true) (builtins.deepSeq ts (builtins.deepSeq zs true)) ]'
 } > "$TEST_ROOT/rounds.nix"
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix" 2>&1 >/dev/null)
+# These budget checks exercise markers' walk, which the owner closure
+# replaces (NIX_UNFORCE_IDENTITY=markers keeps it for comparison); the owner
+# closure takes no rounds and has no budget (checked after each).
+stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix" 2>&1 >/dev/null)
 [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] <= 20 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
 (( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
     || fail "rounds.nix: wrong output"
+ownerStats() {
+    local stats
+    stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$1" 2>&1 >/dev/null)
+    [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+    (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] == 0 )) || fail "$1: the owner closure walked: $stats"
+}
+ownerStats "$TEST_ROOT/rounds.nix"
 
 # Rebuilding the force counts when they outgrow their cap keeps this job's
 # counts (review of markers v2, S2): each job here forces 3 000 fresh cells,
@@ -155,12 +165,13 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch
     echo '];'
     echo 'in builtins.seq old [ (builtins.seq t600 true) (builtins.seq big (builtins.deepSeq ts true)) ]'
 } > "$TEST_ROOT/wide.nix"
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix" 2>&1 >/dev/null)
+stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix" 2>&1 >/dev/null)
 [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
 (( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix") == '[ true true ]' ]] \
     || fail "wide.nix: wrong output"
+ownerStats "$TEST_ROOT/wide.nix"
 
 # String data does not buy closure steps (review of markers v4, S1''): the
 # same job as wide.nix, plus a 32 MiB string built by doubling (64 MiB of
@@ -169,12 +180,13 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}"
 sed 's/^in builtins.seq old \[ (builtins.seq t600 true) (builtins.seq big /  dbl = s: n: if n == 0 then s else dbl (s + s) (n - 1);\n  pad = builtins.stringLength (dbl "x" 25);\n&(builtins.seq pad /; s/true)) ]$/true))) ]/' \
     "$TEST_ROOT/wide.nix" > "$TEST_ROOT/wide-pad.nix"
 grep -q 'seq pad' "$TEST_ROOT/wide-pad.nix" || fail "wide-pad.nix: no padding"
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix" 2>&1 >/dev/null)
+stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix" 2>&1 >/dev/null)
 [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
 (( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix") == '[ true true ]' ]] \
     || fail "wide-pad.nix: wrong output"
+ownerStats "$TEST_ROOT/wide-pad.nix"
 
 # Output equals base: the trace above is printed exactly once with a batch
 # per element too. Fails until replays are silent (effects design R); last,

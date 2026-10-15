@@ -57,7 +57,7 @@ for f in *.nix; do
     expected=$(run "$f" --option eval-unforce false)
     for fallback in promote revert; do
         for k in 2 3; do
-            out=$(NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
+            out=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
                 NIX_UNFORCE_WALK_FALLBACK=$fallback NIX_UNFORCE_PROMOTE=$k \
                 run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
             [[ $out == "$expected" ]] \
@@ -67,7 +67,7 @@ for f in *.nix; do
 done
 
 # The fallback happens, and is counted.
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
+stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
     nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict follows.nix 2>&1 >/dev/null)
 [[ $stats =~ over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "the closure never ran out of budget: $stats"
@@ -114,8 +114,46 @@ done
 for f in *.nix; do
     [[ $f == set.nix || $f == nested.nix ]] && continue
     for k in 2 3; do
-        out=$(NIX_UNFORCE_CLOSURE_CHECK=1 NIX_UNFORCE_PROMOTE=$k \
+        out=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_CLOSURE_CHECK=1 NIX_UNFORCE_PROMOTE=$k \
             run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
         [[ $out != *"unforce check"* ]] || fail "$f (promotion after $k forces): $out"
     done
 done
+
+# The owner closure (the default) promotes nothing that markers' plain
+# closure would not: markers' candidates include every true owner, so an
+# extra promotion would mean a misattributed owner. NIX_UNFORCE_OWNER_CHECK
+# computes both after every job and reports on stderr.
+for f in *.nix; do
+    [[ $f == set.nix || $f == nested.nix ]] && continue
+    for k in 1 2 3; do
+        for consumers in 0 1; do
+            out=$(NIX_UNFORCE_OWNER_CHECK=1 NIX_UNFORCE_OWNER_CONSUMERS=$consumers NIX_UNFORCE_PROMOTE=$k \
+                run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
+            [[ $out != *"unforce owner check"* ]] || fail "$f (owner check, promotion after $k forces): $out"
+            expected=$(run "$f" --option eval-unforce false)
+            [[ $out == "$expected" ]] \
+                || fail "$f (consumers $consumers, promotion after $k forces): got '$out', expected '$expected'"
+        done
+    done
+done
+
+# A young cell that a target owns, forced by the driver (here the JSON
+# printer, forcing the elements of a list the job's target built), runs under
+# that target as owner: every such force changes the owner and back. The
+# segments of a force that allocates nothing are overwritten and those of
+# the driver merged, so the timeline stays short however many there are.
+ownerStat() { # FIELD EXPR
+    NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout nix-instantiate --option eval-unforce true \
+        --option eval-unforce-batch-size 0 --eval --strict --json -E "$2" 2>/dev/null \
+        | sed -n 's/.*"'"$1"'":\([0-9]*\).*/\1/p' | head -n 1
+}
+expr='let L = builtins.genList (i: { v = i * 2; }) 2000; in [ L ]'
+changes=$(ownerStat ownerChanges "$expr")
+segs=$(ownerStat ownerSegsPeak "$expr")
+[[ -n $changes && -n $segs ]] || fail "no owner statistics"
+(( changes >= 2000 )) || fail "driver forces of a target's cells changed the owner $changes times, not >= 2000"
+(( segs <= 16 )) || fail "the owner timeline grew to $segs segments for $changes owner changes"
+# Owners are off in the A/B mode.
+changes=$(NIX_UNFORCE_IDENTITY=markers ownerStat ownerChanges "$expr")
+(( changes == 0 )) || fail "NIX_UNFORCE_IDENTITY=markers still tracks owners: $changes owner changes"
