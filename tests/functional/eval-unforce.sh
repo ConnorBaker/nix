@@ -160,6 +160,20 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix") == '[ true true ]' ]] \
     || fail "wide.nix: wrong output"
 
+# String data does not buy closure steps (review of markers v4, S1''): the
+# same job as wide.nix, plus a 32 MiB string built by doubling (64 MiB of
+# string data in all). When the budget grew with every young byte, the
+# string bought about 16 M steps, and the closure took over 300 rounds.
+sed 's/^in builtins.seq old \[ (builtins.seq t600 true) (builtins.seq big /  dbl = s: n: if n == 0 then s else dbl (s + s) (n - 1);\n  pad = builtins.stringLength (dbl "x" 25);\n&(builtins.seq pad /; s/true)) ]$/true))) ]/' \
+    "$TEST_ROOT/wide.nix" > "$TEST_ROOT/wide-pad.nix"
+grep -q 'seq pad' "$TEST_ROOT/wide-pad.nix" || fail "wide-pad.nix: no padding"
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix" 2>&1 >/dev/null)
+[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
+(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
+[[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix") == '[ true true ]' ]] \
+    || fail "wide-pad.nix: wrong output"
+
 # Output equals base: the trace above is printed exactly once with a batch
 # per element too. Fails until replays are silent (effects design R); last,
 # so that it does not hide the checks above.

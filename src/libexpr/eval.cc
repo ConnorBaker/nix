@@ -89,6 +89,8 @@ static const char * makeImmutableString(std::string_view s)
 
 StringData & StringData::alloc(EvalMemory & mem, size_t size)
 {
+    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]]
+        evalRegion.stringBytes += size;
     void * t = mem.allocBytes<char, sizeof(StringData) + 1>(size);
     auto res = new (t) StringData(size);
     return *res;

@@ -372,6 +372,9 @@ struct EvalRegion
     bool allTypes = false;
     /** The memory was used by an earlier job, so allocations must zero it. */
     bool dirty = false;
+    /** Bytes of string data allocated here, which the producer closure
+        never walks: they do not count towards its step budget. */
+    size_t stringBytes = 0;
 
     bool active() const noexcept
     {

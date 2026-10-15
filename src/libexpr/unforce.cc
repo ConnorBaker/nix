@@ -1722,7 +1722,7 @@ countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTarg
    It writes no target, so the caller turns an allocation failure here into
    a fatal error before anything has changed, and the release that follows
    only assigns, reverts and frees. The caller pauses the region.
-   `youngBytes` is the memory the job allocated, which sets the closure's
+   `youngBytes` is the memory the job allocated other than string data, which sets the closure's
    step budget. Returns a flag per target.
 
    The budget. The closure is a walk per reverted target per round, and
@@ -2548,7 +2548,10 @@ void EvalState::endUnforceScope(size_t mark)
                 YoungSpace{},
                 CellClock{},
                 jobEnd,
-                evalRegion.cur - evalRegion.base,
+                /* String data is never walked: a long string must not buy
+                   the closure steps (review of markers v4, S1''). */
+                size_t(evalRegion.cur - evalRegion.base)
+                    - std::min(evalRegion.stringBytes, size_t(evalRegion.cur - evalRegion.base)),
                 evacuator,
                 copies,
                 printed.empty() ? nullptr : &printed);
