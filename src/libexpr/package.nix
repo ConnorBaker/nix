@@ -16,6 +16,7 @@
   sqlite,
   toml11,
   libcpuid,
+  mimalloc,
 
   # Configuration Options
 
@@ -31,6 +32,11 @@
   # Temporarily disabled on Windows because the `GC_throw_bad_alloc`
   # symbol is missing during linking.
   enableGC ? !stdenv.hostPlatform.isWindows,
+
+  # PROTOTYPE (unforce): allocate evaluator memory from mimalloc heaps, as
+  # the development build (where meson finds mimalloc) does. Packaged
+  # builds enable every auto feature, so the dependency must be present.
+  withMimalloc ? !stdenv.hostPlatform.isWindows,
 }:
 
 let
@@ -68,7 +74,8 @@ mkMesonLibrary (finalAttrs: {
     sqlite
     toml11
   ]
-  ++ lib.optional stdenv.hostPlatform.isx86_64 libcpuid;
+  ++ lib.optional stdenv.hostPlatform.isx86_64 libcpuid
+  ++ lib.optional withMimalloc mimalloc;
 
   propagatedBuildInputs = [
     nix-util
@@ -81,6 +88,7 @@ mkMesonLibrary (finalAttrs: {
 
   mesonFlags = [
     (lib.mesonEnable "gc" enableGC)
+    (lib.mesonEnable "mimalloc" withMimalloc)
   ];
 
   meta = {
