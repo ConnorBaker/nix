@@ -138,6 +138,29 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch
 [[ $(NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr") == "$expected" ]] \
     || fail "counts rebuilt: wrong output"
 
+# A walk is also charged for the width of what it scans (review of markers
+# v3, S1'): beside the chain of rounds.nix, one target holds a young
+# Bindings of 1 000 000 attributes pointing to old cells, which every round
+# scans. Before Bindings widths were charged, this took 600 rounds without
+# reaching the budget.
+{
+    echo 'let'
+    echo '  old = builtins.listToAttrs (builtins.genList (i: { name = "a${toString i}"; value = i; }) 1000000);'
+    echo '  big = removeAttrs old [ "nonexistent" ];'
+    echo '  t1 = { v = [ 1 2 3 ]; w = null; };'
+    for ((i = 2; i <= 600; i++)); do echo "  t$i = { v = [ 1 2 3 ]; w = t$((i - 1)).v; };"; done
+    echo -n '  ts = [ '
+    for ((i = 1; i <= 600; i++)); do echo -n "t$i "; done
+    echo '];'
+    echo 'in builtins.seq old [ (builtins.seq t600 true) (builtins.seq big (builtins.deepSeq ts true)) ]'
+} > "$TEST_ROOT/wide.nix"
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix" 2>&1 >/dev/null)
+[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
+(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
+[[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix") == '[ true true ]' ]] \
+    || fail "wide.nix: wrong output"
+
 # Output equals base: the trace above is printed exactly once with a batch
 # per element too. Fails until replays are silent (effects design R); last,
 # so that it does not hide the checks above.

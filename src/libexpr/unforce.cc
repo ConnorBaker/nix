@@ -1231,9 +1231,10 @@ struct OverBudget
    edges the Evacuator copies, without copying.
 
    Cost. A job may take `budget` steps. A step is charged for every object
-   a walk pops, every element array it claims (plus one per 16 elements it
-   scans), every target a round tests, and the bitmap clears of `dropMemos`
-   in proportion to their size (review of v2, S1: a round tests every
+   a walk pops (plus one per 16 attributes of a Bindings layer or slots of
+   an env whose children it scans), every element array it claims (plus
+   one per 16 elements it scans), every target a round tests, and the
+   bitmap clears of `dropMemos` in proportion to their size (review of v2, S1: a round tests every
    reverted target, so before these were charged a chain found one target
    per round, beside 300 000 targets whose walks pop nothing, cost 45 G
    instructions without ever reaching the budget). So the budget bounds the
@@ -1384,6 +1385,23 @@ struct Closure
         }
     }
 
+    /* How many children `children(p, kind, ...)` scans beyond a value's
+       few: an env's slots, a Bindings layer's attributes. A walk is charged
+       one step per 16 of them (review of markers v3, S1': a 2 M-attribute
+       Bindings cost one step per round). */
+    static size_t width(const void * p, Kind kind)
+    {
+        switch (kind) {
+        case kEnv:
+            return *(const size_t *) ((const char *) p - 16);
+        case kBindings:
+            return ((const Bindings *) p)->layerSize();
+        case kValue:
+            return 0;
+        }
+        return 0;
+    }
+
     /* Add R(content), every young object reachable from `content` without
        pruning, to Evac(S). */
     void mark(const Value & content)
@@ -1410,7 +1428,7 @@ struct Closure
         while (!stack.empty()) {
             auto [p, kind] = stack.back();
             stack.pop_back();
-            step();
+            charge(1 + width(p, kind) / 16);
             children(p, kind, add, array);
         }
     }
@@ -1478,6 +1496,7 @@ struct Closure
                 hit = true;
                 break;
             }
+            charge(width(p, kind) / 16);
             children(p, kind, push, array);
         }
 
