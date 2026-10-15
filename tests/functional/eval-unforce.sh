@@ -5,6 +5,13 @@
 
 source common.sh
 
+# Unforcing never runs in a build with Boehm GC, whatever `eval-unforce` says:
+# no job ends, so no statistics are printed.
+if [[ $(NIX_UNFORCE_STATS=1 nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 \
+    --eval --strict -E '[ 1 ]' 2>&1 >/dev/null) != *'unforce: '* ]]; then
+    skipTest "unforcing is disabled in this build"
+fi
+
 off=(--option eval-unforce false)
 # The default batch size, given explicitly so that a NIX_CONFIG in the
 # environment does not change it.
