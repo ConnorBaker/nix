@@ -7,7 +7,11 @@
 # promotion threshold, `nix-instantiate --eval --strict` and `nix eval` must
 # print what they print without unforcing. The e-*.nix programs are a sample
 # of the printing corpus of the review of markers v2 (§2.2, e2q), on which
-# every program where base prints «repeated» used to differ.
+# every program where base prints «repeated» used to differ. The attr*.nix
+# programs and ae-*.nix (the same sample with the top-level list turned into
+# an attribute set named z3..z0, from the review of markers v3, §1.2) are
+# top-level attribute sets whose Bindings order, in which
+# `nix-instantiate --strict` forces them, is not the printed order.
 #
 # Bump backend only: the mimalloc backend's nested scopes revert what every
 # printed container forced, so there shared values still print in full.
@@ -34,7 +38,7 @@ run() {
 }
 
 on=(--option eval-unforce true --option eval-unforce-batch-size 0)
-for f in rep*.nix e-*.nix; do
+for f in rep*.nix e-*.nix attr*.nix ae-*.nix; do
     for mode in instantiate eval; do
         expected=$(run "$mode" "$f" --option eval-unforce false)
         if [[ $mode == instantiate && $expected != *'«repeated»'* ]]; then
@@ -48,6 +52,14 @@ for f in rep*.nix e-*.nix; do
         out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_CLOSURE_CHECK=1 run "$mode" "$f" "${on[@]}")
         [[ $out != *"unforce check"* ]] || fail "$f ($mode): $out"
     done
+done
+
+# In the default configuration too (attr-desc-batch.nix's zz takes more than
+# a batch).
+for mode in instantiate eval; do
+    expected=$(run "$mode" attr-desc-batch.nix --option eval-unforce false)
+    out=$(NIX_UNFORCE_BACKEND=bump run "$mode" attr-desc-batch.nix --option eval-unforce true)
+    [[ $out == "$expected" ]] || fail "attr-desc-batch.nix ($mode, defaults): got '$out', expected '$expected'"
 done
 
 # Negative control: forgetting what a job printed (NIX_UNFORCE_SEEN=0, as

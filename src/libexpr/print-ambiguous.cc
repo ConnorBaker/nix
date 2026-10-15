@@ -6,16 +6,12 @@
 
 namespace nix {
 
-/* PROTOTYPE: additions to `seen`, in order, so that an unforced child's can
-   be forgotten. */
-static thread_local std::vector<const void *> seenAdded;
-
-static bool markSeen(std::set<const void *> & seen, const Value & v, const void * p, bool unforce)
+/* With unforcing, a `seen` set kept by `UnforceSeen` must hear of each
+   container it marks. */
+static bool markSeen(std::set<const void *> & seen, const Value & v, const void * p)
 {
     if (!seen.insert(p).second)
         return false;
-    if (unforce)
-        seenAdded.push_back(p);
     unforceNoteSeen(seen, v, p);
     return true;
 }
@@ -28,42 +24,12 @@ void printAmbiguous(
     std::set<const void *> * seen,
     NixStringContext * context,
     size_t depth,
-    bool force,
-    bool unforce)
+    PrintAmbiguousRecorder * recorder)
 {
     checkInterrupt();
 
     if (depth > state.settings.maxCallDepth)
         state.error<StackOverflowError>().atPos(v.determinePos(noPos)).debugThrow();
-
-    /* PROTOTYPE: forcing while printing (`force`) is what `--strict` gets
-       from `forceValueDeep` beforehand, but lets each element be unforced
-       once printed (`unforce`). */
-    if (force)
-        state.forceValue(v, v.determinePos(noPos));
-
-    /* With `unforce`, the children of an attribute set or list are unforced
-       in batches. When a batch frees what they allocated, the addresses they
-       added to `seen` are forgotten, since they may be reused (with the bump
-       backend, if the caller keeps `seen` with an `UnforceSeen`, the job's
-       end has already rewritten them, so there is nothing to forget); a
-       batch that frees nothing (nested in another one) leaves them for the
-       enclosing batch. */
-    size_t seenMark = 0;
-    UnforceBatch batch(state, unforce);
-    if (batch.enabled())
-        batch.onEnd = [&](bool freed) {
-            if (freed)
-                for (; seenAdded.size() > seenMark; seenAdded.pop_back())
-                    if (seen && unforceMayHaveFreed(seenAdded.back()))
-                        seen->erase(seenAdded.back());
-        };
-    auto child = [&](Value & c, std::set<const void *> * childSeen) {
-        if (batch.enabled() && !batch.isOpen())
-            seenMark = seenAdded.size();
-        UnforceBatch::Element element(batch);
-        printAmbiguous(state, c, str, childSeen, context, depth + 1, force, unforce);
-    };
     switch (v.type()) {
     case nInt:
         str << v.integer();
@@ -83,44 +49,53 @@ void printAmbiguous(
         str << "null";
         break;
     case nAttrs: {
-        if (seen && !v.attrs()->empty() && !markSeen(*seen, v, v.attrs(), unforce))
+        bool tracked = seen && !v.attrs()->empty();
+        if (tracked && !markSeen(*seen, v, v.attrs())) {
+            auto from = recorder ? (std::streamoff) str.tellp() : 0;
             str << "«repeated»";
-        else {
+            if (recorder)
+                recorder->repeated(v.attrs(), from, str.tellp());
+        } else {
+            if (tracked && recorder)
+                recorder->open(v.attrs(), str.tellp());
             str << "{ ";
             for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
                 str << state.symbols[i->name] << " = ";
-                if (force) {
-                    try {
-                        child(*i->value, seen);
-                    } catch (Error & e) {
-                        state.addErrorTrace(e, i->pos, "while evaluating the attribute '%1%'", state.symbols[i->name]);
-                        throw;
-                    }
-                } else
-                    child(*i->value, seen);
+                printAmbiguous(state, *i->value, str, seen, context, depth + 1, recorder);
                 str << "; ";
             }
             str << "}";
+            if (tracked && recorder)
+                recorder->close(str.tellp());
         }
         break;
     }
-    case nList:
+    case nList: {
         /* Use pointer to the Value instead of pointer to the elements, because
            that would need to explicitly handle the case of SmallList. */
-        if (seen && v.listSize() && !markSeen(*seen, v, &v, unforce))
+        bool tracked = seen && v.listSize();
+        if (tracked && !markSeen(*seen, v, &v)) {
+            auto from = recorder ? (std::streamoff) str.tellp() : 0;
             str << "«repeated»";
-        else {
+            if (recorder)
+                recorder->repeated(&v, from, str.tellp());
+        } else {
+            if (tracked && recorder)
+                recorder->open(&v, str.tellp());
             str << "[ ";
             for (auto v2 : v.listView()) {
                 if (v2)
-                    child(*v2, seen);
+                    printAmbiguous(state, *v2, str, seen, context, depth + 1, recorder);
                 else
                     str << "(nullptr)";
                 str << " ";
             }
             str << "]";
+            if (tracked && recorder)
+                recorder->close(str.tellp());
         }
         break;
+    }
     case nThunk:
         if (!v.isBlackhole()) {
             str << "<CODE>";

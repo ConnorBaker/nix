@@ -493,6 +493,8 @@ struct UnforceSeen
        inside it. */
     std::vector<const Value *> cells;
     std::vector<const void *> keys;
+    /** Called when an entry `from` is rewritten to `to` at a job's end. */
+    std::function<void(const void * from, const void * to)> onRekey;
 
     explicit UnforceSeen(std::set<const void *> & seen);
     ~UnforceSeen();

@@ -2315,6 +2315,8 @@ static void translateSeen(Evacuator & evacuator)
                 continue;
             if (auto copy = evacuator.forwarded(key)) {
                 s->seen.insert(copy);
+                if (s->onRekey)
+                    s->onRekey(key, copy);
                 stats.seenKept++;
             } else
                 stats.seenDropped++;
