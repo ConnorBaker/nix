@@ -2314,8 +2314,11 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
 {
     assert(v.isFailed());
     if (auto recoveryValue = v.failed().recoveryValue) {
-        /* The recovery value may be younger than `v`. */
-        logPreImage(v);
+        /* The recovery value may be younger than `v`. The write is logged
+           with an empty force interval: the force that follows logs `v`
+           again, with its own markers. */
+        if (auto marker = logPreImage(v))
+            endLoggedForce(marker);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {

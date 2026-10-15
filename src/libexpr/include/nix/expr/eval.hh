@@ -1219,6 +1219,16 @@ public:
     {
         Value * target;
         Value preImage;
+        /**
+         * Force markers: the job's allocation clock (`unforceClock`) when
+         * this force of `target` started and ended (`openForce` until it
+         * ends), and the log index of the innermost logged force that was
+         * running when it started (-1: none). Forcing is LIFO, so these
+         * intervals nest or are disjoint.
+         */
+        uint64_t start = 0, end = openForce;
+        int64_t parent = -1;
+        static constexpr uint64_t openForce = ~uint64_t(0);
     };
 
     std::vector<UndoEntry, traceable_allocator<UndoEntry>> undoLog;
@@ -1242,12 +1252,25 @@ public:
      * an unforce scope must restore it: `v` is older than the scope, and not
      * a stack slot of a frame that will have returned when the scope ends.
      */
-    [[gnu::always_inline]] void logPreImage(Value & v)
+    [[gnu::always_inline]] size_t logPreImage(Value & v)
     {
         if (isolationDepth && !evalRegion.contains(&v)) [[unlikely]]
             if (!unforceIsScopeStackSlot(&v))
-                undoLog.push_back({&v, v});
+                return logForce(v);
+        return 0;
     }
+
+    /**
+     * PROTOTYPE. The cold part of `logPreImage`: log `v` with the start
+     * marker of its force. Returns the marker to pass to `endLoggedForce`
+     * (the log index plus one).
+     */
+    [[gnu::noinline]] size_t logForce(Value & v);
+
+    /**
+     * PROTOTYPE. Record the end marker of a logged force, however it ended.
+     */
+    [[gnu::noinline]] void endLoggedForce(size_t marker);
 
     /**
      * PROTOTYPE. Close an unforce scope and unforce every thunk updated

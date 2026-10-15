@@ -144,6 +144,19 @@ public:
         return numAttrs;
     }
 
+    /** PROTOTYPE (unforce). Visit the values of this one layer. */
+    template<typename F>
+    void forEachLayerValue(F && f) const
+    {
+        for (size_type i = 0; i < numAttrs; ++i)
+            f(attrs[i].value);
+    }
+
+    const Bindings * layerBase() const
+    {
+        return baseLayer;
+    }
+
     size_type size() const
     {
         return numAttrsInChain;

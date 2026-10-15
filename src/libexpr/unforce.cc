@@ -19,8 +19,10 @@
 
 #include <cstdlib>
 #include <optional>
+#include <algorithm>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "expr-config-private.hh"
 
@@ -95,9 +97,15 @@ struct Settings
        mapping fresh (kernel-zeroed) pages for every job. */
     bool reuse = getEnv("NIX_UNFORCE_REUSE").value_or("0") != "0";
     /* "bump": one flat region per outermost scope. "mimalloc": a mimalloc
-       heap per scope, in an exclusive arena; every scope is a job, and
-       promotion copies into the enclosing scope's heap. */
+       heap per scope, in an exclusive arena; every scope frees its memory
+       when it ends, and only the outermost one promotes. */
     std::string backend = getEnv("NIX_UNFORCE_BACKEND").value_or("bump");
+    /* How a job's promotion set is closed under "producer-of" (see
+       `closeJob`): "on" (promote the producers), "off" (counts only, the
+       old behaviour), "nested" (the naive rule that only looks for
+       producers nested in a promoted force; for tests), "refuse" (refuse
+       to promote a consumer instead; for measurements). */
+    std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
 };
 
 const Settings & unforceSettings()
@@ -117,6 +125,17 @@ size_t regionSize()
 struct Stats
 {
     size_t jobs = 0, logged = 0, reverted = 0, stubbed = 0, promoted = 0, copiedBytes = 0, regionPeak = 0, relogged = 0;
+    /* Targets logged in a job that an earlier job had forced and reverted. */
+    size_t reforced = 0;
+    /* Job memory released, summed over jobs. */
+    size_t freedBytes = 0;
+    /* Force markers: promotions added by the producer closure, promotions
+       refused (NIX_UNFORCE_MARKERS=refuse), closure rounds, young-graph
+       nodes visited by the closure, jobs whose closure changed anything,
+       and the bookkeeping: bytes the markers add to log entries, and the
+       largest transient bookkeeping of one job close (estimated). */
+    size_t markerPromoted = 0, refused = 0, markerRounds = 0, markerSteps = 0, markerJobs = 0;
+    size_t markerLogBytes = 0, markerPeakBytes = 0;
 } stats;
 
 bool nested()
@@ -132,7 +151,8 @@ static void printStatsAtExit()
         (std::atexit([] {
              std::cerr << fmt(
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
-                 "largest scope %d MiB\n",
+                 "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, refused %d, "
+                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -141,18 +161,26 @@ static void printStatsAtExit()
                  stats.promoted,
                  stats.relogged,
                  stats.copiedBytes >> 20,
-                 stats.regionPeak >> 20);
+                 stats.regionPeak >> 20,
+                 stats.reforced,
+                 stats.freedBytes >> 20,
+                 unforceSettings().markers,
+                 stats.markerPromoted,
+                 stats.refused,
+                 stats.markerRounds,
+                 stats.markerSteps,
+                 stats.markerJobs,
+                 stats.markerLogBytes >> 10,
+                 stats.markerPeakBytes >> 10);
          }),
          true);
 }
 
-/* One scope of the mimalloc backend. `counts` counts, per cell older than
-   this scope, in how many of its child scopes the cell was forced. */
+/* One scope of the mimalloc backend. */
 struct Frame
 {
     size_t logMark;
     void * heap;
-    std::unordered_map<const Value *, uint32_t> counts;
     size_t bytes = 0;
 };
 
@@ -180,6 +208,26 @@ void setCurrentHeap(void * heap)
     currentTheap = heap ? mi_heap_theap((mi_heap_t *) heap) : nullptr;
 }
 #endif
+
+/* The allocation clock of the innermost scope: the bump cursor. It only
+   grows while a scope is open. The mimalloc backend has no clock (its
+   objects have no time, see `CellClock`). */
+static uint64_t unforceClock()
+{
+    if (nested())
+        return 0;
+    return (uintptr_t) evalRegion.cur;
+}
+
+/* Log indices of the logged forces that are running, innermost last. */
+static std::vector<size_t> activeForces;
+
+/* Forget running forces logged at or after `mark` (none should be). */
+static void dropActiveForces(size_t mark)
+{
+    while (!activeForces.empty() && activeForces.back() >= mark)
+        activeForces.pop_back();
+}
 
 #if NIX_USE_BOEHMGC
 GC_push_other_roots_proc prevPushOtherRoots = nullptr;
@@ -390,6 +438,9 @@ struct Evacuator
        wherever allocation currently goes (the enclosing scope's heap). */
     void * youngHeap = nullptr;
 
+    /* If set, the young cells copied, in copy order. */
+    std::vector<const Value *> * copiedCells = nullptr;
+
     bool young(const void * p) const
     {
 #if NIX_UNFORCE_MIMALLOC
@@ -424,6 +475,8 @@ struct Evacuator
         stats.copiedBytes += sizeof(Value);
         *n = *v;
         forward.emplace(v, n);
+        if (copiedCells)
+            copiedCells->push_back(v);
         values.push_back(n);
         return n;
     }
@@ -654,6 +707,488 @@ struct Stubber
     }
 };
 
+/* ---------------------------------------------------------------------------
+   Force markers: closing a job's promotion set under "producer-of".
+
+   Promotion breaks the evaluator's pointer identity (`eqValues` short-cuts on
+   `&v1 == &v2`; Nixpkgs relies on it for `hostPlatform == buildPlatform`)
+   when a promoted cell keeps a copy of a cell that a reverted target rebuilds
+   when it is re-forced: two cells then stand for one cell of an evaluation
+   without unforcing. Force counts cannot rule this out (an earlier promotion
+   creates new old thunks with count 0, so a consumer can reach the threshold
+   before its producer), so the counts only nominate promotions; this closure
+   makes them safe.
+
+   Definitions, for one job (outermost scope). Time is the job's allocation
+   clock (`unforceClock`), the bump cursor; a young object's time a(x) is its
+   address. The mimalloc backend has no clock: its objects have no time.
+   - Targets T: old cells forced in the job (the undo log). Every logged force
+     of t has an interval [s, e) of times: s when it was logged, e when it
+     returned or threw (`endLoggedForce`). Forcing is LIFO, so the intervals
+     form a forest (`parent`), and innermost(a) is the deepest interval
+     containing time a.
+   - The creator of a young object x is the innermost cell (young or old)
+     being forced when x was allocated; owner(x) is the first old cell on the
+     creator chain x, creator(x), creator(creator(x)), ... (a target), or
+     none (allocated by the driver outside any force). Re-forcing owner(x) in
+     a later job is the only thing that can build x again.
+   - c(t) is t's content at job end; R(c) the young objects reachable from
+     it (through cells, Bindings layers, lists, envs, thunk and app
+     operands, lambdas, failure recovery values), as the Evacuator copies.
+   - S ⊆ T is the promoted set and Evac(S) = ∪_{r∈S} R(c(r)), copied with one
+     forwarding table. Identity is only observable on Value cells (no
+     Bindings or list shortcut in `eqValues`, `CompareValues` or `elem`).
+
+   Invariant (OC, ownership closure): every young cell X ∈ Evac(S) has
+   owner(X) ∈ S or no owner.
+
+   OC is sufficient: a reverted target t re-forced later builds only cells
+   that t owns, which are fresh: none of them survives, because a survivor is
+   in Evac(S) and is owned by a member of S, and t ∉ S. A surviving copy is
+   never rebuilt, because its owner is promoted (it is a value and is not
+   re-forced), and every cell on a creator chain below an owner is built only
+   by re-running the owner. So each cell of the evaluation without unforcing
+   has at most one counterpart alive at any time, and the history-independence
+   argument for pure revert (notes/reviews/identity-reliance-review.md §3.2)
+   applies to the heap at the next job's start. OC is also necessary in
+   general: a cell X ∈ Evac(S) owned by a reverted t is rebuilt as X' when t
+   is re-forced, and `X == X'` is observable whenever X holds a function.
+
+   Lemma V (no upward visibility). While t is being forced, cells owned by t
+   are accessible only to t's own evaluation and to forces of young cells
+   owned by t. Reason: a target u forced inside t starts from its pre-image,
+   which refers only to old memory (old cells are written only by their own
+   logged forces, A1/A3 of the review); u gains access to young objects only
+   by allocating them (owned by u or below) or by reading the contents of
+   completed forces, and t's content does not exist until t ends. A young
+   cell forced inside t but created before t started (not owned by t)
+   likewise runs on its own closure. Hence no cell owned by t is allocated
+   while a target nested in t is running.
+
+   Lemma C (closed region). If t owns X and X is reachable at job end from a
+   promoted r ≠ t, then X ∈ R(c(t)), along a path whose interior consists of
+   objects owned by t. Reason: before t ends, no object not owned by t points
+   at an object owned by t (Lemma V; containers are immutable, a cell is
+   written only by its own force, whose evaluation is closed over its creator's
+   data). After t ends, t's evaluation has no frame left, and objects owned by
+   t are found only through c(t): forcing a young thunk owned by t (found in
+   c(t), or through the environment of a lambda in c(t)) puts what it builds
+   into that thunk's own content, which is owned by t and stays reachable
+   from c(t) through the thunk's cell; another evaluation that reads c(t)
+   copies pointers that are reachable from c(t) already.
+
+   Candidates. Let X ∈ Evac(S) be owned by t ∉ S. If t was running when X was
+   allocated, then innermost(a(X)) is t's interval (Lemma V: no nested target
+   was running); otherwise t had ended, a(X) ≥ e. Either way a(X) ≥ s, and
+   by Lemma C every object on the path from c(t) satisfies the same, so
+   allowed(t, a) := a ≥ s ∧ (a ≥ e ∨ innermost(a) is t's interval) holds
+   along it. So t is a candidate producer iff a walk of R(c(t)) that never
+   enters an object with ¬allowed(t, a(x)) reaches a cell of Evac(S). For a
+   target with several intervals (forced again after an error) only a ≥ s
+   of the first interval is used. Objects without a time are never pruned:
+   that only adds candidates (with no times at all the walk is plain
+   reachability, option C's candidate set, which Lemma C also covers).
+
+   This is where the markers differ from allocation-interval attribution
+   (option E of notes/research/identity-reliance.md, rejected as unsound):
+   E names innermost(a(X)) as X's producer. That misses producers whose young
+   thunk is forced inside a later target's interval (the "precedes" and
+   "follows" demos in tests/functional/eval-unforce-identity/: the producer
+   ended before X was allocated). Here the interval only *rules out* targets
+   (those that started after X, or that were inside a nested target when X was
+   allocated), and reachability from the target's own content, which the
+   heap does preserve (Lemma C), supplies the producers that ended earlier.
+   Reachability alone (option C) over-promotes every consumer; the interval
+   test removes consumers that only read data allocated before they started.
+
+   Rule. Promote the candidates (NIX_UNFORCE_MARKERS=on): S is the least
+   superset of the count-nominated set S0 that satisfies OC under the
+   candidate test, computed by rounds until no reverted target is a
+   candidate; promoted candidates are copied with the same Evacuator, so the
+   shared objects keep one copy. The alternative, refusing every member of
+   S0 that reaches a candidate's cell (NIX_UNFORCE_MARKERS=refuse; the
+   greatest subset of S0 satisfying OC), retains less per job but can starve:
+   a consumer that forces a producer's young thunks in the job where the
+   producer is nominated is a candidate (the walk cannot tell whether that
+   young thunk was created before the consumer started), and in a Nixpkgs
+   traversal that recurs in every job, so the fixpoint would never be
+   promoted. The counts (K) stay a heuristic for which cells to consider;
+   correctness depends only on the closure.
+
+   Premises: A1–A4 of the review (every write to old memory is logged;
+   old memory allocated during a job, i.e. fileEvalCache cells and C-API
+   objects, is inert; no escapes; deterministic evaluation), and exceptions
+   carry no evaluator values. Derivation stubs (NIX_UNFORCE_STUB) change
+   identity by construction and are not covered. With the mimalloc backend
+   only the outermost scope promotes (nested scopes revert everything), so
+   the relogging of promoted cells into an enclosing scope cannot break OC.
+   --------------------------------------------------------------------------- */
+
+/* Times of young objects: the address in the bump region. The mimalloc
+   backend's objects have no time, so its walks are plain reachability. */
+struct CellClock
+{
+    bool bump = true;
+
+    std::optional<uint64_t> operator()(const void * p) const
+    {
+        if (bump)
+            return (uintptr_t) p;
+        return std::nullopt;
+    }
+};
+
+/* The force intervals of one job: log entries [mark, size). */
+struct ForceMarkers
+{
+    using Log = decltype(EvalState::undoLog);
+    const Log & log;
+    size_t mark;
+    /* A force still open at job end (none should be) ends with the job. */
+    uint64_t jobEnd;
+    std::unordered_map<const Value *, std::vector<size_t>> byTarget;
+
+    ForceMarkers(const Log & log, size_t mark, uint64_t jobEnd)
+        : log(log)
+        , mark(mark)
+        , jobEnd(jobEnd)
+    {
+        for (auto i = mark; i < log.size(); ++i)
+            byTarget[log[i].target].push_back(i);
+    }
+
+    uint64_t endOf(size_t i) const
+    {
+        auto e = log[i].end;
+        return e == EvalState::UndoEntry::openForce ? jobEnd : e;
+    }
+
+    /* The innermost interval containing time a. Log order is start order
+       and a preorder of the forest, so the last interval starting at or
+       before a is the innermost one or below it. */
+    std::optional<size_t> innermost(uint64_t a) const
+    {
+        size_t lo = mark, hi = log.size();
+        while (lo < hi) {
+            auto mid = lo + (hi - lo) / 2;
+            if (log[mid].start <= a)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        auto i = int64_t(lo) - 1;
+        while (i >= int64_t(mark) && !(a < endOf(i)))
+            i = log[i].parent;
+        if (i < int64_t(mark))
+            return std::nullopt;
+        return size_t(i);
+    }
+
+    /* Whether t can own an object allocated at time a. */
+    bool allowed(const Value * t, uint64_t a) const
+    {
+        auto & es = byTarget.at(t);
+        auto first = es.front();
+        if (a < log[first].start)
+            return false;
+        if (es.size() > 1 || a >= endOf(first))
+            return true;
+        auto in = innermost(a);
+        return in && log[*in].target == t;
+    }
+
+    /* Whether interval i lies inside an interval of a target in `promoted`. */
+    template<typename IsPromoted>
+    bool nestedInPromoted(size_t i, IsPromoted && isPromoted) const
+    {
+        for (auto p = log[i].parent; p >= int64_t(mark); p = log[p].parent)
+            if (isPromoted(log[p].target))
+                return true;
+        return false;
+    }
+};
+
+/* Walks young object graphs as the Evacuator copies them, without copying. */
+struct YoungWalker
+{
+    enum Kind : uint8_t { kValue, kEnv, kBindings };
+
+    Evacuator & evacuator;
+    const CellClock & clock;
+    /* The walk that last visited each object, so that walks need no
+       clearing. */
+    std::unordered_map<const void *, uint32_t> visited;
+    uint32_t walk = 0;
+    std::vector<std::pair<const void *, Kind>> stack;
+
+    void push(const void * p, Kind k)
+    {
+        if (!p || !evacuator.young(p))
+            return;
+        auto [i, fresh] = visited.try_emplace(p, walk);
+        if (!fresh) {
+            if (i->second == walk)
+                return;
+            i->second = walk;
+        }
+        stack.emplace_back(p, k);
+    }
+
+    void children(const Value & v)
+    {
+        switch (v.internalType()) {
+        case tAttrs:
+            push(v.attrs(), kBindings);
+            break;
+        case tListSmall: {
+            auto l = v.rawSmallList();
+            push(l[0], kValue);
+            push(l[1], kValue);
+            break;
+        }
+        case tListN: {
+            auto l = v.rawList();
+            if (evacuator.young(l.elems))
+                for (size_t i = 0; i < l.size; ++i)
+                    push(l.elems[i], kValue);
+            break;
+        }
+        case tThunk:
+            push(v.thunk().env, kEnv);
+            break;
+        case tApp:
+            push(v.app().left, kValue);
+            push(v.app().right, kValue);
+            break;
+        case tPrimOpApp:
+            push(v.primOpApp().left, kValue);
+            push(v.primOpApp().right, kValue);
+            break;
+        case tLambda:
+            push(v.lambda().env, kEnv);
+            break;
+        case tFailed:
+            push(v.failed().recoveryValue, kValue);
+            break;
+        case tUninitialized:
+        case tInt:
+        case tBool:
+        case tNull:
+        case tFloat:
+        case tString:
+        case tPath:
+        case tExternal:
+        case tPrimOp:
+        case tNumberOfInternalTypes:
+            break;
+        }
+    }
+
+    /* Walk from a target's content. `allowed(a)` prunes objects with a time;
+       `hit(v)` is asked for each reached cell that is not pruned, and stops
+       the walk when it returns true. Returns whether it did. */
+    template<typename Allowed, typename Hit>
+    bool run(const Value & content, Allowed && allowed, Hit && hit)
+    {
+        ++walk;
+        stack.clear();
+        children(content);
+        while (!stack.empty()) {
+            auto [p, kind] = stack.back();
+            stack.pop_back();
+            stats.markerSteps++;
+            auto a = clock(p);
+            if (a && !allowed(*a))
+                continue;
+            switch (kind) {
+            case kValue: {
+                auto & v = *(const Value *) p;
+                if (hit(&v))
+                    return true;
+                children(v);
+                break;
+            }
+            case kEnv: {
+                auto e = (const Env *) p;
+                auto size = *(const size_t *) ((const char *) e - 16);
+                push(e->up, kEnv);
+                for (size_t i = 0; i < size; ++i)
+                    push(e->values[i], kValue);
+                break;
+            }
+            case kBindings: {
+                auto b = (const Bindings *) p;
+                b->forEachLayerValue([&](const Value * v) { push(v, kValue); });
+                push(b->layerBase(), kBindings);
+                break;
+            }
+            }
+        }
+        return false;
+    }
+
+    size_t bookkeepingBytes() const
+    {
+        /* Hash nodes of a pointer and a counter, plus buckets; estimated. */
+        return visited.size() * 32 + visited.bucket_count() * sizeof(void *) + stack.capacity() * sizeof(stack[0]);
+    }
+};
+
+/* Decide which of a job's targets to promote, and copy those with
+   `evacuator`. `counts` holds the force counts that nominate promotions.
+   Returns a flag per target. */
+std::vector<bool> closeJob(
+    EvalState & state,
+    size_t mark,
+    const std::vector<Value *> & targets,
+    Evacuator & evacuator,
+    bool canCopy,
+    std::unordered_map<const Value *, uint32_t> & counts,
+    const CellClock & clock,
+    uint64_t jobEnd)
+{
+    auto & cfg = unforceSettings();
+    std::vector<bool> promote(targets.size());
+    bool counting = canCopy && cfg.promoteAfter;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        if (!counting)
+            continue;
+        auto before = counts[targets[i]]++;
+        if (before)
+            stats.reforced++;
+        promote[i] = before + 1 >= cfg.promoteAfter;
+    }
+
+    auto copy = [&](size_t i) {
+        *targets[i] = evacuator.copy(*targets[i]);
+        stats.promoted++;
+    };
+
+    auto & mode = cfg.markers;
+    bool any = std::find(promote.begin(), promote.end(), true) != promote.end();
+    if (!any || mode == "off" || !canCopy) {
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (promote[i])
+                copy(i);
+        return promote;
+    }
+
+    ForceMarkers markers(state.undoLog, mark, jobEnd);
+    YoungWalker walker{evacuator, clock};
+    size_t peak = 0;
+    auto notePeak = [&] {
+        peak = std::max(
+            peak,
+            walker.bookkeepingBytes() + markers.byTarget.size() * 64 + (state.undoLog.size() - mark) * sizeof(size_t));
+    };
+    auto changedBefore = stats.markerPromoted + stats.refused;
+
+    if (mode == "refuse") {
+        /* Mark Evac(S), find the candidates' cells in it, and refuse every
+           member of S that reaches one, until none is found. */
+        while (true) {
+            stats.markerRounds++;
+            std::unordered_set<const void *> evac;
+            for (size_t i = 0; i < targets.size(); ++i)
+                if (promote[i])
+                    walker.run(
+                        *targets[i],
+                        [](uint64_t) { return true; },
+                        [&](const Value * v) {
+                            evac.insert(v);
+                            return false;
+                        });
+            std::unordered_set<const void *> hits;
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (promote[i])
+                    continue;
+                auto t = targets[i];
+                walker.run(
+                    *t,
+                    [&](uint64_t a) { return markers.allowed(t, a); },
+                    [&](const Value * v) {
+                        if (!evac.count(v))
+                            return false;
+                        hits.insert(v);
+                        return true;
+                    });
+            }
+            notePeak();
+            if (hits.empty())
+                break;
+            for (size_t i = 0; i < targets.size(); ++i)
+                if (promote[i]
+                    && walker.run(
+                        *targets[i],
+                        [](uint64_t) { return true; },
+                        [&](const Value * v) { return hits.count(v) != 0; })) {
+                    promote[i] = false;
+                    stats.refused++;
+                }
+        }
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (promote[i])
+                copy(i);
+    } else {
+        std::unordered_map<const Value *, size_t> index;
+        for (size_t i = 0; i < targets.size(); ++i)
+            index.emplace(targets[i], i);
+        std::vector<const Value *> copiedCells;
+        if (mode == "nested")
+            evacuator.copiedCells = &copiedCells;
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (promote[i])
+                copy(i);
+        for (bool changed = true; changed;) {
+            changed = false;
+            stats.markerRounds++;
+            std::vector<uint64_t> copiedTimes;
+            if (mode == "nested") {
+                for (auto v : copiedCells)
+                    if (auto a = clock(v))
+                        copiedTimes.push_back(*a);
+                std::sort(copiedTimes.begin(), copiedTimes.end());
+            }
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (promote[i])
+                    continue;
+                auto t = targets[i];
+                bool candidate;
+                if (mode == "nested") {
+                    /* The naive rule: t is a producer of a promoted r iff t's
+                       force is nested in r's and Evac(S) has a cell allocated
+                       during t's force. Unsound: see `precedes.nix`. */
+                    candidate = false;
+                    for (auto e : markers.byTarget.at(t)) {
+                        if (!markers.nestedInPromoted(e, [&](const Value * r) { return promote[index.at(r)]; }))
+                            continue;
+                        auto lo = std::lower_bound(copiedTimes.begin(), copiedTimes.end(), state.undoLog[e].start);
+                        if (lo != copiedTimes.end() && *lo < markers.endOf(e))
+                            candidate = true;
+                    }
+                } else
+                    candidate = walker.run(
+                        *t,
+                        [&](uint64_t a) { return markers.allowed(t, a); },
+                        [&](const Value * v) { return evacuator.forward.count(v) != 0; });
+                if (candidate) {
+                    promote[i] = true;
+                    copy(i);
+                    stats.markerPromoted++;
+                    changed = true;
+                }
+            }
+            notePeak();
+        }
+        evacuator.copiedCells = nullptr;
+    }
+
+    if (stats.markerPromoted + stats.refused != changedBefore)
+        stats.markerJobs++;
+    stats.markerPeakBytes = std::max(stats.markerPeakBytes, peak);
+    return promote;
+}
+
 } // namespace
 
 void unforceDebugChain(EvalState & state, const Value * v)
@@ -732,7 +1267,9 @@ std::string unforceStatsJSON()
     if (!stats.jobs)
         return "";
     return fmt(
-        R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d})",
+        R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
+        R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,"refused":%d,)"
+        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -740,7 +1277,18 @@ std::string unforceStatsJSON()
         stats.promoted,
         stats.relogged,
         stats.copiedBytes,
-        stats.regionPeak);
+        stats.regionPeak,
+        stats.reforced,
+        stats.copiedBytes,
+        stats.freedBytes,
+        unforceSettings().markers,
+        stats.markerPromoted,
+        stats.refused,
+        stats.markerRounds,
+        stats.markerSteps,
+        stats.markerJobs,
+        stats.markerLogBytes,
+        stats.markerPeakBytes);
 }
 
 static size_t allocatorErrors = 0;
@@ -930,20 +1478,21 @@ static void beginHeapScope(size_t logMark)
 }
 
 /* Close the innermost heap scope: every cell older than it that it forced
-   is reverted, or promoted, i.e. copied into the enclosing scope's heap (or,
-   for the outermost scope, out of all scopes). A promoted cell older than
-   the enclosing scope too now points into that scope, so it is logged there
-   again. Then the scope's heap is destroyed wholesale. */
+   is reverted, or, for the outermost scope, possibly promoted (copied out of
+   all scopes; see `closeJob`). Then the scope's heap is destroyed
+   wholesale. */
 static void endHeapScope(EvalState & state, size_t mark)
 {
     auto & cfg = unforceSettings();
     auto & log = state.undoLog;
+    auto jobEnd = unforceClock();
     Frame f = std::move(frames.back());
     frames.pop_back();
     Frame * parent = frames.empty() ? nullptr : &frames.back();
     stats.jobs++;
     generation++;
     stats.logged += log.size() - mark;
+    dropActiveForces(mark);
 
     std::unordered_map<Value *, Value> preImages;
     std::vector<Value *> targets;
@@ -952,36 +1501,33 @@ static void endHeapScope(EvalState & state, size_t mark)
             targets.push_back(log[i].target);
 
     setCurrentHeap(parent ? parent->heap : nullptr);
-    std::vector<EvalState::UndoEntry> relog;
-    {
-        std::optional<PauseRegion> pause;
-        if (!parent)
-            pause.emplace();
-        Evacuator evacuator{state};
-        evacuator.youngHeap = f.heap;
-        auto & counts = parent ? parent->counts : state.forceCounts;
+    if (parent) {
+        /* Only the outermost scope promotes, as with the bump backend: a
+           nested scope reverts everything it forced, which keeps identity
+           (pure revert), whereas a cell promoted into the enclosing scope
+           would be relogged there and could be reverted after a cell holding
+           a copy of its data was promoted. */
         for (auto target : targets) {
-            auto & pre = preImages.at(target);
-            if (cfg.promoteAfter && ++counts[target] >= cfg.promoteAfter) {
-                *target = evacuator.copy(*target);
-                stats.promoted++;
-                /* The parent restores it, unless it is a slot of a frame
-                   that will have returned by then. */
-                if (parent && !inHeap(parent->heap, target) && !unforceIsScopeStackSlot(target))
-                    relog.push_back({target, pre});
-                continue;
-            }
-            *target = pre;
+            *target = preImages.at(target);
             stats.reverted++;
         }
+    } else {
+        PauseRegion pause;
+        Evacuator evacuator{state};
+        evacuator.youngHeap = f.heap;
+        CellClock clock{.bump = false};
+        auto promoted = closeJob(state, mark, targets, evacuator, true, state.forceCounts, clock, jobEnd);
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (!promoted[i]) {
+                *targets[i] = preImages.at(targets[i]);
+                stats.reverted++;
+            }
     }
 
     log.resize(mark);
-    for (auto & e : relog)
-        log.push_back(e);
-    stats.relogged += relog.size();
     if (!parent)
         log.shrink_to_fit();
+    stats.freedBytes += f.bytes;
     stats.regionPeak = std::max(stats.regionPeak, f.bytes);
     if (getenv("NIX_UNFORCE_VERIFY"))
         verifyHeapScope(f.heap);
@@ -1014,6 +1560,31 @@ bool unforceIsScopeStackSlot(const void * p)
        backend, only the job (the outermost scope) with the bump one. */
     auto mark = nested() ? scopeStackMarks.back() : scopeStackMarks.front();
     return (const char *) p >= stackLow && (const char *) p < mark;
+}
+
+size_t EvalState::logForce(Value & v)
+{
+    UndoEntry e{&v, v};
+    e.start = unforceClock();
+    e.parent = activeForces.empty() ? -1 : int64_t(activeForces.back());
+    undoLog.push_back(e);
+    stats.markerLogBytes += sizeof(UndoEntry) - offsetof(UndoEntry, start);
+    activeForces.push_back(undoLog.size() - 1);
+    return undoLog.size();
+}
+
+void EvalState::endLoggedForce(size_t marker)
+{
+    auto i = marker - 1;
+    /* Every logged force ends here, innermost first; anything above `i`
+       would belong to a scope that closed while this force ran. */
+    while (!activeForces.empty() && activeForces.back() > i)
+        activeForces.pop_back();
+    if (!activeForces.empty() && activeForces.back() == i) {
+        activeForces.pop_back();
+        if (i < undoLog.size())
+            undoLog[i].end = unforceClock();
+    }
 }
 
 size_t EvalState::beginUnforceScope(const void * stackMark)
@@ -1052,6 +1623,8 @@ void EvalState::endUnforceScope(size_t mark)
     stats.jobs++;
     generation++;
     stats.logged += undoLog.size() - mark;
+    auto jobEnd = unforceClock();
+    dropActiveForces(mark);
 
     /* A cell may have been forced more than once (after a recoverable
        error); its oldest pre-image is the one from before the job. */
@@ -1066,14 +1639,14 @@ void EvalState::endUnforceScope(size_t mark)
         Evacuator evacuator{*this};
         Stubber stubber{*this, evacuator};
         bool canCopy = evalRegion.allTypes;
+        CellClock clock;
+        auto promoted = closeJob(*this, mark, targets, evacuator, canCopy, forceCounts, clock, jobEnd);
 
-        for (auto target : targets) {
-            auto & pre = preImages.at(target);
-            if (canCopy && cfg.promoteAfter && ++forceCounts[target] >= cfg.promoteAfter) {
-                *target = evacuator.copy(*target);
-                stats.promoted++;
+        for (size_t i = 0; i < targets.size(); ++i) {
+            auto target = targets[i];
+            if (promoted[i])
                 continue;
-            }
+            auto & pre = preImages.at(target);
             if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
                 auto source = allocValue();
                 *source = pre;
@@ -1103,6 +1676,8 @@ void EvalState::endUnforceScope(size_t mark)
         }
     }
 
+    if (evalRegion.base)
+        stats.freedBytes += evalRegion.cur - evalRegion.base;
     undoLog.resize(mark);
     undoLog.shrink_to_fit();
     if (evalRegion.base)
