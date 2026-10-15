@@ -3918,4 +3918,65 @@ TEST_F(GitUtilsTest, acquiredCommitProducerReleasesItsCaches)
     EXPECT_EQ(invalidated->lstat(CanonPath("/d/e/f")).type, SourceAccessor::tRegular);
 }
 
+/* Acquisition releases the private attribute handle of a commit's
+   export-ignore filter, and the next decision reopens it from the
+   repository's path. So once that path no longer opens, every explained
+   miss reports the Git error, an export-ignored path and an absent one
+   alike. After the first explained miss the reopened handle is kept
+   again. */
+TEST_F(GitUtilsTest, acquiredCommitProducerReopensItsAttributeHandle)
+{
+    git_repository * rawRepo = nullptr;
+    ASSERT_EQ(git_repository_open(&rawRepo, tmpDir.string().c_str()), 0);
+    Finally closeRepo = [&]() { git_repository_free(rawRepo); };
+    write(".gitattributes", "ignored export-ignore\n");
+    write("ignored", "i");
+    write("a", "a");
+    auto rev = commitPaths(rawRepo, {".gitattributes", "ignored", "a"}, "one");
+
+    auto producer = openRepo()->getAccessor(rev, {.exportIgnore = true}, "");
+    ASSERT_FALSE(producer->isFixed());
+    auto acquired = GitRepo::acquire(SourcePath{producer}, true);
+    EXPECT_EQ(acquired->readFile(CanonPath("/a")), "a");
+
+    auto gitDir = tmpDir / ".git";
+    auto moved = tmpDir / ".git.moved";
+    auto move = [&] { std::filesystem::rename(gitDir, moved); };
+    auto unmove = [&] { std::filesystem::rename(moved, gitDir); };
+
+    /* The handle the traversal used is gone, so the decision needs the
+       repository's path. */
+    move();
+    {
+        Finally restore = unmove;
+        for (auto path : {CanonPath("/ignored"), CanonPath("/missing")}) {
+            SCOPED_TRACE(path.abs());
+            EXPECT_THAT(
+                [&] { acquired->lstat(path); },
+                ::testing::ThrowsMessage<Error>(::testing::AllOf(
+                    testing::HasSubstrIgnoreANSIMatcher("opening Git repository"),
+                    testing::HasSubstrIgnoreANSIMatcher("to read its attributes"))));
+            /* Only the explanation fails; the acquired value still answers. */
+            EXPECT_FALSE(acquired->pathExists(path));
+        }
+        EXPECT_EQ(acquired->readFile(CanonPath("/a")), "a");
+    }
+
+    /* Once the path opens again, the explanation reopens the handle... */
+    EXPECT_THAT(
+        [&] { acquired->lstat(CanonPath("/ignored")); },
+        ::testing::ThrowsMessage<RestrictedPathError>(
+            testing::HasSubstrIgnoreANSIMatcher("fetched with exportIgnore enabled")));
+
+    /* ...and keeps it, so a later move no longer affects it. /missing has no
+       decision yet, so this one needs the handle. */
+    move();
+    {
+        Finally restore = unmove;
+        EXPECT_THAT(
+            [&] { acquired->lstat(CanonPath("/missing")); },
+            ::testing::ThrowsMessage<FileNotFound>(testing::HasSubstrIgnoreANSIMatcher("does not exist")));
+    }
+}
+
 } // namespace nix::fetchers
