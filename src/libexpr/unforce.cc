@@ -1464,6 +1464,12 @@ struct Closure
     const CellClock & clock;
     Marks marks;
     std::vector<std::pair<const void *, Kind>> stack;
+    /* `mark`'s element arrays whose elements are still to be added, and
+       how many: taken one element at a time once `stack` is empty, so that
+       marking a list of n young elements does not push n entries at once
+       (review of markers v4, B1-mem: a 4 M-element list took 64 MiB of
+       stack). */
+    std::vector<std::pair<Value * const *, size_t>> arrays;
     /* Objects visited by the current walk. */
     std::vector<const void *> touched;
     /* Memos waiting for a walk that starts at or after their θ (a heap,
@@ -1605,16 +1611,26 @@ struct Closure
             auto old = marks.add(elems, inEvac);
             if (!(old & inEvac)) {
                 reachedNew |= old & reached;
-                for (size_t i = 0; i < size; ++i)
-                    add(elems[i], kValue);
+                if (size)
+                    arrays.emplace_back(elems, size);
             }
         };
+        arrays.clear();
         children(content, add, array);
-        while (!stack.empty()) {
-            auto [p, kind] = stack.back();
-            stack.pop_back();
-            charge(1 + width(p, kind) / 16);
-            children(p, kind, add, array);
+        for (;;) {
+            if (!stack.empty()) {
+                auto [p, kind] = stack.back();
+                stack.pop_back();
+                charge(1 + width(p, kind) / 16);
+                children(p, kind, add, array);
+            } else if (!arrays.empty()) {
+                auto & [elems, left] = arrays.back();
+                auto e = *elems++;
+                if (!--left)
+                    arrays.pop_back();
+                add(e, kValue);
+            } else
+                break;
         }
     }
 
@@ -1717,8 +1733,9 @@ struct Closure
 
     void notePeak()
     {
-        auto bytes = marks.bytes() + stack.capacity() * sizeof(stack[0]) + touched.capacity() * sizeof(void *)
-                     + pendingSize * sizeof(void *) + pending.capacity() * sizeof(pending[0]);
+        auto bytes = marks.bytes() + stack.capacity() * sizeof(stack[0]) + arrays.capacity() * sizeof(arrays[0])
+                     + touched.capacity() * sizeof(void *) + pendingSize * sizeof(void *)
+                     + pending.capacity() * sizeof(pending[0]);
         peak = std::max(peak, bytes);
     }
 };
