@@ -2243,6 +2243,10 @@ std::vector<bool> decideJob(
         auto closed = promote;
         /* Consumers of promoted targets (a heuristic, see the setting):
            nominate them and close again, until nothing changes. */
+        if (ownerConsumersOn) {
+            std::sort(ownerConsumers.begin(), ownerConsumers.end());
+            ownerConsumers.erase(std::unique(ownerConsumers.begin(), ownerConsumers.end()), ownerConsumers.end());
+        }
         for (bool more = ownerConsumersOn && !ownerConsumers.empty(); more;) {
             more = false;
             for (auto [c, p] : ownerConsumers) {
@@ -3039,7 +3043,10 @@ static void youngForce(const Value & v)
     if (o == curOwner)
         return;
     stats.ownerChanges++;
-    if (curOwner && o && ownerConsumersOn)
+    /* A consumer forcing many cells of one producer records the pair once
+       per run of them (pwith-100-200000: 20 M forces, 100 producers). */
+    if (curOwner && o && ownerConsumersOn
+        && (ownerConsumers.empty() || ownerConsumers.back() != std::pair{curOwner, o}))
         ownerConsumers.emplace_back(curOwner, o);
     pushOpen(&v, false, true, o);
 }
