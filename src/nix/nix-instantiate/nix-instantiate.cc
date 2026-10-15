@@ -47,11 +47,24 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
         return;
     }
 
+    /* As `printAmbiguous` on the whole value, which marks the top level as
+       seen before printing its elements, so that an element referring back
+       to it prints as «repeated». The top level was forced before any batch
+       opened, so no batch frees it: it stays seen. */
+    const void * top = v.type() == nAttrs ? (v.attrs()->empty() ? nullptr : (const void *) v.attrs())
+                                          : (v.listSize() ? (const void *) &v : nullptr);
     std::set<const void *> seen;
+    auto seedSeen = [&]() {
+        if (top)
+            seen.insert(top);
+    };
+    seedSeen();
     UnforceBatch batch(state);
     batch.onEnd = [&](bool freed) {
-        if (freed)
+        if (freed) {
             seen.clear();
+            seedSeen();
+        }
     };
 
     if (v.type() == nAttrs) {
