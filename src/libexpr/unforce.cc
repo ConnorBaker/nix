@@ -2262,7 +2262,17 @@ void UnforceBatch::open()
 
 bool UnforceBatch::full() const
 {
-    return mark && unforceCurrentScopeBytes() >= state->settings.unforceBatchSize;
+    if (!mark)
+        return false;
+    /* Besides what the job allocated, its end holds its log (at the
+       capacity it has grown to) and its targets (`JobTargets`, two words
+       per entry). The batch bounds those too, so that a job that forces
+       many cells while allocating little stays within about one batch of
+       memory beyond what it keeps (review of markers v4, B1-mem). */
+    auto & log = state->undoLog;
+    auto bookkeeping =
+        (log.capacity() - *mark) * sizeof(EvalState::UndoEntry) + (log.size() - *mark) * 2 * sizeof(void *);
+    return unforceCurrentScopeBytes() + bookkeeping >= state->settings.unforceBatchSize;
 }
 
 UnforceBatch::Element::Element(UnforceBatch & batch)
