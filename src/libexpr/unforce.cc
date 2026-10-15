@@ -136,8 +136,12 @@ struct Stats
        largest transient bookkeeping of one job close (estimated). */
     size_t markerPromoted = 0, refused = 0, markerRounds = 0, markerSteps = 0, markerJobs = 0;
     size_t markerLogBytes = 0, markerPeakBytes = 0;
-    /* Jobs that promoted nothing because client code ran in them. */
-    size_t clientJobs = 0;
+    /* Jobs that promoted nothing because client code ran in them, and the
+       cells reverted at their ends. */
+    size_t clientJobs = 0, revertedInClientJobs = 0;
+    /* Cells reverted by nested scopes of the mimalloc backend, which never
+       promote (so these are reverted whatever the promotion threshold). */
+    size_t innerScopeReverts = 0;
 } stats;
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). */
@@ -157,7 +161,8 @@ static void printStatsAtExit()
              std::cerr << fmt(
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, refused %d, "
-                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB; client-code jobs %d\n",
+                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB; client-code jobs %d, reverted in client-code jobs %d, "
+                 "inner-scope reverts %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -177,7 +182,9 @@ static void printStatsAtExit()
                  stats.markerJobs,
                  stats.markerLogBytes >> 10,
                  stats.markerPeakBytes >> 10,
-                 stats.clientJobs);
+                 stats.clientJobs,
+                 stats.revertedInClientJobs,
+                 stats.innerScopeReverts);
          }),
          true);
 }
@@ -1283,7 +1290,8 @@ std::string unforceStatsJSON()
     return fmt(
         R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,"refused":%d,)"
-        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,"clientJobs":%d})",
+        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,"clientJobs":%d,)"
+        R"("revertedInClientJobs":%d,"innerScopeReverts":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -1303,7 +1311,9 @@ std::string unforceStatsJSON()
         stats.markerJobs,
         stats.markerLogBytes,
         stats.markerPeakBytes,
-        stats.clientJobs);
+        stats.clientJobs,
+        stats.revertedInClientJobs,
+        stats.innerScopeReverts);
 }
 
 static size_t allocatorErrors = 0;
@@ -1525,6 +1535,7 @@ static void endHeapScope(EvalState & state, size_t mark)
         for (auto target : targets) {
             *target = preImages.at(target);
             stats.reverted++;
+            stats.innerScopeReverts++;
         }
     } else {
         PauseRegion pause;
@@ -1536,6 +1547,8 @@ static void endHeapScope(EvalState & state, size_t mark)
             if (!promoted[i]) {
                 *targets[i] = preImages.at(targets[i]);
                 stats.reverted++;
+                if (clientCodeInJob)
+                    stats.revertedInClientJobs++;
             }
     }
 
@@ -1696,6 +1709,8 @@ void EvalState::endUnforceScope(size_t mark)
             }
             *target = pre;
             stats.reverted++;
+            if (clientCodeInJob)
+                stats.revertedInClientJobs++;
         }
     }
 
