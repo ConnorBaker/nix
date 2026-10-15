@@ -199,3 +199,19 @@ expr='let
 in [ c ]'
 pairs=$(ownerStat ownerConsumerPairsPeak "$expr")
 [[ -n $pairs ]] && (( pairs <= 4 )) || fail "an alternating consumer recorded ${pairs:-no} consumer pairs"
+
+# The copy limit (print-meta-200: one job copied 1 101 MiB while its 1 679 MiB
+# region was still mapped). A job whose Evac(S) exceeds the limit is kept
+# whole, with base's output.
+expr='let
+  xs = builtins.genList (i: { v = [ i ]; }) 20000;
+  s = { inherit xs; n = builtins.length xs; };
+in [ s.n s.n (builtins.length s.xs) s.xs ]'
+limitStats=$(NIX_UNFORCE_COPY_LIMIT=4096 NIX_UNFORCE_PROMOTE=1 NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout \
+    nix-instantiate --option eval-unforce true --eval --strict --json -E "$expr" 2> /dev/null | tr -d ' \n')
+[[ $limitStats =~ \"ownerCopyLimitJobs\":([0-9]+) ]] && (( BASH_REMATCH[1] >= 1 )) \
+    || fail "a 4 KiB copy limit kept no job whole"
+NIX_UNFORCE_COPY_LIMIT=4096 NIX_UNFORCE_PROMOTE=1 nix-instantiate --option eval-unforce true --eval --strict --json \
+    -E "$expr" > "$TEST_ROOT/copylimit-on.json"
+nix-instantiate --option eval-unforce false --eval --strict --json -E "$expr" > "$TEST_ROOT/copylimit-off.json"
+cmp -s "$TEST_ROOT/copylimit-on.json" "$TEST_ROOT/copylimit-off.json" || fail "a job kept whole by the copy limit differs from base"

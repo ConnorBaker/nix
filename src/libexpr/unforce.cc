@@ -144,6 +144,11 @@ struct Settings
        batch size, and at least 4 MiB. A job that needs more is kept whole.
        Small values are for tests. */
     size_t ownerBudget = string2Int<size_t>(getEnv("NIX_UNFORCE_OWNER_BUDGET").value_or("0")).value_or(0);
+    /* With "owners": the most of the young memory one job's decision may
+       copy (Evac(S), in bytes); 0 (the default) means a quarter of the
+       batch size, and at least 4 MiB. A job whose Evac(S) is larger is kept
+       whole instead. */
+    size_t copyLimit = string2Int<size_t>(getEnv("NIX_UNFORCE_COPY_LIMIT").value_or("0")).value_or(0);
 };
 
 const Settings & unforceSettings()
@@ -207,7 +212,7 @@ struct Stats
        false positives). */
     size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
            ownerConsumerNominated = 0, ownerCheckExtra = 0, ownerCheckFewer = 0, ownerOverflowJobs = 0,
-           ownerConsumerPairsPeak = 0;
+           ownerConsumerPairsPeak = 0, ownerCopyLimitJobs = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -1975,7 +1980,19 @@ struct Closure
     /* What `mark` added to Evac(S), in bytes (string data, which it does
        not walk, excluded). */
     size_t markedBytes = 0;
+    /* `mark` throws `OverBudget` once what it marked, with the marks
+       themselves, exceeds this (the owner closure's copy limit). */
+    size_t markedLimit = SIZE_MAX;
     size_t peak = 0;
+
+    void checkMarked()
+    {
+        size_t marksBytes = 0;
+        if constexpr (requires { marks.allocated; })
+            marksBytes = marks.allocated * sizeof(typename Marks::Piece);
+        if (markedBytes + marksBytes > markedLimit) [[unlikely]]
+            throw OverBudget{};
+    }
 
     void step()
     {
@@ -2097,6 +2114,7 @@ struct Closure
                 markedBytes += k == kValue ? sizeof(Value)
                                : k == kEnv ? sizeof(Env) + width(p, k) * sizeof(Value *)
                                            : sizeof(Bindings) + width(p, k) * sizeof(Attr);
+                checkMarked();
                 if (onMark && k != kEnv)
                     onMark(onMarkCtx, p);
                 stack.emplace_back(p, k);
@@ -2107,6 +2125,7 @@ struct Closure
             if (!(old & inEvac)) {
                 reachedNew |= old & reached;
                 markedBytes += size * sizeof(Value *);
+                checkMarked();
                 if (onMark)
                     onMark(onMarkCtx, elems);
                 if (size)
@@ -2532,13 +2551,25 @@ std::vector<bool> decideJob(
         auto nominated = promote;
         OwnerClosure oc(targets, promote);
         /* As below: a printing job that may be kept whole marks Evac(S)
-           first, and copies only if it keeps less than half its memory. */
-        bool markFirst = keepWhole && printed;
+           first, and copies only if it keeps less than half its memory.
+
+           So does a job larger than the copy limit (a quarter of the
+           batch, at least 4 MiB): it marks Evac(S) first, and if Evac(S)
+           exceeds the limit, the job is kept whole instead (exact: nothing
+           is reverted), because the copies and the Evacuator's table would
+           exceed the batch while the region is still mapped. A job no
+           larger than the limit cannot copy more, so it copies at once
+           (review identity-owners-v1 follow-up: print-meta-200 copied
+           1 101 MiB in one job). */
+        auto copyLimit =
+            cfg.copyLimit ? cfg.copyLimit : std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
+        bool markFirst = keepWhole && (printed || youngBytes > copyLimit);
         std::optional<Closure<RegionMarks>> marker;
         if (markFirst) {
             marker.emplace(young, clock, RegionMarks(evalRegion.base, evalRegion.cur));
             marker->onMark = &OwnerClosure::note;
             marker->onMarkCtx = &oc;
+            marker->markedLimit = copyLimit;
         } else {
             evacuator.onIdentity = &OwnerClosure::note;
             evacuator.onIdentityCtx = &oc;
@@ -2549,8 +2580,10 @@ std::vector<bool> decideJob(
             else
                 copy(i);
         };
+        std::vector<bool> closed;
+        try {
         oc.run(join);
-        auto closed = promote;
+        closed = promote;
         /* Consumers of promoted targets (a heuristic, see the setting):
            nominate them and close again, until nothing changes. */
         std::vector<std::pair<uint32_t, uint32_t>> pairs;
@@ -2575,6 +2608,13 @@ std::vector<bool> decideJob(
             if (more)
                 oc.run(join);
         }
+        } catch (OverBudget &) {
+            /* Evac(S) is larger than the copy limit. */
+            evacuator.onIdentity = nullptr;
+            stats.ownerCopyLimitJobs++;
+            *keepWhole = true;
+            return promote;
+        }
         evacuator.onIdentity = nullptr;
         stats.markerPromoted += oc.added;
         if (oc.added)
@@ -2598,7 +2638,10 @@ std::vector<bool> decideJob(
                     stats.ownerCheckFewer++;
             }
         }
-        if (markFirst && 2 * marker->markedBytes >= youngBytes)
+        /* Markers' rule for printing jobs (it keeps the printer's «repeated»
+           cheaply); a job that marked first only for the copy limit
+           copies. */
+        if (markFirst && printed && 2 * marker->markedBytes >= youngBytes)
             *keepWhole = true;
         if (!keepWhole || !*keepWhole)
             copyPromoted();
@@ -2850,7 +2893,7 @@ std::string unforceStatsJSON()
         R"("revertedInClientJobs":%d,"innerScopeReverts":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
         R"("keptJobBytes":%d,"identity":"%s","ownerLookups":%d,"ownerChanges":%d,"ownerSegsPeak":%d,)"
         R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,"ownerCheckExtra":%d,"ownerCheckFewer":%d,)"
-        R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d})",
+        R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -2893,7 +2936,8 @@ std::string unforceStatsJSON()
         stats.ownerCheckExtra,
         stats.ownerCheckFewer,
         stats.ownerOverflowJobs,
-        stats.ownerConsumerPairsPeak);
+        stats.ownerConsumerPairsPeak,
+        stats.ownerCopyLimitJobs);
 }
 
 static size_t allocatorErrors = 0;
