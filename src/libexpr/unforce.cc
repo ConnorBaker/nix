@@ -172,12 +172,12 @@ struct Stats
        promote (so these are reverted whatever the promotion threshold). */
     size_t innerScopeReverts = 0;
     /* `UnforceSeen`: targets nominated because a printer printed the
-       container they hold, printers' `seen` entries rewritten to a copy's
-       address at job ends, and entries dropped (none since a job that would
-       drop one keeps all its memory instead: those jobs, and their bytes,
-       are `keptJobs` and `keptJobBytes`, reported in NIX_SHOW_STATS only, so
-       that the stats line keeps the form the identity harness parses). */
-    size_t seenNominated = 0, seenKept = 0, seenDropped = 0, keptJobs = 0, keptJobBytes = 0;
+       container they hold, and printers' `seen` entries rewritten to a
+       copy's address at job ends. No entry is ever dropped: a job that
+       would drop one keeps all its memory instead (`keptJobs`, and the
+       bytes those jobs used, `keptJobBytes`, which is what they retain:
+       kept jobs share one mapping). */
+    size_t seenNominated = 0, seenKept = 0, keptJobs = 0, keptJobBytes = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -219,7 +219,7 @@ static void printStatsAtExit()
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
                  "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
-                 "inner-scope reverts %d; seen nominated %d, kept %d, dropped %d\n",
+                 "inner-scope reverts %d; seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -250,7 +250,8 @@ static void printStatsAtExit()
                  stats.innerScopeReverts,
                  stats.seenNominated,
                  stats.seenKept,
-                 stats.seenDropped);
+                 stats.keptJobs,
+                 stats.keptJobBytes >> 10);
          }),
          true);
 }

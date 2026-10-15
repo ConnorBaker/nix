@@ -84,5 +84,6 @@ out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_SEEN=0 run instantiate rep.nix "${on[
 
 # What was kept is counted.
 stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
-[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+),\ dropped\ ([0-9]+) ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] >= 1 && BASH_REMATCH[3] == 0 )) || fail "rep.nix: $stats"
+[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+)\ \(([0-9]+)\ KiB\)$ ]] \
+    || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] >= 1 )) || fail "rep.nix: nothing nominated: $stats"
