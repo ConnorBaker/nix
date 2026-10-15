@@ -911,10 +911,13 @@ struct Stubber
    Rule. Promote the candidates (NIX_UNFORCE_MARKERS=on): S is the least
    superset of the count-nominated set S0 that satisfies OC under the
    candidate test, computed by rounds until no reverted target is a
-   candidate; the promoted set is then copied with one Evacuator, so the
-   shared objects keep one copy. The decision copies nothing: Evac(S) is
-   marked by walking, so it runs before the job's memory is released, and
-   only the copies themselves allocate during the release. The alternative,
+   candidate; the promoted set is copied with one Evacuator, so the shared
+   objects keep one copy. The decision, copies included, runs before the
+   job's memory is released and writes no target (`decideJob`): with the
+   default budget fallback every target is copied as it joins S and the
+   copies mark Evac(S); with the "revert" fallback Evac(S) is marked by
+   walking and the copies follow the decision. The release then only
+   assigns, reverts and frees. The alternative,
    refusing every member of S0 that reaches a candidate's cell (the
    greatest subset of S0 satisfying OC), retains less per job but can starve:
    a consumer that forces a producer's young thunks in the job where the
