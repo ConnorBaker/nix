@@ -72,9 +72,9 @@ for f in rep.nix attr-desc.nix e-X01-00000.nix; do
         [[ $out == "$expected" ]] || fail "$f (revert fallback, promotion after $k forces): got '$out', expected '$expected'"
     done
 done
-stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
-    NIX_UNFORCE_WALK_FALLBACK=revert nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
-[[ $stats =~ jobs\ kept\ whole\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+stats=$(NIX_UNFORCE_BACKEND=bump NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout NIX_UNFORCE_WALK_BUDGET_BASE=0 \
+    NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert nix-instantiate "${on[@]}" --eval --strict rep.nix 2>/dev/null)
+[[ $stats =~ \"keptJobs\":\ *([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "rep.nix (revert fallback): no job was kept whole: $stats"
 
 # Negative control: forgetting what a job printed (NIX_UNFORCE_SEEN=0, as
@@ -84,5 +84,5 @@ out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_SEEN=0 run instantiate rep.nix "${on[
 
 # What was kept is counted.
 stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
-[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+),\ dropped\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 && BASH_REMATCH[2] >= 1 && BASH_REMATCH[3] == 0 )) || fail "rep.nix: $stats"
