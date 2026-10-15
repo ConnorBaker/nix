@@ -24,6 +24,21 @@ dot = find_program('dot', native : true, required : false)
 
 nix_bin_dir = fs.parent(nix.full_path())
 
+# PROTOTYPE (unforce): the build configuration, for tests whose expectations
+# hold for one configuration only (eval-stack-parity.sh pins stack depths).
+build_config = 'unknown'
+if add_languages('cpp', native : false, required : false)
+  cxx_for_config = meson.get_compiler('cpp')
+  build_config = '@0@-@1@ @2@ lto=@3@ unity=@4@ sanitize=@5@'.format(
+    cxx_for_config.get_id(),
+    cxx_for_config.version(),
+    get_option('buildtype'),
+    get_option('b_lto'),
+    get_option('unity'),
+    get_option('b_sanitize'),
+  )
+endif
+
 subdir('nix-meson-build-support/default-system-cpu')
 
 test_confdata = {
@@ -266,6 +281,7 @@ foreach suite : suites
         'ASAN_OPTIONS' : asan_options,
         '_NIX_TEST_SOURCE_DIR' : meson.current_source_dir(),
         '_NIX_TEST_BUILD_DIR' : meson.current_build_dir(),
+        '_NIX_TEST_BUILD_CONFIG' : build_config,
         'TEST_SUITE_NAME' : suite_name,
         'TEST_NAME' : name,
         'NIX_REMOTE' : '',

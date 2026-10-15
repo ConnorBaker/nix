@@ -1,0 +1,7 @@
+Stack size hard limit is 16777216, which is less than the desired 62914560. If possible, increase the hard limit, e.g. with 'ulimit -Hs 61440'.
+error:
+       … while evaluating list element at index 0
+
+       (19765 duplicate frames omitted)
+
+       error: stack overflow; max-call-depth exceeded

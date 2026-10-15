@@ -1,0 +1,40 @@
+# Programs of eval-stack-parity.sh (and notes/ci/stack-parity.nix). Tab-separated:
+# name, tool, max-call-depth, class, class arguments, expression (@N@ stands for N). Classes:
+#   int E: prints the number E;  nat: prints a number;  fmt F E: prints F with %d replaced by E;
+#   has F E: some output line contains F with %d replaced by E;  count P E: E output lines contain P;
+#   rep A M B: prints A N times, then M, then B N times;  catch: the catchable max-call-depth error.
+# E is an arithmetic expression in n (the N of the run).
+chain	strict	10000	int	n - 1	let chain = n: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then 0 else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; in chain @N@
+cedge	strict	2500	catch	let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain @N@ (wrap 2501 0)
+tojson	strict	1000000	int	2 * n + 2	builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)))
+regex	strict	10000	int	1	builtins.length (builtins.match "(a|b)*" (builtins.concatStringsSep "" (builtins.genList (_: "ab") @N@)))
+recur	strict	1000000	int	n	let f = n: if n == 0 then 0 else 1 + f (n - 1); in f @N@
+foldl	strict	1000000	int	n	builtins.foldl' (f: x: y: f (y + x)) (y: y) (builtins.genList (x: 1) @N@) 0
+deepseq	strict	1000000	int	1	builtins.deepSeq (builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)) 1
+printi	strict	1000000	rep	[ 	[ ]	 ]	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+printl	lazy	1000000	rep	[ 	[ ]	 ]	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+printe	eval	1000000	rep	[ 	[ ]	 ]	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+printea	eval	1000000	rep	{ a = 	{ }	; }	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+ijson	ijson	1000000	rep	[	[]	]	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+ejson	ejson	1000000	rep	[	[]	]	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+ixml	ixml	1000000	count	<list>	n + 1	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)
+tojsona	strict	1000000	int	6 * n + 2	builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)))
+ijsona	ijson	1000000	rep	{"a":	{}	}	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+ejsona	ejson	1000000	rep	{"a":	{}	}	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+ixmla	ixml	1000000	count	name="a">	n	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+printia	strict	1000000	rep	{ a = 	{ }	; }	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+printla	lazy	1000000	rep	{ a = 	<CODE>	; }	builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)
+toxmll	strict	1000000	nat	builtins.stringLength (builtins.toXML (builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) @N@)))
+toxmla	strict	1000000	nat	builtins.stringLength (builtins.toXML (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) @N@)))
+inbatch	strict	10000	fmt	[ %d ]	n - 1	[ (let chain = n: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then 0 else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; in chain @N@) ]
+inbatche	eval	10000	fmt	[ %d ]	n - 1	[ (let chain = n: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then 0 else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; in chain @N@) ]
+inbatchj	ejson	10000	fmt	[%d]	n - 1	[ (let chain = n: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then 0 else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; in chain @N@) ]
+inbatchx	ixml	10000	has	<int value="%d" />	n - 1	{ a = (let chain = n: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then 0 else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; in chain @N@); }
+trace	strict	1000000	int	0	let t = n: if n == 0 then 0 else builtins.trace "t" (0 + t (n - 1)); in t @N@
+tryeval	strict	1000000	int	0	let t = n: if n == 0 then 0 else (builtins.tryEval (0 + t (n - 1))).value; in t @N@
+sortrec	strict	1000000	int	0	let t = n: if n == 0 then 0 else builtins.head (builtins.sort (a: b: a < b) [ (t (n - 1)) ]); in t @N@
+cdepe	eval	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
+cdepl	lazy	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
+cdepj	ijson	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
+cdepx	ixml	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
+cdepja	strict	@N@	catch	builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) (@N@ + 10))))

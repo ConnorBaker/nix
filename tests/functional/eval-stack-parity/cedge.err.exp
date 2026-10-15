@@ -1,18 +1,18 @@
 Stack size hard limit is 16777216, which is less than the desired 62914560. If possible, increase the hard limit, e.g. with 'ulimit -Hs 61440'.
 error:
-       … while evaluating the attribute '"5819"'
+       … while evaluating the attribute '"5824"'
          at «string»:1:164:
-            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5820 (wrap 2501 0)
+            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5825 (wrap 2501 0)
              |                                                                                                                                                                    ^
 
-       … from the definition of '"5819"'
+       … from the definition of '"5824"'
          at «string»:1:94:
-            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5820 (wrap 2501 0)
+            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5825 (wrap 2501 0)
              |                                                                                              ^
 
        (stack trace truncated; use '--show-trace' to show the full, detailed trace)
 
        error: stack overflow; max-call-depth exceeded
        at «string»:1:234:
-            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5820 (wrap 2501 0)
+            1| let chain = n: base: let s = builtins.listToAttrs (builtins.genList (i: { name = toString i; value = if i == 0 then base else s.${toString (i - 1)} + 1; }) n); in s.${toString (n - 1)}; wrap = n: v: if n == 0 then v else 0 + wrap (n - 1) v; in chain 5825 (wrap 2501 0)
              |                                                                                                                                                                                                                                          ^

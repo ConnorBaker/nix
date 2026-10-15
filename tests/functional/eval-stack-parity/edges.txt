@@ -1,0 +1,36 @@
+# Base's edges for eval-stack-parity.sh (written by STACK_PARITY_CALIBRATE=1)
+# base: master a9f38ea0e (notes/stack/frozen/base-master)  build: gcc-15.2.0 debugoptimized lto=false unity=off sanitize=none  stack: 16384 KiB  setarch: setarch -R
+chain 9612
+cedge 5826
+tojson 19770
+regex 15410
+recur 6350
+foldl 5790
+deepseq 15879
+printi 15881
+printl 65512
+printe 52410
+printea 15190
+ijson 19776
+ejson 19778
+ixml 24375
+tojsona 8249
+ijsona 8252
+ejsona 8252
+ixmla 15880
+printia 15880
+printla 65510
+toxmll 24368
+toxmla 15875
+inbatch 9611
+inbatche 9612
+inbatchj 9612
+inbatchx 9611
+trace 3347
+tryeval 2985
+sortrec 2750
+cdepe 52387
+cdepl 65490
+cdepj 19767
+cdepx 24366
+cdepja 8249

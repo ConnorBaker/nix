@@ -1,0 +1,18 @@
+Stack size hard limit is 16777216, which is less than the desired 62914560. If possible, increase the hard limit, e.g. with 'ulimit -Hs 61440'.
+error:
+       … while calling the 'stringLength' builtin
+         at «string»:1:1:
+            1| builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) (8248 + 10))))
+             | ^
+
+       … while calling the 'toJSON' builtin
+         at «string»:1:24:
+            1| builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) (8248 + 10))))
+             |                        ^
+
+       (stack trace truncated; use '--show-trace' to show the full, detailed trace)
+
+       error: stack overflow; max-call-depth exceeded
+       at «string»:1:68:
+            1| builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) (8248 + 10))))
+             |                                                                    ^
