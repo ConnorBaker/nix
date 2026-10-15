@@ -127,8 +127,9 @@ TEST_F(nix_api_expr_test, unforce_external_printer_is_client_code)
     nix::printValueAsJSON(state->state, true, *list->value, nix::noPos, out, context, false, true);
     EXPECT_EQ(out.str(), "[42,42]");
     /* Unforcing never runs with Boehm GC (`unforceEnabled`). */
-    if (!NIX_USE_BOEHMGC)
+    if (!NIX_USE_BOEHMGC) {
         EXPECT_GE(unforceClientJobs(), before + 2);
+    }
     nix_gc_decref(ctx, list);
     nix_gc_decref(ctx, extValue);
 }
