@@ -120,6 +120,10 @@ struct Settings
     /* Most entries the force counts may hold (`countTargets`); 0: the
        default, max(256 Ki, eval-unforce-batch-size / 256). Dev override. */
     uint64_t countsCap = std::stoull(getEnv("NIX_UNFORCE_COUNTS_CAP").value_or("0"));
+    /* Whether printers' `seen` sets are kept exact across jobs
+       (`UnforceSeen`). Dev override, for measurements and as a negative
+       control: "0" restores forgetting them. */
+    bool keepSeen = getEnv("NIX_UNFORCE_SEEN").value_or("1") != "0";
 };
 
 const Settings & unforceSettings()
@@ -166,6 +170,10 @@ struct Stats
     /* Cells reverted by nested scopes of the mimalloc backend, which never
        promote (so these are reverted whatever the promotion threshold). */
     size_t innerScopeReverts = 0;
+    /* `UnforceSeen`: targets nominated because a printer printed the
+       container they hold, and printers' `seen` entries rewritten to a
+       copy's address or erased (not kept) at job ends. */
+    size_t seenNominated = 0, seenKept = 0, seenDropped = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -207,7 +215,7 @@ static void printStatsAtExit()
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
                  "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
-                 "inner-scope reverts %d\n",
+                 "inner-scope reverts %d; seen nominated %d, kept %d, dropped %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -235,7 +243,10 @@ static void printStatsAtExit()
                  stats.stackTargets,
                  stats.clientJobs,
                  stats.revertedInClientJobs,
-                 stats.innerScopeReverts);
+                 stats.innerScopeReverts,
+                 stats.seenNominated,
+                 stats.seenKept,
+                 stats.seenDropped);
          }),
          true);
 }
@@ -1603,8 +1614,8 @@ countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTarg
 
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
-   `counts` nominate, and the producer closure adds what identity needs (see
-   above). This is the fallible step before the job's memory is released.
+   `counts` nominate, as do the cells in `printed` (`UnforceSeen`), and the
+   producer closure adds what identity needs (see above). This is the fallible step before the job's memory is released.
    It writes no target, so the caller turns an allocation failure here into
    a fatal error before anything has changed, and the release that follows
    only assigns, reverts and frees. The caller pauses the region.
@@ -1643,7 +1654,8 @@ std::vector<bool> decideJob(
     uint64_t jobEnd,
     size_t youngBytes,
     Evacuator & evacuator,
-    std::vector<Value> & copies)
+    std::vector<Value> & copies,
+    const std::unordered_set<const Value *> * printed = nullptr)
 {
     auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
@@ -1663,6 +1675,16 @@ std::vector<bool> decideJob(
 
     if (canCopy && cfg.promoteAfter)
         promote = countTargets(counts, targets, state.settings.unforceBatchSize);
+
+    /* Cells holding a container that a printer printed (`UnforceSeen`)
+       are nominated like counted ones, so that the container keeps its
+       address's identity for the rest of the print. */
+    if (printed && canCopy && cfg.markers != "off")
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (!promote[i] && printed->count(targets.cells[i])) {
+                promote[i] = true;
+                stats.seenNominated++;
+            }
 
     /* Objects that client code built in this job were allocated outside the
        region: the closure cannot see them, and re-forcing the cell that
@@ -2218,6 +2240,71 @@ void unforceNoteClientCode()
         clientCodeInJob = true;
 }
 
+/* Live `UnforceSeen` sets on this thread. */
+static thread_local std::vector<UnforceSeen *> seenSets;
+
+UnforceSeen::UnforceSeen(std::set<const void *> & seen)
+    : seen(seen)
+{
+    seenSets.push_back(this);
+}
+
+UnforceSeen::~UnforceSeen()
+{
+    std::erase(seenSets, this);
+}
+
+bool unforceSeenExact()
+{
+    return !nested() && unforceSettings().keepSeen;
+}
+
+void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key)
+{
+    if (seenSets.empty() || !evalRegion.base || !unforceSeenExact())
+        return;
+    for (auto s : seenSets)
+        if (&s->seen == &seen) {
+            /* A target holding the container is outside the job's memory;
+               keys inside it are what the job end must rewrite. */
+            if (!evalRegion.contains(&cell))
+                s->cells.push_back(&cell);
+            if (evalRegion.contains(key))
+                s->keys.push_back(key);
+            return;
+        }
+}
+
+/* The cells the live `UnforceSeen` sets reported in this job. */
+static std::unordered_set<const Value *> printedCells()
+{
+    std::unordered_set<const Value *> printed;
+    for (auto s : seenSets)
+        printed.insert(s->cells.begin(), s->cells.end());
+    return printed;
+}
+
+/* At a job's end, after the decision has copied what it keeps: rewrite the
+   job's own entries of the live `UnforceSeen` sets to their copies'
+   addresses, or erase them if they were not kept (their memory is about to
+   be released, and its addresses reused). */
+static void translateSeen(Evacuator & evacuator)
+{
+    for (auto s : seenSets) {
+        for (auto key : s->keys) {
+            if (!s->seen.erase(key))
+                continue;
+            if (auto copy = evacuator.forwarded(key)) {
+                s->seen.insert(copy);
+                stats.seenKept++;
+            } else
+                stats.seenDropped++;
+        }
+        s->keys.clear();
+        s->cells.clear();
+    }
+}
+
 bool unforceIsScopeStackSlot(const void * p)
 {
     if (scopeStackMarks.empty() || !stackLow)
@@ -2322,6 +2409,7 @@ void EvalState::endUnforceScope(size_t mark)
         std::vector<Value> copies;
         try {
             jt.emplace(undoLog, mark);
+            auto printed = printedCells();
             promoted = decideJob(
                 *this,
                 mark,
@@ -2333,7 +2421,9 @@ void EvalState::endUnforceScope(size_t mark)
                 jobEnd,
                 evalRegion.cur - evalRegion.base,
                 evacuator,
-                copies);
+                copies,
+                printed.empty() ? nullptr : &printed);
+            translateSeen(evacuator);
             pruneCounts(forceCounts, *jt, promoted);
         } catch (std::bad_alloc &) {
             unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");

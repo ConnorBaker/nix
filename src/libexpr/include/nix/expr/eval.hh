@@ -26,6 +26,7 @@
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
 #include <map>
+#include <set>
 #include <optional>
 #include <functional>
 #include <span>
@@ -467,6 +468,51 @@ extern BumpArena evalBaseArena;
  * unforced values anywhere).
  */
 bool unforceMayHaveFreed(const void * p);
+
+/**
+ * PROTOTYPE. Keeps a printer's address-keyed `seen` set (its «repeated»
+ * tracking) as exact across the end of unforce jobs as without unforcing,
+ * while this object lives: a container printed in one job and reached
+ * again in a later one must still print as «repeated».
+ *
+ * Every container the printer marks seen in a job is reported with
+ * `unforceNoteSeen`. At the job's end, the cells holding them nominate
+ * themselves for promotion (like the force counts do), so the containers
+ * are kept, and the set's entries for the job's own objects are rewritten
+ * to the copies' addresses; those that were not kept (client code ran in
+ * the job, or the closure fell back to reverting) are erased instead.
+ * With the bump backend only; with the mimalloc backend, whose nested
+ * scopes revert everything, the printers forget what a freeing scope
+ * added (`unforceMayHaveFreed`) as before.
+ */
+struct UnforceSeen
+{
+    std::set<const void *> & seen;
+    /* Reported in the open job: cells outside the job's memory that held a
+       printed container (targets among them are nominated), and keys
+       inside it. */
+    std::vector<const Value *> cells;
+    std::vector<const void *> keys;
+
+    explicit UnforceSeen(std::set<const void *> & seen);
+    ~UnforceSeen();
+    UnforceSeen(const UnforceSeen &) = delete;
+    UnforceSeen & operator=(const UnforceSeen &) = delete;
+};
+
+/**
+ * PROTOTYPE. `key` (a Bindings, or a list's cell) of the container that
+ * `cell` holds was just added to `seen`. Does nothing unless an
+ * `UnforceSeen` for `seen` is alive and a job is open.
+ */
+void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key);
+
+/**
+ * PROTOTYPE. Whether the open unforce jobs keep `UnforceSeen` sets exact
+ * (the bump backend), so that a printer need not forget what a freeing
+ * job added.
+ */
+bool unforceSeenExact();
 
 /**
  * PROTOTYPE. Counts unforce scopes that have freed memory. A pointer into

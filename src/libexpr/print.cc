@@ -335,8 +335,11 @@ private:
     /* The unforce batch for the elements of one attribute set or list. When
        it frees what they allocated, the addresses they added to `seen` are
        forgotten, so that one reused for another value is not reported as
-       repeated; shared values may print in full again. A batch that frees
-       nothing (nested in another one) leaves them for the enclosing batch. */
+       repeated. With the bump backend the job's end has already rewritten
+       them to the kept copies' addresses (`UnforceSeen`), so this finds
+       nothing to forget; with the mimalloc backend shared values may print
+       in full again. A batch that frees nothing (nested in another one)
+       leaves them for the enclosing batch. */
     struct ElementBatch
     {
         Printer & printer;
@@ -370,17 +373,18 @@ private:
         print(v, depth);
     }
 
-    bool markSeen(const void * p)
+    bool markSeen(const Value & v, const void * p)
     {
         if (!seen->insert(p).second)
             return false;
         seenAdded.push_back(p);
+        unforceNoteSeen(*seen, v, p);
         return true;
     }
 
     void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !markSeen(v.attrs())) {
+        if (seen && !markSeen(v, v.attrs())) {
             printRepeated();
             return;
         }
@@ -459,7 +463,7 @@ private:
 
     void printList(Value & v, size_t depth)
     {
-        if (seen && v.listSize() && !markSeen(&v)) {
+        if (seen && v.listSize() && !markSeen(v, &v)) {
             printRepeated();
             return;
         }
@@ -706,6 +710,10 @@ public:
         } else {
             seen.reset();
         }
+        /* Unforcing while printing: keep `seen` exact across jobs. */
+        std::optional<UnforceSeen> keepSeen;
+        if (seen && options.unforce)
+            keepSeen.emplace(*seen);
 
         ValuesSeen seen;
         print(v, 0);

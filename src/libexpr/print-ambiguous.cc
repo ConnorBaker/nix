@@ -10,12 +10,13 @@ namespace nix {
    be forgotten. */
 static thread_local std::vector<const void *> seenAdded;
 
-static bool markSeen(std::set<const void *> & seen, const void * p, bool unforce)
+static bool markSeen(std::set<const void *> & seen, const Value & v, const void * p, bool unforce)
 {
     if (!seen.insert(p).second)
         return false;
     if (unforce)
         seenAdded.push_back(p);
+    unforceNoteSeen(seen, v, p);
     return true;
 }
 
@@ -43,9 +44,11 @@ void printAmbiguous(
 
     /* With `unforce`, the children of an attribute set or list are unforced
        in batches. When a batch frees what they allocated, the addresses they
-       added to `seen` are forgotten, since they may be reused; a batch that
-       frees nothing (nested in another one) leaves them for the enclosing
-       batch. */
+       added to `seen` are forgotten, since they may be reused (with the bump
+       backend, if the caller keeps `seen` with an `UnforceSeen`, the job's
+       end has already rewritten them, so there is nothing to forget); a
+       batch that frees nothing (nested in another one) leaves them for the
+       enclosing batch. */
     size_t seenMark = 0;
     UnforceBatch batch(state, unforce);
     if (batch.enabled())
@@ -80,7 +83,7 @@ void printAmbiguous(
         str << "null";
         break;
     case nAttrs: {
-        if (seen && !v.attrs()->empty() && !markSeen(*seen, v.attrs(), unforce))
+        if (seen && !v.attrs()->empty() && !markSeen(*seen, v, v.attrs(), unforce))
             str << "«repeated»";
         else {
             str << "{ ";
@@ -104,7 +107,7 @@ void printAmbiguous(
     case nList:
         /* Use pointer to the Value instead of pointer to the elements, because
            that would need to explicitly handle the case of SmallList. */
-        if (seen && v.listSize() && !markSeen(*seen, &v, unforce))
+        if (seen && v.listSize() && !markSeen(*seen, v, &v, unforce))
             str << "«repeated»";
         else {
             str << "[ ";

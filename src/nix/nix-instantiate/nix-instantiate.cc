@@ -31,9 +31,11 @@ enum OutputKind { okPlain, okRaw, okXML, okJSON };
  * forced deeply in `forceValueDeep`'s order and with its traces, so errors
  * are the same as without unforcing, and printed in batches: before a batch
  * ends (unforcing what its elements forced), its elements are printed, in
- * printing order, into buffers that are assembled at the end. The output is
- * the same as without unforcing while it fits in one batch; a value shared
- * between batches prints in full instead of as «repeated».
+ * printing order, into buffers that are assembled at the end. Containers
+ * printed in one batch are kept when it ends, with their addresses in `seen`
+ * rewritten (`UnforceSeen`), so that one reached again in a later batch
+ * prints as «repeated», as without unforcing (with the mimalloc backend it
+ * prints in full instead).
  */
 static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringContext & context)
 {
@@ -59,9 +61,10 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
             seen.insert(top);
     };
     seedSeen();
+    UnforceSeen keepSeen(seen);
     UnforceBatch batch(state);
     batch.onEnd = [&](bool freed) {
-        if (freed) {
+        if (freed && !unforceSeenExact()) {
             seen.clear();
             seedSeen();
         }
