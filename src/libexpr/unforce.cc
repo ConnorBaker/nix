@@ -536,6 +536,23 @@ struct Evacuator
         return n;
     }
 
+    /* A list's element array, copied once however many list values share
+       it (lists are immutable, and every array has the size it was built
+       with, so the values sharing one also share its size). */
+    Value * const * elements(Value * const * elems, size_t size)
+    {
+        if (!young(elems))
+            return elems;
+        if (auto f = forwarded(elems))
+            return f;
+        auto n = (Value **) state.mem.allocBytes(size * sizeof(Value *));
+        stats.copiedBytes += size * sizeof(Value *);
+        forward.emplace(elems, n);
+        for (size_t i = 0; i < size; ++i)
+            n[i] = value(elems[i]);
+        return n;
+    }
+
     using Context = Value::StringWithContext::Context;
 
     const Context * context(const Context * c)
@@ -589,15 +606,7 @@ struct Evacuator
         }
         case tListN: {
             auto l = v.rawList();
-            auto elems = l.elems;
-            if (young(elems)) {
-                auto n = (Value **) state.mem.allocBytes(l.size * sizeof(Value *));
-                stats.copiedBytes += l.size * sizeof(Value *);
-                for (size_t i = 0; i < l.size; ++i)
-                    n[i] = value(elems[i]);
-                elems = n;
-            }
-            v.setRawList({.size = l.size, .elems = elems});
+            v.setRawList({.size = l.size, .elems = elements(l.elems, l.size)});
             break;
         }
         case tThunk:

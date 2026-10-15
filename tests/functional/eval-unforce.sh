@@ -67,3 +67,15 @@ for opts in on batch0; do
     out=$(nix-instantiate "${o[@]}" --eval --strict -E 'builtins.genList (x: x + "foo") 2' 2>/dev/null) && fail "should fail"
     [[ -z $out ]] || fail "nix-instantiate --strict ($opts) printed partial output: $out"
 done
+
+# Promotion copies a list's element array once, however many promoted cells
+# hold that list: here 200 cells share one 50 000-element array, which is
+# 0.4 MB copied once and 80 MB copied per cell.
+expr='let
+  S = { big = builtins.genList (i: i) 50000; };
+  ts = builtins.genList (i: { y = S.big; }) 200;
+in [ (builtins.seq ts true) (builtins.foldl'"'"' (a: t: builtins.seq (builtins.length t.y) a) true ts) ]'
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=1 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr" 2>&1 >/dev/null)
+[[ $stats =~ promoted\ ([0-9]+).*copied\ ([0-9]+)\ MiB ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] >= 200 )) || fail "expected at least 200 promotions: $stats"
+(( BASH_REMATCH[2] < 16 )) || fail "a shared list array was copied per cell: $stats"
