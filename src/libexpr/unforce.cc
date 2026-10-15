@@ -365,9 +365,53 @@ void hookCollector()
 /* With NIX_UNFORCE_REUSE, the region the next job reuses. */
 static char * regionSpare = nullptr;
 
+static size_t pageSize()
+{
+    static const size_t page = sysconf(_SC_PAGESIZE);
+    return page;
+}
+
+static char * pageUp(char * p)
+{
+    return (char *) (((uintptr_t) p + pageSize() - 1) & ~(uintptr_t) (pageSize() - 1));
+}
+
+/* Kept jobs (`retainRegion`) share one mapping: [keptStart, keptFloor) holds
+   their objects, which are ordinary memory from then on, and the jobs after
+   them allocate above it, up to keptEnd, so a kept job costs no page or
+   mapping of its own (review of markers v4, S4). */
+static char * keptStart = nullptr;
+static char * keptFloor = nullptr;
+static char * keptEnd = nullptr;
+
+/* Stop allocating above the kept jobs: their mapping keeps only its prefix. */
+static void leaveKeptMapping()
+{
+    if (!keptStart)
+        return;
+    auto tail = pageUp(keptFloor);
+    if (tail < keptEnd)
+        munmap(tail, keptEnd - tail);
+    keptStart = keptFloor = keptEnd = nullptr;
+}
+
 void openRegion(bool allTypes)
 {
     hookCollector();
+    if (keptStart) {
+        /* Continue above the kept jobs while at least half a region is left
+           (with the tripwire, released memory is not reused). */
+        if (!unforceSettings().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
+            evalRegion.base = evalRegion.cur = keptFloor;
+            evalRegion.end = keptEnd;
+            evalRegion.allTypes = allTypes;
+            /* Released above the floor as zero pages, and the floor's own
+               page zeroed above it (`releaseRegion`). */
+            evalRegion.dirty = false;
+            return;
+        }
+        leaveKeptMapping();
+    }
     auto & spare = regionSpare;
     bool dirty = false;
     if (unforceSettings().reuse && spare)
@@ -472,9 +516,19 @@ void releaseRegion()
     if (getenv("NIX_UNFORCE_VERIFY"))
         verifyNoEscapes();
     auto base = evalRegion.base;
-    stats.regionPeak = std::max(stats.regionPeak, size_t(evalRegion.cur - base));
-    lastReleased = {(uintptr_t) base, (uintptr_t) evalRegion.cur};
+    auto cur = evalRegion.cur;
+    stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
+    lastReleased = {(uintptr_t) base, (uintptr_t) cur};
     evalRegion = EvalRegion{};
+    if (keptStart && base == keptFloor) {
+        /* Above kept jobs: free this job's pages, and zero what it used of
+           the floor's page, which the kept objects share. */
+        auto up = pageUp(base);
+        memset(base, 0, std::min(cur, up) - base);
+        if (cur > up)
+            madvise(up, pageUp(cur) - up, MADV_DONTNEED);
+        return;
+    }
     if (unforceSettings().reuse)
         return;
     if (unforceSettings().tripwire) {
@@ -484,18 +538,23 @@ void releaseRegion()
         munmap(base, regionSize());
 }
 
-/* A job that keeps all its memory (see `UnforceSeen`): its region becomes
-   ordinary memory for the rest of the process. The unused tail is
-   unmapped, and the region is never reused or reported as freed. */
+/* A job that keeps all its memory (see `UnforceSeen`): its objects become
+   ordinary memory for the rest of the process, never reused or reported as
+   freed. Later jobs allocate above them in the same mapping (`keptStart`). */
 static void retainRegion()
 {
     auto base = evalRegion.base;
-    auto used = size_t(evalRegion.cur - base);
-    stats.regionPeak = std::max(stats.regionPeak, used);
-    auto page = size_t(sysconf(_SC_PAGESIZE));
-    auto kept = (used + page - 1) / page * page;
-    if (kept < regionSize())
-        munmap(base + kept, regionSize() - kept);
+    auto cur = evalRegion.cur;
+    stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
+    stats.keptJobBytes += cur - base;
+    if (keptStart && base == keptFloor)
+        keptFloor = cur;
+    else {
+        leaveKeptMapping();
+        keptStart = base;
+        keptFloor = cur;
+        keptEnd = evalRegion.end;
+    }
     if (regionSpare == base)
         regionSpare = nullptr;
     lastReleased = {0, 0};
@@ -2561,11 +2620,9 @@ void EvalState::endUnforceScope(size_t mark)
         }
     }
 
-    if (keepWhole) {
+    if (keepWhole)
         stats.keptJobs++;
-        if (evalRegion.base)
-            stats.keptJobBytes += evalRegion.cur - evalRegion.base;
-    } else if (evalRegion.base)
+    else if (evalRegion.base)
         stats.freedBytes += evalRegion.cur - evalRegion.base;
     clientCodeInJob = false;
     undoLog.resize(mark);
