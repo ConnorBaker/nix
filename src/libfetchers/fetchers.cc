@@ -300,7 +300,9 @@ std::pair<ref<SourceAccessor>, Input> Input::getAccessorChecked(const Settings &
         checkLocks(*this, result);
 
         if ((requireFixed || getTreeHash() || getNarHash()) && !source->isFixed()) {
-            source = GitRepo::acquire(SourcePath{source});
+            /* Lookup misses keep the producer's explanation, as an unacquired
+               input would give (e.g. the worktree's `git add -N` hint). */
+            source = GitRepo::acquire(SourcePath{source}, /*explainMisses=*/true);
             result.cachedFingerprint.emplace(std::nullopt);
         }
 

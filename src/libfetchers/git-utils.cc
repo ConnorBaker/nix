@@ -1694,7 +1694,7 @@ static GitRepo::Options tarballCacheOptions()
     };
 }
 
-ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
+ref<SourceAccessor> GitRepo::acquire(const SourcePath & source, bool explainMisses)
 {
     using File = fso::VariantT<std::string, true, merkle::TreeEntry, boost::container::flat_map>;
     struct Acquire : NodeVisitor<File>
@@ -1755,12 +1755,52 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
     struct Accessor final : FsoSourceAccessor<Accessor, File, FsoVirtualSourceAccessor, true>
     {
         const File root;
+        /* Consulted only to explain a lookup of a path the value lacks, never
+           for a successful read or a name. */
+        const std::optional<SourcePath> producer;
+        std::mutex producerLock;
         friend struct FsoSourceAccessor<Accessor, File, FsoVirtualSourceAccessor, true>;
         void anchor() override {}
-        Accessor(File value) : root(std::move(value))
+        Accessor(File value, std::optional<SourcePath> producer)
+            : root(std::move(value))
+            , producer(std::move(producer))
         {
             knownRoot = root.metadata;
             fingerprint = gitObjectFingerprint(root.metadata.mode, root.metadata.hash);
+        }
+        /* The producer's own error for a missing path, e.g. a worktree's
+           "not tracked by Git" hint. If the producer now has the path, the
+           acquired value still lacks it. */
+        void explainMiss(const CanonPath & path)
+        {
+            if (!producer)
+                return;
+            std::lock_guard lock(producerLock);
+            producer->accessor->lstat(producer->path / path);
+        }
+        const File & require(const CanonPath & path)
+        {
+            if (auto file = find(path))
+                return *file;
+            explainMiss(path);
+            throw FileNotFound("file '%s' does not exist", showPath(path));
+        }
+        Stat lstat(const CanonPath & path) override
+        {
+            if (auto file = find(path))
+                return file->lstat();
+            explainMiss(path);
+            throw FileNotFound("path '%s' does not exist", showPath(path));
+        }
+        /* Display as the producer did: its root display is kept verbatim (a
+           filesystem root has no trailing slash), children are joined once. */
+        std::string showPath(const CanonPath & path) override
+        {
+            if (path.isRoot())
+                return displayPrefix + displaySuffix;
+            if (displayPrefix.ends_with('/'))
+                return displayPrefix + std::string(path.rel()) + displaySuffix;
+            return SourceAccessor::showPath(path);
         }
         bool isFixed() override { return true; }
         bool allowsConcurrentTraversal() override { return true; }
@@ -1781,7 +1821,7 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source)
     if (acquire.failure)
         std::rethrow_exception(acquire.failure);
     auto display = source.to_string();
-    auto accessor = make_ref<Accessor>(std::move(value));
+    auto accessor = make_ref<Accessor>(std::move(value), explainMisses ? std::optional{source} : std::nullopt);
     accessor->setPathDisplay(std::move(display));
     return ref<SourceAccessor>{std::move(accessor).get_ptr()};
 }

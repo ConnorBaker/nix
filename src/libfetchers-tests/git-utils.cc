@@ -3613,4 +3613,56 @@ TEST_F(GitUtilsTest, acquiredRootModesRetainTheRenderedValue)
     RecordProperty("ignored_cache_states", 3u);
 }
 
+/* Acquisition keeps its producer's diagnostics. Paths display as the
+   producer's did, so a filesystem root has no trailing slash. With
+   `explainMisses`, a lookup of a path the value lacks raises the producer's
+   own error, such as a worktree's "not tracked by Git" hint; the producer
+   still never answers a read. */
+TEST_F(GitUtilsTest, acquiredTreeKeepsProducerDiagnostics)
+{
+    auto dir = tmpDir / "acquire-diagnostics";
+    createDirs(dir);
+    writeFile(dir / "tracked", "a");
+    writeFile(dir / "untracked", "b");
+    auto fs = makeFSSourceAccessor(dir);
+    auto memory = make_ref<MemorySourceAccessor>();
+    memory->addFile(CanonPath("/tracked"), "a");
+    memory->setPathDisplay("«memory»");
+    for (auto display : {fs, ref<SourceAccessor>(memory)}) {
+        auto producer = AllowListSourceAccessor::create(
+            display, {}, {CanonPath::root, CanonPath("/tracked")}, [](const CanonPath & path) {
+                return RestrictedPathError("Path '%s' is not tracked by Git.", path.rel());
+            });
+        for (bool explain : {false, true}) {
+            SCOPED_TRACE(fmt("producer=%s explain=%d", producer->showPath(CanonPath::root), explain));
+            auto acquired = GitRepo::acquire(SourcePath{producer}, explain);
+            for (auto path : {CanonPath::root, CanonPath("/tracked"), CanonPath("/missing/below")})
+                EXPECT_EQ(acquired->showPath(path), producer->showPath(path));
+            EXPECT_EQ(acquired->readFile(CanonPath("/tracked")), "a");
+            for (auto path : {CanonPath("/untracked"), CanonPath("/missing"), CanonPath("/tracked/below")}) {
+                EXPECT_FALSE(acquired->pathExists(path));
+                EXPECT_EQ(acquired->maybeLstat(path), std::nullopt);
+                if (explain) {
+                    EXPECT_THAT(
+                        [&] { acquired->lstat(path); },
+                        ::testing::ThrowsMessage<RestrictedPathError>(
+                            testing::HasSubstrIgnoreANSIMatcher(fmt("Path '%s' is not tracked by Git.", path.rel()))));
+                    EXPECT_THROW(acquired->readFile(path), RestrictedPathError);
+                    EXPECT_THROW(acquired->readDirectory(path), RestrictedPathError);
+                } else {
+                    EXPECT_THAT(
+                        [&] { acquired->lstat(path); },
+                        ::testing::ThrowsMessage<FileNotFound>(testing::HasSubstrIgnoreANSIMatcher(
+                            fmt("path '%s' does not exist", producer->showPath(path)))));
+                    EXPECT_THROW(acquired->readFile(path), FileNotFound);
+                    EXPECT_THROW(acquired->readDirectory(path), FileNotFound);
+                }
+            }
+        }
+    }
+    /* The posix root displays as the directory itself. */
+    EXPECT_EQ(GitRepo::acquire(SourcePath{fs})->showPath(CanonPath::root), fs->showPath(CanonPath::root));
+    EXPECT_FALSE(fs->showPath(CanonPath::root).ends_with('/'));
+}
+
 } // namespace nix::fetchers

@@ -113,8 +113,13 @@ struct GitRepo
         std::string displayPrefix,
         std::shared_ptr<fetchers::Cache> cache = nullptr) = 0;
 
-    /** Acquire the rendered value into a private in-memory canonical SHA-256 ODB. */
-    static ref<SourceAccessor> acquire(const SourcePath & source);
+    /** Acquire the rendered value into a private in-memory canonical SHA-256 ODB.
+     * Paths display as `source` displays them, so a filesystem root keeps
+     * its lack of a trailing slash. With
+     * `explainMisses`, a failed lookup of a path the value lacks first lets
+     * `source` report that path, e.g. a worktree's "not tracked by Git"
+     * hint; `source` is then retained for these diagnostics only. */
+    static ref<SourceAccessor> acquire(const SourcePath & source, bool explainMisses = false);
 
     /** A live filesystem view with retained tracked membership. */
     virtual ref<SourceAccessor> getAccessor(
