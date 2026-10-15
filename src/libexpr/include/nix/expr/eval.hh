@@ -385,20 +385,6 @@ struct EvalRegion
         (review of markers v4, B1-mem). */
     uint8_t * envSizes = nullptr;
     const char * envSizesBase = nullptr;
-    /** Owner timeline (bump backend): the start of the current owner
-        segment. Every object in [seg, cur) was allocated while the force
-        that is running now was the innermost owner (see "The owner
-        timeline" in unforce.cc), so a force of a cell in that range keeps
-        the owner. `base` when owners are not tracked. */
-    char * seg = nullptr;
-
-    /** Whether `p` was allocated in the current owner segment (see
-        `seg`): a force of it changes no owner. Never true for the mimalloc
-        backend. */
-    [[gnu::always_inline]] bool inSegment(const void * p) const noexcept
-    {
-        return (const char *) p >= seg && (const char *) p < cur;
-    }
 
     bool active() const noexcept
     {
@@ -453,12 +439,6 @@ struct EvalRegion
 };
 
 extern EvalRegion evalRegion;
-
-/** PROTOTYPE. The cell of the innermost force that an unforce hook pushed
-    (a logged force, or a young force that changed the owner; see "The owner
-    timeline" in unforce.cc), or null. `endLoggedForce` leaves the inline
-    path only for it. Process-wide, like `evalRegion`. */
-extern const Value * unforceOpenTop;
 
 #if !NIX_USE_BOEHMGC
 /** PROTOTYPE. Zeroed evaluator memory outside unforce scopes, without Boehm
@@ -1386,19 +1366,15 @@ public:
      */
     [[gnu::always_inline]] void logPreImage(Value & v)
     {
-        /* A young cell of the current owner segment needs nothing: no log
-           entry (it is young) and no owner change. */
-        if (isolationDepth && !evalRegion.inSegment(&v)) [[unlikely]]
+        if (isolationDepth) [[unlikely]]
             logPreImageSlow(v);
     }
 
     /**
      * PROTOTYPE. The out-of-line part of `logPreImage`: log `v` with the
-     * start marker of its force, or change the owner for a young cell of
-     * another owner segment. Not `cold`: with the owner timeline, a driver
-     * forcing young cells of a target comes here once per force.
+     * start marker of its force.
      */
-    [[gnu::noinline]] void logPreImageSlow(Value & v);
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
 
     /**
      * PROTOTYPE. After a force of `v`, however it ended: record the end
@@ -1408,11 +1384,11 @@ public:
      */
     [[gnu::always_inline]] void endLoggedForce(Value & v)
     {
-        if (isolationDepth && unforceOpenTop == &v) [[unlikely]]
+        if (isolationDepth) [[unlikely]]
             endLoggedForceSlow(v);
     }
 
-    [[gnu::noinline]] void endLoggedForceSlow(Value & v);
+    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
 
     /**
      * PROTOTYPE. Close an unforce scope and unforce every thunk updated

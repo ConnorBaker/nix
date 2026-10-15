@@ -43,7 +43,6 @@
 namespace nix {
 
 EvalRegion evalRegion;
-const Value * unforceOpenTop = nullptr;
 BumpArena evalBaseArena;
 
 /* The address range freed by the last region release. */
@@ -366,10 +365,11 @@ static thread_local std::vector<size_t> activeForces;
    Zero-length segments are overwritten and equal neighbours merged, so a
    force that allocates nothing leaves no trace.
 
-   The hooks keep nothing across the evaluation (STACK-PARITY.md, R1): a
-   force that pushes something (a logged force, or a young force that
-   changed the owner) pushes `v` on `opens`, and `endLoggedForce` leaves the
-   inline path only when `unforceOpenTop` is `v`.
+   The hooks keep markers' inline shape (STACK-PARITY.md, R1: one test of
+   `isolationDepth`, one cold out-of-line call; review identity-owners-v1,
+   B1); every test below runs in the out-of-line part. A force that pushes
+   something (a logged force, or a young force that changed the owner)
+   pushes `v` on `opens`, and its end pops it when the top is `v`'s.
 
    At the job's end owner(x) is exact for every copied object, so the
    closure needs no walk: promote S0, look up the owner of every
@@ -451,7 +451,7 @@ static HookStack<OwnerSeg> ownerSegs = [] {
    force that changed the owner. `saved` is the owner to restore, with bit
    0 set for a logged force (whose owner changed iff `ownersOn`, which is
    fixed for the job). `opens` never empties: its bottom entry is a
-   sentinel whose cell is null, so `unforceOpenTop` is the top's cell. */
+   sentinel whose cell is null. */
 struct OpenForce
 {
     const Value * cell;
@@ -485,6 +485,8 @@ static void clearOpens()
     openLogIndices.clear();
 }
 static const Value * curOwner = nullptr;
+/* The start of the open segment: [ownerSeg, cur) is `curOwner`'s. */
+static char * ownerSeg = nullptr;
 static bool ownersOn = false;
 static bool ownerConsumersOn = false;
 /* (consumer, producer): the target that was the owner when a young cell of
@@ -492,7 +494,7 @@ static bool ownerConsumersOn = false;
 static std::vector<std::pair<const Value *, const Value *>> ownerConsumers;
 
 
-/* The open segment is [evalRegion.seg, cur), owned by `curOwner`;
+/* The open segment is [ownerSeg, cur), owned by `curOwner`;
    `ownerSegs` holds the closed ones before it. Adjacent segments (closed
    or open) never have the same owner, so a force that allocates nothing
    changes the owner without touching `ownerSegs`, and one that allocates
@@ -507,18 +509,18 @@ static void setOwner(const Value * o);
 [[gnu::always_inline]] inline static void setOwnerLast(const Value * o)
 {
     auto c = evalRegion.cur;
-    if (c == evalRegion.seg) [[likely]] {
+    if (c == ownerSeg) [[likely]] {
         if (ownerSegs.back().owner == o) {
-            evalRegion.seg = (char *) ownerSegs.back().start;
+            ownerSeg = (char *) ownerSegs.back().start;
             ownerSegs.pop();
         }
     } else {
         if (ownerSegs.t == ownerSegs.e) [[unlikely]]
             return setOwner(o);
-        *ownerSegs.t++ = {(uintptr_t) evalRegion.seg, curOwner};
+        *ownerSegs.t++ = {(uintptr_t) ownerSeg, curOwner};
         if (ownerSegs.t > ownerSegs.high) [[unlikely]]
             ownerSegs.high = ownerSegs.t;
-        evalRegion.seg = c;
+        ownerSeg = c;
     }
     curOwner = o;
 }
@@ -529,17 +531,17 @@ static void setOwner(const Value * o);
        the owner, the start of a logged force of `o`, or the end of either).
        If it did not, the timeline would only gain a needless boundary. */
     auto c = evalRegion.cur;
-    if (c == evalRegion.seg) [[likely]] {
+    if (c == ownerSeg) [[likely]] {
         /* Nothing was allocated under the current owner since it began. */
         if (ownerSegs.back().owner == o) {
-            evalRegion.seg = (char *) ownerSegs.back().start;
+            ownerSeg = (char *) ownerSegs.back().start;
             ownerSegs.pop();
         }
     } else {
-        ownerSegs.push({(uintptr_t) evalRegion.seg, curOwner});
+        ownerSegs.push({(uintptr_t) ownerSeg, curOwner});
         if (ownerSegs.t > ownerSegs.high) [[unlikely]]
             ownerSegs.high = ownerSegs.t;
-        evalRegion.seg = c;
+        ownerSeg = c;
     }
     curOwner = o;
 }
@@ -550,7 +552,7 @@ static size_t ownerHint = 0;
 [[gnu::always_inline]] inline static const Value * ownerOf(const void * p)
 {
     auto a = (uintptr_t) p;
-    if (a >= (uintptr_t) evalRegion.seg)
+    if (a >= (uintptr_t) ownerSeg)
         return curOwner;
     /* Lookups come in runs (the Evacuator copies depth first). The
        sentinel is entry 0. */
@@ -575,19 +577,14 @@ static void openOwners()
     ownerConsumers.clear();
     curOwner = nullptr;
     ownerHint = 0;
-    evalRegion.seg = evalRegion.base;
+    ownerSeg = evalRegion.base;
 }
 
-[[gnu::always_inline]] inline static void setOpenTop()
-{
-    unforceOpenTop = opens.back().cell;
-}
 
 /* A young force that changes the owner to `o`. */
 [[gnu::noinline]] static void pushYoungOpen(const Value * cell, const Value * o)
 {
     opens.push({cell, (uintptr_t) curOwner});
-    unforceOpenTop = cell;
     setOwner(o);
 }
 
@@ -598,7 +595,6 @@ static void pushLoggedOpen(const Value * cell, size_t logIndex)
     openLogIndices.push(logIndex);
     if (ownersOn)
         setOwner(cell);
-    unforceOpenTop = cell;
 }
 
 static void closeOwners()
@@ -612,7 +608,6 @@ static void closeOwners()
     ownerSegs.clear();
     ownerSegs.push(segSentinel);
     clearOpens();
-    unforceOpenTop = nullptr;
     curOwner = nullptr;
 }
 
@@ -629,7 +624,6 @@ static void dropActiveForces(size_t mark)
             openLogIndices.pop();
         opens.pop();
     }
-    setOpenTop();
 }
 
 #if NIX_USE_BOEHMGC
@@ -3193,7 +3187,6 @@ bool unforceIsScopeStackSlot(const void * p)
     if (opens.t == opens.e) [[unlikely]]
         return pushYoungOpen(&v, o);
     *opens.t++ = {&v, (uintptr_t) curOwner};
-    unforceOpenTop = &v;
     setOwnerLast(o);
 }
 
@@ -3238,12 +3231,19 @@ bool unforceIsScopeStackSlot(const void * p)
 
 void EvalState::logPreImageSlow(Value & v)
 {
+    /* A young cell of the open segment keeps the owner, and needs no log
+       entry. With owners off, the open segment is all of [base, cur). The
+       test is here, not inline: the hook's inline part is markers' one
+       test of `isolationDepth` (STACK-PARITY.md, R1; review
+       identity-owners-v1, B1). */
+    if ((const char *) &v >= ownerSeg && (const char *) &v < evalRegion.cur) [[likely]]
+        return;
     /* Mostly a driver forcing a cell of the segment just below the open
        one (so young), whose owner differs from the current one (adjacent
        segments never share an owner). With owners off, `ownerSegs` holds
        only its sentinel. */
     auto p = (uintptr_t) &v;
-    if (p >= ownerSegs.back().start && p < (uintptr_t) evalRegion.seg) [[likely]]
+    if (p >= ownerSegs.back().start && p < (uintptr_t) ownerSeg) [[likely]]
         return youngOwnerChange(v, ownerSegs.back().owner);
     return logPreImageRest(*this, v);
 }
@@ -3273,7 +3273,6 @@ void EvalState::logPreImageSlow(Value & v)
 {
     auto saved = opens.back().saved;
     opens.pop();
-    setOpenTop();
     openLogIndices.pop();
     if (ownersOn)
         setOwner((const Value *) (saved & ~uintptr_t(1)));
@@ -3282,15 +3281,13 @@ void EvalState::logPreImageSlow(Value & v)
 
 void EvalState::endLoggedForceSlow(Value & v)
 {
-    /* Called when `v` is the innermost open force (`unforceOpenTop`, which
-       is the cell of `opens`' top). */
-    if (opens.back().cell != &v) [[unlikely]]
+    /* Only a force whose start pushed `v` on `opens` has anything to end. */
+    if (opens.back().cell != &v) [[likely]]
         return;
     auto saved = opens.back().saved;
     if (saved & 1) [[unlikely]]
         return endLoggedOpen(*this, v);
     opens.pop();
-    setOpenTop();
     /* Only a young force that changed the owner pushes this. */
     setOwnerLast((const Value *) saved);
 }
