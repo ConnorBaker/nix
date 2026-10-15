@@ -106,6 +106,13 @@ struct Settings
        `decideJob`): "on" (promote the producers), "off" (counts only, the
        old behaviour; for negative controls). */
     std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
+    /* The closure's step budget per job (`decideJob`): a fixed allowance
+       plus a number of steps per KiB the job allocated. Dev overrides. */
+    uint64_t walkBudgetBase = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_BASE").value_or("1000000"));
+    uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("64"));
+    /* What a job whose closure runs out of budget does: "promote" every
+       target, or "revert" every target. Both keep identity. */
+    std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
 };
 
 const Settings & unforceSettings()
@@ -135,6 +142,10 @@ struct Stats
        entries, and the largest transient bookkeeping of one job close
        (estimated). */
     size_t markerPromoted = 0, markerRounds = 0, markerSteps = 0, markerJobs = 0;
+    /* The closure's budget: jobs that ran out of it (and so promoted, or
+       reverted, every target), the most steps one job took, and the most
+       steps per KiB of job memory one job took. */
+    size_t budgetJobs = 0, maxJobSteps = 0, maxStepsPerKiB = 0;
     size_t markerLogBytes = 0, markerPeakBytes = 0;
     /* Jobs that promoted nothing because client code ran in them, and the
        cells reverted at their ends. */
@@ -161,7 +172,8 @@ static void printStatsAtExit()
              std::cerr << fmt(
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
-                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB; client-code jobs %d, reverted in client-code jobs %d, "
+                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
+                 "max steps per KiB %d; client-code jobs %d, reverted in client-code jobs %d, "
                  "inner-scope reverts %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
@@ -181,6 +193,10 @@ static void printStatsAtExit()
                  stats.markerJobs,
                  stats.markerLogBytes >> 10,
                  stats.markerPeakBytes >> 10,
+                 stats.budgetJobs,
+                 unforceSettings().walkFallback,
+                 stats.maxJobSteps,
+                 stats.maxStepsPerKiB,
                  stats.clientJobs,
                  stats.revertedInClientJobs,
                  stats.innerScopeReverts);
@@ -971,6 +987,17 @@ struct YoungWalker
     std::unordered_map<const void *, uint32_t> visited;
     uint32_t walk = 0;
     std::vector<std::pair<const void *, Kind>> stack;
+    /* Steps taken in this job, and how many it may take. */
+    uint64_t steps = 0, budget = UINT64_MAX;
+
+    struct OverBudget
+    {};
+
+    void step()
+    {
+        if (++steps > budget) [[unlikely]]
+            throw OverBudget{};
+    }
 
     /* Call `f(p, kind)` for each object `v` refers to directly. */
     template<typename F>
@@ -1063,7 +1090,7 @@ struct YoungWalker
         while (!stack.empty()) {
             auto [p, kind] = stack.back();
             stack.pop_back();
-            stats.markerSteps++;
+            step();
             children(p, kind, add);
         }
     }
@@ -1091,7 +1118,7 @@ struct YoungWalker
         while (!stack.empty()) {
             auto [p, kind] = stack.back();
             stack.pop_back();
-            stats.markerSteps++;
+            step();
             auto a = clock(p);
             if (a && !allowed(*a))
                 continue;
@@ -1117,7 +1144,22 @@ static const bool failDecide = getEnv("NIX_UNFORCE_FAIL_DECIDE").value_or("0") !
    This is the fallible step before the job's memory is released: it copies
    and writes nothing but its own bookkeeping, so the caller turns an
    allocation failure here into a fatal error before any target has
-   changed. Returns a flag per target. */
+   changed. `youngBytes` is the memory the job allocated, which sets the
+   closure's step budget. Returns a flag per target.
+
+   The budget. The closure is a walk per reverted target per round, and
+   targets can share young structure that every one of them may reach, so
+   it can take steps quadratic in the job's size (review S1:
+   walk-2000-100000, 400 M steps). A job that runs out of budget falls back
+   to a promotion set that needs no walk and keeps identity on its own:
+   - "promote" (the default): S = T. Every young cell's owner is a target
+     or nothing, so OC holds. This is what K = 1 does for every job: the
+     job keeps what it forced, as without unforcing, and its CPU cost is
+     the copy, linear in what is kept.
+   - "revert": S = {} (pure revert). Nothing is kept, so a hot producer is
+     rebuilt in later jobs; a workload that kept exceeding the budget
+     would recompute it every job.
+   Neither is partial: the fallback replaces the whole decision. */
 std::vector<bool> decideJob(
     EvalState & state,
     size_t mark,
@@ -1126,7 +1168,8 @@ std::vector<bool> decideJob(
     std::unordered_map<const Value *, uint32_t> & counts,
     const YoungSpace & young,
     const CellClock & clock,
-    uint64_t jobEnd)
+    uint64_t jobEnd,
+    size_t youngBytes)
 {
     auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
@@ -1157,6 +1200,7 @@ std::vector<bool> decideJob(
 
     ForceMarkers markers(state.undoLog, mark, jobEnd);
     YoungWalker walker{young, clock};
+    walker.budget = cfg.walkBudgetBase + cfg.walkBudgetPerKiB * (youngBytes >> 10);
     /* Evac(S): every young object a promoted target's content reaches. */
     std::unordered_set<const void *> evac;
     size_t peak = 0;
@@ -1168,35 +1212,48 @@ std::vector<bool> decideJob(
     };
     auto changedBefore = stats.markerPromoted;
 
-    for (size_t i = 0; i < targets.size(); ++i)
-        if (promote[i])
-            walker.mark(*targets[i], evac);
-    /* Rounds: find every reverted target that is a candidate against the
-       current Evac(S), then promote them all. The candidate test is
-       monotone in S, so this reaches the same least fixpoint as promoting
-       each candidate as soon as it is found. */
-    while (true) {
-        stats.markerRounds++;
-        std::vector<size_t> found;
-        for (size_t i = 0; i < targets.size(); ++i) {
+    try {
+        for (size_t i = 0; i < targets.size(); ++i)
             if (promote[i])
-                continue;
-            auto t = targets[i];
-            if (walker.run(
-                    *t,
-                    [&](uint64_t a) { return markers.allowed(t, a); },
-                    [&](const Value * v) { return evac.count(v) != 0; }))
-                found.push_back(i);
+                walker.mark(*targets[i], evac);
+        /* Rounds: find every reverted target that is a candidate against
+           the current Evac(S), then promote them all. The candidate test
+           is monotone in S, so this reaches the same least fixpoint as
+           promoting each candidate as soon as it is found. */
+        auto closure = promote;
+        size_t added = 0;
+        while (true) {
+            stats.markerRounds++;
+            std::vector<size_t> found;
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (closure[i])
+                    continue;
+                auto t = targets[i];
+                if (walker.run(
+                        *t,
+                        [&](uint64_t a) { return markers.allowed(t, a); },
+                        [&](const Value * v) { return evac.count(v) != 0; }))
+                    found.push_back(i);
+            }
+            notePeak();
+            if (found.empty())
+                break;
+            for (auto i : found) {
+                closure[i] = true;
+                added++;
+                walker.mark(*targets[i], evac);
+            }
         }
+        promote = std::move(closure);
+        stats.markerPromoted += added;
+    } catch (YoungWalker::OverBudget &) {
         notePeak();
-        if (found.empty())
-            break;
-        for (auto i : found) {
-            promote[i] = true;
-            stats.markerPromoted++;
-            walker.mark(*targets[i], evac);
-        }
+        stats.budgetJobs++;
+        promote.assign(targets.size(), cfg.walkFallback != "revert");
     }
+    stats.markerSteps += walker.steps;
+    stats.maxJobSteps = std::max<size_t>(stats.maxJobSteps, walker.steps);
+    stats.maxStepsPerKiB = std::max<size_t>(stats.maxStepsPerKiB, walker.steps / std::max<size_t>(1, youngBytes >> 10));
 
     if (stats.markerPromoted != changedBefore)
         stats.markerJobs++;
@@ -1324,7 +1381,8 @@ std::string unforceStatsJSON()
     return fmt(
         R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,)"
-        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,"clientJobs":%d,)"
+        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,)"
+        R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,"clientJobs":%d,)"
         R"("revertedInClientJobs":%d,"innerScopeReverts":%d})",
         stats.jobs,
         stats.logged,
@@ -1344,6 +1402,10 @@ std::string unforceStatsJSON()
         stats.markerJobs,
         stats.markerLogBytes,
         stats.markerPeakBytes,
+        stats.budgetJobs,
+        unforceSettings().walkFallback,
+        stats.maxJobSteps,
+        stats.maxStepsPerKiB,
         stats.clientJobs,
         stats.revertedInClientJobs,
         stats.innerScopeReverts);
@@ -1564,7 +1626,8 @@ static void endHeapScope(EvalState & state, size_t mark)
             for (size_t i = 0; i < f.chunks.size(); ++i)
                 clock.chunks.emplace_back((uintptr_t) f.chunks[i], i * cellsPerChunk);
             std::sort(clock.chunks.begin(), clock.chunks.end());
-            promoted = decideJob(state, mark, targets, true, state.forceCounts, YoungSpace{f.heap}, clock, jobEnd);
+            promoted = decideJob(
+                state, mark, targets, true, state.forceCounts, YoungSpace{f.heap}, clock, jobEnd, f.bytes);
         }
     } catch (std::bad_alloc &) {
         unforceFatal("deciding which values to keep at the end of an unforce scope");
@@ -1721,7 +1784,16 @@ void EvalState::endUnforceScope(size_t mark)
         for (auto i = mark; i < undoLog.size(); ++i)
             if (preImages.try_emplace(undoLog[i].target, undoLog[i].preImage).second)
                 targets.push_back(undoLog[i].target);
-        promoted = decideJob(*this, mark, targets, evalRegion.allTypes, forceCounts, YoungSpace{}, CellClock{}, jobEnd);
+        promoted = decideJob(
+            *this,
+            mark,
+            targets,
+            evalRegion.allTypes,
+            forceCounts,
+            YoungSpace{},
+            CellClock{},
+            jobEnd,
+            evalRegion.cur - evalRegion.base);
     } catch (std::bad_alloc &) {
         unforceFatal("deciding which values to keep at the end of an unforce batch");
     }

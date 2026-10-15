@@ -41,3 +41,26 @@ for f in *.nix; do
         done
     done
 done
+
+# A job whose producer closure runs out of its step budget falls back to
+# promoting, or reverting, every target it forced. Both keep identity: with
+# a budget of 0 steps every closure falls back.
+for f in *.nix; do
+    [[ $f == set.nix || $f == nested.nix ]] && continue
+    expected=$(run "$f" --option eval-unforce false)
+    for fallback in promote revert; do
+        for k in 2 3; do
+            out=$(NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
+                NIX_UNFORCE_WALK_FALLBACK=$fallback NIX_UNFORCE_PROMOTE=$k \
+                run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
+            [[ $out == "$expected" ]] \
+                || fail "$f (budget 0, fallback $fallback, promotion after $k forces): got '$out', expected '$expected'"
+        done
+    done
+done
+
+# The fallback happens, and is counted.
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
+    nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict follows.nix 2>&1 >/dev/null)
+[[ $stats =~ over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] >= 1 )) || fail "the closure never ran out of budget: $stats"
