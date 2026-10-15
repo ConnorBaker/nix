@@ -146,7 +146,7 @@ done
 ownerStat() { # FIELD EXPR
     NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout nix-instantiate --option eval-unforce true \
         --option eval-unforce-batch-size 0 --eval --strict --json -E "$2" 2>/dev/null \
-        | sed -n 's/.*"'"$1"'":\([0-9]*\).*/\1/p' | head -n 1
+        | sed -n 's/.*"'"$1"'": *\([0-9]*\).*/\1/p' | head -n 1
 }
 expr='let L = builtins.genList (i: { v = i * 2; }) 2000; in [ L ]'
 changes=$(ownerStat ownerChanges "$expr")

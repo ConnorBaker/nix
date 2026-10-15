@@ -1394,9 +1394,11 @@ public:
 
     /**
      * PROTOTYPE. The out-of-line part of `logPreImage`: log `v` with the
-     * start marker of its force.
+     * start marker of its force, or change the owner for a young cell of
+     * another owner segment. Not `cold`: with the owner timeline, a driver
+     * forcing young cells of a target comes here once per force.
      */
-    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
+    [[gnu::noinline]] void logPreImageSlow(Value & v);
 
     /**
      * PROTOTYPE. After a force of `v`, however it ended: record the end
@@ -1410,7 +1412,7 @@ public:
             endLoggedForceSlow(v);
     }
 
-    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
+    [[gnu::noinline]] void endLoggedForceSlow(Value & v);
 
     /**
      * PROTOTYPE. Close an unforce scope and unforce every thunk updated
