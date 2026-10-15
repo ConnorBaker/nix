@@ -20,6 +20,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <optional>
 #include <algorithm>
 #include <set>
@@ -513,6 +514,16 @@ struct Evacuator
        wherever allocation currently goes (the enclosing scope's heap). */
     void * youngHeap = nullptr;
 
+    /* If set, called for every young object as it is copied. */
+    std::function<void(const void *)> onForward;
+
+    void note(const void * p, void * n)
+    {
+        forward.emplace(p, n);
+        if (onForward)
+            onForward(p);
+    }
+
     bool young(const void * p) const
     {
 #if NIX_UNFORCE_MIMALLOC
@@ -546,7 +557,7 @@ struct Evacuator
         auto n = state.allocValue();
         stats.copiedBytes += sizeof(Value);
         *n = *v;
-        forward.emplace(v, n);
+        note(v, n);
         values.push_back(n);
         return n;
     }
@@ -562,7 +573,7 @@ struct Evacuator
         stats.copiedBytes += sizeof(Env) + size * sizeof(Value *);
         n.up = e->up;
         std::copy_n(e->values, size, n.values);
-        forward.emplace(e, &n);
+        note(e, &n);
         envs.emplace_back(&n, size);
         return &n;
     }
@@ -574,7 +585,7 @@ struct Evacuator
         if (auto f = forwarded(s))
             return f;
         auto n = (const StringData *) copyBytes(s, sizeof(StringData) + s->size() + 1);
-        forward.emplace(s, (void *) n);
+        note(s, (void *) n);
         return n;
     }
 
@@ -589,7 +600,7 @@ struct Evacuator
             return f;
         auto n = (Value **) state.mem.allocBytes(size * sizeof(Value *));
         stats.copiedBytes += size * sizeof(Value *);
-        forward.emplace(elems, n);
+        note(elems, n);
         for (size_t i = 0; i < size; ++i)
             n[i] = value(elems[i]);
         return n;
@@ -608,7 +619,7 @@ struct Evacuator
         auto elems = const_cast<Context::value_type *>(n->begin());
         for (size_t i = 0; i < c->size(); ++i)
             elems[i] = string(c->begin()[i]);
-        forward.emplace(c, n);
+        note(c, n);
         return n;
     }
 
@@ -624,7 +635,7 @@ struct Evacuator
             state.mem.allocBytes(bytes),
             [&](Value * v) { return value(v); },
             [&](const Bindings * base) { return bindings(base); });
-        forward.emplace(b, (void *) n);
+        note(b, (void *) n);
         return n;
     }
 
@@ -1015,8 +1026,7 @@ struct ForceMarkers
                 childIntervals[fill[log[j].parent - mark]++] = {log[j].start, endOf(j)};
         for (size_t i = 0; i < targets.size(); ++i) {
             auto f = targets.first[i];
-            spans.push_back(
-                {log[f].start, endOf(f), !targets.repeated[i], begin[f - mark], begin[f - mark + 1]});
+            spans.push_back({log[f].start, endOf(f), !targets.repeated[i], begin[f - mark], begin[f - mark + 1]});
         }
     }
 
@@ -1053,23 +1063,23 @@ struct YoungSpace
     }
 };
 
-/* Per young object, three flags of the closure (`Closure`): in Evac(S),
-   visited by the current walk, and known to reach no Evac(S) cell from
-   the walks still to come (a memo). */
-enum Flag { inEvac, visited, memo, nFlags };
+/* Per young object, four flags of the closure (`Closure`): in Evac(S),
+   visited by the current walk, known to reach no Evac(S) cell from the
+   walks still to come (a memo), and reached by some walk of this job. */
+enum Flag : uint8_t { inEvac = 1, visited = 2, memo = 4, reached = 8 };
 
-/* The flags of the bump region's objects: a bitmap per flag, one bit per
-   16-byte granule (bump allocations are 16-byte aligned), in 64 KiB pieces
-   of the region that are allocated when first touched. At most 3 bits per
-   16 bytes of the job, 2.3 %. */
+/* The flags of the bump region's objects: four bits per 16-byte granule
+   (bump allocations are 16-byte aligned), side by side so that one load
+   reads them all, in pieces covering 64 KiB of the region that are
+   allocated when first touched. At most 3.1 % of the job's memory. */
 struct RegionMarks
 {
     static constexpr size_t granuleShift = 4, pieceShift = 16;
-    static constexpr size_t words = (size_t(1) << (pieceShift - granuleShift)) / 64;
+    static constexpr size_t words = (size_t(1) << (pieceShift - granuleShift)) / 16;
 
     struct Piece
     {
-        uint64_t bits[nFlags][words] = {};
+        uint64_t nibbles[words] = {};
     };
 
     uintptr_t base;
@@ -1082,36 +1092,61 @@ struct RegionMarks
     {
     }
 
-    bool test(const void * p, Flag f) const
+    uint8_t get(const void * p) const
     {
         auto g = ((uintptr_t) p - base) >> granuleShift;
         auto & piece = pieces[g >> (pieceShift - granuleShift)];
-        return piece && (piece->bits[f][(g >> 6) % words] >> (g & 63) & 1);
+        return piece ? (piece->nibbles[(g >> 4) % words] >> ((g & 15) * 4)) & 15 : 0;
     }
 
-    void set(const void * p, Flag f)
+    /* Set `flags` on `p`; returns the flags it had. */
+    uint8_t add(const void * p, uint8_t flags)
     {
         auto g = ((uintptr_t) p - base) >> granuleShift;
         auto & piece = pieces[g >> (pieceShift - granuleShift)];
-        if (!piece) {
+        if (!piece) [[unlikely]] {
             piece = std::make_unique<Piece>();
             allocated++;
         }
-        piece->bits[f][(g >> 6) % words] |= uint64_t(1) << (g & 63);
+        auto & w = piece->nibbles[(g >> 4) % words];
+        auto shift = (g & 15) * 4;
+        uint8_t old = (w >> shift) & 15;
+        w |= uint64_t(flags) << shift;
+        return old;
     }
 
-    void clear(const void * p, Flag f)
+    /* For a walk: if `p` is neither visited nor memo'd, mark it visited
+       and return true. One lookup. */
+    bool claim(const void * p)
+    {
+        auto g = ((uintptr_t) p - base) >> granuleShift;
+        auto & piece = pieces[g >> (pieceShift - granuleShift)];
+        if (!piece) [[unlikely]] {
+            piece = std::make_unique<Piece>();
+            allocated++;
+        }
+        auto & w = piece->nibbles[(g >> 4) % words];
+        auto shift = (g & 15) * 4;
+        if ((w >> shift) & (visited | memo))
+            return false;
+        w |= uint64_t(visited) << shift;
+        return true;
+    }
+
+    void remove(const void * p, uint8_t flags)
     {
         auto g = ((uintptr_t) p - base) >> granuleShift;
         if (auto & piece = pieces[g >> (pieceShift - granuleShift)])
-            piece->bits[f][(g >> 6) % words] &= ~(uint64_t(1) << (g & 63));
+            piece->nibbles[(g >> 4) % words] &= ~(uint64_t(flags) << ((g & 15) * 4));
     }
 
-    void clearAll(Flag f)
+    void removeAll(uint8_t flags)
     {
+        auto mask = ~(uint64_t(flags) * 0x1111111111111111);
         for (auto & piece : pieces)
             if (piece)
-                std::fill(std::begin(piece->bits[f]), std::end(piece->bits[f]), 0);
+                for (auto & w : piece->nibbles)
+                    w &= mask;
     }
 
     size_t bytes() const
@@ -1125,27 +1160,39 @@ struct HeapMarks
 {
     std::unordered_map<const void *, uint8_t> flags;
 
-    bool test(const void * p, Flag f) const
+    uint8_t get(const void * p) const
     {
         auto i = flags.find(p);
-        return i != flags.end() && (i->second >> f & 1);
+        return i == flags.end() ? 0 : i->second;
     }
 
-    void set(const void * p, Flag f)
+    uint8_t add(const void * p, uint8_t f)
     {
-        flags[p] |= 1 << f;
+        auto & b = flags[p];
+        auto old = b;
+        b |= f;
+        return old;
     }
 
-    void clear(const void * p, Flag f)
+    bool claim(const void * p)
+    {
+        auto & b = flags[p];
+        if (b & (visited | memo))
+            return false;
+        b |= visited;
+        return true;
+    }
+
+    void remove(const void * p, uint8_t f)
     {
         if (auto i = flags.find(p); i != flags.end())
-            i->second &= ~(1 << f);
+            i->second &= ~f;
     }
 
-    void clearAll(Flag f)
+    void removeAll(uint8_t f)
     {
         for (auto & [p, b] : flags)
-            b &= ~(1 << f);
+            b &= ~f;
     }
 
     size_t bytes() const
@@ -1162,23 +1209,38 @@ struct OverBudget
    edges the Evacuator copies, without copying.
 
    Cost. Every walk takes steps (objects popped), and a job may take
-   `budget` of them. Three things keep the count down:
-   - Evac(S) is marked once per object: marking stops at marked objects,
-     so all of a job's marking is linear in Evac(S).
+   `budget` of them. These keep the count down:
+   - Evac(S) is marked once per object, by the copies themselves or by a
+     marking walk that stops at marked objects: linear in Evac(S).
    - A list's element array is visited once per walk however many list
      values share it.
-   - Memo. Within a round Evac(S) is fixed. A walk from target w that ends
+   - Memo. While Evac(S) does not change, a walk from target w that ends
      without a hit has shown, for every object x it visited (pruned ones
-     included), that no Evac(S) cell is reachable from x through objects
-     with times >= θ, where θ = s(w), or e(w) if it pruned an object inside
-     its own interval (a child's); without such prunes every object of time
-     >= s(w) it met was allowed. A later walk u never enters an object of
-     time < s(u) (allowed(u, a) implies a >= s(u)), so if s(u) >= θ, u can
-     skip x: it would find no hit below x. Targets are walked in start
-     order, so a memo with θ = s(w) holds for every later walk of the round;
-     one with θ = e(w) is held back until a walk starts at or after e(w).
-     A walk that hits leaves no memo (its target joins S anyway), and the
-     memos are dropped when a round ends, since S grows. */
+     included), that no identity-bearing object of Evac(S) is reachable
+     from x through objects with times >= θ, where θ = s(w), or e(w) if it
+     pruned an object inside its own interval (a child's); without such
+     prunes every object of time >= s(w) it met was allowed. A later walk u
+     never enters an object of time < s(u) (allowed(u, a) implies
+     a >= s(u)), so if s(u) >= θ, u can skip x: it would find no hit below
+     x. A round walks the targets in start order, so a memo with θ = s(w)
+     holds for every later walk of the round; one with θ = e(w) is held back
+     until a walk starts at or after e(w). Every round starts with no memos,
+     since it starts again from the earliest target. A walk that hits
+     leaves no memo (its target joins S).
+     Memos waiting for their θ hold at most `pendingCap` objects; beyond
+     that a memo is not kept, which only costs steps.
+   - `reached`. Every object visited by a walk that ends without a hit is
+     marked `reached` (and stays so for the job). The objects a reverted
+     target's walk can visit do not change while the job is decided (the
+     graph is fixed), and all of them are `reached` once it has been
+     walked: by its own walk, or by the earlier hit-free walk whose memo let
+     it skip them (a memo covers only objects that walk explored or
+     pruned). So when S grows and none of the objects newly added to
+     Evac(S) is `reached`, no reverted target already walked can have
+     become a candidate, and every memo still holds (a memo of x fails only
+     if a new Evac(S) object is reachable from x through objects its walk
+     explored). Only when a new object is `reached` are the memos dropped
+     and all targets walked again. */
 template<typename Marks>
 struct Closure
 {
@@ -1190,8 +1252,17 @@ struct Closure
     std::vector<std::pair<const void *, Kind>> stack;
     /* Objects visited by the current walk. */
     std::vector<const void *> touched;
-    /* Memos waiting for a walk that starts at or after their θ. */
+    /* Memos waiting for a walk that starts at or after their θ (a heap,
+       smallest θ first), and the objects they hold. */
     std::vector<std::pair<uint64_t, std::vector<const void *>>> pending;
+    static constexpr auto laterTheta = [](const auto & a, const auto & b) { return a.first > b.first; };
+    size_t pendingSize = 0;
+    static constexpr size_t pendingCap = size_t(1) << 20;
+    /* Whether `mark` added an object some walk reached. */
+    bool reachedNew = false;
+    /* For the check (NIX_UNFORCE_CLOSURE_CHECK): no memos, and every
+       promotion starts another round. */
+    bool memos = true;
     /* Steps taken in this job, and how many it may take. */
     uint64_t steps = 0, budget = UINT64_MAX;
     size_t peak = 0;
@@ -1284,14 +1355,18 @@ struct Closure
     {
         stack.clear();
         auto add = [&](const void * p, Kind k) {
-            if (p && young(p) && !marks.test(p, inEvac)) {
-                marks.set(p, inEvac);
+            if (!p || !young(p))
+                return;
+            auto old = marks.add(p, inEvac);
+            if (!(old & inEvac)) {
+                reachedNew |= old & reached;
                 stack.emplace_back(p, k);
             }
         };
         auto array = [&](Value * const * elems, size_t size) {
-            if (!marks.test(elems, inEvac)) {
-                marks.set(elems, inEvac);
+            auto old = marks.add(elems, inEvac);
+            if (!(old & inEvac)) {
+                reachedNew |= old & reached;
                 for (size_t i = 0; i < size; ++i)
                     add(elems[i], kValue);
             }
@@ -1310,20 +1385,19 @@ struct Closure
     bool candidate(const Value & content, const ForceMarkers & markers, const ForceMarkers::Span & t)
     {
         /* Memos of earlier walks that hold from here on. */
-        std::erase_if(pending, [&](auto & m) {
-            if (m.first > t.s)
-                return false;
-            for (auto p : m.second)
-                marks.set(p, memo);
-            return true;
-        });
+        while (!pending.empty() && pending.front().first <= t.s) {
+            std::pop_heap(pending.begin(), pending.end(), laterTheta);
+            for (auto p : pending.back().second)
+                marks.add(p, memo);
+            pendingSize -= pending.back().second.size();
+            pending.pop_back();
+        }
 
         stack.clear();
         touched.clear();
         auto push = [&](const void * p, Kind k) {
-            if (!p || !young(p) || marks.test(p, visited) || marks.test(p, memo))
+            if (!p || !young(p) || !marks.claim(p))
                 return;
-            marks.set(p, visited);
             touched.push_back(p);
             stack.emplace_back(p, k);
         };
@@ -1339,13 +1413,12 @@ struct Closure
         /* An element array is checked where it is reached: its elements
            are pushed only if it is neither pruned nor a hit. */
         auto array = [&](Value * const * elems, size_t size) {
-            if (hit || marks.test(elems, visited) || marks.test(elems, memo))
+            if (hit || !marks.claim(elems))
                 return;
-            marks.set(elems, visited);
             touched.push_back(elems);
             if (pruned(elems))
                 return;
-            if (marks.test(elems, inEvac)) {
+            if (marks.get(elems) & inEvac) {
                 hit = true;
                 return;
             }
@@ -1362,23 +1435,31 @@ struct Closure
             /* Identity is observable on cells (`eqValues`) and on Bindings
                (the printers' «repeated» tracking keys on the Bindings);
                envs are never compared. */
-            if (kind != kEnv && marks.test(p, inEvac)) {
+            if (kind != kEnv && marks.get(p) & inEvac) {
                 hit = true;
                 break;
             }
             children(p, kind, push, array);
         }
 
-        for (auto p : touched)
-            marks.clear(p, visited);
+        /* `reached` records the walks that leave their target reverted
+           (see `Closure`); a target that hit joins S. */
+        for (auto p : touched) {
+            marks.remove(p, visited);
+            if (!hit)
+                marks.add(p, reached);
+        }
         notePeak();
-        if (!hit) {
+        if (!hit && memos) {
             auto theta = ownPruned ? t.e : t.s;
             if (theta <= t.s)
                 for (auto p : touched)
-                    marks.set(p, memo);
-            else
+                    marks.add(p, memo);
+            else if (pendingSize + touched.size() <= pendingCap) {
+                pendingSize += touched.size();
                 pending.emplace_back(theta, std::move(touched));
+                std::push_heap(pending.begin(), pending.end(), laterTheta);
+            }
         }
         return hit;
     }
@@ -1387,65 +1468,84 @@ struct Closure
     void dropMemos()
     {
         pending.clear();
-        marks.clearAll(memo);
+        pendingSize = 0;
+        marks.removeAll(memo);
     }
 
     void notePeak()
     {
-        auto bytes = marks.bytes() + stack.capacity() * sizeof(stack[0]) + touched.capacity() * sizeof(void *);
-        for (auto & m : pending)
-            bytes += m.second.capacity() * sizeof(void *);
+        auto bytes = marks.bytes() + stack.capacity() * sizeof(stack[0]) + touched.capacity() * sizeof(void *)
+                     + pendingSize * sizeof(void *) + pending.capacity() * sizeof(pending[0]);
         peak = std::max(peak, bytes);
     }
 };
 
+/* Dev: compare every closure with a plain recomputation (slow). */
+static const bool checkClosure = getEnv("NIX_UNFORCE_CLOSURE_CHECK").value_or("0") != "0";
+
 /* For tests of the fatal path: fail the decision's allocations. */
 static const bool failDecide = getEnv("NIX_UNFORCE_FAIL_DECIDE").value_or("0") != "0";
 
-/* The closure's rounds: find every reverted target that is a candidate
-   against the current Evac(S), then promote them all. The candidate test
-   is monotone in S, so this reaches the least fixpoint, whatever the order.
-   Returns the promotions added. */
-template<typename Marks>
+/* The closure's rounds. Each round walks the reverted targets in start
+   order and promotes a candidate as soon as it is found: `join(i)` adds
+   target i's R(c) to Evac(S) (`mark`, or a copy that marks what it
+   copies), so the targets after it are tested against the larger Evac(S).
+   If what join added meets no object a reverted target's walk reached
+   (`reachedNew` false; see `Closure`), the memos stay valid and the targets
+   already tested stay non-candidates; otherwise the memos are dropped and
+   another round tests everything again. The candidate test is monotone in
+   S, so this reaches the least fixpoint. Returns the promotions added. */
+template<typename Marks, typename Join>
 size_t closePromotions(
-    Closure<Marks> & closure, const JobTargets & targets, const ForceMarkers & markers, std::vector<bool> & promote)
+    Closure<Marks> & closure,
+    const JobTargets & targets,
+    const ForceMarkers & markers,
+    std::vector<bool> & promote,
+    Join && join)
 {
     for (size_t i = 0; i < targets.size(); ++i)
         if (promote[i])
-            closure.mark(*targets.cells[i]);
+            join(i);
     size_t added = 0;
-    while (true) {
+    for (bool again = true; again;) {
+        again = false;
         stats.markerRounds++;
-        std::vector<size_t> found;
-        for (size_t i = 0; i < targets.size(); ++i)
-            if (!promote[i] && closure.candidate(*targets.cells[i], markers, markers.spans[i]))
-                found.push_back(i);
-        if (found.empty())
-            break;
+        /* A memo holds only for walks that start after its own; a round
+           starts again from the earliest target. */
         closure.dropMemos();
-        for (auto i : found) {
+        for (size_t i = 0; i < targets.size(); ++i) {
+            if (promote[i] || !closure.candidate(*targets.cells[i], markers, markers.spans[i]))
+                continue;
             promote[i] = true;
             added++;
-            closure.mark(*targets.cells[i]);
+            closure.reachedNew = false;
+            join(i);
+            if (closure.reachedNew || !closure.memos) {
+                closure.dropMemos();
+                again = true;
+            }
         }
     }
     return added;
 }
 
-/* Decide which of a job's targets to promote: the counts in `counts`
-   nominate, and the producer closure adds what identity needs (see above).
-   This is the fallible step before the job's memory is released: it copies
-   and writes nothing but its own bookkeeping, so the caller turns an
-   allocation failure here into a fatal error before any target has
-   changed. `youngBytes` is the memory the job allocated, which sets the
-   closure's step budget. Returns a flag per target.
+/* Decide which of a job's targets to promote, and copy them with
+   `evacuator` into `copies` (indexed like the targets): the counts in
+   `counts` nominate, and the producer closure adds what identity needs (see
+   above). This is the fallible step before the job's memory is released.
+   It writes no target, so the caller turns an allocation failure here into
+   a fatal error before anything has changed, and the release that follows
+   only assigns, reverts and frees. The caller pauses the region.
+   `youngBytes` is the memory the job allocated, which sets the closure's
+   step budget. Returns a flag per target.
 
    The budget. The closure is a walk per reverted target per round, and
    targets can share young structure that every one of them may reach, so
    even with the memo it can take steps quadratic in the job's size (review
-   S1: walk-2000-100000 took 400 M steps before the memo). A job that runs
-   out of budget falls back to a promotion set that needs no walk and keeps
-   identity on its own:
+   S1: walk-2000-100000 took 400 M steps before the memo; see
+   tmp/markers-v2's nested adversary for one the memo does not help). A job
+   that runs out of budget falls back to a promotion set that needs no walk
+   and keeps identity on its own:
    - "promote" (the default): S = T. Every young cell's owner is a target
      or nothing, so OC holds. This is what K = 1 does for every job: the
      job keeps what it forced, as without unforcing, and its CPU cost is
@@ -1453,7 +1553,13 @@ size_t closePromotions(
    - "revert": S = {} (pure revert). Nothing is kept, so a hot producer is
      rebuilt in later jobs; a workload that kept exceeding the budget
      would recompute it every job.
-   Neither is partial: the fallback replaces the whole decision. */
+   Neither is partial: the fallback replaces the whole decision.
+
+   Evac(S). With the "promote" fallback S only grows, so every target that
+   joins S is copied at once and the Evacuator marks Evac(S) as it copies:
+   no copy is ever wasted, and Evac(S) costs no walk of its own. With the
+   "revert" fallback nothing may be copied before the decision is final, so
+   Evac(S) is marked by a walk (`Closure::mark`) and the copies follow. */
 std::vector<bool> decideJob(
     EvalState & state,
     size_t mark,
@@ -1463,10 +1569,26 @@ std::vector<bool> decideJob(
     const YoungSpace & young,
     const CellClock & clock,
     uint64_t jobEnd,
-    size_t youngBytes)
+    size_t youngBytes,
+    Evacuator & evacuator,
+    std::vector<Value> & copies)
 {
     auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
+    copies.resize(targets.size());
+    std::vector<bool> copied(targets.size());
+    auto copy = [&](size_t i) {
+        if (!copied[i]) {
+            copies[i] = evacuator.copy(*targets.cells[i]);
+            copied[i] = true;
+        }
+    };
+    auto copyPromoted = [&] {
+        for (size_t i = 0; i < targets.size(); ++i)
+            if (promote[i])
+                copy(i);
+    };
+
     bool counting = canCopy && cfg.promoteAfter;
     for (size_t i = 0; i < targets.size(); ++i) {
         if (!counting)
@@ -1488,29 +1610,39 @@ std::vector<bool> decideJob(
     }
 
     bool any = std::find(promote.begin(), promote.end(), true) != promote.end();
-    if (!any || cfg.markers == "off" || !canCopy)
+    if (!any || cfg.markers == "off" || !canCopy) {
+        copyPromoted();
         return promote;
+    }
 
     if (failDecide)
         throw std::bad_alloc();
 
     ForceMarkers markers(state.undoLog, mark, jobEnd, targets);
     auto budget = cfg.walkBudgetBase + cfg.walkBudgetPerKiB * (youngBytes >> 10);
+    bool fallbackPromote = cfg.walkFallback != "revert";
     uint64_t steps = 0;
     size_t peak = 0;
+    auto nominated = promote;
     auto decide = [&](auto & closure) {
         closure.budget = budget;
+        if (fallbackPromote)
+            evacuator.onForward = [&](const void * p) { closure.reachedNew |= closure.marks.add(p, inEvac) & reached; };
         auto closed = promote;
         try {
-            auto added = closePromotions(closure, targets, markers, closed);
+            auto added = fallbackPromote ? closePromotions(closure, targets, markers, closed, copy)
+                                         : closePromotions(closure, targets, markers, closed, [&](size_t i) {
+                                               closure.mark(*targets.cells[i]);
+                                           });
             promote = std::move(closed);
             stats.markerPromoted += added;
             if (added)
                 stats.markerJobs++;
         } catch (OverBudget &) {
             stats.budgetJobs++;
-            promote.assign(targets.size(), cfg.walkFallback != "revert");
+            promote.assign(targets.size(), fallbackPromote);
         }
+        evacuator.onForward = nullptr;
         closure.notePeak();
         steps = closure.steps;
         peak = closure.peak;
@@ -1522,12 +1654,39 @@ std::vector<bool> decideJob(
         Closure<RegionMarks> closure{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
         decide(closure);
     }
+    if (checkClosure && !young.heap) {
+        /* Recompute the closure plainly (marking walks, no memos, a round
+           after every promotion) and compare. */
+        Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
+        plain.memos = false;
+        auto o = nominated;
+        bool over = false;
+        try {
+            closePromotions(plain, targets, markers, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
+        } catch (OverBudget &) {
+            over = true;
+        }
+        if (!over && o != promote)
+            for (size_t i = 0; i < targets.size(); ++i)
+                if (o[i] != promote[i])
+                    std::cerr << fmt(
+                        "unforce check: job %d target %d (start %d, end %d, %s): plain closure %s, decided %s\n",
+                        stats.jobs,
+                        i,
+                        markers.spans[i].s,
+                        markers.spans[i].e,
+                        markers.spans[i].single ? "single" : "repeated",
+                        o[i] ? "promotes" : "reverts",
+                        promote[i] ? "promotes" : "reverts");
+    }
+    copyPromoted();
 
     stats.markerSteps += steps;
     stats.maxJobSteps = std::max<size_t>(stats.maxJobSteps, steps);
     stats.maxStepsPerKiB = std::max<size_t>(stats.maxStepsPerKiB, steps / std::max<size_t>(1, youngBytes >> 10));
-    stats.markerPeakBytes = std::max(stats.markerPeakBytes, peak + markers.spans.capacity() * sizeof(markers.spans[0])
-                                                                + markers.childIntervals.capacity() * 16);
+    stats.markerPeakBytes = std::max(
+        stats.markerPeakBytes,
+        peak + markers.spans.capacity() * sizeof(markers.spans[0]) + markers.childIntervals.capacity() * 16);
     return promote;
 }
 
@@ -1914,23 +2073,39 @@ static void endHeapScope(EvalState & state, size_t mark)
     stats.logged += log.size() - mark;
     dropActiveForces(mark);
 
+    /* Copies go to wherever allocation goes once this scope is closed. */
+    setCurrentHeap(parent ? parent->heap : nullptr);
     std::optional<JobTargets> jt;
     std::vector<bool> promoted;
+    std::vector<Value> copies;
     try {
         jt.emplace(log, mark);
         if (!parent) {
+            PauseRegion pause;
+            Evacuator evacuator{state};
+            evacuator.youngHeap = f.heap;
             CellClock clock{.bump = false};
             for (size_t i = 0; i < f.chunks.size(); ++i)
                 clock.chunks.emplace_back((uintptr_t) f.chunks[i], i * cellsPerChunk);
             std::sort(clock.chunks.begin(), clock.chunks.end());
-            promoted = decideJob(state, mark, *jt, true, state.forceCounts, YoungSpace{f.heap}, clock, jobEnd, f.bytes);
+            promoted = decideJob(
+                state,
+                mark,
+                *jt,
+                true,
+                state.forceCounts,
+                YoungSpace{f.heap},
+                clock,
+                jobEnd,
+                f.bytes,
+                evacuator,
+                copies);
             pruneCounts(state.forceCounts, *jt, promoted, state.settings.unforceBatchSize);
         }
     } catch (std::bad_alloc &) {
-        unforceFatal("deciding which values to keep at the end of an unforce scope");
+        unforceFatal("deciding which values to keep at the end of an unforce scope, and copying them");
     }
 
-    setCurrentHeap(parent ? parent->heap : nullptr);
     if (parent) {
         /* Only the outermost scope promotes, as with the bump backend: a
            nested scope reverts everything it forced, which keeps identity
@@ -1943,23 +2118,17 @@ static void endHeapScope(EvalState & state, size_t mark)
             stats.innerScopeReverts++;
         }
     } else
-        try {
-            PauseRegion pause;
-            Evacuator evacuator{state};
-            evacuator.youngHeap = f.heap;
-            for (size_t i = 0; i < jt->size(); ++i)
-                if (promoted[i]) {
-                    *jt->cells[i] = evacuator.copy(*jt->cells[i]);
-                    stats.promoted++;
-                } else {
-                    *jt->cells[i] = jt->preImages[i];
-                    stats.reverted++;
-                    if (clientCodeInJob)
-                        stats.revertedInClientJobs++;
-                }
-        } catch (std::bad_alloc &) {
-            unforceFatal("promoting values out of an unforce scope");
-        }
+        /* The release allocates nothing. */
+        for (size_t i = 0; i < jt->size(); ++i)
+            if (promoted[i]) {
+                *jt->cells[i] = copies[i];
+                stats.promoted++;
+            } else {
+                *jt->cells[i] = jt->preImages[i];
+                stats.reverted++;
+                if (clientCodeInJob)
+                    stats.revertedInClientJobs++;
+            }
 
     log.resize(mark);
     if (!parent) {
@@ -2071,74 +2240,82 @@ void EvalState::endUnforceScope(size_t mark)
     auto jobEnd = unforceClock();
     dropActiveForces(mark);
 
-    /* Before anything is released: decide what to promote. */
-    std::optional<JobTargets> jt;
-    std::vector<bool> promoted;
-    try {
-        jt.emplace(undoLog, mark);
-        promoted = decideJob(
-            *this,
-            mark,
-            *jt,
-            evalRegion.allTypes,
-            forceCounts,
-            YoungSpace{},
-            CellClock{},
-            jobEnd,
-            evalRegion.cur - evalRegion.base);
-        pruneCounts(forceCounts, *jt, promoted, settings.unforceBatchSize);
-    } catch (std::bad_alloc &) {
-        unforceFatal("deciding which values to keep at the end of an unforce batch");
-    }
-
-    /* The release: its only allocations are the promotion copies. */
-    try {
+    /* Before anything is released: decide what to promote, and copy it.
+       The Evacuator, whose table is keyed by young addresses, goes before
+       the region does. */
+    {
         PauseRegion pause;
         Evacuator evacuator{*this};
-        Stubber stubber{*this, evacuator};
-        auto & targets = jt->cells;
-        for (size_t i = 0; i < targets.size(); ++i)
-            if (promoted[i]) {
-                *targets[i] = evacuator.copy(*targets[i]);
-                stats.promoted++;
-            }
-
-        for (size_t i = 0; i < targets.size(); ++i) {
-            auto target = targets[i];
-            if (promoted[i])
-                continue;
-            auto & pre = jt->preImages[i];
-            if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
-                auto source = allocValue();
-                *source = pre;
-                if (getenv("NIX_UNFORCE_DEBUG")) {
-                    auto n = target->attrs()->get(s.name);
-                    sourceRegistry[source] =
-                        fmt("source for %s (job %d, pre-image %s)",
-                            n && n->value->internalType() == tString ? std::string(n->value->string_view()) : "?",
-                            stats.jobs,
-                            pre.internalType() == tApp     ? "app"
-                            : pre.internalType() == tThunk ? "thunk"
-                                                           : "other");
-                }
-                /* Memoise within one stub only (outputs refer to each other).
-                   Another cell holding the same derivation, such as an alias
-                   whose recipe is `self.foo`, must not share this stub: its
-                   fallbacks would select from a recipe that evaluates to the
-                   stub itself. */
-                stubber.memo.clear();
-                *target = *stubber.stub(*target, source, 0);
-                evacuator.drain();
-                stats.stubbed++;
-                continue;
-            }
-            *target = pre;
-            stats.reverted++;
-            if (clientCodeInJob)
-                stats.revertedInClientJobs++;
+        std::optional<JobTargets> jt;
+        std::vector<bool> promoted;
+        std::vector<Value> copies;
+        try {
+            jt.emplace(undoLog, mark);
+            promoted = decideJob(
+                *this,
+                mark,
+                *jt,
+                evalRegion.allTypes,
+                forceCounts,
+                YoungSpace{},
+                CellClock{},
+                jobEnd,
+                evalRegion.cur - evalRegion.base,
+                evacuator,
+                copies);
+            pruneCounts(forceCounts, *jt, promoted, settings.unforceBatchSize);
+        } catch (std::bad_alloc &) {
+            unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");
         }
-    } catch (std::bad_alloc &) {
-        unforceFatal("promoting values out of an unforce batch");
+
+        /* The release: assigns, reverts and frees. Only derivation stubs
+           (NIX_UNFORCE_STUB, a dev mode) allocate here. */
+        try {
+            Stubber stubber{*this, evacuator};
+            auto & targets = jt->cells;
+            for (size_t i = 0; i < targets.size(); ++i)
+                if (promoted[i]) {
+                    *targets[i] = copies[i];
+                    stats.promoted++;
+                }
+
+            for (size_t i = 0; i < targets.size(); ++i) {
+                auto target = targets[i];
+                if (promoted[i])
+                    continue;
+                auto & pre = jt->preImages[i];
+                if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
+                    auto source = allocValue();
+                    *source = pre;
+                    if (getenv("NIX_UNFORCE_DEBUG")) {
+                        auto n = target->attrs()->get(s.name);
+                        sourceRegistry[source] =
+                            fmt("source for %s (job %d, pre-image %s)",
+                                n && n->value->internalType() == tString ? std::string(n->value->string_view()) : "?",
+                                stats.jobs,
+                                pre.internalType() == tApp     ? "app"
+                                : pre.internalType() == tThunk ? "thunk"
+                                                               : "other");
+                    }
+                    /* Memoise within one stub only (outputs refer to each other).
+                       Another cell holding the same derivation, such as an alias
+                       whose recipe is `self.foo`, must not share this stub: its
+                       fallbacks would select from a recipe that evaluates to the
+                       stub itself. */
+                    stubber.memo.clear();
+                    *target = *stubber.stub(*target, source, 0);
+                    evacuator.drain();
+                    stats.stubbed++;
+                    continue;
+                }
+                *target = pre;
+                stats.reverted++;
+                if (clientCodeInJob)
+                    stats.revertedInClientJobs++;
+            }
+        } catch (std::bad_alloc &) {
+            unforceFatal("building derivation stubs at the end of an unforce batch");
+        }
     }
 
     if (evalRegion.base)

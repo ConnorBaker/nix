@@ -101,3 +101,15 @@ for k in 2 3 4 5; do
         done
     done
 done
+
+# The closure's shortcuts (memos, `reached`, copying as it decides) must
+# reach the same promotion set as a plain recomputation, which
+# NIX_UNFORCE_CLOSURE_CHECK runs after every job and reports on stderr.
+for f in *.nix; do
+    [[ $f == set.nix || $f == nested.nix ]] && continue
+    for k in 2 3; do
+        out=$(NIX_UNFORCE_CLOSURE_CHECK=1 NIX_UNFORCE_PROMOTE=$k \
+            run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
+        [[ $out != *"unforce check"* ]] || fail "$f (promotion after $k forces): $out"
+    done
+done
