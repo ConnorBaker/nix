@@ -34,3 +34,6 @@ cdepl 65490
 cdepj 19767
 cdepx 24366
 cdepja 8249
+hasattr 6549
+getattr 5694
+concatmap 3968

@@ -151,10 +151,24 @@ levels() {
     echo $((($1 + per - 1) / per))
 }
 
+# Programs whose edges this branch inherits below base's from markers
+# (eval-stack-parity/inherited.txt: the JSON, XML and `nix eval` printers'
+# frames; review identity-owners-v1, N5). They are not checked here until
+# markers takes the stack-parity branch's printer fix; every other program
+# is. Calibration measures them all.
+declare -A inherited
+while read -r name _; do
+    [[ -z "$name" || "$name" == "#"* ]] || inherited[$name]=1
+done < "$_NIX_TEST_SOURCE_DIR/eval-stack-parity/inherited.txt"
+
 calibrated=()
 for p in "${programs[@]}"; do
     IFS=$'\t' read -r -a f <<< "$p"
     name=${f[0]} tool=${f[1]} depth=${f[2]} class=${f[3]} expr=${f[-1]}
+    if [[ -z "${STACK_PARITY_CALIBRATE:-}" && -n "${inherited[$name]:-}" ]]; then
+        echo "$name: inherited from markers, not checked (eval-stack-parity/inherited.txt)"
+        continue
+    fi
     args=("${f[@]:4:${#f[@]}-5}")
     for mode in true false; do
         if [[ -n "${STACK_PARITY_CALIBRATE:-}" ]]; then

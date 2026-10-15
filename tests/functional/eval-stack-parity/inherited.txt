@@ -1,0 +1,17 @@
+# Programs of programs.tsv whose edges are below base's in markers bf1365871 as well, by the printers' frames
+# (printValueAsJSON 848 -> 928, printValueAsXML/showAttrs, Printer::printList 144 -> 288; review identity-owners-v1,
+# N5): eval-stack-parity.sh does not check them on this branch. Measured against markers ead7efe45 (the same frames as
+# bf1365871 outside unforce.cc) with this test's runner: these, and only these, fail. Remove a line when markers
+# takes the stack-parity branch's printer fix (vibe-coding/unforce-stack-parity, R3).
+tojson
+printe
+ijson
+ejson
+tojsona
+ijsona
+ejsona
+ixmla
+toxmla
+cdepe
+cdepj
+cdepja

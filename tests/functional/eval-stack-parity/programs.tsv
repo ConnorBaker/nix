@@ -38,3 +38,6 @@ cdepl	lazy	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x:
 cdepj	ijson	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
 cdepx	ixml	@N@	catch	builtins.foldl' (acc: _: [ acc ]) [ ] (builtins.genList (x: x) (@N@ + 10))
 cdepja	strict	@N@	catch	builtins.stringLength (builtins.toJSON (builtins.foldl' (acc: _: { a = acc; }) { } (builtins.genList (x: x) (@N@ + 10))))
+hasattr	strict	1000000	fmt	true	0	let f = n: if n == 0 then true else (if f (n - 1) then { a = 1; } else { }) ? a; in f @N@
+getattr	strict	1000000	int	n	let f = n: if n == 0 then { a = 0; } else { a = builtins.getAttr "a" (f (n - 1)) + 1; }; in (f @N@).a
+concatmap	strict	1000000	int	n	let f = n: if n == 0 then [ 0 ] else builtins.concatMap (x: [ (x + 1) ]) (f (n - 1)); in builtins.head (f @N@)
