@@ -318,4 +318,10 @@ bool CachingFilteringSourceAccessor::isAllowed(const CanonPath & path)
     return res;
 }
 
+void CachingFilteringSourceAccessor::invalidateCache()
+{
+    cache->clear();
+    FilteringSourceAccessor::invalidateCache();
+}
+
 } // namespace nix

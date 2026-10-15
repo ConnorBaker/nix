@@ -1820,6 +1820,11 @@ ref<SourceAccessor> GitRepo::acquire(const SourcePath & source, bool explainMiss
     auto value = traverse(*source.accessor, source.path, defaultPathFilter, acquire);
     if (acquire.failure)
         std::rethrow_exception(acquire.failure);
+    /* A retained producer only explains misses, which reopen what they
+       need. Drop what the traversal cached: a filesystem tree's directory
+       fds and an export-ignore decision per path. */
+    if (explainMisses)
+        source.accessor->invalidateCache();
     auto display = source.to_string();
     auto accessor = make_ref<Accessor>(std::move(value), explainMisses ? std::optional{source} : std::nullopt);
     accessor->setPathDisplay(std::move(display));

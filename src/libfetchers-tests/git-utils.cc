@@ -7,6 +7,7 @@
 #include "nix/fetchers/fetch-settings.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/fetch-to-store.hh"
+#include "nix/fetchers/filtering-source-accessor.hh"
 #include "nix/util/merkle-files.hh"
 #include "nix/util/nar-accessor.hh"
 #include "nix/util/memory-source-accessor.hh"
@@ -3731,6 +3732,85 @@ TEST_F(GitUtilsTest, acquiredMissNeverBecomesSuccess)
         EXPECT_EQ(names(CanonPath::root), std::vector<std::string>{"dir"});
         EXPECT_EQ(names(CanonPath("/dir")), std::vector<std::string>{"a"});
         EXPECT_EQ(acquired->readFile(CanonPath("/dir/a")), "a");
+    }
+}
+
+/* A producer retained to explain misses keeps no traversal caches: its
+   directory fds and filter decisions are dropped after capture, and a miss
+   still gets the producer's explanation. */
+TEST_F(GitUtilsTest, acquiredTreeReleasesProducerCaches)
+{
+    auto dir = tmpDir / "acquire-release";
+    for (auto name : {"d0", "d1", "d2", "d3"}) {
+        createDirs(dir / name / "e");
+        writeFile(dir / name / "e" / "f", name);
+    }
+    writeFile(dir / "untracked", "u");
+
+    struct Counting final : CachingFilteringSourceAccessor
+    {
+        void anchor() override {}
+
+        unsigned & decisions;
+
+        Counting(ref<SourceAccessor> next, unsigned & decisions)
+            : CachingFilteringSourceAccessor(
+                  SourcePath(next),
+                  [](const CanonPath & path) {
+                      return RestrictedPathError("Path '%s' is not tracked by Git.", path.rel());
+                  })
+            , decisions(decisions)
+        {
+        }
+
+        bool isAllowedUncached(const CanonPath & path) override
+        {
+            ++decisions;
+            return path != CanonPath("/untracked");
+        }
+    };
+
+    /* Directory fds the process holds on the producer's tree. */
+    auto heldFds = [&]() -> std::optional<size_t> {
+        std::error_code ec;
+        std::filesystem::directory_iterator fds("/proc/self/fd", ec);
+        if (ec)
+            return std::nullopt;
+        size_t n = 0;
+        for (auto & fd : fds) {
+            auto target = std::filesystem::read_symlink(fd.path(), ec);
+            if (!ec && (target == dir || target.string().starts_with(dir.string() + "/")))
+                ++n;
+        }
+        return n;
+    };
+    for (bool explain : {false, true}) {
+        SCOPED_TRACE(fmt("explain=%d", explain));
+        unsigned decisions = 0;
+        auto producer = make_ref<Counting>(makeFSSourceAccessor(dir), decisions);
+        auto acquired = GitRepo::acquire(SourcePath{producer}, explain);
+        auto traversed = decisions;
+        EXPECT_GT(traversed, 0u);
+        producer->isAllowed(CanonPath("/d0/e/f"));
+        auto held = heldFds();
+        if (explain) {
+            /* The decision was forgotten and is made again. */
+            EXPECT_EQ(decisions, traversed + 1);
+            /* At most the root fd remains. */
+            if (held) {
+                EXPECT_LE(*held, 1u);
+            }
+            EXPECT_THROW(acquired->lstat(CanonPath("/untracked")), RestrictedPathError);
+        } else {
+            /* Control: an unretained producer is left as the caller has it. */
+            EXPECT_EQ(decisions, traversed);
+            if (held) {
+                EXPECT_GT(*held, 1u);
+            }
+            EXPECT_THROW(acquired->lstat(CanonPath("/untracked")), FileNotFound);
+        }
+        EXPECT_THROW(acquired->readFile(CanonPath("/d0/e/missing")), FileNotFound);
+        EXPECT_EQ(acquired->readFile(CanonPath("/d3/e/f")), "d3");
     }
 }
 

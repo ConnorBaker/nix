@@ -123,6 +123,9 @@ struct CachingFilteringSourceAccessor : FilteringSourceAccessor
 
     bool isAllowed(const CanonPath & path) override;
 
+    /** Also forget the decisions, which `isAllowedUncached` recomputes. */
+    void invalidateCache() override;
+
     virtual bool isAllowedUncached(const CanonPath & path) = 0;
 };
 
