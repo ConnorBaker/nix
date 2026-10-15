@@ -358,6 +358,7 @@ void * evalRegionHeapAlloc(size_t n);
     (see `unforceClock`). */
 void * evalRegionHeapAllocCell();
 bool evalRegionHeapContains(const void * p);
+void evalRegionNoteBigEnv(const void * env, size_t size);
 
 struct EvalRegion
 {
@@ -375,10 +376,30 @@ struct EvalRegion
     /** Bytes of string data allocated here, which the producer closure
         never walks: they do not count towards its step budget. */
     size_t stringBytes = 0;
+    /** Bump backend: the size of each Env allocated here, one byte per
+        16-byte granule of the region's mapping from `envSizesBase` (255:
+        see `evalRegionNoteBigEnv`). Copying an Env out of the region needs
+        its size, which the Env does not hold; a side table, released at
+        the job's end, keeps the Envs themselves as small as without
+        unforcing, so a job that keeps its memory keeps no size prefixes
+        (review of markers v4, B1-mem). */
+    uint8_t * envSizes = nullptr;
+    const char * envSizesBase = nullptr;
 
     bool active() const noexcept
     {
         return (cur || heap) && !paused;
+    }
+
+    [[gnu::always_inline]] void noteEnvSize(const void * env, size_t size)
+    {
+        auto & s = envSizes[((const char *) env - envSizesBase) >> 4];
+        if (size < 255) [[likely]]
+            s = size;
+        else {
+            s = 255;
+            evalRegionNoteBigEnv(env, size);
+        }
     }
 
     /** Whether `p` was allocated in the innermost scope. */

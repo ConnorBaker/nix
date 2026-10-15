@@ -87,12 +87,18 @@ Env & EvalMemory::allocEnv(size_t size)
 
     Env * env;
 
-    /* In an all-types region, prefix each Env with its size, so that it can
-       be copied out of the region. */
+    /* In an all-types region, record each Env's size, so that it can be
+       copied out of the region: in the bump region's side table, or with
+       the mimalloc backend as a prefix. */
     if (evalRegion.allTypes && evalRegion.active()) [[unlikely]] {
-        auto p = (char *) evalRegion.alloc(16 + sizeof(Env) + size * sizeof(Value *));
-        *(size_t *) p = size;
-        return *(Env *) (p + 16);
+        if (evalRegion.heap) [[unlikely]] {
+            auto p = (char *) evalRegion.alloc(16 + sizeof(Env) + size * sizeof(Value *));
+            *(size_t *) p = size;
+            return *(Env *) (p + 16);
+        }
+        auto p = evalRegion.bump(sizeof(Env) + size * sizeof(Value *));
+        evalRegion.noteEnvSize(p, size);
+        return *(Env *) p;
     }
 
 #if NIX_USE_BOEHMGC

@@ -384,6 +384,67 @@ static char * keptStart = nullptr;
 static char * keptFloor = nullptr;
 static char * keptEnd = nullptr;
 
+/* The side table of Env sizes (`EvalRegion::envSizes`) of the bump
+   region's mapping `envSizeMapping`, and the sizes too large for it. */
+static uint8_t * envSizeTable = nullptr;
+static const char * envSizeMapping = nullptr;
+static std::unordered_map<const void *, size_t> bigEnvSizes;
+
+static size_t envSizeTableBytes()
+{
+    return regionSize() / 16;
+}
+
+static void noteBigEnv(const void * env, size_t size)
+{
+    bigEnvSizes[env] = size;
+}
+
+/* The size of a young Env: with the mimalloc backend from its prefix,
+   otherwise from the side table. */
+static size_t envSizeOf(const Env * e, bool heap)
+{
+    if (heap)
+        return *(const size_t *) ((const char *) e - 16);
+    auto s = envSizeTable[((const char *) e - envSizeMapping) >> 4];
+    return s < 255 ? s : bigEnvSizes.at(e);
+}
+
+static void unmapEnvSizeTable()
+{
+    if (envSizeTable)
+        munmap(envSizeTable, envSizeTableBytes());
+    envSizeTable = nullptr;
+    envSizeMapping = nullptr;
+}
+
+/* Point the region at the side table of `mapping`, mapping one if it has
+   none yet. */
+static void useEnvSizeTable(const char * mapping)
+{
+    if (envSizeMapping != mapping) {
+        unmapEnvSizeTable();
+        envSizeTable = (uint8_t *) mapArena(envSizeTableBytes());
+        envSizeMapping = mapping;
+    }
+    evalRegion.envSizes = envSizeTable;
+    evalRegion.envSizesBase = envSizeMapping;
+}
+
+/* At a job's end its Envs are copied or kept as old objects, or freed:
+   none of their sizes is read again. */
+static void dropEnvSizes(const char * base, const char * cur)
+{
+    std::unordered_map<const void *, size_t>().swap(bigEnvSizes);
+    if (!envSizeTable || cur <= base)
+        return;
+    auto from = (uintptr_t) (envSizeTable + ((base - envSizeMapping) >> 4)) & ~(uintptr_t) (pageSize() - 1);
+    auto to = (char *) envSizeTable + ((cur - envSizeMapping + 15) >> 4);
+    /* Entries below `base` belong to kept jobs, those above `cur` to none
+       yet: the whole pages can go. */
+    madvise((void *) from, pageUp(to) - (char *) from, MADV_DONTNEED);
+}
+
 /* Stop allocating above the kept jobs: their mapping keeps only its prefix. */
 static void leaveKeptMapping()
 {
@@ -405,6 +466,7 @@ void openRegion(bool allTypes)
             evalRegion.base = evalRegion.cur = keptFloor;
             evalRegion.end = keptEnd;
             evalRegion.allTypes = allTypes;
+            useEnvSizeTable(keptStart);
             /* Released above the floor as zero pages, and the floor's own
                page zeroed above it (`releaseRegion`). */
             evalRegion.dirty = false;
@@ -422,6 +484,7 @@ void openRegion(bool allTypes)
     evalRegion.end = evalRegion.base + regionSize();
     evalRegion.allTypes = allTypes;
     evalRegion.dirty = dirty;
+    useEnvSizeTable(spare);
     if (!unforceSettings().reuse)
         spare = nullptr;
 }
@@ -520,6 +583,7 @@ void releaseRegion()
     stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     lastReleased = {(uintptr_t) base, (uintptr_t) cur};
     evalRegion = EvalRegion{};
+    dropEnvSizes(base, cur);
     if (keptStart && base == keptFloor) {
         /* Above kept jobs: free this job's pages, and zero what it used of
            the floor's page, which the kept objects share. */
@@ -536,6 +600,8 @@ void releaseRegion()
         madvise(base, regionSize(), MADV_DONTNEED);
     } else
         munmap(base, regionSize());
+    if (envSizeMapping == base)
+        unmapEnvSizeTable();
 }
 
 /* A job that keeps all its memory (see `UnforceSeen`): its objects become
@@ -547,6 +613,7 @@ static void retainRegion()
     auto cur = evalRegion.cur;
     stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     stats.keptJobBytes += cur - base;
+    dropEnvSizes(base, cur);
     if (keptStart && base == keptFloor)
         keptFloor = cur;
     else {
@@ -666,7 +733,7 @@ struct Evacuator
             return e;
         if (auto f = forwarded(e))
             return f;
-        auto size = *(const size_t *) ((const char *) e - 16);
+        auto size = envSizeOf(e, youngHeap != nullptr);
         auto & n = state.mem.allocEnv(size);
         stats.copiedBytes += sizeof(Env) + size * sizeof(Value *);
         n.up = e->up;
@@ -1454,7 +1521,7 @@ struct Closure
             break;
         case kEnv: {
             auto e = (const Env *) p;
-            auto size = *(const size_t *) ((const char *) e - 16);
+            auto size = envSizeOf(e, young.heap != nullptr);
             f(e->up, kEnv);
             for (size_t i = 0; i < size; ++i)
                 f(e->values[i], kValue);
@@ -1473,11 +1540,11 @@ struct Closure
        few: an env's slots, a Bindings layer's attributes. A walk is charged
        one step per 16 of them (review of markers v3, S1': a 2 M-attribute
        Bindings cost one step per round). */
-    static size_t width(const void * p, Kind kind)
+    size_t width(const void * p, Kind kind) const
     {
         switch (kind) {
         case kEnv:
-            return *(const size_t *) ((const char *) p - 16);
+            return envSizeOf((const Env *) p, young.heap != nullptr);
         case kBindings:
             return ((const Bindings *) p)->layerSize();
         case kValue:
@@ -1982,6 +2049,11 @@ void * evalRegionHeapAllocCell()
 #else
     unreachable();
 #endif
+}
+
+void evalRegionNoteBigEnv(const void * env, size_t size)
+{
+    noteBigEnv(env, size);
 }
 
 bool evalRegionHeapContains(const void * p)
