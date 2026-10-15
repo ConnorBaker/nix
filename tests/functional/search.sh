@@ -46,3 +46,39 @@ e=$'\x1b' # grep doesn't support \e, \033 or even \x1b
 (( $(nix search -f search.nix foo ^ --exclude 'foo|bar' | grep -Ec 'foo|bar') == 0 ))
 (( $(nix search -f search.nix foo ^ -e foo --exclude bar | grep -Ec 'foo|bar') == 0 ))
 [[ $(nix search -f search.nix '' ^ -e bar --json | jq -c 'keys') == '["foo","hello"]' ]]
+
+## Evaluation errors under legacyPackages are skipped, however the package set is selected
+
+cat > "$TEST_ROOT/legacy.nix" <<'EOF'
+let
+  pkg = name: {
+    type = "derivation";
+    inherit name;
+  };
+in
+{
+  legacyPackages.sys = {
+    broken = throw "this package fails to evaluate";
+    foo = pkg "foo-1";
+    bar = pkg "bar-2";
+  };
+  other = {
+    broken = throw "this package fails to evaluate";
+    foo = pkg "foo-1";
+  };
+}
+EOF
+
+[[ $(nix search -f "$TEST_ROOT/legacy.nix" '' ^ --json | jq -c 'keys') == '["legacyPackages.sys.bar","legacyPackages.sys.foo"]' ]]
+# Attribute paths are shown relative to the selected value.
+[[ $(nix search -f "$TEST_ROOT/legacy.nix" legacyPackages.sys ^ --json | jq -c 'keys') == '["bar","foo"]' ]]
+[[ $(nix search --impure --expr "import $TEST_ROOT/legacy.nix" legacyPackages.sys ^ --json | jq -c 'keys') == '["bar","foo"]' ]]
+
+# Errors outside legacyPackages are not skipped.
+expectStderr 1 nix search -f "$TEST_ROOT/legacy.nix" other ^ --json | grepQuiet "this package fails to evaluate"
+
+# Errors in selecting the value to search are not skipped either.
+expectStderr 1 nix search -f "$TEST_ROOT/legacy.nix" legacyPackages.sys.broken ^ --json | grepQuiet "this package fails to evaluate"
+echo '{ pkgs }: { legacyPackages.sys = pkgs; }' > "$TEST_ROOT/legacy-args.nix"
+expectStderr 1 nix search -f "$TEST_ROOT/legacy-args.nix" legacyPackages.sys ^ --json | grepQuiet "argument without a value"
+[[ $(nix search -f "$TEST_ROOT/legacy-args.nix" --arg pkgs "(import $TEST_ROOT/legacy.nix).legacyPackages.sys" legacyPackages.sys ^ --json | jq -c 'keys') == '["bar","foo"]' ]]

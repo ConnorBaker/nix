@@ -48,6 +48,15 @@ class InstallableAttrPath : public InstallableValue
 
 public:
 
+    /**
+     * The attribute path that selects this installable's value from the
+     * file or expression, as given on the command line.
+     */
+    const std::string & getAttrPath() const
+    {
+        return attrPath;
+    }
+
     static InstallableAttrPath parse(
         ref<EvalState> state,
         SourceExprCommand & cmd,

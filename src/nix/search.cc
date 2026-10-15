@@ -1,4 +1,5 @@
 #include "nix/cmd/command-installable-value.hh"
+#include "nix/cmd/installable-attr-path.hh"
 #include "nix/store/globals.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
@@ -88,6 +89,28 @@ struct CmdSearch : InstallableValueCommand, MixJSON
             jsonOut = json::object();
 
         uint64_t results = 0;
+
+        /* The attribute paths of the cursors of a `--file`/`--expr`
+           installable are relative to the value it selected, while those of
+           a flake installable start at the flake outputs. So for
+           `nix search -f FILE legacyPackages.x86_64-linux`, `attrPath` does
+           not start with `legacyPackages`. Record whether the installable's
+           own attribute path does, so that evaluation errors in the packages
+           below it are skipped as they are for flakes. This is only
+           computed once the selected value has been evaluated, so the
+           attribute path is known to parse. */
+        auto installableAttrPath = installable.dynamic_pointer_cast<InstallableAttrPath>();
+        std::optional<bool> selectedUnderLegacyPackages;
+        auto isSelectedUnderLegacyPackages = [&]() {
+            if (!selectedUnderLegacyPackages) {
+                selectedUnderLegacyPackages = false;
+                if (installableAttrPath) {
+                    auto prefix = AttrPath::parse(*state, installableAttrPath->getAttrPath());
+                    selectedUnderLegacyPackages = !prefix.empty() && state->symbols[prefix[0]] == "legacyPackages";
+                }
+            }
+            return *selectedUnderLegacyPackages;
+        };
 
         std::function<void(eval_cache::AttrCursor & cursor, const AttrPath & attrPath, bool initialRecurse)> visit;
 
@@ -181,7 +204,9 @@ struct CmdSearch : InstallableValueCommand, MixJSON
                 }
 
             } catch (EvalError & e) {
-                if (!(attrPath.size() > 0 && attrPathS[0] == "legacyPackages"))
+                /* Errors in the selected value itself (an empty `attrPath`)
+                   are never skipped. */
+                if (!(attrPath.size() > 0 && (attrPathS[0] == "legacyPackages" || isSelectedUnderLegacyPackages())))
                     throw;
             }
         };
