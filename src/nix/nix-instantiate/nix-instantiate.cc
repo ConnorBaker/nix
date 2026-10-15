@@ -27,184 +27,79 @@ static int rootNr = 0;
 enum OutputKind { okPlain, okRaw, okXML, okJSON };
 
 /**
- * PROTOTYPE. `--strict` output with unforcing. The top-level elements are
- * forced deeply in `forceValueDeep`'s order and with its traces, so errors
- * are the same as without unforcing, and printed in batches: before a batch
- * ends (unforcing what its elements forced), its elements are printed, in
- * printing order, into buffers that are assembled at the end. Containers
- * printed in one batch are kept when it ends, with their addresses in `seen`
- * rewritten (`UnforceSeen`), so that one reached again in a later batch
- * prints as «repeated», as without unforcing (with the mimalloc backend it
- * prints in full instead).
+ * PROTOTYPE. `--strict` output with unforcing. As without unforcing, the
+ * value is forced deeply (`forceValueDeep`'s order, traces and depth: its
+ * top-level elements are walked one by one, sharing one set of walked
+ * cells, so that a cell is walked once, as one `forceValueDeep` of the whole
+ * value walks it) and then printed once, so nothing is printed if forcing
+ * fails. The elements are forced in batches, each unforcing what its
+ * elements forced except what they reach: the walked cells are kept forced
+ * and their addresses valid (`UnforceSeen`), so the value printed at the end
+ * is the value forced, with its sharing, and «repeated» is decided by
+ * `printAmbiguous` exactly as without unforcing. Peak memory is what the
+ * printed value needs (as without unforcing) plus a batch.
  *
- * A top-level attribute set is forced, and so printed, in its Bindings
- * order, but printed out in lexicographic order. Which occurrence of a
- * shared container is printed in full depends on that order, so the
- * attributes' texts are recorded with where each container occurs
- * (`StrictAttrsAssembler`), and the choice is made again when they are
- * assembled.
+ * Where walked cells cannot be kept (the mimalloc backend, or
+ * NIX_UNFORCE_SEEN=0), each batch's elements are printed before it ends, into
+ * buffers assembled at the end in printing order; a value shared between
+ * batches then prints in full instead of as «repeated».
  */
-/**
- * PROTOTYPE. The parts of a printed value (`printStrictUnforced`'s
- * attributes), each printed in some order with one `seen` set, and
- * assembled in another as if printed in that order: every attribute set and
- * list that `seen` tracks is printed in full where it first occurs in the
- * assembled order and as «repeated» everywhere else, which is what
- * `printAmbiguous` on the whole value prints. Every container has exactly one
- * full rendering among the parts (the first in printing order), whose text
- * is reused wherever the assembled order needs it.
- *
- * Containers are identified by ids rather than addresses: `rekey` follows an
- * address rewritten by `UnforceSeen`, and `forget` drops every address when
- * `seen` is cleared (the mimalloc backend), since freed addresses are reused.
- */
-struct StrictAttrsAssembler : PrintAmbiguousRecorder
-{
-    struct Node
-    {
-        size_t id;
-        bool full;
-        std::streamoff from, to;
-        std::vector<size_t> children;
-    };
-
-    struct Part
-    {
-        std::string text;
-        std::vector<Node> nodes;
-        std::vector<size_t> roots;
-    };
-
-    std::vector<Part> parts;
-    std::map<const void *, size_t> ids;
-    /* Per id, its full rendering: (part, node). */
-    std::vector<std::pair<size_t, size_t>> fullOf;
-    std::vector<size_t> open_;
-    std::optional<size_t> topId;
-
-    size_t idOf(const void * key)
-    {
-        auto [i, fresh] = ids.try_emplace(key, fullOf.size());
-        if (fresh)
-            fullOf.emplace_back(SIZE_MAX, SIZE_MAX);
-        return i->second;
-    }
-
-    void rekey(const void * from, const void * to)
-    {
-        auto i = ids.find(from);
-        if (i == ids.end())
-            return;
-        auto id = i->second;
-        ids.erase(i);
-        ids[to] = id;
-    }
-
-    /* The top level, which `seen` always holds (it is never freed). */
-    const void * topKey = nullptr;
-
-    void forget()
-    {
-        ids.clear();
-        if (topId)
-            ids[topKey] = *topId;
-    }
-
-    void seedTop(const void * top)
-    {
-        if (top) {
-            topKey = top;
-            topId = idOf(top);
-        }
-    }
-
-    size_t attach(Node && n)
-    {
-        auto & p = parts.back();
-        p.nodes.push_back(std::move(n));
-        auto i = p.nodes.size() - 1;
-        (open_.empty() ? p.roots : p.nodes[open_.back()].children).push_back(i);
-        return i;
-    }
-
-    void open(const void * key, std::streamoff at) override
-    {
-        auto id = idOf(key);
-        auto i = attach({id, true, at, at, {}});
-        fullOf[id] = {parts.size() - 1, i};
-        open_.push_back(i);
-    }
-
-    void close(std::streamoff at) override
-    {
-        parts.back().nodes[open_.back()].to = at;
-        open_.pop_back();
-    }
-
-    void repeated(const void * key, std::streamoff from, std::streamoff to) override
-    {
-        attach({idOf(key), false, from, to, {}});
-    }
-
-    /** Print `v` as a new part; returns its index. */
-    size_t print(
-        EvalState & state, Value & v, std::set<const void *> & seen, NixStringContext & context, size_t depth)
-    {
-        parts.emplace_back();
-        std::ostringstream str;
-        printAmbiguous(state, v, str, &seen, &context, depth, this);
-        parts.back().text = str.str();
-        return parts.size() - 1;
-    }
-
-    std::set<size_t> emitted;
-
-    void emitSpan(std::ostream & out, const Part & p, std::streamoff from, std::streamoff to, const std::vector<size_t> & kids)
-    {
-        auto pos = from;
-        for (auto k : kids) {
-            auto & n = p.nodes[k];
-            out.write(p.text.data() + pos, n.from - pos);
-            emitNode(out, p, n);
-            pos = n.to;
-        }
-        out.write(p.text.data() + pos, to - pos);
-    }
-
-    void emitNode(std::ostream & out, const Part & p, const Node & n)
-    {
-        if (!emitted.insert(n.id).second) {
-            out << "«repeated»";
-            return;
-        }
-        if (n.full) {
-            emitSpan(out, p, n.from, n.to, n.children);
-            return;
-        }
-        auto [pi, ni] = fullOf.at(n.id);
-        assert(pi != SIZE_MAX);
-        auto & fp = parts.at(pi);
-        auto & fn = fp.nodes.at(ni);
-        emitSpan(out, fp, fn.from, fn.to, fn.children);
-    }
-
-    /** Write part `i`; the parts must be written in the assembled order. */
-    void emit(std::ostream & out, size_t i)
-    {
-        if (topId && emitted.empty())
-            emitted.insert(*topId);
-        auto & p = parts.at(i);
-        emitSpan(out, p, 0, p.text.size(), p.roots);
-    }
-};
-
 static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringContext & context)
 {
     /* As `forceValueDeep`'s outermost level, so that call depth (and with it
        where a stack overflow is reported) is the same. */
     auto _level = state.addCallDepth(v.determinePos(noPos));
+    std::set<const void *> walked;
+    walked.insert(&v);
     state.forceValue(v, v.determinePos(noPos));
     if (v.type() != nAttrs && !v.isList()) {
+        std::set<const void *> seen;
+        printAmbiguous(state, v, out, &seen, &context);
+        return;
+    }
+
+    /* Walk element `e` (with `forceValueDeep`'s trace for it). */
+    auto forceElement = [&](Value & e, auto && trace) {
+        try {
+            state.forceValueDeep(e, walked);
+        } catch (Error & err) {
+            trace(err);
+            throw;
+        }
+    };
+
+    if (unforceSeenExact()) {
+        {
+            UnforceSeen keepWalked(walked);
+            UnforceBatch batch(state);
+            if (v.type() == nAttrs)
+                for (auto & i : *v.attrs()) {
+                    batch.open();
+                    forceElement(*i.value, [&](Error & e) {
+                        /* The trace `forceValueDeep` adds. */
+                        e.addTrace(
+                            state.positions[i.pos],
+                            HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
+                    });
+                    if (batch.full())
+                        batch.end();
+                }
+            else {
+                size_t index = 0;
+                for (auto v2 : v.listView()) {
+                    batch.open();
+                    forceElement(*v2, [&](Error & e) {
+                        e.addTrace(nullptr, HintFmt("while evaluating list element at index %1%", index));
+                    });
+                    index++;
+                    if (batch.full())
+                        batch.end();
+                }
+            }
+            batch.end();
+        }
+        /* As `forceValueDeep`'s set is gone before base prints. */
+        std::set<const void *>().swap(walked);
         std::set<const void *> seen;
         printAmbiguous(state, v, out, &seen, &context);
         return;
@@ -214,6 +109,7 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
        seen before printing its elements, so that an element referring back
        to it prints as «repeated». The top level was forced before any batch
        opened, so no batch frees it: it stays seen. */
+    std::ostringstream buffer;
     const void * top = v.type() == nAttrs ? (v.attrs()->empty() ? nullptr : (const void *) v.attrs())
                                           : (v.listSize() ? (const void *) &v : nullptr);
     std::set<const void *> seen;
@@ -222,38 +118,38 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
             seen.insert(top);
     };
     seedSeen();
-    StrictAttrsAssembler assembler;
-    assembler.seedTop(top);
-    UnforceSeen keepSeen(seen);
-    keepSeen.onRekey = [&](const void * from, const void * to) { assembler.rekey(from, to); };
     UnforceBatch batch(state);
     batch.onEnd = [&](bool freed) {
-        if (freed && !unforceSeenExact()) {
+        if (freed) {
             seen.clear();
             seedSeen();
-            assembler.forget();
+            walked.clear();
+            walked.insert(&v);
         }
     };
 
     if (v.type() == nAttrs) {
         auto sorted = v.attrs()->lexicographicOrder(state.symbols);
-        std::map<const Attr *, size_t> part;
+        std::map<const Attr *, size_t> rank;
+        for (auto [n, a] : enumerate(sorted))
+            rank[a] = n;
+        std::map<const Attr *, std::string> printed;
         std::vector<const Attr *> pending;
         auto printPending = [&]() {
-            for (auto a : pending)
-                part[a] = assembler.print(state, *a->value, seen, context, 1);
+            std::sort(pending.begin(), pending.end(), [&](auto a, auto b) { return rank[a] < rank[b]; });
+            for (auto a : pending) {
+                std::ostringstream str;
+                printAmbiguous(state, *a->value, str, &seen, &context, 1);
+                printed[a] = str.str();
+            }
             pending.clear();
         };
         for (auto & i : *v.attrs()) {
             batch.open();
-            try {
-                state.forceValueDeep(*i.value);
-            } catch (Error & e) {
-                /* The trace `forceValueDeep` adds. */
+            forceElement(*i.value, [&](Error & e) {
                 e.addTrace(
                     state.positions[i.pos], HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
-                throw;
-            }
+            });
             pending.push_back(&i);
             if (batch.full()) {
                 printPending();
@@ -262,33 +158,28 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
         }
         printPending();
         batch.end();
-        out << "{ ";
-        for (auto i : sorted) {
-            out << state.symbols[i->name] << " = ";
-            assembler.emit(out, part.at(i));
-            out << "; ";
-        }
-        out << "}";
+        buffer << "{ ";
+        for (auto i : sorted)
+            buffer << state.symbols[i->name] << " = " << printed[i] << "; ";
+        buffer << "}";
     } else {
-        out << "[ ";
+        buffer << "[ ";
         size_t index = 0;
         for (auto v2 : v.listView()) {
             batch.open();
-            try {
-                state.forceValueDeep(*v2);
-            } catch (Error & e) {
+            forceElement(*v2, [&](Error & e) {
                 e.addTrace(nullptr, HintFmt("while evaluating list element at index %1%", index));
-                throw;
-            }
-            printAmbiguous(state, *v2, out, &seen, &context, 1);
-            out << " ";
+            });
+            printAmbiguous(state, *v2, buffer, &seen, &context, 1);
+            buffer << " ";
             index++;
             if (batch.full())
                 batch.end();
         }
         batch.end();
-        out << "]";
+        buffer << "]";
     }
+    out << buffer.str();
 }
 
 void processExpr(
@@ -333,11 +224,9 @@ void processExpr(
                 std::cout << std::endl;
             } else {
                 if (strict && unforceEnabled(state)) {
-                    /* It forces while printing: print nothing if forcing
-                       fails, as `forceValueDeep` before printing does. */
-                    std::ostringstream out;
-                    printStrictUnforced(state, vRes, out, context);
-                    std::cout << out.str();
+                    /* It prints nothing if forcing fails, as
+                       `forceValueDeep` before printing does. */
+                    printStrictUnforced(state, vRes, std::cout, context);
                 } else {
                     if (strict)
                         state.forceValueDeep(vRes);

@@ -1039,6 +1039,15 @@ public:
     void forceValueDeep(Value & v);
 
     /**
+     * PROTOTYPE (unforce). The same, skipping cells already in `seen`
+     * and adding the cells it walks: several calls with one `seen` walk
+     * what one call on a value containing all of them walks. The cells are
+     * reported with `unforceNoteSeen`, so an `UnforceSeen` for `seen` keeps
+     * them forced and their addresses valid across unforce jobs.
+     */
+    void forceValueDeep(Value & v, std::set<const void *> & seen);
+
+    /**
      * Force `v`, and then verify that it has the expected type.
      */
     NixInt forceInt(Value & v, const PosIdx pos, std::string_view errorCtx);

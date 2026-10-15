@@ -6,16 +6,6 @@
 
 namespace nix {
 
-/* With unforcing, a `seen` set kept by `UnforceSeen` must hear of each
-   container it marks. */
-static bool markSeen(std::set<const void *> & seen, const Value & v, const void * p)
-{
-    if (!seen.insert(p).second)
-        return false;
-    unforceNoteSeen(seen, v, p);
-    return true;
-}
-
 // See: https://github.com/NixOS/nix/issues/9730
 void printAmbiguous(
     EvalState & state,
@@ -23,8 +13,7 @@ void printAmbiguous(
     std::ostream & str,
     std::set<const void *> * seen,
     NixStringContext * context,
-    size_t depth,
-    PrintAmbiguousRecorder * recorder)
+    size_t depth)
 {
     checkInterrupt();
 
@@ -49,53 +38,36 @@ void printAmbiguous(
         str << "null";
         break;
     case nAttrs: {
-        bool tracked = seen && !v.attrs()->empty();
-        if (tracked && !markSeen(*seen, v, v.attrs())) {
-            auto from = recorder ? (std::streamoff) str.tellp() : 0;
+        if (seen && !v.attrs()->empty() && !seen->insert(v.attrs()).second)
             str << "«repeated»";
-            if (recorder)
-                recorder->repeated(v.attrs(), from, str.tellp());
-        } else {
-            if (tracked && recorder)
-                recorder->open(v.attrs(), str.tellp());
+        else {
             str << "{ ";
             for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
                 str << state.symbols[i->name] << " = ";
-                printAmbiguous(state, *i->value, str, seen, context, depth + 1, recorder);
+                printAmbiguous(state, *i->value, str, seen, context, depth + 1);
                 str << "; ";
             }
             str << "}";
-            if (tracked && recorder)
-                recorder->close(str.tellp());
         }
         break;
     }
-    case nList: {
+    case nList:
         /* Use pointer to the Value instead of pointer to the elements, because
            that would need to explicitly handle the case of SmallList. */
-        bool tracked = seen && v.listSize();
-        if (tracked && !markSeen(*seen, v, &v)) {
-            auto from = recorder ? (std::streamoff) str.tellp() : 0;
+        if (seen && v.listSize() && !seen->insert(&v).second)
             str << "«repeated»";
-            if (recorder)
-                recorder->repeated(&v, from, str.tellp());
-        } else {
-            if (tracked && recorder)
-                recorder->open(&v, str.tellp());
+        else {
             str << "[ ";
             for (auto v2 : v.listView()) {
                 if (v2)
-                    printAmbiguous(state, *v2, str, seen, context, depth + 1, recorder);
+                    printAmbiguous(state, *v2, str, seen, context, depth + 1);
                 else
                     str << "(nullptr)";
                 str << " ";
             }
             str << "]";
-            if (tracked && recorder)
-                recorder->close(str.tellp());
         }
         break;
-    }
     case nThunk:
         if (!v.isBlackhole()) {
             str << "<CODE>";
