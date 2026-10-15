@@ -90,6 +90,7 @@ suites = [
       'eval-store.sh',
       'eval.sh',
       'eval-unforce.sh',
+      'eval-unforce-identity.sh',
       'experimental-features.sh',
       'export-graph.sh',
       'export.sh',
