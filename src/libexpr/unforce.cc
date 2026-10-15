@@ -143,7 +143,7 @@ struct Stats
     /* Job memory released, summed over jobs. */
     size_t freedBytes = 0;
     /* Force markers: promotions added by the producer closure, closure
-       rounds, young-graph nodes visited by the closure, jobs whose closure
+       rounds, budget steps the closure was charged, jobs whose closure
        changed anything, and the bookkeeping: bytes the markers add to log
        entries, and the largest transient bookkeeping of one job close
        (estimated). */
@@ -1145,13 +1145,17 @@ struct RegionMarks
             piece->nibbles[(g >> 4) % words] &= ~(uint64_t(flags) << ((g & 15) * 4));
     }
 
-    void removeAll(uint8_t flags)
+    /* Returns its cost in closure steps (`Closure::charge`), scaled so
+       that a step stands for about as much work as popping an object:
+       64 words cleared, or 64 empty pieces skipped. */
+    uint64_t removeAll(uint8_t flags)
     {
         auto mask = ~(uint64_t(flags) * 0x1111111111111111);
         for (auto & piece : pieces)
             if (piece)
                 for (auto & w : piece->nibbles)
                     w &= mask;
+        return 1 + pieces.size() / 64 + allocated * (words / 64);
     }
 
     size_t bytes() const
@@ -1194,10 +1198,11 @@ struct HeapMarks
             i->second &= ~f;
     }
 
-    void removeAll(uint8_t f)
+    uint64_t removeAll(uint8_t f)
     {
         for (auto & [p, b] : flags)
             b &= ~f;
+        return 1 + flags.size() / 8;
     }
 
     size_t bytes() const
@@ -1213,8 +1218,14 @@ struct OverBudget
 /* The producer closure of one job: walks of young object graphs along the
    edges the Evacuator copies, without copying.
 
-   Cost. Every walk takes steps (objects popped), and a job may take
-   `budget` of them. These keep the count down:
+   Cost. A job may take `budget` steps. A step is charged for every object
+   a walk pops, every element array it claims (plus one per 16 elements it
+   scans), every target a round tests, and the bitmap clears of `dropMemos`
+   in proportion to their size (review of v2, S1: a round tests every
+   reverted target, so before these were charged a chain found one target
+   per round, beside 300 000 targets whose walks pop nothing, cost 45 G
+   instructions without ever reaching the budget). So the budget bounds the
+   whole decision, not only its walks. These keep the count down:
    - Evac(S) is marked once per object, by the copies themselves or by a
      marking walk that stops at marked objects: linear in Evac(S).
    - A list's element array is visited once per walk however many list
@@ -1275,6 +1286,13 @@ struct Closure
     void step()
     {
         if (++steps > budget) [[unlikely]]
+            throw OverBudget{};
+    }
+
+    void charge(uint64_t n)
+    {
+        steps += n;
+        if (steps > budget) [[unlikely]]
             throw OverBudget{};
     }
 
@@ -1389,6 +1407,9 @@ struct Closure
        an identity-bearing object of Evac(S): t is a candidate producer. */
     bool candidate(const Value & content, const ForceMarkers & markers, const ForceMarkers::Span & t)
     {
+        /* Testing the target at all, even if its walk pops nothing. */
+        step();
+
         /* Memos of earlier walks that hold from here on. */
         while (!pending.empty() && pending.front().first <= t.s) {
             std::pop_heap(pending.begin(), pending.end(), laterTheta);
@@ -1420,6 +1441,7 @@ struct Closure
         auto array = [&](Value * const * elems, size_t size) {
             if (hit || !marks.claim(elems))
                 return;
+            charge(1 + size / 16);
             touched.push_back(elems);
             if (pruned(elems))
                 return;
@@ -1474,7 +1496,7 @@ struct Closure
     {
         pending.clear();
         pendingSize = 0;
-        marks.removeAll(memo);
+        charge(marks.removeAll(memo));
     }
 
     void notePeak()

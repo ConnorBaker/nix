@@ -88,3 +88,26 @@ out=$(NIX_UNFORCE_FAIL_DECIDE=1 nix-instantiate "${batch0[@]}" --eval --strict \
 (( rc == 134 )) || fail "expected abort() (status 134), got $rc: $out"
 [[ $out == *"out of memory while deciding"*"--option eval-unforce false"* ]] \
     || fail "no fatal message: $out"
+
+# The closure's step budget bounds the whole decision, not only its walks
+# (review of markers v2, S1): here a chain t1..t600 is found one target per
+# round (promoting t(i+1) puts t(i)'s list in the kept set), and every round
+# also tests 300 000 targets forced to integers, whose walks pop nothing.
+# Before rounds and targets were charged this took 600 rounds and about
+# 90 times base's instructions without reaching the budget.
+{
+    echo 'let'
+    echo '  t1 = { v = [ 1 2 3 ]; w = null; };'
+    for ((i = 2; i <= 600; i++)); do echo "  t$i = { v = [ 1 2 3 ]; w = t$((i - 1)).v; };"; done
+    echo '  zs = builtins.genList (builtins.add 0) 300000;'
+    echo -n '  ts = [ '
+    for ((i = 1; i <= 600; i++)); do echo -n "t$i "; done
+    echo '];'
+    echo 'in builtins.seq zs [ (builtins.seq t600 true) (builtins.deepSeq ts (builtins.deepSeq zs true)) ]'
+} > "$TEST_ROOT/rounds.nix"
+stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix" 2>&1 >/dev/null)
+[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] <= 20 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
+(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
+[[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
+    || fail "rounds.nix: wrong output"
