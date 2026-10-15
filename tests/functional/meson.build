@@ -88,6 +88,7 @@ suites = [
       'derivation-json.sh',
       'dump-db.sh',
       'eval-store.sh',
+      'eval-stack-parity.sh',
       'eval.sh',
       'eval-unforce.sh',
       'eval-unforce-identity.sh',
