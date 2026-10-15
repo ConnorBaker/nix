@@ -48,7 +48,7 @@ Value * EvalMemory::allocValue()
 {
     if (evalRegion.active()) [[unlikely]] {
         stats.nrValues++;
-        return (Value *) evalRegion.alloc(sizeof(Value));
+        return (Value *) evalRegion.allocCell();
     }
 #if NIX_USE_BOEHMGC
     /* Allocation cache for GC'd Value objects. Boehm GC is already a global resource, so thread_local is

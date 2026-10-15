@@ -195,7 +195,16 @@ struct Frame
     size_t logMark;
     void * heap;
     size_t bytes = 0;
+    /* Value cells are carved from chunks of the heap in allocation order,
+       so that a cell's address gives its allocation time (`CellClock`). */
+    std::vector<char *> chunks;
+    char * cellCur = nullptr;
+    char * cellEnd = nullptr;
 };
+
+/* Bytes per cell chunk of the mimalloc backend, and cells per chunk. */
+constexpr size_t cellChunkBytes = 32 << 10;
+constexpr size_t cellsPerChunk = cellChunkBytes / 16;
 
 std::vector<Frame> frames;
 
@@ -222,13 +231,19 @@ void setCurrentHeap(void * heap)
 }
 #endif
 
-/* The allocation clock of the innermost scope: the bump cursor. It only
-   grows while a scope is open. The mimalloc backend has no clock (its
-   objects have no time, see `CellClock`). */
+/* The allocation clock of the innermost scope: the bump cursor, or with
+   the mimalloc backend the time of the next cell (see `CellClock`). It only
+   grows while a scope is open. */
 static uint64_t unforceClock()
 {
-    if (nested())
-        return 0;
+#if NIX_UNFORCE_MIMALLOC
+    if (nested()) {
+        if (frames.empty() || frames.back().chunks.empty())
+            return 0;
+        auto & f = frames.back();
+        return (f.chunks.size() - 1) * cellsPerChunk + (f.cellCur - f.chunks.back()) / 16;
+    }
+#endif
     return (uintptr_t) evalRegion.cur;
 }
 
@@ -733,8 +748,9 @@ struct Stubber
    makes them safe.
 
    Definitions, for one job (outermost scope). Time is the job's allocation
-   clock (`unforceClock`), the bump cursor; a young object's time a(x) is its
-   address. The mimalloc backend has no clock: its objects have no time.
+   clock (`unforceClock`): the bump cursor, or the cell clock of the mimalloc
+   backend's chunks; a young object's time a(x) is its address (bump), or its
+   chunk position (mimalloc cells; other mimalloc objects have no time).
    - Targets T: old cells forced in the job (the undo log). Every logged force
      of t has an interval [s, e) of times: s when it was logged, e when it
      returned or threw (`endLoggedForce`). Forcing is LIFO, so the intervals
@@ -837,17 +853,27 @@ struct Stubber
    the relogging of promoted cells into an enclosing scope cannot break OC.
    --------------------------------------------------------------------------- */
 
-/* Times of young objects: the address in the bump region. The mimalloc
-   backend's objects have no time, so its walks are plain reachability. */
+/* Times of young objects: the address in the bump region; for the mimalloc
+   backend, a cell's position in its scope's chunks (no time otherwise). */
 struct CellClock
 {
     bool bump = true;
+    /* (chunk start, time of its first cell), sorted by address. */
+    std::vector<std::pair<uintptr_t, uint64_t>> chunks;
 
     std::optional<uint64_t> operator()(const void * p) const
     {
+        auto a = (uintptr_t) p;
         if (bump)
-            return (uintptr_t) p;
-        return std::nullopt;
+            return a;
+        auto i =
+            std::upper_bound(chunks.begin(), chunks.end(), a, [](uintptr_t a, const auto & c) { return a < c.first; });
+        if (i == chunks.begin())
+            return std::nullopt;
+        --i;
+        if (a >= i->first + cellChunkBytes)
+            return std::nullopt;
+        return i->second + (a - i->first) / 16;
     }
 };
 
@@ -1262,6 +1288,27 @@ void * evalBaseAlloc(size_t n)
 }
 #endif
 
+void * evalRegionHeapAllocCell()
+{
+#if NIX_UNFORCE_MIMALLOC
+    auto & f = frames.back();
+    if (f.cellCur == f.cellEnd) [[unlikely]] {
+        auto chunk = (char *) mi_theap_zalloc(currentTheap, cellChunkBytes);
+        if (!chunk)
+            throw std::bad_alloc();
+        f.chunks.push_back(chunk);
+        f.cellCur = chunk;
+        f.cellEnd = chunk + cellChunkBytes;
+        f.bytes += cellChunkBytes;
+    }
+    auto p = f.cellCur;
+    f.cellCur += 16;
+    return p;
+#else
+    unreachable();
+#endif
+}
+
 bool evalRegionHeapContains(const void * p)
 {
 #if NIX_UNFORCE_MIMALLOC
@@ -1542,6 +1589,9 @@ static void endHeapScope(EvalState & state, size_t mark)
         Evacuator evacuator{state};
         evacuator.youngHeap = f.heap;
         CellClock clock{.bump = false};
+        for (size_t i = 0; i < f.chunks.size(); ++i)
+            clock.chunks.emplace_back((uintptr_t) f.chunks[i], i * cellsPerChunk);
+        std::sort(clock.chunks.begin(), clock.chunks.end());
         auto promoted = closeJob(state, mark, targets, evacuator, true, state.forceCounts, clock, jobEnd);
         for (size_t i = 0; i < targets.size(); ++i)
             if (!promoted[i]) {

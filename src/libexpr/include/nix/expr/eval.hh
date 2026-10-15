@@ -352,6 +352,10 @@ struct StaticEvalSymbols
  * Single-threaded evaluation only.
  */
 void * evalRegionHeapAlloc(size_t n);
+/** A `Value` cell from the innermost scope's heap, carved from chunks in
+    allocation order, so that a cell's address gives its allocation time
+    (see `unforceClock`). */
+void * evalRegionHeapAllocCell();
 bool evalRegionHeapContains(const void * p);
 
 struct EvalRegion
@@ -386,6 +390,14 @@ struct EvalRegion
         if (heap) [[unlikely]]
             return evalRegionHeapAlloc(n);
         return bump(n);
+    }
+
+    /** A `Value` cell. In the bump region, addresses are allocation order. */
+    [[gnu::always_inline]] void * allocCell()
+    {
+        if (heap) [[unlikely]]
+            return evalRegionHeapAllocCell();
+        return bump(16);
     }
 
     [[gnu::always_inline]] void * bump(size_t n)
