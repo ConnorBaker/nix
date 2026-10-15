@@ -15,6 +15,7 @@
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/expr/tests/nix_api_expr.hh"
 #include "nix/util/memory-source-accessor.hh"
+#include "nix/expr/print.hh"
 
 #include <gtest/gtest.h>
 
@@ -175,6 +176,61 @@ TEST_F(nix_api_expr_test, unforce_c_primop_cells_not_promoted_with_consumers)
     bool equal = false;
     nix::job(st, [&] { equal = st.eqValues(*S, *nix::attr(st, *R, "a"), nix::noPos, ""); });
     EXPECT_TRUE(equal);
+
+    nix_gc_decref(ctx, mk);
+    nix_gc_decref(ctx, primop);
+    nix_gc_decref(ctx, g);
+}
+
+static size_t unforceStat(std::string_view name)
+{
+    auto json = nix::unforceStatsJSON();
+    auto key = "\"" + std::string(name) + "\":";
+    auto i = json.find(key);
+    return i == std::string::npos ? 0 : std::stoul(json.substr(i + key.size()));
+}
+
+/* A set printed in a job where client code ran, and reached again in a later
+   job, prints as «repeated» (review of markers v3, S4). That job promotes
+   nothing, so it would revert the set, which the next job would rebuild at
+   another address; it keeps all its memory instead. Printed as `nix eval`
+   prints (a job per list element). */
+TEST_F(nix_api_expr_test, unforce_client_code_job_keeps_repeated)
+{
+    auto & st = state->state;
+    state->ownedSettings->unforceBatchSize = 0;
+
+    nix_value * g = nix_alloc_value(ctx, state);
+    nix_expr_eval_from_string(ctx, state, "_: { f = x: x; }", ".", g);
+    nix_value_force(ctx, state, g);
+    PrimOp * primop = nix_alloc_primop(ctx, primop_mk, 1, "mk", nullptr, nullptr, g);
+    ASSERT_NE(nullptr, primop);
+    nix_value * mk = nix_alloc_value(ctx, state);
+    nix_init_primop(ctx, mk, primop);
+
+    auto fn = st.allocValue();
+    st.eval(
+        st.parseExprFromString(
+            "mk: let s = { a = 1; }; in [ (builtins.seq (mk null) s) s ]", st.rootPath(nix::CanonPath::root)),
+        *fn);
+    auto print = [&](bool unforce) {
+        state->ownedSettings->unforce = unforce;
+        auto v = st.allocValue();
+        v->mkApp(fn, mk->value);
+        std::ostringstream out;
+        nix::printValue(st, out, *v, nix::PrintOptions{.force = true, .derivationPaths = true, .unforce = unforce});
+        return out.str();
+    };
+
+    auto expected = print(false);
+    EXPECT_EQ(expected, "[ { a = 1; } «repeated» ]");
+    auto clientJobs = unforceStat("clientJobs"), kept = unforceStat("keptJobs");
+    EXPECT_EQ(print(true), expected);
+    /* Unforcing never runs with Boehm GC (`unforceEnabled`). */
+    if (!NIX_USE_BOEHMGC) {
+        EXPECT_GE(unforceStat("clientJobs"), clientJobs + 1);
+        EXPECT_GE(unforceStat("keptJobs"), kept + 1);
+    }
 
     nix_gc_decref(ctx, mk);
     nix_gc_decref(ctx, primop);

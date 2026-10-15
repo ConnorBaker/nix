@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <unistd.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -172,8 +173,9 @@ struct Stats
     size_t innerScopeReverts = 0;
     /* `UnforceSeen`: targets nominated because a printer printed the
        container they hold, and printers' `seen` entries rewritten to a
-       copy's address or erased (not kept) at job ends. */
-    size_t seenNominated = 0, seenKept = 0, seenDropped = 0;
+       copy's address at job ends; jobs that kept all their memory (and its
+       bytes) because the decision would not have kept such an entry. */
+    size_t seenNominated = 0, seenKept = 0, keptJobs = 0, keptJobBytes = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -215,7 +217,7 @@ static void printStatsAtExit()
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
                  "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
-                 "inner-scope reverts %d; seen nominated %d, kept %d, dropped %d\n",
+                 "inner-scope reverts %d; seen nominated %d, kept %d; jobs kept whole %d (%d MiB)\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -246,7 +248,8 @@ static void printStatsAtExit()
                  stats.innerScopeReverts,
                  stats.seenNominated,
                  stats.seenKept,
-                 stats.seenDropped);
+                 stats.keptJobs,
+                 stats.keptJobBytes >> 20);
          }),
          true);
 }
@@ -358,10 +361,13 @@ void hookCollector()
 #endif
 }
 
+/* With NIX_UNFORCE_REUSE, the region the next job reuses. */
+static char * regionSpare = nullptr;
+
 void openRegion(bool allTypes)
 {
     hookCollector();
-    static char * spare = nullptr;
+    auto & spare = regionSpare;
     bool dirty = false;
     if (unforceSettings().reuse && spare)
         dirty = true;
@@ -475,6 +481,24 @@ void releaseRegion()
         madvise(base, regionSize(), MADV_DONTNEED);
     } else
         munmap(base, regionSize());
+}
+
+/* A job that keeps all its memory (see `UnforceSeen`): its region becomes
+   ordinary memory for the rest of the process. The unused tail is
+   unmapped, and the region is never reused or reported as freed. */
+static void retainRegion()
+{
+    auto base = evalRegion.base;
+    auto used = size_t(evalRegion.cur - base);
+    stats.regionPeak = std::max(stats.regionPeak, used);
+    auto page = size_t(sysconf(_SC_PAGESIZE));
+    auto kept = (used + page - 1) / page * page;
+    if (kept < regionSize())
+        munmap(base + kept, regionSize() - kept);
+    if (regionSpare == base)
+        regionSpare = nullptr;
+    lastReleased = {0, 0};
+    evalRegion = EvalRegion{};
 }
 
 bool isScalar(const Value & v)
@@ -1931,7 +1955,8 @@ std::string unforceStatsJSON()
         R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,)"
         R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,)"
         R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
-        R"("revertedInClientJobs":%d,"innerScopeReverts":%d})",
+        R"("revertedInClientJobs":%d,"innerScopeReverts":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
+        R"("keptJobBytes":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -1959,7 +1984,11 @@ std::string unforceStatsJSON()
         stats.stackTargets,
         stats.clientJobs,
         stats.revertedInClientJobs,
-        stats.innerScopeReverts);
+        stats.innerScopeReverts,
+        stats.seenNominated,
+        stats.seenKept,
+        stats.keptJobs,
+        stats.keptJobBytes);
 }
 
 static size_t allocatorErrors = 0;
@@ -2303,24 +2332,42 @@ static std::unordered_set<const Value *> printedCells()
     return printed;
 }
 
+/* Whether the decision kept (copied) every object the live `UnforceSeen`
+   sets reported in this job. */
+static bool seenAllKept(Evacuator & evacuator)
+{
+    for (auto s : seenSets)
+        for (auto key : s->keys)
+            if (s->seen.count(key) && !evacuator.forwarded(key))
+                return false;
+    return true;
+}
+
 /* At a job's end, after the decision has copied what it keeps: rewrite the
    job's own entries of the live `UnforceSeen` sets to their copies'
-   addresses, or erase them if they were not kept (their memory is about to
-   be released, and its addresses reused). */
+   addresses. Only called when `seenAllKept`; the job otherwise keeps its
+   memory and the entries stay valid as they are. */
 static void translateSeen(Evacuator & evacuator)
 {
     for (auto s : seenSets) {
         for (auto key : s->keys) {
             if (!s->seen.erase(key))
                 continue;
-            if (auto copy = evacuator.forwarded(key)) {
-                s->seen.insert(copy);
-                if (s->onRekey)
-                    s->onRekey(key, copy);
-                stats.seenKept++;
-            } else
-                stats.seenDropped++;
+            auto copy = evacuator.forwarded(key);
+            assert(copy);
+            s->seen.insert(copy);
+            if (s->onRekey)
+                s->onRekey(key, copy);
+            stats.seenKept++;
         }
+        s->keys.clear();
+        s->cells.clear();
+    }
+}
+
+static void forgetSeenReports()
+{
+    for (auto s : seenSets) {
         s->keys.clear();
         s->cells.clear();
     }
@@ -2422,6 +2469,7 @@ void EvalState::endUnforceScope(size_t mark)
     /* Before anything is released: decide what to promote, and copy it.
        The Evacuator, whose table is keyed by young addresses, goes before
        the region does. */
+    bool keepWhole = false;
     {
         PauseRegion pause;
         Evacuator evacuator{*this};
@@ -2444,7 +2492,17 @@ void EvalState::endUnforceScope(size_t mark)
                 evacuator,
                 copies,
                 printed.empty() ? nullptr : &printed);
-            translateSeen(evacuator);
+            /* A printer's «repeated» entry for an object the decision does
+               not keep (client code ran in the job, or the closure fell back
+               to reverting) would be lost, and the object, rebuilt later,
+               printed in full. Keep the whole job instead: nothing is
+               promoted, reverted or freed, as without unforcing (review of
+               markers v3, S4). */
+            keepWhole = !seenAllKept(evacuator);
+            if (keepWhole)
+                forgetSeenReports();
+            else
+                translateSeen(evacuator);
             pruneCounts(forceCounts, *jt, promoted);
         } catch (std::bad_alloc &) {
             unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");
@@ -2452,61 +2510,71 @@ void EvalState::endUnforceScope(size_t mark)
 
         /* The release: assigns, reverts and frees. Only derivation stubs
            (NIX_UNFORCE_STUB, a dev mode) allocate here. */
-        try {
-            Stubber stubber{*this, evacuator};
-            auto & targets = jt->cells;
-            for (size_t i = 0; i < targets.size(); ++i)
-                if (promoted[i]) {
-                    *targets[i] = copies[i];
-                    stats.promoted++;
-                }
-
-            for (size_t i = 0; i < targets.size(); ++i) {
-                auto target = targets[i];
-                if (promoted[i])
-                    continue;
-                auto & pre = jt->preImages[i];
-                if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
-                    auto source = allocValue();
-                    *source = pre;
-                    if (getenv("NIX_UNFORCE_DEBUG")) {
-                        auto n = target->attrs()->get(s.name);
-                        sourceRegistry[source] =
-                            fmt("source for %s (job %d, pre-image %s)",
-                                n && n->value->internalType() == tString ? std::string(n->value->string_view()) : "?",
-                                stats.jobs,
-                                pre.internalType() == tApp     ? "app"
-                                : pre.internalType() == tThunk ? "thunk"
-                                                               : "other");
+        if (!keepWhole) {
+            try {
+                Stubber stubber{*this, evacuator};
+                auto & targets = jt->cells;
+                for (size_t i = 0; i < targets.size(); ++i)
+                    if (promoted[i]) {
+                        *targets[i] = copies[i];
+                        stats.promoted++;
                     }
-                    /* Memoise within one stub only (outputs refer to each other).
-                       Another cell holding the same derivation, such as an alias
-                       whose recipe is `self.foo`, must not share this stub: its
-                       fallbacks would select from a recipe that evaluates to the
-                       stub itself. */
-                    stubber.memo.clear();
-                    *target = *stubber.stub(*target, source, 0);
-                    evacuator.drain();
-                    stats.stubbed++;
-                    continue;
+
+                for (size_t i = 0; i < targets.size(); ++i) {
+                    auto target = targets[i];
+                    if (promoted[i])
+                        continue;
+                    auto & pre = jt->preImages[i];
+                    if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
+                        auto source = allocValue();
+                        *source = pre;
+                        if (getenv("NIX_UNFORCE_DEBUG")) {
+                            auto n = target->attrs()->get(s.name);
+                            sourceRegistry[source] =
+                                fmt("source for %s (job %d, pre-image %s)",
+                                    n && n->value->internalType() == tString ? std::string(n->value->string_view()) : "?",
+                                    stats.jobs,
+                                    pre.internalType() == tApp     ? "app"
+                                    : pre.internalType() == tThunk ? "thunk"
+                                                                   : "other");
+                        }
+                        /* Memoise within one stub only (outputs refer to each other).
+                           Another cell holding the same derivation, such as an alias
+                           whose recipe is `self.foo`, must not share this stub: its
+                           fallbacks would select from a recipe that evaluates to the
+                           stub itself. */
+                        stubber.memo.clear();
+                        *target = *stubber.stub(*target, source, 0);
+                        evacuator.drain();
+                        stats.stubbed++;
+                        continue;
+                    }
+                    *target = pre;
+                    stats.reverted++;
+                    if (clientCodeInJob)
+                        stats.revertedInClientJobs++;
                 }
-                *target = pre;
-                stats.reverted++;
-                if (clientCodeInJob)
-                    stats.revertedInClientJobs++;
+            } catch (std::bad_alloc &) {
+                unforceFatal("building derivation stubs at the end of an unforce batch");
             }
-        } catch (std::bad_alloc &) {
-            unforceFatal("building derivation stubs at the end of an unforce batch");
         }
     }
 
-    if (evalRegion.base)
+    if (keepWhole) {
+        stats.keptJobs++;
+        if (evalRegion.base)
+            stats.keptJobBytes += evalRegion.cur - evalRegion.base;
+    } else if (evalRegion.base)
         stats.freedBytes += evalRegion.cur - evalRegion.base;
     clientCodeInJob = false;
     undoLog.resize(mark);
     undoLog.shrink_to_fit();
-    if (evalRegion.base)
-        releaseRegion();
+    if (evalRegion.base) {
+        if (keepWhole)
+            retainRegion();
+        else
+            releaseRegion();
+    }
 
     if (cfg.stats)
         printStatsAtExit();

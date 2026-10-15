@@ -479,8 +479,10 @@ bool unforceMayHaveFreed(const void * p);
  * `unforceNoteSeen`. At the job's end, the cells holding them nominate
  * themselves for promotion (like the force counts do), so the containers
  * are kept, and the set's entries for the job's own objects are rewritten
- * to the copies' addresses; those that were not kept (client code ran in
- * the job, or the closure fell back to reverting) are erased instead.
+ * to the copies' addresses (`onRekey` hears of each). If any of them would
+ * not be kept (client code ran in the job, or the closure fell back to
+ * reverting), the job keeps all its memory instead: nothing is promoted,
+ * reverted or freed, and the entries stay as they are.
  * With the bump backend only; with the mimalloc backend, whose nested
  * scopes revert everything, the printers forget what a freeing scope
  * added (`unforceMayHaveFreed`) as before.

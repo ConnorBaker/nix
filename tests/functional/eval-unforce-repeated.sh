@@ -62,6 +62,22 @@ for mode in instantiate eval; do
     [[ $out == "$expected" ]] || fail "attr-desc-batch.nix ($mode, defaults): got '$out', expected '$expected'"
 done
 
+# A job whose decision would not keep a printed container (here the closure
+# falls back to reverting) keeps all its memory instead, so that the
+# container is still «repeated» later (review of markers v3, S4).
+for f in rep.nix attr-desc.nix e-X01-00000.nix; do
+    expected=$(run instantiate "$f" --option eval-unforce false)
+    for k in 0 2; do
+        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_PROMOTE=$k NIX_UNFORCE_WALK_BUDGET_BASE=0 \
+            NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert run instantiate "$f" "${on[@]}")
+        [[ $out == "$expected" ]] || fail "$f (revert fallback, promotion after $k forces): got '$out', expected '$expected'"
+    done
+done
+stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 NIX_UNFORCE_WALK_BUDGET_BASE=0 NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 \
+    NIX_UNFORCE_WALK_FALLBACK=revert nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
+[[ $stats =~ jobs\ kept\ whole\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+(( BASH_REMATCH[1] >= 1 )) || fail "rep.nix (revert fallback): no job was kept whole: $stats"
+
 # Negative control: forgetting what a job printed (NIX_UNFORCE_SEEN=0, as
 # before) prints shared values in full again.
 out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_SEEN=0 run instantiate rep.nix "${on[@]}")
@@ -69,5 +85,5 @@ out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_SEEN=0 run instantiate rep.nix "${on[
 
 # What was kept is counted.
 stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
-[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+),\ dropped\ ([0-9]+) ]] || fail "no unforce stats: $stats"
+[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 && BASH_REMATCH[2] >= 1 && BASH_REMATCH[3] == 0 )) || fail "rep.nix: $stats"
