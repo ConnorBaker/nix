@@ -48,6 +48,11 @@ EvalErrorBuilder<T> & EvalErrorBuilder<T>::withSuggestions(Suggestions & s)
 template<class T>
 EvalErrorBuilder<T> & EvalErrorBuilder<T>::withFrame(const Env & env, const Expr & expr)
 {
+    // The frame is only ever read by the debugger, and nothing pops it, so
+    // pushing it unconditionally grows `debugTraces` with every caught error.
+    if (!error.state.debugRepl)
+        return *this;
+
     // NOTE: This is abusing side-effects.
     // TODO: check compatibility with nested debugger calls.
     // TODO: What side-effects??

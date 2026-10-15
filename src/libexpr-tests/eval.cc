@@ -180,6 +180,18 @@ TEST_F(EvalStateTest, getBuiltin_fail)
     ASSERT_THROW(state.getBuiltin("nonexistent"), EvalError);
 }
 
+TEST_F(EvalStateTest, caughtErrorsDoNotGrowDebugTraces)
+{
+    ASSERT_FALSE(state.debugRepl);
+
+    auto v = eval("(builtins.tryEval (assert false; 1)).success");
+    ASSERT_EQ(v.boolean(), false);
+    EXPECT_TRUE(state.debugTraces.empty());
+
+    ASSERT_THROW(eval("{ }.missing"), EvalError);
+    EXPECT_TRUE(state.debugTraces.empty());
+}
+
 class PureEvalTest : public LibExprTest
 {
 public:
