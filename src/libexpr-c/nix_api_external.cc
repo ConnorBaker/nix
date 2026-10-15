@@ -139,9 +139,11 @@ public:
         EvalState wrapper{state};
         /* PROTOTYPE (unforce): this may run while printing inside an unforce
            scope; what the C code allocates with `wrapper` is its own, so it
-           goes outside the scope. */
+           goes outside the scope, where the job's producer closure cannot
+           see it, so the job then promotes nothing. */
         {
             nix::PauseRegion pause;
+            nix::unforceNoteClientCode();
             desc.printValueAsJSON(v, &wrapper, strict, &ctx, copyToStore, &res);
         }
         if (res.str.empty()) {
@@ -169,6 +171,7 @@ public:
         EvalState wrapper{state};
         /* PROTOTYPE (unforce): as in `printValueAsJSON`. */
         nix::PauseRegion pause;
+        nix::unforceNoteClientCode();
         desc.printValueAsXML(
             v, &wrapper, strict, location, &doc, &ctx, &drvsSeen, *reinterpret_cast<const uint32_t *>(&pos));
     }

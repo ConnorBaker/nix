@@ -168,8 +168,10 @@ nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)
     try {
         nix::Value * value;
         {
-            /* PROTOTYPE (unforce): client-owned, see `new_nix_value`. */
+            /* PROTOTYPE (unforce): client-owned, see `new_nix_value`; the
+               job, if one is open, then promotes nothing. */
             nix::PauseRegion pause;
+            nix::unforceNoteClientCode();
             value = state->state.allocValue();
         }
         nix_value * res = new_nix_value(value, state->state.mem);
