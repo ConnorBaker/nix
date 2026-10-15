@@ -79,3 +79,12 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=1 nix-instantiate "${batch0[@]}"
 [[ $stats =~ promoted\ ([0-9]+).*copied\ ([0-9]+)\ MiB ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 200 )) || fail "expected at least 200 promotions: $stats"
 (( BASH_REMATCH[2] < 16 )) || fail "a shared list array was copied per cell: $stats"
+
+# Running out of memory while deciding what to keep at the end of a batch is
+# fatal: a clear message, then abort(), before any value has changed.
+rc=0
+out=$(NIX_UNFORCE_FAIL_DECIDE=1 nix-instantiate "${batch0[@]}" --eval --strict \
+    -E 'let s = { a = 1; }; in [ s.a s.a s.a ]' 2>&1) || rc=$?
+(( rc == 134 )) || fail "expected abort() (status 134), got $rc: $out"
+[[ $out == *"out of memory while deciding"*"--option eval-unforce false"* ]] \
+    || fail "no fatal message: $out"
