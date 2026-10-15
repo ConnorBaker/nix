@@ -816,11 +816,24 @@ struct Stubber
      it (through cells, Bindings layers, lists, envs, thunk and app
      operands, lambdas, failure recovery values), as the Evacuator copies.
    - S ⊆ T is the promoted set and Evac(S) = ∪_{r∈S} R(c(r)), copied with one
-     forwarding table. Identity is only observable on Value cells (no
-     Bindings or list shortcut in `eqValues`, `CompareValues` or `elem`).
+     forwarding table.
+   - Observation model: what an evaluation without unforcing can tell
+     apart by address. `eqValues` (and so `==`, `elem`, `genericClosure`,
+     `CompareValues`) short-cuts on the cell address and has no Bindings or
+     list shortcut; the printers' «repeated» tracking (`print.cc`,
+     `print-ambiguous.cc`; stdout, `trace:` and error text) keys attrsets on
+     their Bindings and lists on their cell; the derivation walker's
+     `done` set keys on Bindings (off while unforcing). Identity-bearing
+     objects are therefore cells and Bindings. Element arrays are counted
+     with them for safety, although nothing compares them by address; envs
+     and strings are never compared by address.
 
-   Invariant (OC, ownership closure): every young cell X ∈ Evac(S) has
-   owner(X) ∈ S or no owner.
+   Invariant (OC, ownership closure): every young identity-bearing object X
+   ∈ Evac(S) has owner(X) ∈ S or no owner. (Until 2026-10-15 OC covered
+   cells only, and a promoted cell could keep a copy of a reverted
+   producer's Bindings that held only old cells: base prints the second
+   occurrence as «repeated», markers printed it in full; review
+   notes/reviews/identity-comparison.md §2.2, B1.)
 
    OC is sufficient: a reverted target t re-forced later builds only cells
    that t owns, which are fresh: none of them survives, because a survivor is
@@ -863,7 +876,8 @@ struct Stubber
    by Lemma C every object on the path from c(t) satisfies the same, so
    allowed(t, a) := a ≥ s ∧ (a ≥ e ∨ innermost(a) is t's interval) holds
    along it. So t is a candidate producer iff a walk of R(c(t)) that never
-   enters an object with ¬allowed(t, a(x)) reaches a cell of Evac(S). For a
+   enters an object with ¬allowed(t, a(x)) reaches an identity-bearing object
+   of Evac(S) (Lemma C holds for every object t owns). For a
    target with several intervals (forced again after an error) only a ≥ s
    of the first interval is used. Objects without a time are never pruned:
    that only adds candidates (with no times at all the walk is plain
@@ -1292,7 +1306,7 @@ struct Closure
     }
 
     /* Whether a walk from target t's content, pruned by `allowed`, reaches
-       a cell of Evac(S): t is a candidate producer. */
+       an identity-bearing object of Evac(S): t is a candidate producer. */
     bool candidate(const Value & content, const ForceMarkers & markers, const ForceMarkers::Span & t)
     {
         /* Memos of earlier walks that hold from here on. */
@@ -1313,25 +1327,42 @@ struct Closure
             touched.push_back(p);
             stack.emplace_back(p, k);
         };
+        bool hit = false, ownPruned = false;
+        /* Whether `p` (not visited yet) is pruned for t. */
+        auto pruned = [&](const void * p) {
+            auto a = clock(p);
+            if (!a || markers.allowed(t, *a))
+                return false;
+            ownPruned |= *a >= t.s;
+            return true;
+        };
+        /* An element array is checked where it is reached: its elements
+           are pushed only if it is neither pruned nor a hit. */
         auto array = [&](Value * const * elems, size_t size) {
-            if (marks.test(elems, visited) || marks.test(elems, memo))
+            if (hit || marks.test(elems, visited) || marks.test(elems, memo))
                 return;
             marks.set(elems, visited);
             touched.push_back(elems);
+            if (pruned(elems))
+                return;
+            if (marks.test(elems, inEvac)) {
+                hit = true;
+                return;
+            }
             for (size_t i = 0; i < size; ++i)
                 push(elems[i], kValue);
         };
-        bool hit = false, ownPruned = false;
         children(content, push, array);
-        while (!stack.empty()) {
+        while (!hit && !stack.empty()) {
             auto [p, kind] = stack.back();
             stack.pop_back();
             step();
-            if (auto a = clock(p); a && !markers.allowed(t, *a)) {
-                ownPruned |= *a >= t.s;
+            if (pruned(p))
                 continue;
-            }
-            if (kind == kValue && marks.test(p, inEvac)) {
+            /* Identity is observable on cells (`eqValues`) and on Bindings
+               (the printers' «repeated» tracking keys on the Bindings);
+               envs are never compared. */
+            if (kind != kEnv && marks.test(p, inEvac)) {
                 hit = true;
                 break;
             }

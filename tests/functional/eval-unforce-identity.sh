@@ -22,10 +22,11 @@ run() {
     shift
     # nested.nix is printed by `nix eval`, whose nested containers are
     # scopes of their own with the mimalloc backend.
+    # The exit status is part of the output (bind3.nix fails, as in base).
     if [[ $f == nested.nix ]]; then
-        nix eval "$@" --impure --file "$f" 2>&1
+        nix eval "$@" --impure --file "$f" 2>&1 || echo "exit status $?"
     else
-        nix-instantiate "$@" --eval --strict "$f" 2>&1
+        nix-instantiate "$@" --eval --strict "$f" 2>&1 || echo "exit status $?"
     fi
 }
 
