@@ -473,6 +473,14 @@ size_t unforceGeneration();
  */
 bool unforceIsScopeStackSlot(const void * p);
 
+/**
+ * PROTOTYPE. Client code (a C API primop) is about to run. If an unforce
+ * scope is open, the job promotes nothing: what the client builds is
+ * allocated outside the job's region, where the producer closure cannot see
+ * it, and a re-forced call builds it anew.
+ */
+void unforceNoteClientCode();
+
 /** PROTOTYPE. Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();
 

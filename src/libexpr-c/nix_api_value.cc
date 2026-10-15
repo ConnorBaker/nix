@@ -69,9 +69,12 @@ static void nix_c_primop_wrapper(
        traversal of the `nix` CLI) allocates outside it, so that nothing the C
        code creates or keeps is freed when the scope ends. Its arguments may
        still be younger than the scope; the C code must not keep them beyond
-       this call, as the C API documents for values without a reference. */
+       this call, as the C API documents for values without a reference.
+       What it builds is invisible to the job's producer closure, so the job
+       then promotes nothing. */
     std::optional<nix::PauseRegion> pause;
     pause.emplace();
+    nix::unforceNoteClientCode();
 
     nix_value * vTmpPtr = new_nix_value(&vTmp, state.mem);
 

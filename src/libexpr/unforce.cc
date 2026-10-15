@@ -136,7 +136,12 @@ struct Stats
        largest transient bookkeeping of one job close (estimated). */
     size_t markerPromoted = 0, refused = 0, markerRounds = 0, markerSteps = 0, markerJobs = 0;
     size_t markerLogBytes = 0, markerPeakBytes = 0;
+    /* Jobs that promoted nothing because client code ran in them. */
+    size_t clientJobs = 0;
 } stats;
+
+/* Whether client code ran in the open job (`unforceNoteClientCode`). */
+bool clientCodeInJob = false;
 
 bool nested()
 {
@@ -152,7 +157,7 @@ static void printStatsAtExit()
              std::cerr << fmt(
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, refused %d, "
-                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB\n",
+                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB; client-code jobs %d\n",
                  nested() ? "scopes" : "jobs",
                  stats.jobs,
                  stats.logged,
@@ -171,7 +176,8 @@ static void printStatsAtExit()
                  stats.markerSteps,
                  stats.markerJobs,
                  stats.markerLogBytes >> 10,
-                 stats.markerPeakBytes >> 10);
+                 stats.markerPeakBytes >> 10,
+                 stats.clientJobs);
          }),
          true);
 }
@@ -1064,6 +1070,14 @@ std::vector<bool> closeJob(
         stats.promoted++;
     };
 
+    /* Objects that client code built in this job were allocated outside the
+       region: the closure cannot see them, and re-forcing the cell that
+       called the client builds them again. Pure revert keeps identity. */
+    if (clientCodeInJob) {
+        stats.clientJobs++;
+        return std::vector<bool>(targets.size());
+    }
+
     auto & mode = cfg.markers;
     bool any = std::find(promote.begin(), promote.end(), true) != promote.end();
     if (!any || mode == "off" || !canCopy) {
@@ -1269,7 +1283,7 @@ std::string unforceStatsJSON()
     return fmt(
         R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,"refused":%d,)"
-        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d})",
+        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,"clientJobs":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -1288,7 +1302,8 @@ std::string unforceStatsJSON()
         stats.markerSteps,
         stats.markerJobs,
         stats.markerLogBytes,
-        stats.markerPeakBytes);
+        stats.markerPeakBytes,
+        stats.clientJobs);
 }
 
 static size_t allocatorErrors = 0;
@@ -1525,8 +1540,10 @@ static void endHeapScope(EvalState & state, size_t mark)
     }
 
     log.resize(mark);
-    if (!parent)
+    if (!parent) {
         log.shrink_to_fit();
+        clientCodeInJob = false;
+    }
     stats.freedBytes += f.bytes;
     stats.regionPeak = std::max(stats.regionPeak, f.bytes);
     if (getenv("NIX_UNFORCE_VERIFY"))
@@ -1551,6 +1568,12 @@ static thread_local const char * stackLow = [] {
     }
     return (const char *) addr;
 }();
+
+void unforceNoteClientCode()
+{
+    if (!scopeStackMarks.empty())
+        clientCodeInJob = true;
+}
 
 bool unforceIsScopeStackSlot(const void * p)
 {
@@ -1678,6 +1701,7 @@ void EvalState::endUnforceScope(size_t mark)
 
     if (evalRegion.base)
         stats.freedBytes += evalRegion.cur - evalRegion.base;
+    clientCodeInJob = false;
     undoLog.resize(mark);
     undoLog.shrink_to_fit();
     if (evalRegion.base)
