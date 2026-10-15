@@ -2319,8 +2319,8 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
         /* The recovery value may be younger than `v`. The write is logged
            with an empty force interval: the force that follows logs `v`
            again, with its own markers. */
-        if (auto marker = logPreImage(v))
-            endLoggedForce(marker);
+        logPreImage(v);
+        endLoggedForce(v);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {
@@ -2355,7 +2355,10 @@ void EvalState::forceValueDeep(Value & v, std::set<const void *> & seen)
 
         if (!seen.insert(&v).second)
             return;
-        unforceNoteSeen(seen, v, &v);
+        /* Out of line and behind one test, so that this level's frame is
+           base's (STACK-PARITY.md, R1). */
+        if (state.isolationDepth) [[unlikely]]
+            unforceNoteSeen(seen, v, &v);
 
         state.forceValue(v, v.determinePos(noPos));
 

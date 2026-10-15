@@ -537,7 +537,7 @@ struct UnforceSeen
  * `cell` holds was just added to `seen`. Does nothing unless an
  * `UnforceSeen` for `seen` is alive and a job is open.
  */
-void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key);
+[[gnu::noinline, gnu::cold]] void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key);
 
 /**
  * PROTOTYPE. Whether the open unforce jobs keep `UnforceSeen` sets exact
@@ -1358,26 +1358,37 @@ public:
      * PROTOTYPE. Record `v`'s current contents before it is overwritten, if
      * an unforce scope must restore it: `v` is older than the scope, and not
      * a stack slot of a frame that will have returned when the scope ends.
+     *
+     * Shaped for the evaluator's stack frames (STACK-PARITY.md, R1): one
+     * test, one out-of-line call, and nothing returned and kept across the
+     * evaluation. The start of the force goes on a thread-local stack, and
+     * `endLoggedForce` matches it by `&v`.
      */
-    [[gnu::always_inline]] size_t logPreImage(Value & v)
+    [[gnu::always_inline]] void logPreImage(Value & v)
     {
-        if (isolationDepth && !evalRegion.contains(&v)) [[unlikely]]
-            if (!unforceIsScopeStackSlot(&v))
-                return logForce(v);
-        return 0;
+        if (isolationDepth) [[unlikely]]
+            logPreImageSlow(v);
     }
 
     /**
-     * PROTOTYPE. The cold part of `logPreImage`: log `v` with the start
-     * marker of its force. Returns the marker to pass to `endLoggedForce`
-     * (the log index plus one).
+     * PROTOTYPE. The out-of-line part of `logPreImage`: log `v` with the
+     * start marker of its force.
      */
-    [[gnu::noinline]] size_t logForce(Value & v);
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
 
     /**
-     * PROTOTYPE. Record the end marker of a logged force, however it ended.
+     * PROTOTYPE. After a force of `v`, however it ended: record the end
+     * marker of its logged start, if the innermost open one is `v`'s.
+     * `isolationDepth` may have changed during the force; a start that was
+     * not logged, or that a job's end dropped, is simply not found.
      */
-    [[gnu::noinline]] void endLoggedForce(size_t marker);
+    [[gnu::always_inline]] void endLoggedForce(Value & v)
+    {
+        if (isolationDepth) [[unlikely]]
+            endLoggedForceSlow(v);
+    }
+
+    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
 
     /**
      * PROTOTYPE. Close an unforce scope and unforce every thunk updated

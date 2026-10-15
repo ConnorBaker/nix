@@ -131,11 +131,12 @@ Env & EvalMemory::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
+        /* Unforcing: a logged force gets start and end markers. Logged
+           before anything is loaded, so that nothing is live across it. */
+        logPreImage(v);
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
-        /* Unforcing: a logged force gets start and end markers. */
-        auto marker = logPreImage(v);
         try {
             v.mkBlackhole();
             if (env) [[likely]]
@@ -143,26 +144,22 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             else
                 ExprBlackHole::throwInfiniteRecursionError(*this, v);
         } catch (...) {
-            if (marker) [[unlikely]]
-                endLoggedForce(marker);
+            endLoggedForce(v);
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-        if (marker) [[unlikely]]
-            endLoggedForce(marker);
+        endLoggedForce(v);
     } else if (v.isApp()) {
+        logPreImage(v);
         Value savedApp = v;
-        auto marker = logPreImage(v);
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
         } catch (...) {
-            if (marker) [[unlikely]]
-                endLoggedForce(marker);
+            endLoggedForce(v);
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-        if (marker) [[unlikely]]
-            endLoggedForce(marker);
+        endLoggedForce(v);
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

@@ -2687,29 +2687,34 @@ bool unforceIsScopeStackSlot(const void * p)
     return (const char *) p >= stackLow && (const char *) p < mark;
 }
 
-size_t EvalState::logForce(Value & v)
+void EvalState::logPreImageSlow(Value & v)
 {
+    if (evalRegion.contains(&v) || unforceIsScopeStackSlot(&v))
+        return;
     UndoEntry e{&v, v};
     e.start = unforceClock();
     e.parent = activeForces.empty() ? -1 : int64_t(activeForces.back());
     undoLog.push_back(e);
     stats.markerLogBytes += sizeof(UndoEntry) - offsetof(UndoEntry, start);
     activeForces.push_back(undoLog.size() - 1);
-    return undoLog.size();
 }
 
-void EvalState::endLoggedForce(size_t marker)
+void EvalState::endLoggedForceSlow(Value & v)
 {
-    auto i = marker - 1;
-    /* Every logged force ends here, innermost first; anything above `i`
-       would belong to a scope that closed while this force ran. */
-    while (!activeForces.empty() && activeForces.back() > i)
+    /* Every logged force ends here, innermost first, so the innermost open
+       one is `v`'s if `v`'s start was logged. One that a job's end dropped
+       (`dropActiveForces`) is not found. */
+    if (activeForces.empty())
+        return;
+    auto i = activeForces.back();
+    if (i >= undoLog.size()) {
         activeForces.pop_back();
-    if (!activeForces.empty() && activeForces.back() == i) {
-        activeForces.pop_back();
-        if (i < undoLog.size())
-            undoLog[i].end = unforceClock();
+        return;
     }
+    if (undoLog[i].target != &v)
+        return;
+    activeForces.pop_back();
+    undoLog[i].end = unforceClock();
 }
 
 /* The EvalState whose job is open. The per-job state above is per thread,
