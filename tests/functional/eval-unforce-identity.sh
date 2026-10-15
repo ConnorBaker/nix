@@ -157,3 +157,18 @@ segs=$(ownerStat ownerSegsPeak "$expr")
 # Owners are off in the A/B mode.
 changes=$(NIX_UNFORCE_IDENTITY=markers ownerStat ownerChanges "$expr")
 (( changes == 0 )) || fail "NIX_UNFORCE_IDENTITY=markers still tracks owners: $changes owner changes"
+
+# A job whose timeline outgrows what is kept between jobs (64 Ki segments):
+# the driver alternates between young cells of two targets, and every force
+# allocates. The stacks are freed at the job's end, and the output is base's.
+expr='let
+  n = 40000;
+  a = builtins.listToAttrs [ { name = "x"; value = builtins.genList (i: { v = [ i ]; }) n; } ];
+  b = builtins.listToAttrs [ { name = "x"; value = builtins.genList (i: { v = [ (i + 1) ]; }) n; } ];
+in [ a b (builtins.genList (i: builtins.head (builtins.elemAt a.x i).v + builtins.head (builtins.elemAt b.x i).v) n) a.x b.x ]'
+segs=$(ownerStat ownerSegsPeak "$expr")
+(( segs > 65536 )) || fail "the alternating job made only $segs owner segments"
+nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict --json -E "$expr" \
+    > "$TEST_ROOT/alternate-on.json"
+nix-instantiate --option eval-unforce false --eval --strict --json -E "$expr" > "$TEST_ROOT/alternate-off.json"
+cmp -s "$TEST_ROOT/alternate-on.json" "$TEST_ROOT/alternate-off.json" || fail "the alternating job's output differs from base"

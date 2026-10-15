@@ -416,6 +416,17 @@ struct HookStack
         *t++ = x;
     }
 
+    /* Free the storage if it holds more than `keep` entries, so that one
+       large job's high-water mark does not stay allocated for the rest of
+       the run (review of effects v5, B4). The caller then refills it. */
+    void shrink(size_t keep)
+    {
+        if (size_t(e - b) > keep) {
+            std::free(b);
+            b = t = e = high = nullptr;
+        }
+    }
+
     void pop() { --t; }
     T & back() const { return t[-1]; }
     bool empty() const { return t == b; }
@@ -461,8 +472,14 @@ static bool opensEmpty()
     return opens.size() <= 1;
 }
 
+/* What the timeline's stacks keep allocated between jobs: 64 Ki entries,
+   1 MiB of `ownerSegs` or `opens`. */
+static constexpr size_t ownerKeep = 64 * 1024;
+
 static void clearOpens()
 {
+    opens.shrink(ownerKeep);
+    openLogIndices.shrink(ownerKeep);
     opens.clear();
     opens.push({nullptr, 0});
     openLogIndices.clear();
@@ -587,8 +604,11 @@ static void pushLoggedOpen(const Value * cell, size_t logIndex)
 static void closeOwners()
 {
     ownersOn = false;
+    if (ownerConsumers.capacity() > ownerKeep)
+        ownerConsumers = {};
     ownerConsumers.clear();
     stats.ownerSegsPeak = std::max(stats.ownerSegsPeak, size_t(ownerSegs.high - ownerSegs.b));
+    ownerSegs.shrink(ownerKeep);
     ownerSegs.clear();
     ownerSegs.push(segSentinel);
     clearOpens();
