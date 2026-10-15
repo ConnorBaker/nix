@@ -1126,33 +1126,67 @@ struct CellClock
 /* A job's targets, in the order of their first log entries (= the order
    their first forces started). A cell may have been forced more than once
    (after a recoverable error); its oldest pre-image is the one from before
-   the job. */
+   the job.
+
+   Memory. Built at every job's end, beside the log, so it is kept small:
+   the pre-images stay in the log (which lives until the release), and the
+   repeated cells are found by sorting the log indices by cell, not with a
+   hash map (review of markers v4, B1-mem: the map and copied pre-images
+   took about 70 bytes per target, more than the log itself). */
 struct JobTargets
 {
+    const decltype(EvalState::undoLog) & log;
     std::vector<Value *> cells;
-    std::vector<Value> preImages;
     /* The log index of each target's first entry, and whether it has more. */
     std::vector<size_t> first;
     std::vector<bool> repeated;
 
     JobTargets(const decltype(EvalState::undoLog) & log, size_t mark)
+        : log(log)
     {
-        std::unordered_map<const Value *, size_t> index;
-        for (auto i = mark; i < log.size(); ++i) {
-            auto [it, fresh] = index.try_emplace(log[i].target, cells.size());
-            if (fresh) {
-                cells.push_back(log[i].target);
-                preImages.push_back(log[i].preImage);
-                first.push_back(i);
-                repeated.push_back(false);
-            } else
-                repeated[it->second] = true;
+        auto n = log.size() - mark;
+        /* Log indices by (cell, index); the first of each run is a target's
+           first entry. */
+        std::vector<size_t> byCell(n);
+        for (size_t i = 0; i < n; ++i)
+            byCell[i] = mark + i;
+        std::sort(byCell.begin(), byCell.end(), [&](size_t a, size_t b) {
+            auto ca = log[a].target, cb = log[b].target;
+            return ca != cb ? std::less<const Value *>{}(ca, cb) : a < b;
+        });
+        /* The first entries in log order, with the repeated flag in the
+           top bit. */
+        constexpr size_t more = size_t(1) << (sizeof(size_t) * 8 - 1);
+        size_t targets = 0;
+        const Value * prev = nullptr;
+        for (size_t i = 0; i < n; ++i) {
+            auto cell = log[byCell[i]].target;
+            if (!targets || cell != prev)
+                byCell[targets++] = byCell[i];
+            else
+                byCell[targets - 1] |= more;
+            prev = cell;
         }
+        byCell.resize(targets);
+        std::sort(byCell.begin(), byCell.end(), [&](size_t a, size_t b) { return (a & ~more) < (b & ~more); });
+        cells.reserve(targets);
+        repeated.reserve(targets);
+        for (auto & f : byCell) {
+            repeated.push_back(f & more);
+            f &= ~more;
+            cells.push_back(log[f].target);
+        }
+        first = std::move(byCell);
     }
 
     size_t size() const
     {
         return cells.size();
+    }
+
+    const Value & preImage(size_t i) const
+    {
+        return log[first[i]].preImage;
     }
 };
 
@@ -1829,9 +1863,12 @@ std::vector<bool> decideJob(
 {
     auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
-    copies.resize(targets.size());
     std::vector<bool> copied(targets.size());
     auto copy = [&](size_t i) {
+        /* Sized at the first copy: a job that copies nothing (it reverts
+           or keeps everything) needs none. */
+        if (copies.empty())
+            copies.resize(targets.size());
         if (!copied[i]) {
             copies[i] = evacuator.copy(*targets.cells[i]);
             copied[i] = true;
@@ -2367,7 +2404,7 @@ static void endHeapScope(EvalState & state, size_t mark)
            would be relogged there and could be reverted after a cell holding
            a copy of its data was promoted. */
         for (size_t i = 0; i < jt->size(); ++i) {
-            *jt->cells[i] = jt->preImages[i];
+            *jt->cells[i] = jt->preImage(i);
             stats.reverted++;
             stats.innerScopeReverts++;
         }
@@ -2378,7 +2415,7 @@ static void endHeapScope(EvalState & state, size_t mark)
                 *jt->cells[i] = copies[i];
                 stats.promoted++;
             } else {
-                *jt->cells[i] = jt->preImages[i];
+                *jt->cells[i] = jt->preImage(i);
                 stats.reverted++;
                 if (clientCodeInJob)
                     stats.revertedInClientJobs++;
@@ -2659,7 +2696,7 @@ void EvalState::endUnforceScope(size_t mark)
                     auto target = targets[i];
                     if (promoted[i])
                         continue;
-                    auto & pre = jt->preImages[i];
+                    auto & pre = jt->preImage(i);
                     if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
                         auto source = allocValue();
                         *source = pre;
