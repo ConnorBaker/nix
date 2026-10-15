@@ -138,14 +138,20 @@ inline constexpr std::string_view narVersionMagic1 = "nix-archive-1";
 
 inline constexpr std::string_view caseHackSuffix = "~nix~case~hack~";
 
-/** Ordinary serialized child names, excluding empty/dot names, slash, NUL and the reserved marker. */
+/** Child names before the marker reservation: excluding empty/dot names, slash and NUL. */
+inline bool isWellFormedNarName(std::string_view name) noexcept
+{
+    return !name.empty() && name != "." && name != ".." && name.find('/') == name.npos
+           && name.find('\0') == name.npos;
+}
+
+/** Ordinary serialized child names: well-formed and without the reserved marker. */
 inline bool isValidNarName(std::string_view name) noexcept
 {
     /* The marker is NAR's case-collision encoding. Accepting it
        would give one serialized name and another unhacked name, making
        the NAR's object hash depend on the platform's case-hack setting. */
-    return !name.empty() && name != "." && name != ".." && name.find('/') == name.npos
-           && name.find('\0') == name.npos && name.find(caseHackSuffix) == name.npos;
+    return isWellFormedNarName(name) && name.find(caseHackSuffix) == name.npos;
 }
 
 /**

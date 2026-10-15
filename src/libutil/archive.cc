@@ -358,8 +358,14 @@ static void parse(FileSystemObjectSink & sink, Source & source, const CanonPath 
                 expectTag("name");
 
                 auto name = getString(narMaxName);
-                if (!isValidNarName(name))
+                if (!isValidNarName(name)) {
+                    /* Admission is `isValidNarName`'s; the diagnostic names
+                       the reserved marker when it is the only defect. */
+                    if (isWellFormedNarName(name))
+                        throw badArchive(
+                            "NAR contains file name '%s' with the case-hack suffix '%s'", name, caseHackSuffix);
                     throw badArchive("NAR contains invalid file name '%1%'", name);
+                }
                 if (name <= prevName)
                     throw badArchive("NAR directory is not sorted");
                 prevName = name;

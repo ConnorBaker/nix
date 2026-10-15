@@ -157,7 +157,7 @@ TEST_F(NarTest, entryNameWithCaseHackSuffixIsRefusedUnderEitherSetting)
             ASSERT_THAT(
                 [&]() { parseNar(narWithEntry(hacked), mode); },
                 ::testing::ThrowsMessage<SerialisationError>(testing::HasSubstrIgnoreANSIMatcher(
-                    "bad archive: NAR contains invalid file name '" + hacked + "'")));
+                    "bad archive: NAR contains file name '" + hacked + "' with the case-hack suffix")));
             EXPECT_EQ(parseNar(narWithEntry("foo1"), mode), narWithEntry("foo1").size());
         }
     }
@@ -276,7 +276,7 @@ TEST_F(NarTest, caseHackSuffixRefusedAndNeverEmittedOnEveryPlatform)
             ASSERT_THAT(
                 [&]() { parseNar(narWithEntry(hacked), mode); },
                 ::testing::ThrowsMessage<SerialisationError>(testing::HasSubstrIgnoreANSIMatcher(
-                    "bad archive: NAR contains invalid file name '" + hacked + "'")));
+                    "bad archive: NAR contains file name '" + hacked + "' with the case-hack suffix")));
         cells++;
     }
     EXPECT_EQ(cells, 4u) << "`use-case-hack` on and off, dump and parse";
