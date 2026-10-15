@@ -77,3 +77,26 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=100 nix-instantiate --option 
     --option eval-unforce-batch-size 0 --eval --strict -E 'builtins.genList (i: { inherit i; }) 1000' 2>&1 >/dev/null)
 [[ $stats =~ counts\ peak\ ([0-9]+),\ counts\ resets\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] <= 101 && BASH_REMATCH[2] >= 1 )) || fail "the force counts outgrew their cap: $stats"
+
+# Generated schedules (from the epoch branch): each makes a count-only policy
+# diverge at exactly one K. K-1 jobs force R (and P), one job forces P only,
+# so P is promoted with P.a copied unforced, then one job forces R alone,
+# which reaches K and is promoted holding a copy of P.a's value; P.a is
+# reverted and rebuilt by the comparison.
+schedule() {
+    local k=$1 warm="" i
+    for ((i = 1; i < k; i++)); do warm+=' (builtins.seq R true)'; done
+    echo "let P = { a = { f = x: x; }; }; R = P.a; in [$warm (P ? a) (builtins.seq R true) (R == P.a) ]"
+}
+for k in 2 3 4 5; do
+    expr=$(schedule "$k")
+    expected=$(nix-instantiate --option eval-unforce false --eval --strict -E "$expr")
+    for backend in "${backends[@]}"; do
+        for promote in 0 1 2 3 4 5; do
+            out=$(NIX_UNFORCE_BACKEND=$backend NIX_UNFORCE_PROMOTE=$promote nix-instantiate \
+                --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict -E "$expr")
+            [[ $out == "$expected" ]] \
+                || fail "schedule for K=$k (backend $backend, NIX_UNFORCE_PROMOTE=$promote): got '$out', expected '$expected'"
+        done
+    done
+done
