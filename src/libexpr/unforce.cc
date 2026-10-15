@@ -1485,6 +1485,9 @@ struct Closure
     bool memos = true;
     /* Steps taken in this job, and how many it may take. */
     uint64_t steps = 0, budget = UINT64_MAX;
+    /* What `mark` added to Evac(S), in bytes (string data, which it does
+       not walk, excluded). */
+    size_t markedBytes = 0;
     size_t peak = 0;
 
     void step()
@@ -1604,6 +1607,9 @@ struct Closure
             auto old = marks.add(p, inEvac);
             if (!(old & inEvac)) {
                 reachedNew |= old & reached;
+                markedBytes += k == kValue ? sizeof(Value)
+                               : k == kEnv ? sizeof(Env) + width(p, k) * sizeof(Value *)
+                                           : sizeof(Bindings) + width(p, k) * sizeof(Attr);
                 stack.emplace_back(p, k);
             }
         };
@@ -1611,6 +1617,7 @@ struct Closure
             auto old = marks.add(elems, inEvac);
             if (!(old & inEvac)) {
                 reachedNew |= old & reached;
+                markedBytes += size * sizeof(Value *);
                 if (size)
                     arrays.emplace_back(elems, size);
             }
@@ -1789,6 +1796,10 @@ size_t closePromotions(
     return added;
 }
 
+/* Per target of a job, whether a live `UnforceSeen` set reported it
+   (`reportedTargets`). */
+using Reported = std::vector<bool>;
+
 /* Count a job's forces of its targets; returns whether each reached K.
 
    The map's cap. So that the counts do not grow with the length of a
@@ -1804,18 +1815,25 @@ size_t closePromotions(
    lose its count that way; the closure does not depend on the counts. The
    old counts are read out before the old map is freed and the new one
    built, so the two never coexist. */
-static std::vector<bool>
-countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTargets & targets, uint64_t batchSize)
+static std::vector<bool> countTargets(
+    std::unordered_map<const Value *, uint32_t> & counts,
+    const JobTargets & targets,
+    uint64_t batchSize,
+    const Reported * skip)
 {
     auto & cfg = unforceSettings();
     auto cap = cfg.countsCap ? cfg.countsCap : std::max<uint64_t>(256 << 10, batchSize / 256);
-    if (counts.size() + targets.size() > cap) {
+    auto counted = targets.size();
+    if (skip)
+        for (size_t i = 0; i < targets.size(); ++i)
+            counted -= (*skip)[i];
+    if (counts.size() + counted > cap) {
         std::vector<uint32_t> prior(targets.size());
         for (size_t i = 0; i < targets.size(); ++i)
             if (auto c = counts.find(targets.cells[i]); c != counts.end())
                 prior[i] = c->second;
         std::unordered_map<const Value *, uint32_t>().swap(counts);
-        counts.reserve(targets.size());
+        counts.reserve(counted);
         for (size_t i = 0; i < targets.size(); ++i)
             if (prior[i])
                 counts.emplace(targets.cells[i], prior[i]);
@@ -1823,6 +1841,10 @@ countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTarg
     }
     std::vector<bool> reached(targets.size());
     for (size_t i = 0; i < targets.size(); ++i) {
+        /* Reported cells are nominated anyway (`decideJob`): counting them
+           would only grow the map. */
+        if (skip && (*skip)[i])
+            continue;
         if (onThreadStack(targets.cells[i]))
             stats.stackTargets++;
         auto before = counts[targets.cells[i]]++;
@@ -1835,7 +1857,8 @@ countTargets(std::unordered_map<const Value *, uint32_t> & counts, const JobTarg
 
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
-   `counts` nominate, as do the cells in `printed` (`UnforceSeen`), and the
+   `counts` nominate, as do the targets `printed` marks (`UnforceSeen`; null
+   when the printers reported nothing in the job), and the
    producer closure adds what identity needs (see above). This is the fallible step before the job's memory is released.
    It writes no target, so the caller turns an allocation failure here into
    a fatal error before anything has changed, and the release that follows
@@ -1876,7 +1899,8 @@ std::vector<bool> decideJob(
     size_t youngBytes,
     Evacuator & evacuator,
     std::vector<Value> & copies,
-    const std::unordered_set<const Value *> * printed = nullptr)
+    const Reported * printed = nullptr,
+    bool * keepWhole = nullptr)
 {
     auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
@@ -1898,14 +1922,17 @@ std::vector<bool> decideJob(
     };
 
     if (canCopy && cfg.promoteAfter)
-        promote = countTargets(counts, targets, state.settings.unforceBatchSize);
+        promote = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
 
-    /* Cells holding a container that a printer printed (`UnforceSeen`)
-       are nominated like counted ones, so that the container keeps its
-       address's identity for the rest of the print. */
-    if (printed && canCopy && cfg.markers != "off")
+    /* Cells reported to an `UnforceSeen` (holding a container a printer
+       printed, or walked by `forceValueDeep` for a printer that prints
+       later) are nominated like counted ones, so that what they hold stays
+       forced and keeps its identity for the rest of the print. With
+       NIX_UNFORCE_MARKERS=off they are promoted without the closure, as
+       counted ones are. */
+    if (printed && canCopy)
         for (size_t i = 0; i < targets.size(); ++i)
-            if (!promote[i] && printed->count(targets.cells[i])) {
+            if (!promote[i] && (*printed)[i]) {
                 promote[i] = true;
                 stats.seenNominated++;
             }
@@ -1927,34 +1954,57 @@ std::vector<bool> decideJob(
     if (failDecide)
         throw std::bad_alloc();
 
-    ForceMarkers markers(state.undoLog, mark, jobEnd, targets);
+    /* When every target is promoted (a printing job often nominates them
+       all), the closure has nothing to decide: only Evac(S) is needed. */
+    bool allPromoted = std::find(promote.begin(), promote.end(), false) == promote.end();
+    std::optional<ForceMarkers> markers;
+    if (!allPromoted)
+        markers.emplace(state.undoLog, mark, jobEnd, targets);
     auto budget = cfg.walkBudgetBase + cfg.walkBudgetPerKiB * (youngBytes >> 10);
     bool fallbackPromote = cfg.walkFallback != "revert";
     uint64_t steps = 0;
     size_t peak = 0;
     auto nominated = promote;
+    /* A job that printers reported cells in (`UnforceSeen`) may keep most
+       of what it allocated: a job forcing one large printed value keeps all
+       of it. Copying that would double the job's memory at its end, so
+       Evac(S) is marked first, and if it is at least half the job's memory
+       (string data aside), or the closure runs out of budget, the job keeps
+       all its memory instead (`keepWhole`): no copy, and no more than
+       without unforcing (review of markers v4, B1-mem). */
+    bool markFirst = keepWhole && printed;
+    bool copyAsWeGo = fallbackPromote && !markFirst;
+    size_t markedBytes = 0;
     auto decide = [&](auto & closure) {
         closure.budget = budget;
-        if (fallbackPromote)
+        if (copyAsWeGo)
             evacuator.onForward = [&](const void * p) { closure.reachedNew |= closure.marks.add(p, inEvac) & reached; };
         auto closed = promote;
         try {
-            auto added = fallbackPromote ? closePromotions(closure, targets, markers, closed, copy)
-                                         : closePromotions(closure, targets, markers, closed, [&](size_t i) {
-                                               closure.mark(*targets.cells[i]);
-                                           });
+            auto close = [&](auto && join) -> size_t {
+                if (allPromoted) {
+                    for (size_t i = 0; i < targets.size(); ++i)
+                        join(i);
+                    return 0;
+                }
+                return closePromotions(closure, targets, *markers, closed, join);
+            };
+            auto added = copyAsWeGo ? close(copy) : close([&](size_t i) { closure.mark(*targets.cells[i]); });
             promote = std::move(closed);
             stats.markerPromoted += added;
             if (added)
                 stats.markerJobs++;
         } catch (OverBudget &) {
             stats.budgetJobs++;
-            promote.assign(targets.size(), fallbackPromote);
+            if (markFirst)
+                *keepWhole = true;
+            promote.assign(targets.size(), fallbackPromote && !markFirst);
         }
         evacuator.onForward = nullptr;
         closure.notePeak();
         steps = closure.steps;
         peak = closure.peak;
+        markedBytes = closure.markedBytes;
     };
     if (young.heap) {
         Closure<HeapMarks> closure{young, clock};
@@ -1963,7 +2013,7 @@ std::vector<bool> decideJob(
         Closure<RegionMarks> closure{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
         decide(closure);
     }
-    if (checkClosure && !young.heap) {
+    if (checkClosure && !young.heap && markers) {
         /* Recompute the closure plainly (marking walks, no memos, a round
            after every promotion) and compare. */
         Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
@@ -1971,7 +2021,7 @@ std::vector<bool> decideJob(
         auto o = nominated;
         bool over = false;
         try {
-            closePromotions(plain, targets, markers, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
+            closePromotions(plain, targets, *markers, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
         } catch (OverBudget &) {
             over = true;
         }
@@ -1982,20 +2032,25 @@ std::vector<bool> decideJob(
                         "unforce check: job %d target %d (start %d, end %d, %s): plain closure %s, decided %s\n",
                         stats.jobs,
                         i,
-                        markers.spans[i].s,
-                        markers.spans[i].e,
-                        markers.spans[i].single ? "single" : "repeated",
+                        markers->spans[i].s,
+                        markers->spans[i].e,
+                        markers->spans[i].single ? "single" : "repeated",
                         o[i] ? "promotes" : "reverts",
                         promote[i] ? "promotes" : "reverts");
     }
-    copyPromoted();
+    if (markFirst && 2 * markedBytes >= youngBytes)
+        *keepWhole = true;
+    if (!keepWhole || !*keepWhole)
+        copyPromoted();
 
     stats.markerSteps += steps;
     stats.maxJobSteps = std::max<size_t>(stats.maxJobSteps, steps);
     stats.maxStepsPerKiB = std::max<size_t>(stats.maxStepsPerKiB, steps / std::max<size_t>(1, youngBytes >> 10));
     stats.markerPeakBytes = std::max(
         stats.markerPeakBytes,
-        peak + markers.spans.capacity() * sizeof(markers.spans[0]) + markers.childIntervals.capacity() * 16);
+        peak
+            + (markers ? markers->spans.capacity() * sizeof(markers->spans[0]) + markers->childIntervals.capacity() * 16
+                       : 0));
     return promote;
 }
 
@@ -2507,65 +2562,118 @@ void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const vo
 {
     if (seenSets.empty() || !evalRegion.base || !unforceSeenExact())
         return;
+    /* A cell inside the job's memory is no target. A key inside it is
+       found again at the job's end as an entry within that memory
+       (`jobKeys`), and a cell that is its own key as an entry of the set,
+       so neither is recorded: only a cell outside the job's memory that
+       holds a container keyed elsewhere (a Bindings). */
+    if (evalRegion.contains(&cell))
+        return;
     for (auto s : seenSets)
         if (&s->seen == &seen) {
-            /* A target holding the container is outside the job's memory;
-               keys inside it are what the job end must rewrite. */
-            if (!evalRegion.contains(&cell))
+            if ((const void *) &cell == key)
+                s->selfKeyed = true;
+            else
                 s->cells.push_back(&cell);
-            if (evalRegion.contains(key))
-                s->keys.push_back(key);
             return;
         }
 }
 
-/* The cells the live `UnforceSeen` sets reported in this job. */
-static std::unordered_set<const Value *> printedCells()
+/* The entries of `seen` inside the job's memory: the keys the job's
+   reports added (no entry points into memory a job freed, since a job
+   that frees rewrites its own first). */
+static auto jobKeys(std::set<const void *> & seen)
 {
-    std::unordered_set<const Value *> printed;
-    for (auto s : seenSets)
-        printed.insert(s->cells.begin(), s->cells.end());
-    return printed;
+    return std::ranges::subrange(
+        seen.lower_bound((const void *) evalRegion.base), seen.lower_bound((const void *) evalRegion.cur));
 }
 
-/* Whether the decision kept (copied) every object the live `UnforceSeen`
-   sets reported in this job. */
-static bool seenAllKept(Evacuator & evacuator)
+/* Whether the live `UnforceSeen` sets reported anything in this job. */
+static bool seenReportedAny()
 {
     for (auto s : seenSets)
-        for (auto key : s->keys)
-            if (s->seen.count(key) && !evacuator.forwarded(key))
+        if (!s->cells.empty() || s->selfKeyed || !jobKeys(s->seen).empty())
+            return true;
+    return false;
+}
+
+/* Per target, whether the live `UnforceSeen` sets reported it in this job:
+   as a cell holding a container keyed elsewhere, or as a key of its own. A
+   target in a set was added in this job, since it held a thunk when the
+   job began, and a reported cell is never reverted (`seenAllKept`). */
+static Reported reportedTargets(const JobTargets & targets)
+{
+    std::vector<const Value *> cells;
+    for (auto s : seenSets) {
+        if (cells.empty())
+            cells.swap(s->cells);
+        else {
+            cells.insert(cells.end(), s->cells.begin(), s->cells.end());
+            std::vector<const Value *>().swap(s->cells);
+        }
+    }
+    std::sort(cells.begin(), cells.end());
+    Reported reported(targets.size());
+    for (size_t i = 0; i < targets.size(); ++i) {
+        auto t = targets.cells[i];
+        if (std::binary_search(cells.begin(), cells.end(), t))
+            reported[i] = true;
+        else
+            for (auto s : seenSets)
+                if (s->selfKeyed && s->seen.count(t)) {
+                    reported[i] = true;
+                    break;
+                }
+    }
+    return reported;
+}
+
+/* Whether the decision kept everything the live `UnforceSeen` sets
+   reported in this job: every reported target is promoted, and every entry
+   inside the job's memory was copied. */
+static bool seenAllKept(Evacuator & evacuator, const std::vector<bool> & promoted, const Reported * reported)
+{
+    if (reported)
+        for (size_t i = 0; i < promoted.size(); ++i)
+            if (!promoted[i] && (*reported)[i])
+                return false;
+    for (auto s : seenSets)
+        for (auto key : jobKeys(s->seen))
+            if (!evacuator.forwarded(key))
                 return false;
     return true;
 }
 
 /* At a job's end, after the decision has copied what it keeps: rewrite the
    job's own entries of the live `UnforceSeen` sets to their copies'
-   addresses. Only called when `seenAllKept`; the job otherwise keeps its
-   memory and the entries stay valid as they are. */
+   addresses, moving each node (no allocation). Only called when
+   `seenAllKept`; the job otherwise keeps its memory and the entries stay
+   valid as they are. The copies lie outside the job's memory, so none is
+   met again. */
 static void translateSeen(Evacuator & evacuator)
 {
     for (auto s : seenSets) {
-        for (auto key : s->keys) {
-            if (!s->seen.erase(key))
-                continue;
+        auto stop = (const void *) evalRegion.cur;
+        for (auto i = s->seen.lower_bound((const void *) evalRegion.base);
+             i != s->seen.end() && std::less<const void *>{}(*i, stop);) {
+            auto key = *i;
             auto copy = evacuator.forwarded(key);
-            assert(copy);
-            s->seen.insert(copy);
+            assert(copy && !evalRegion.contains(copy));
+            auto node = s->seen.extract(i++);
+            node.value() = copy;
+            s->seen.insert(std::move(node));
             if (s->onRekey)
                 s->onRekey(key, copy);
             stats.seenKept++;
         }
-        s->keys.clear();
-        s->cells.clear();
     }
 }
 
 static void forgetSeenReports()
 {
     for (auto s : seenSets) {
-        s->keys.clear();
-        s->cells.clear();
+        std::vector<const Value *>().swap(s->cells);
+        s->selfKeyed = false;
     }
 }
 
@@ -2674,7 +2782,9 @@ void EvalState::endUnforceScope(size_t mark)
         std::vector<Value> copies;
         try {
             jt.emplace(undoLog, mark);
-            auto printed = printedCells();
+            std::optional<Reported> printed;
+            if (seenReportedAny())
+                printed = reportedTargets(*jt);
             promoted = decideJob(
                 *this,
                 mark,
@@ -2690,18 +2800,19 @@ void EvalState::endUnforceScope(size_t mark)
                     - std::min(evalRegion.stringBytes, size_t(evalRegion.cur - evalRegion.base)),
                 evacuator,
                 copies,
-                printed.empty() ? nullptr : &printed);
+                printed ? &*printed : nullptr,
+                &keepWhole);
             /* A printer's «repeated» entry for an object the decision does
                not keep (client code ran in the job, or the closure fell back
                to reverting) would be lost, and the object, rebuilt later,
                printed in full. Keep the whole job instead: nothing is
                promoted, reverted or freed, as without unforcing (review of
-               markers v3, S4). */
-            keepWhole = !seenAllKept(evacuator);
-            if (keepWhole)
-                forgetSeenReports();
-            else
+               markers v3, S4). The decision may also have chosen that
+               (`decideJob`). */
+            keepWhole = keepWhole || !seenAllKept(evacuator, promoted, printed ? &*printed : nullptr);
+            if (!keepWhole)
                 translateSeen(evacuator);
+            forgetSeenReports();
             pruneCounts(forceCounts, *jt, promoted);
         } catch (std::bad_alloc &) {
             unforceFatal("deciding which values to keep at the end of an unforce batch, and copying them");

@@ -81,7 +81,7 @@ for f in *.nix; do
     [[ $out == "$expected" ]] || fail "$f (counts capped at 1): got '$out', expected '$expected'"
 done
 stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=100 nix-instantiate --option eval-unforce true \
-    --option eval-unforce-batch-size 0 --eval --strict -E 'builtins.genList (i: i * 2) 1000' 2>&1 >/dev/null)
+    --option eval-unforce-batch-size 0 --eval --strict --json -E 'builtins.genList (i: { inherit i; }) 1000' 2>&1 >/dev/null)
 [[ $stats =~ counts\ peak\ ([0-9]+),\ counts\ resets\ ([0-9]+) ]] || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] <= 101 && BASH_REMATCH[2] >= 1 )) || fail "the force counts outgrew their cap: $stats"
 

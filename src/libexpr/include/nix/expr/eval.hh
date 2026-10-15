@@ -514,11 +514,15 @@ bool unforceMayHaveFreed(const void * p);
 struct UnforceSeen
 {
     std::set<const void *> & seen;
-    /* Reported in the open job: cells outside the job's memory that held a
-       printed container (targets among them are nominated), and keys
-       inside it. */
+    /* Reported in the open job: cells outside the job's memory that hold
+       a container keyed elsewhere (a Bindings); targets among them are
+       nominated. The job's own keys are the set's entries inside its
+       memory, and a cell that is its own key is an entry of the set, so
+       neither is recorded (a vector of them would grow with the job). */
     std::vector<const Value *> cells;
-    std::vector<const void *> keys;
+    /* Whether a cell outside the job's memory was reported as its own key
+       in the open job. */
+    bool selfKeyed = false;
     /** Called when an entry `from` is rewritten to `to` at a job's end. */
     std::function<void(const void * from, const void * to)> onRekey;
 
