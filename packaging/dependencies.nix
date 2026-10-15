@@ -13,17 +13,19 @@ in
 scope: {
   inherit stdenv;
 
+  # 3.5.4 or later: 3.5.1 leaks a page per destroyed heap once an arena is
+  # larger than 4 GiB (fixed by mimalloc 6c45ba09, first released in 3.5.2).
   mimalloc =
-    if lib.versionAtLeast pkgs.mimalloc.version "3.5.1" then
+    if lib.versionAtLeast pkgs.mimalloc.version "3.5.4" then
       pkgs.mimalloc
     else
       pkgs.mimalloc.overrideAttrs rec {
-        version = "3.5.1";
+        version = "3.5.4";
         src = pkgs.fetchFromGitHub {
           owner = "microsoft";
           repo = "mimalloc";
           tag = "v${version}";
-          hash = "sha256-hljle/jR2hNvy2ikdOna9QZiyqzAuMjNUfC7vxl7g7k=";
+          hash = "sha256-xAxqcJ92qdJtOvB9JghkIQ3HJ9InjZt+IZvJ6W99r0k=";
         };
       };
 

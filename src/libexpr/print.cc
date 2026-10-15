@@ -164,6 +164,9 @@ private:
     PrintOptions options;
     NixStringContext * context;
     std::optional<ValuesSeen> seen;
+    /* What was added to `seen`, in order, so that an element's unforce scope
+       can forget the addresses it is about to free. */
+    std::vector<const void *> seenAdded;
     size_t totalAttrsPrinted = 0;
     size_t totalListItemsPrinted = 0;
     std::string indent;
@@ -329,9 +332,55 @@ private:
         return itemType == nList || itemType == nAttrs || itemType == nThunk;
     }
 
+    /* The unforce batch for the elements of one attribute set or list. When
+       it frees what they allocated, the addresses they added to `seen` are
+       forgotten, so that one reused for another value is not reported as
+       repeated; shared values may print in full again. A batch that frees
+       nothing (nested in another one) leaves them for the enclosing batch. */
+    struct ElementBatch
+    {
+        Printer & printer;
+        /* Before `batch`, whose destructor (ending the batch) uses it. */
+        size_t seenMark = 0;
+        UnforceBatch batch;
+
+        ElementBatch(Printer & printer)
+            : printer(printer)
+            , batch(printer.state, printer.options.unforce)
+        {
+            batch.onEnd = [this](bool freed) {
+                auto & p = this->printer;
+                if (freed)
+                    for (; p.seenAdded.size() > seenMark; p.seenAdded.pop_back())
+                        if (p.seen && unforceMayHaveFreed(p.seenAdded.back()))
+                            p.seen->erase(p.seenAdded.back());
+            };
+        }
+    };
+
+    void printElement(Value & v, size_t depth, ElementBatch & elements)
+    {
+        if (!elements.batch.enabled()) {
+            print(v, depth);
+            return;
+        }
+        if (!elements.batch.isOpen())
+            elements.seenMark = seenAdded.size();
+        UnforceBatch::Element element(elements.batch);
+        print(v, depth);
+    }
+
+    bool markSeen(const void * p)
+    {
+        if (!seen->insert(p).second)
+            return false;
+        seenAdded.push_back(p);
+        return true;
+    }
+
     void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !seen->insert(v.attrs()).second) {
+        if (seen && !markSeen(v.attrs())) {
             printRepeated();
             return;
         }
@@ -355,6 +404,7 @@ private:
 
             size_t currentAttrsPrinted = 0;
 
+            ElementBatch elements(*this);
             for (auto & i : sorted) {
                 printSpace(prettyPrint);
 
@@ -365,7 +415,7 @@ private:
 
                 printAttributeName(output, i.first);
                 output << " = ";
-                print(*i.second, depth + 1);
+                printElement(*i.second, depth + 1, elements);
                 output << ";";
                 totalAttrsPrinted++;
                 currentAttrsPrinted++;
@@ -409,7 +459,7 @@ private:
 
     void printList(Value & v, size_t depth)
     {
-        if (seen && v.listSize() && !seen->insert(&v).second) {
+        if (seen && v.listSize() && !markSeen(&v)) {
             printRepeated();
             return;
         }
@@ -422,6 +472,7 @@ private:
 
             size_t currentListItemsPrinted = 0;
 
+            ElementBatch elements(*this);
             for (auto elem : listItems) {
                 printSpace(prettyPrint);
 
@@ -431,7 +482,7 @@ private:
                 }
 
                 if (elem) {
-                    print(*elem, depth + 1);
+                    printElement(*elem, depth + 1, elements);
                 } else {
                     printNullptr();
                 }

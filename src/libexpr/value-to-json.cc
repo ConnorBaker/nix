@@ -11,7 +11,13 @@ using json = nlohmann::json;
 
 // TODO: rename. It doesn't print.
 json printValueAsJSON(
-    EvalState & state, bool strict, Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    NixStringContext & context,
+    bool copyToStore,
+    bool unforce)
 {
     checkInterrupt();
 
@@ -56,17 +62,19 @@ json printValueAsJSON(
                     // In some coercions, Nix would coerce paths to a raw string
                     // if they came from a __toString result.
                     auto copyToStore2 = copyToStore && !cameThroughToString;
-                    return printValueAsJSON(state, strict, *peeled, pos, context, copyToStore2);
+                    return printValueAsJSON(state, strict, *peeled, pos, context, copyToStore2, unforce);
                 }
                 // Peelable attrs handled. Returned attrs are not peelable.
                 // Quirk: builtins.toJSON { outPath.foo = true; } == "{\"foo\":true}"
                 // All that remains is to return a JSON object.
                 json obj = json::object();
+                UnforceBatch batch(state, unforce);
                 for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
                     try {
+                        UnforceBatch::Element element(batch);
                         obj.emplace(
                             state.symbols[a->name],
-                            printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore));
+                            printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore, unforce));
                     } catch (Error & e) {
                         e.addTrace(
                             state.positions[a->pos],
@@ -82,9 +90,11 @@ json printValueAsJSON(
     case nList: {
         out = json::array();
         int i = 0;
+        UnforceBatch batch(state, unforce);
         for (auto elem : v.listView()) {
             try {
-                out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore));
+                UnforceBatch::Element element(batch);
+                out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore, unforce));
             } catch (Error & e) {
                 e.addTrace(state.positions[pos], HintFmt("while evaluating list element at index %1%", i));
                 throw;
@@ -119,10 +129,11 @@ void printValueAsJSON(
     const PosIdx pos,
     std::ostream & str,
     NixStringContext & context,
-    bool copyToStore)
+    bool copyToStore,
+    bool unforce)
 {
     try {
-        str << printValueAsJSON(state, strict, v, pos, context, copyToStore);
+        str << printValueAsJSON(state, strict, v, pos, context, copyToStore, unforce);
     } catch (nlohmann::json::exception & e) {
         throw JSONSerializationError("JSON serialization error: %s", e.what());
     }

@@ -3,3 +3,9 @@ option(
   type : 'feature',
   description : 'enable garbage collection in the Nix expression evaluator (requires Boehm GC)',
 )
+
+option(
+  'mimalloc',
+  type : 'feature',
+  description : 'allocate evaluator memory from mimalloc heaps, which unforcing releases wholesale (intended to replace Boehm GC)',
+)

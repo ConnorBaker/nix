@@ -316,6 +316,15 @@ void PackageInfo::setMeta(const std::string & name, Value * v)
 /* Cache for already considered attrsets. */
 typedef std::set<const Bindings *> Done;
 
+/* Where found derivations go. With `unforce`, every attribute is processed
+   in its own unforce scope, so the sink must finish with a derivation
+   before returning: afterwards its attributes may be thunks again. */
+struct DrvSink
+{
+    std::function<void(PackageInfo &)> fun;
+    bool unforce = false;
+};
+
 /* Evaluate value `v'.  If it evaluates to a set of type `derivation',
    then put information about it in `drvs' (unless it's already in `done').
    The result boolean indicates whether it makes sense
@@ -324,7 +333,7 @@ static bool getDerivation(
     EvalState & state,
     Value & v,
     const std::string & attrPath,
-    PackageInfos & drvs,
+    const DrvSink & drvs,
     Done & done,
     bool ignoreAssertionFailures)
 {
@@ -335,14 +344,16 @@ static bool getDerivation(
 
         /* Remove spurious duplicates (e.g., a set like `rec { x =
            derivation {...}; y = x;}'. */
-        if (!done.insert(v.attrs()).second)
+        /* Addresses are no identity once values can be unforced: the
+           sink dedupes instead. */
+        if (!drvs.unforce && !done.insert(v.attrs()).second)
             return false;
 
         PackageInfo drv(state, attrPath, v.attrs());
 
         drv.queryName();
 
-        drvs.push_back(drv);
+        drvs.fun(drv);
 
         return false;
 
@@ -357,7 +368,7 @@ std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool igno
 {
     Done done;
     PackageInfos drvs;
-    getDerivation(state, v, "", drvs, done, ignoreAssertionFailures);
+    getDerivation(state, v, "", DrvSink{[&](PackageInfo & d) { drvs.push_back(d); }}, done, ignoreAssertionFailures);
     if (drvs.size() != 1)
         return {};
     return std::move(drvs.front());
@@ -394,7 +405,7 @@ static void getDerivations(
     Value & vIn,
     const std::string & pathPrefix,
     const Bindings & autoArgs,
-    PackageInfos & drvs,
+    const DrvSink & drvs,
     Done & done,
     bool ignoreAssertionFailures)
 {
@@ -418,8 +429,12 @@ static void getDerivations(
            there are names clashes between derivations, the derivation
            bound to the attribute with the "lower" name should take
            precedence). */
+        /* With `unforce`, what each attribute's evaluation forced is
+           unforced once its batch is done (see `UnforceBatch`). */
+        UnforceBatch batch(state, drvs.unforce);
         for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
             std::string_view symbol{state.symbols[i->name]};
+            UnforceBatch::Element element(batch);
             try {
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
@@ -449,8 +464,10 @@ static void getDerivations(
 
     else if (v.type() == nList) {
         auto listView = v.listView();
+        UnforceBatch batch(state, drvs.unforce);
         for (auto [n, elem] : enumerate(listView)) {
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
+            UnforceBatch::Element element(batch);
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *elem, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
         }
@@ -469,7 +486,27 @@ void getDerivations(
     bool ignoreAssertionFailures)
 {
     Done done;
-    getDerivations(state, v, pathPrefix, autoArgs, drvs, done, ignoreAssertionFailures);
+    getDerivations(
+        state,
+        v,
+        pathPrefix,
+        autoArgs,
+        DrvSink{[&](PackageInfo & d) { drvs.push_back(d); }},
+        done,
+        ignoreAssertionFailures);
+}
+
+void forEachDerivation(
+    EvalState & state,
+    Value & v,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    std::function<void(PackageInfo &)> sink,
+    bool unforce,
+    bool ignoreAssertionFailures)
+{
+    Done done;
+    getDerivations(state, v, pathPrefix, autoArgs, DrvSink{std::move(sink), unforce}, done, ignoreAssertionFailures);
 }
 
 } // namespace nix

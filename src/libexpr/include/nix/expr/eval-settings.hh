@@ -486,6 +486,34 @@ public:
           The default value is chosen to balance performance and memory usage. On 32 bit systems
           where memory is scarce, the default is a large value to reduce the amount of allocations.
     )"};
+
+    Setting<bool> unforce{
+        this,
+        true,
+        "eval-unforce",
+        R"(
+          Whether traversals that visit each value once (printing and serialising
+          results, `nix search`, `nix flake show` and `nix flake check`, and
+          `nix-instantiate` without `--eval`) undo the evaluation they caused once
+          it is no longer needed, returning thunks to their unevaluated state and
+          freeing what they computed. Values needed again are recomputed, or kept
+          once they have been needed repeatedly.
+
+          This bounds the memory of evaluating, say, every package in Nixpkgs by
+          what one batch (see `eval-unforce-batch-size`) needs rather than by the
+          whole result. It is disabled while the debugger is active.
+        )"};
+
+    Setting<uint64_t> unforceBatchSize{
+        this,
+        64 * 1024 * 1024,
+        "eval-unforce-batch-size",
+        R"(
+          With `eval-unforce`, how many bytes a traversal may allocate before it
+          undoes the evaluation of the elements it has visited so far. Smaller
+          batches use less memory but recompute shared work more often; `0`
+          undoes after every element.
+        )"};
 };
 
 /**

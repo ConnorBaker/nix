@@ -137,7 +137,13 @@ public:
         nix_string_context ctx{context};
         nix_string_return res{""};
         EvalState wrapper{state};
-        desc.printValueAsJSON(v, &wrapper, strict, &ctx, copyToStore, &res);
+        /* PROTOTYPE (unforce): this may run while printing inside an unforce
+           scope; what the C code allocates with `wrapper` is its own, so it
+           goes outside the scope. */
+        {
+            nix::PauseRegion pause;
+            desc.printValueAsJSON(v, &wrapper, strict, &ctx, copyToStore, &res);
+        }
         if (res.str.empty()) {
             return nix::ExternalValueBase::printValueAsJSON(state, strict, context, copyToStore);
         }
@@ -161,6 +167,8 @@ public:
         }
         nix_string_context ctx{context};
         EvalState wrapper{state};
+        /* PROTOTYPE (unforce): as in `printValueAsJSON`. */
+        nix::PauseRegion pause;
         desc.printValueAsXML(
             v, &wrapper, strict, location, &doc, &ctx, &drvsSeen, *reinterpret_cast<const uint32_t *>(&pos));
     }

@@ -121,6 +121,29 @@ private:
     static constexpr unsigned maxLayers = 8;
 
 public:
+    /**
+     * PROTOTYPE (unforce). A copy of this one layer in @p mem, with each
+     * value and the base layer passed through the given maps.
+     */
+    template<typename MapValue, typename MapBase>
+    const Bindings * copyLayer(void * mem, MapValue && mapValue, MapBase && mapBase) const
+    {
+        auto res = new (mem) Bindings();
+        res->pos = pos;
+        res->numAttrs = numAttrs;
+        res->numAttrsInChain = numAttrsInChain;
+        res->numLayers = numLayers;
+        res->baseLayer = baseLayer ? mapBase(baseLayer) : nullptr;
+        for (size_type i = 0; i < numAttrs; ++i)
+            res->attrs[i] = Attr(attrs[i].name, mapValue(attrs[i].value), attrs[i].pos);
+        return res;
+    }
+
+    size_type layerSize() const
+    {
+        return numAttrs;
+    }
+
     size_type size() const
     {
         return numAttrsInChain;

@@ -98,7 +98,13 @@ struct CmdSearch : InstallableValueCommand, MixJSON
             Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating '%s'", attrPathStr));
             try {
                 auto recurse = [&]() {
-                    for (const auto & attr : cursor.getAttrs()) {
+                    /* What visiting the children forces is unforced in
+                       batches. Cursors keep only roots to values, and each
+                       child's cursors die with it. */
+                    auto attrs = cursor.getAttrs();
+                    UnforceBatch batch(*state);
+                    for (const auto & attr : attrs) {
+                        UnforceBatch::Element element(batch);
                         auto cursor2 = cursor.getAttr(state->symbols[attr]);
                         auto attrPath2(attrPath);
                         attrPath2.push_back(attr);

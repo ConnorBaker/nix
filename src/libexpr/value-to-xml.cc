@@ -1,4 +1,5 @@
 #include "nix/expr/value-to-xml.hh"
+#include "nix/util/finally.hh"
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/util/signals.hh"
@@ -24,6 +25,10 @@ static void printValueAsXML(
     StringSet & drvsSeen,
     const PosIdx pos);
 
+/* PROTOTYPE: whether the current render unforces each element (see the public
+   `printValueAsXML`). */
+static thread_local bool unforceElements = false;
+
 static void posToXML(EvalState & state, XMLAttrs & xmlAttrs, const Pos & pos)
 {
     if (auto path = std::get_if<SourcePath>(&pos.origin))
@@ -43,6 +48,7 @@ static void showAttrs(
 {
     StringSet names;
 
+    UnforceBatch batch(state, unforceElements);
     for (auto & a : attrs.lexicographicOrder(state.symbols)) {
         XMLAttrs xmlAttrs;
         xmlAttrs["name"] = state.symbols[a->name];
@@ -50,6 +56,7 @@ static void showAttrs(
             posToXML(state, xmlAttrs, state.positions[a->pos]);
 
         XMLOpenElement _(doc, "attr", xmlAttrs);
+        UnforceBatch::Element element(batch);
         printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
     }
 }
@@ -131,8 +138,11 @@ static void printValueAsXML(
 
     case nList: {
         XMLOpenElement _(doc, "list");
-        for (auto v2 : v.listView())
+        UnforceBatch batch(state, unforceElements);
+        for (auto v2 : v.listView()) {
+            UnforceBatch::Element element(batch);
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);
+        }
         break;
     }
 
@@ -198,8 +208,11 @@ void printValueAsXML(
     Value & v,
     std::ostream & out,
     NixStringContext & context,
-    const PosIdx pos)
+    const PosIdx pos,
+    bool unforce)
 {
+    auto savedUnforce = std::exchange(unforceElements, unforce);
+    Finally restoreUnforce([&] { unforceElements = savedUnforce; });
     XMLWriter doc(true, out);
     XMLOpenElement root(doc, "expr");
     StringSet drvsSeen;

@@ -23,6 +23,8 @@ void printAmbiguous(
     std::ostream & str,
     std::set<const void *> * seen,
     NixStringContext * context = nullptr,
-    size_t depth = 0);
+    size_t depth = 0,
+    bool force = false,
+    bool unforce = false);
 
 } // namespace nix

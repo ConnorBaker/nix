@@ -1549,6 +1549,48 @@ public:
         return getStorage<Lambda>();
     }
 
+    /* PROTOTYPE (unforce): raw payload access for copying values out of a
+       job region. */
+    InternalType internalType() const noexcept
+    {
+        return getInternalType();
+    }
+
+    const StringData * stringData() const noexcept
+    {
+        return getStorage<StringWithContext>().str;
+    }
+
+    const StringData * pathData() const noexcept
+    {
+        return getStorage<Path>().path;
+    }
+
+    List rawList() const noexcept
+    {
+        return getStorage<List>();
+    }
+
+    SmallList rawSmallList() const noexcept
+    {
+        return getStorage<SmallList>();
+    }
+
+    void setRawList(List l) noexcept
+    {
+        setStorage(l);
+    }
+
+    void setRawSmallList(SmallList l) noexcept
+    {
+        setStorage(l);
+    }
+
+    void setRawFailed(Failed * f) noexcept
+    {
+        setStorage(f);
+    }
+
     ClosureThunk thunk() const noexcept
     {
         return getStorage<ClosureThunk>();

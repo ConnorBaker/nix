@@ -60,6 +60,12 @@ struct PrintOptions
     bool trackRepeated = true;
 
     /**
+     * PROTOTYPE. If true (with `force`), unforce each attribute and list
+     * element once printed. Only for callers done with the value afterwards.
+     */
+    bool unforce = false;
+
+    /**
      * Maximum depth to evaluate to.
      */
     size_t maxDepth = std::numeric_limits<size_t>::max();

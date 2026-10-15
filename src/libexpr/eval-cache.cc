@@ -375,11 +375,28 @@ EvalCache::EvalCache(
 {
 }
 
+/* PROTOTYPE. A Value * cached inside an unforce scope (e.g. a child's
+   first evaluation, when the database answered for its parent) may be freed
+   when a scope ends, so record the generation and derive it again once that
+   changes. One cached outside any scope stays valid: scopes free only what
+   they allocated, though they may revert the cell to a thunk, which users
+   of the cursor force anyway. */
+static std::optional<size_t> cacheGeneration(const EvalState & state)
+{
+    return state.isolationDepth ? std::optional(unforceGeneration()) : std::nullopt;
+}
+
+static bool isStale(const std::optional<size_t> & generation)
+{
+    return generation && *generation != unforceGeneration();
+}
+
 Value * EvalCache::getRootValue()
 {
-    if (!value) {
+    if (!value || isStale(valueGeneration)) {
         debug("getting root value");
         value = allocRootValue(rootLoader());
+        valueGeneration = cacheGeneration(state);
     }
     return *value;
 }
@@ -395,8 +412,10 @@ AttrCursor::AttrCursor(
     , parent(parent)
     , cachedValue(std::move(cachedValue))
 {
-    if (value)
+    if (value) {
         _value = allocRootValue(value);
+        _valueGeneration = cacheGeneration(root->state);
+    }
 }
 
 AttrKey AttrCursor::getKey()
@@ -412,7 +431,7 @@ AttrKey AttrCursor::getKey()
 
 Value & AttrCursor::getValue()
 {
-    if (!_value) {
+    if (!_value || isStale(_valueGeneration)) {
         if (parent) {
             auto & vParent = parent->first->getValue();
             root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
@@ -422,6 +441,7 @@ Value & AttrCursor::getValue()
             _value = allocRootValue(attr->value);
         } else
             _value = allocRootValue(root->getRootValue());
+        _valueGeneration = cacheGeneration(root->state);
     }
     return **_value;
 }

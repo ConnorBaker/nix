@@ -412,6 +412,12 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
         auto checkDerivation =
             [&](const std::string & attrPath, Value & v, const PosIdx pos) -> std::optional<StorePath> {
+            /* What a check forces is unforced when it is done; only its
+               results (paths, errors) outlive it. Checks do not share a
+               batch: between them, the loops calling them force outputs
+               they go on using. */
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking derivation %s", attrPath));
                 auto packageInfo = getDerivation(*state, v, false);
@@ -436,6 +442,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         std::map<DerivedPath, std::vector<AttrPath>> attrPathsByDrv;
 
         auto checkApp = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
@@ -477,6 +485,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkOverlay = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking overlay '%s'", attrPath));
                 state->forceValue(v, pos);
@@ -494,6 +504,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkModule = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS module '%s'", attrPath));
                 state->forceValue(v, pos);
@@ -530,6 +542,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkNixOSConfiguration = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS configuration '%s'", attrPath));
                 const Bindings & bindings = Bindings::emptyBindings;
@@ -544,6 +558,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkTemplate = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking template '%s'", attrPath));
 
@@ -577,6 +593,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkBundler = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceBatch batch(*state);
+            UnforceBatch::Element element(batch);
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking bundler '%s'", attrPath));
                 state->forceValue(v, pos);
@@ -1279,12 +1297,22 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                     if (!json)
                         logger->cout("%s", headerPrefix);
                     std::vector<Symbol> attrs;
-                    for (const auto & attr : visitor.getAttrs()) {
-                        if (hasContent(visitor, attrPath, attr))
-                            attrs.push_back(attr);
+                    /* What checking and visiting the children forces is
+                       unforced in batches. Cursors keep only roots to
+                       values, and each child's cursors die with it. */
+                    {
+                        auto children = visitor.getAttrs();
+                        UnforceBatch batch(*state);
+                        for (const auto & attr : children) {
+                            UnforceBatch::Element element(batch);
+                            if (hasContent(visitor, attrPath, attr))
+                                attrs.push_back(attr);
+                        }
                     }
 
+                    UnforceBatch batch(*state);
                     for (const auto & [last, attr] : markLast(attrs)) {
+                        UnforceBatch::Element element(batch);
                         const auto & attrName = state->symbols[attr];
                         auto visitor2 = visitor.getAttr(attrName);
                         auto attrPath2(attrPath);

@@ -9,6 +9,11 @@
 
 namespace nix {
 
+/**
+ * @param unforce PROTOTYPE: with `strict`, unforce each attribute and list
+ * element once it is printed. Only for callers that are done with `v`
+ * afterwards (command output).
+ */
 void printValueAsXML(
     EvalState & state,
     bool strict,
@@ -16,6 +21,7 @@ void printValueAsXML(
     Value & v,
     std::ostream & out,
     NixStringContext & context,
-    const PosIdx pos);
+    const PosIdx pos,
+    bool unforce = false);
 
-}
+} // namespace nix

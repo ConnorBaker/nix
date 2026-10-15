@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <functional>
 #include "nix/expr/eval.hh"
 #include "nix/store/path.hh"
 
@@ -114,6 +115,21 @@ void getDerivations(
     const std::string & pathPrefix,
     const Bindings & autoArgs,
     PackageInfos & drvs,
+    bool ignoreAssertionFailures);
+
+/**
+ * PROTOTYPE. Like `getDerivations`, but hands each derivation to `sink` as
+ * soon as it is found. With `unforce`, everything forced while finding and
+ * processing one attribute is unforced afterwards, so the memory it retained
+ * can be reclaimed; `sink` must be done with the derivation when it returns.
+ */
+void forEachDerivation(
+    EvalState & state,
+    Value & v,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    std::function<void(PackageInfo &)> sink,
+    bool unforce,
     bool ignoreAssertionFailures);
 
 } // namespace nix

@@ -21,6 +21,7 @@
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
 
+#include <unordered_map>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
@@ -343,6 +344,150 @@ struct StaticEvalSymbols
     }
 };
 
+/**
+ * PROTOTYPE (job regions). A bump region holding what one job (an outermost
+ * unforce scope) allocates, released wholesale when the job ends. In
+ * "values" mode only `Value` cells live here; in "all" mode every evaluator
+ * object does, and each `Env` carries a size header so it can be copied out.
+ * Single-threaded evaluation only.
+ */
+void * evalRegionHeapAlloc(size_t n);
+bool evalRegionHeapContains(const void * p);
+
+struct EvalRegion
+{
+    char * base = nullptr;
+    char * cur = nullptr;
+    char * end = nullptr;
+    /** mimalloc backend (NIX_UNFORCE_BACKEND=mimalloc): the innermost
+        scope's `mi_heap_t`, instead of the bump range above. */
+    void * heap = nullptr;
+    /** Allocate elsewhere for now: the data outlives the job. */
+    bool paused = false;
+    bool allTypes = false;
+    /** The memory was used by an earlier job, so allocations must zero it. */
+    bool dirty = false;
+
+    bool active() const noexcept
+    {
+        return (cur || heap) && !paused;
+    }
+
+    /** Whether `p` was allocated in the innermost scope. */
+    bool contains(const void * p) const noexcept
+    {
+        if (heap) [[unlikely]]
+            return evalRegionHeapContains(p);
+        return (const char *) p >= base && (const char *) p < cur;
+    }
+
+    [[gnu::always_inline]] void * alloc(size_t n)
+    {
+        if (heap) [[unlikely]]
+            return evalRegionHeapAlloc(n);
+        return bump(n);
+    }
+
+    [[gnu::always_inline]] void * bump(size_t n)
+    {
+        n = (n + 15) & ~size_t(15);
+        if (size_t(end - cur) < n) [[unlikely]]
+            throw std::bad_alloc();
+        auto p = cur;
+        cur += n;
+        if (dirty)
+            memset(p, 0, n);
+        return p;
+    }
+};
+
+extern EvalRegion evalRegion;
+
+#if !NIX_USE_BOEHMGC
+/** PROTOTYPE. Zeroed evaluator memory outside unforce scopes, without Boehm
+    GC: from mimalloc's default heap when available. Never freed. */
+void * evalBaseAlloc(size_t n);
+#endif
+
+struct PauseRegion
+{
+    bool saved = std::exchange(evalRegion.paused, true);
+
+    ~PauseRegion()
+    {
+        evalRegion.paused = saved;
+    }
+};
+
+/**
+ * PROTOTYPE. A never-freed bump arena for evaluator objects outside job
+ * regions, used instead of `calloc` when Boehm GC is disabled and
+ * `NIX_NOGC_BUMP` is set. Memory is zero because it comes fresh from mmap.
+ */
+struct BumpArena
+{
+    char * cur = nullptr;
+    char * end = nullptr;
+
+    [[gnu::always_inline]] void * alloc(size_t n)
+    {
+        n = (n + 15) & ~size_t(15);
+        if (size_t(end - cur) >= n) [[likely]] {
+            auto p = cur;
+            cur += n;
+            return p;
+        }
+        return refill(n);
+    }
+
+    void * refill(size_t n);
+
+    /** Every mapping handed out, for heap verification: [start, end). */
+    std::vector<std::pair<char *, char *>> chunks;
+};
+
+extern BumpArena evalBaseArena;
+
+/**
+ * PROTOTYPE. Whether an address recorded before the last unforce scope ended
+ * may since have been freed (and so may be reused): true inside the last
+ * released region, and always when unforcing without regions (Boehm reclaims
+ * unforced values anywhere).
+ */
+bool unforceMayHaveFreed(const void * p);
+
+/**
+ * PROTOTYPE. Counts unforce scopes that have freed memory. A pointer into
+ * evaluator memory cached outside a scope (e.g. by an eval-cache cursor) is
+ * stale if this has changed since it was cached and `unforceMayHaveFreed`
+ * holds for it.
+ */
+size_t unforceGeneration();
+
+/**
+ * PROTOTYPE. Whether `p` is on this thread's stack below the stack pointer
+ * that the innermost unforce scope's opener had: a slot of a frame entered
+ * since, which will have returned when the scope ends, so it must not be
+ * restored then. (Stacks other than the thread's, e.g. coroutines', are not
+ * recognised.)
+ */
+bool unforceIsScopeStackSlot(const void * p);
+
+/** PROTOTYPE. Bytes allocated so far in the innermost unforce scope. */
+size_t unforceCurrentScopeBytes();
+
+/** PROTOTYPE. NIX_SHOW_STATS sections as JSON text, or empty. */
+std::string unforceStatsJSON();
+std::string allocatorStatsJSON();
+
+/**
+ * PROTOTYPE. Whether traversals unforce what they visit: the `eval-unforce`
+ * setting, unless the debugger is active (its traces refer to environments
+ * that unforcing frees).
+ */
+bool unforceEnabled(const EvalState & state);
+extern const bool evalUseBaseArena;
+
 class EvalMemory
 {
 public:
@@ -373,6 +518,7 @@ public:
     inline void * allocBytes(size_t count);
 
     inline Value * allocValue();
+
     inline Env & allocEnv(size_t size);
 
     Bindings * allocBindings(size_t capacity);
@@ -400,6 +546,68 @@ public:
 
 private:
     Statistics stats;
+};
+
+/**
+ * PROTOTYPE. Unforcing for a traversal that visits each element once
+ * (printing or serialising a value, searching, checking): what visiting its
+ * elements forced is unforced, and what it allocated freed, when their batch
+ * ends. Consecutive elements share a batch until it has allocated
+ * `eval-unforce-batch-size` bytes; the destructor ends the last one.
+ *
+ * The traversal must keep nothing allocated while visiting an element beyond
+ * the batch, except what it has converted to its own output (text, JSON,
+ * store paths). Visited cells may be thunks again afterwards.
+ */
+class UnforceBatch
+{
+    EvalState * state;
+    std::optional<size_t> mark;
+    bool job = false;
+
+public:
+    /** Called when a batch ends, with whether it freed anything (only a
+        batch that is not nested in another one does, except with the
+        mimalloc backend). */
+    std::function<void(bool freed)> onEnd;
+
+    UnforceBatch(EvalState & state, bool enabled = true);
+    ~UnforceBatch();
+    UnforceBatch(const UnforceBatch &) = delete;
+
+    bool enabled() const
+    {
+        return state;
+    }
+
+    bool isOpen() const
+    {
+        return mark.has_value();
+    }
+
+    /** Visit one element: opens a batch if none is open, and ends it when
+        the element is done if the batch is full. */
+    struct Element
+    {
+        UnforceBatch & batch;
+        /* Not inlined, so that it can find its caller's stack pointer. */
+        [[gnu::noinline]] explicit Element(UnforceBatch & batch);
+        ~Element();
+    };
+
+    /** Open a batch if none is open, for a caller that ends batches itself
+        (see `full`) instead of using `Element`. Not inlined, so that it can
+        find its caller's stack pointer. */
+    [[gnu::noinline]] void open();
+
+    /** Whether the open batch has allocated `eval-unforce-batch-size`. */
+    bool full() const;
+
+    /** End the open batch, if any. */
+    void end();
+
+private:
+    void openAt(const void * stackMark);
 };
 
 class EvalState : public std::enable_shared_from_this<EvalState>
@@ -1000,6 +1208,53 @@ private:
     size_t callDepth = 0;
 
 public:
+
+    /**
+     * PROTOTYPE (thunk rollback). While `isolationDepth > 0`, every thunk
+     * update records the thunk's pre-image here, so that the unforce scope's
+     * end can restore it. Traceable: the log keeps each target alive, so a
+     * restore never writes into reused memory.
+     */
+    struct UndoEntry
+    {
+        Value * target;
+        Value preImage;
+    };
+
+    std::vector<UndoEntry, traceable_allocator<UndoEntry>> undoLog;
+    unsigned isolationDepth = 0;
+
+    /** Policy only: in how many jobs each old cell was forced. */
+    std::unordered_map<const Value *, uint32_t> forceCounts;
+
+    /**
+     * PROTOTYPE. Open an unforce scope: thunks updated until the matching
+     * `endUnforceScope` are recorded. Returns the log mark to pass back.
+     * `stackMark` bounds the frames that the scope outlives (see
+     * `unforceIsScopeStackSlot`): the stack pointer of the function whose
+     * callees run inside the scope. By default that is the caller, hence not
+     * inlined.
+     */
+    [[gnu::noinline]] size_t beginUnforceScope(const void * stackMark = nullptr);
+
+    /**
+     * PROTOTYPE. Record `v`'s current contents before it is overwritten, if
+     * an unforce scope must restore it: `v` is older than the scope, and not
+     * a stack slot of a frame that will have returned when the scope ends.
+     */
+    [[gnu::always_inline]] void logPreImage(Value & v)
+    {
+        if (isolationDepth && !evalRegion.contains(&v)) [[unlikely]]
+            if (!unforceIsScopeStackSlot(&v))
+                undoLog.push_back({&v, v});
+    }
+
+    /**
+     * PROTOTYPE. Close an unforce scope and unforce every thunk updated
+     * inside it (except pinned ones). Only call it when nothing forced in
+     * the scope is still referenced by C++ code that expects it forced.
+     */
+    void endUnforceScope(size_t mark);
 
     /**
      * Check that the call depth is within limits, and increment it, until the returned object is destroyed.

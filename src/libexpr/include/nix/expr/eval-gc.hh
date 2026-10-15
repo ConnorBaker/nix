@@ -82,6 +82,11 @@ void initGC();
  */
 void assertGCInitialized();
 
+/**
+ * PROTOTYPE. Allocator setup at startup (mimalloc options, error hook).
+ */
+void initAllocator();
+
 #if NIX_USE_BOEHMGC
 /**
  * The number of GC cycles since initGC().

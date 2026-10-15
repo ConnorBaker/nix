@@ -90,11 +90,13 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
                     [[maybe_unused]] bool directoryCreated = std::filesystem::create_directory(path);
                     // Directory should not already exist
                     assert(directoryCreated);
+                    UnforceBatch batch(*state);
                     for (auto & attr : *v.attrs()) {
                         std::string_view name = state->symbols[attr.name];
                         try {
                             if (name == "." || name == "..")
                                 throw Error("invalid file name '%s'", name);
+                            UnforceBatch::Element element(batch);
                             recurse(*attr.value, attr.pos, path / name);
                         } catch (Error & e) {
                             e.addTrace(
@@ -115,11 +117,12 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         }
 
         else if (json) {
-            printJSON(printValueAsJSON(*state, true, *v, pos, context, false));
+            printJSON(printValueAsJSON(*state, true, *v, pos, context, false, true));
         }
 
         else {
-            ValuePrinter printer(*state, *v, PrintOptions{.force = true, .derivationPaths = true}, &context);
+            ValuePrinter printer(
+                *state, *v, PrintOptions{.force = true, .derivationPaths = true, .unforce = true}, &context);
             logger->cout("%s", printer);
         }
 

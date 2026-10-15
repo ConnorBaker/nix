@@ -15,11 +15,13 @@ namespace nix {
 [[gnu::always_inline]]
 inline void * EvalMemory::allocBytes(size_t n)
 {
+    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]]
+        return evalRegion.alloc(n);
     void * p;
 #if NIX_USE_BOEHMGC
     p = GC_MALLOC(n);
 #else
-    p = calloc(n, 1);
+    p = evalUseBaseArena ? evalBaseArena.alloc(n) : evalBaseAlloc(n);
 #endif
     if (!p)
         throw std::bad_alloc();
@@ -44,6 +46,10 @@ inline void * EvalMemory::allocBytes(size_t count)
 [[gnu::always_inline]]
 Value * EvalMemory::allocValue()
 {
+    if (evalRegion.active()) [[unlikely]] {
+        stats.nrValues++;
+        return (Value *) evalRegion.alloc(sizeof(Value));
+    }
 #if NIX_USE_BOEHMGC
     /* Allocation cache for GC'd Value objects. Boehm GC is already a global resource, so thread_local is
        a natural solution. Multiple EvalState instances on the same thread will reuse the same cache. */
@@ -81,6 +87,14 @@ Env & EvalMemory::allocEnv(size_t size)
 
     Env * env;
 
+    /* In an all-types region, prefix each Env with its size, so that it can
+       be copied out of the region. */
+    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]] {
+        auto p = (char *) evalRegion.alloc(16 + sizeof(Env) + size * sizeof(Value *));
+        *(size_t *) p = size;
+        return *(Env *) (p + 16);
+    }
+
 #if NIX_USE_BOEHMGC
     if (size == 1) {
         /* Allocation cache for size-1 Env objects. Boehm GC is already a global resource, so thread_local is
@@ -114,6 +128,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
+        logPreImage(v);
         try {
             v.mkBlackhole();
             if (env) [[likely]]
@@ -126,6 +141,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         }
     } else if (v.isApp()) {
         Value savedApp = v;
+        logPreImage(v);
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
         } catch (...) {

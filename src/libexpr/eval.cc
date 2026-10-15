@@ -30,6 +30,8 @@
 
 #include "parser-tab.hh"
 
+#include <unordered_set>
+#include <sys/mman.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
@@ -1120,6 +1122,7 @@ struct ExprParseFile : Expr, gc
     // FIXME: make this a reference (see below).
     SourcePath path;
     bool mustBeTrivial;
+    Expr * parsed = nullptr;
 
     ExprParseFile(SourcePath & path, bool mustBeTrivial)
         : path(path)
@@ -1131,7 +1134,11 @@ struct ExprParseFile : Expr, gc
     {
         printTalkative("evaluating file '%s'", path);
 
-        auto e = state.parseExprFromFile(path);
+        /* Memoise the parse apart from the evaluation, so unforcing the
+           cached thunk does not re-parse into the append-only AST arena. */
+        if (!parsed)
+            parsed = state.parseExprFromFile(path);
+        auto e = parsed;
 
         try {
             auto dts =
@@ -1181,6 +1188,8 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         *resolvedPath,
         nullptr,
         [&](auto & i) {
+            /* The cache outlives any job region. */
+            PauseRegion pause;
             vExpr = allocValue();
             vExpr->mkThunk(&baseEnv, expr);
             i.second = vExpr;
@@ -2305,6 +2314,8 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
 {
     assert(v.isFailed());
     if (auto recoveryValue = v.failed().recoveryValue) {
+        /* The recovery value may be younger than `v`. */
+        logPreImage(v);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {
@@ -3154,6 +3165,11 @@ void EvalState::printStatistics()
         {"cycles", gcCycles},
     };
 #endif
+    /* PROTOTYPE: allocator and unforcing statistics. */
+    if (auto s = unforceStatsJSON(); !s.empty())
+        topObj["unforce"] = json::parse(s);
+    if (auto s = allocatorStatsJSON(); !s.empty())
+        topObj["allocator"] = json::parse(s);
 
     if (countCalls) {
         {

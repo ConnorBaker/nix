@@ -12,6 +12,8 @@
 #include "nix_api_store_internal.h"
 #include "nix_api_value.h"
 
+#include <optional>
+
 static nix::Value & check_value_out(nix_value * value)
 {
     auto & v = check_value_not_null(value);
@@ -23,6 +25,9 @@ static nix::Value & check_value_out(nix_value * value)
 
 static nix_value * new_nix_value(nix::Value * v, nix::EvalMemory & mem)
 {
+    /* PROTOTYPE (unforce): the handle belongs to the client, so it must not
+       be freed when an unforce scope ends. */
+    nix::PauseRegion pause;
     nix_value * ret = new (mem.allocBytes(sizeof(nix_value))) nix_value{
         .value = v,
         .mem = &mem,
@@ -59,6 +64,15 @@ static void nix_c_primop_wrapper(
     // ok because we don't see a need for this yet (e.g. inspecting thunks,
     // or maybe something to make blackholes work better; we don't know).
     nix::Value vTmp;
+
+    /* PROTOTYPE (unforce): a C primop called inside an unforce scope (by a
+       traversal of the `nix` CLI) allocates outside it, so that nothing the C
+       code creates or keeps is freed when the scope ends. Its arguments may
+       still be younger than the scope; the C code must not keep them beyond
+       this call, as the C API documents for values without a reference. */
+    std::optional<nix::PauseRegion> pause;
+    pause.emplace();
+
     nix_value * vTmpPtr = new_nix_value(&vTmp, state.mem);
 
     std::vector<nix_value *> external_args;
@@ -85,6 +99,8 @@ static void nix_c_primop_wrapper(
             .atPos(nix::noPos)
             .debugThrow();
     }
+
+    pause.reset();
 
     if (vTmp.type() == nix::nThunk) {
         // We might allow this in the future if it makes sense for the evaluator
@@ -147,7 +163,13 @@ nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)
     if (context)
         context->last_err_code = NIX_OK;
     try {
-        nix_value * res = new_nix_value(state->state.allocValue(), state->state.mem);
+        nix::Value * value;
+        {
+            /* PROTOTYPE (unforce): client-owned, see `new_nix_value`. */
+            nix::PauseRegion pause;
+            value = state->state.allocValue();
+        }
+        nix_value * res = new_nix_value(value, state->state.mem);
         return res;
     }
     NIXC_CATCH_ERRS_NULL

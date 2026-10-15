@@ -97,6 +97,12 @@ cpuid = dependency('libcpuid', 'cpuid', required : false)
 configdata_priv.set('HAVE_LIBCPUID', cpuid.found().to_int())
 deps_private += cpuid
 
+# PROTOTYPE (unforce): mimalloc heaps for evaluator memory. Programs linking
+# libnixexpr then load libmimalloc, which overrides their malloc.
+mimalloc = dependency('mimalloc', required : get_option('mimalloc'))
+configdata_priv.set('NIX_UNFORCE_MIMALLOC', mimalloc.found().to_int())
+deps_private += mimalloc
+
 config_priv_h = configure_file(
   configuration : configdata_priv,
   output : 'expr-config-private.hh',
@@ -157,6 +163,7 @@ sources = files(
   'eval-profiler.cc',
   'eval-settings.cc',
   'eval.cc',
+  'unforce.cc',
   'function-trace.cc',
   'get-drvs.cc',
   'json-to-value.cc',
