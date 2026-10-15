@@ -1,6 +1,8 @@
 #pragma once
 ///@file
 
+// For `NIX_USE_BOEHMGC`
+#include "nix/expr/config.hh"
 #include "nix/expr/diagnose.hh"
 #include "nix/expr/eval-profiler-settings.hh"
 #include "nix/util/configuration.hh"
@@ -487,9 +489,12 @@ public:
           where memory is scarce, the default is a large value to reduce the amount of allocations.
     )"};
 
+    /* PROTOTYPE. Never with Boehm GC: a collection may free an old cell
+       and hand its address to a new one, and nothing here has been built
+       or tested against that (the force counts are keyed by address). */
     Setting<bool> unforce{
         this,
-        true,
+        !NIX_USE_BOEHMGC,
         "eval-unforce",
         R"(
           Whether traversals that visit each value once (printing and serialising
@@ -501,7 +506,8 @@ public:
 
           This bounds the memory of evaluating, say, every package in Nixpkgs by
           what one batch (see `eval-unforce-batch-size`) needs rather than by the
-          whole result. It is disabled while the debugger is active.
+          whole result. It is disabled while the debugger is active, and in
+          builds with Boehm GC.
         )"};
 
     Setting<uint64_t> unforceBatchSize{

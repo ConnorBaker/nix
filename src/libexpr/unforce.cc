@@ -1669,7 +1669,8 @@ size_t unforceCurrentScopeBytes()
 
 bool unforceEnabled(const EvalState & state)
 {
-    return state.settings.unforce && !state.debugRepl;
+    /* Not with Boehm GC, whatever the setting (see `eval-unforce`). */
+    return !NIX_USE_BOEHMGC && state.settings.unforce && !state.debugRepl;
 }
 
 UnforceBatch::UnforceBatch(EvalState & state, bool enabled)
