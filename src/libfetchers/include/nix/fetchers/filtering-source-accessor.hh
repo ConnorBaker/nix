@@ -1,6 +1,7 @@
 #pragma once
 
 #include "nix/util/source-path.hh"
+#include "nix/util/sync.hh"
 
 #include <memory>
 #include <set>
@@ -117,13 +118,26 @@ ref<SourceAccessor> makeFixedSetFilteringSourceAccessor(const SourcePath & src, 
  */
 struct CachingFilteringSourceAccessor : FilteringSourceAccessor
 {
-    const ref<boost::concurrent_flat_map<CanonPath, bool>> cache;
+private:
+    using Decisions = boost::concurrent_flat_map<CanonPath, bool>;
 
+    /**
+     * The current view's decisions. A decision is recorded in the map that
+     * was current when it was looked up, so one computed across an
+     * invalidation lands in the retired map, never in its replacement.
+     */
+    SharedSync<std::shared_ptr<Decisions>> decisions;
+
+public:
     CachingFilteringSourceAccessor(const SourcePath & src, MakeNotAllowedError && makeNotAllowedError);
 
     bool isAllowed(const CanonPath & path) override;
 
-    /** Also forget the decisions, which `isAllowedUncached` recomputes. */
+    /**
+     * Also forget the decisions, which `isAllowedUncached` recomputes.
+     * The empty map is published once the child has been invalidated,
+     * as `makeCachingSourceAccessor`'s view does.
+     */
     void invalidateCache() override;
 
     virtual bool isAllowedUncached(const CanonPath & path) = 0;

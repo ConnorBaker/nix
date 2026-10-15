@@ -1,4 +1,5 @@
 #include "nix/fetchers/filtering-source-accessor.hh"
+#include "nix/util/finally.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/util.hh"
 #include "nix/util/hash.hh"
@@ -304,23 +305,34 @@ ref<AllowListSourceAccessor> AllowListSourceAccessor::create(
 CachingFilteringSourceAccessor::CachingFilteringSourceAccessor(
     const SourcePath & src, MakeNotAllowedError && makeNotAllowedError)
     : FilteringSourceAccessor(src, std::move(makeNotAllowedError))
-    , cache(make_ref<boost::concurrent_flat_map<CanonPath, bool>>())
+    , decisions(std::make_shared<Decisions>())
 {
 }
 
 bool CachingFilteringSourceAccessor::isAllowed(const CanonPath & path)
 {
-    if (auto allowed = getConcurrent(*cache, path))
-        return *allowed;
+    std::shared_ptr<Decisions> observed;
+    {
+        auto current = decisions.readLock();
+        if (auto allowed = getConcurrent(**current, path))
+            return *allowed;
+        observed = *current;
+    }
     auto owner = weak_from_this().lock();
     auto res = isAllowedUncached(path);
-    cache->emplace(path, res);
+    observed->emplace(path, res);
     return res;
 }
 
 void CachingFilteringSourceAccessor::invalidateCache()
 {
-    cache->clear();
+    auto owner = weak_from_this().lock();
+    auto replacement = std::make_shared<Decisions>();
+    /* Decisions made while the child invalidates still belong to the old
+       view. Publish the empty map on completion, including exceptional
+       completion; the old one is freed here, outside the lock, unless a
+       decision in flight still holds it. */
+    Finally publish{[&] { decisions.lock()->swap(replacement); }};
     FilteringSourceAccessor::invalidateCache();
 }
 
