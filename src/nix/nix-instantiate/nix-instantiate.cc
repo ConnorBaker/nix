@@ -26,38 +26,11 @@ static int rootNr = 0;
 
 enum OutputKind { okPlain, okRaw, okXML, okJSON };
 
-/**
- * PROTOTYPE. `--strict` output with unforcing. As without unforcing, the
- * value is forced deeply (`forceValueDeep`'s order, traces and depth: its
- * top-level elements are walked one by one, sharing one set of walked
- * cells, so that a cell is walked once, as one `forceValueDeep` of the whole
- * value walks it) and then printed once, so nothing is printed if forcing
- * fails. The elements are forced in batches, each unforcing what its
- * elements forced except what they reach: the walked cells are kept forced
- * and their addresses valid (`UnforceSeen`), so the value printed at the end
- * is the value forced, with its sharing, and «repeated» is decided by
- * `printAmbiguous` exactly as without unforcing. Peak memory is what the
- * printed value needs (as without unforcing) plus a batch.
- *
- * Where walked cells cannot be kept (the mimalloc backend, or
- * NIX_UNFORCE_SEEN=0), each batch's elements are printed before it ends, into
- * buffers assembled at the end in printing order; a value shared between
- * batches then prints in full instead of as «repeated».
- */
-static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringContext & context)
+/* `printStrictUnforced` where walked cells cannot be kept: each batch's
+   elements are printed before it ends (see below). */
+[[gnu::noinline]] static void printStrictUnforcedBuffered(
+    EvalState & state, Value & v, std::ostream & out, NixStringContext & context, std::set<const void *> & walked)
 {
-    /* As `forceValueDeep`'s outermost level, so that call depth (and with it
-       where a stack overflow is reported) is the same. */
-    auto _level = state.addCallDepth(v.determinePos(noPos));
-    std::set<const void *> walked;
-    walked.insert(&v);
-    state.forceValue(v, v.determinePos(noPos));
-    if (v.type() != nAttrs && !v.isList()) {
-        std::set<const void *> seen;
-        printAmbiguous(state, v, out, &seen, &context);
-        return;
-    }
-
     /* Walk element `e` (with `forceValueDeep`'s trace for it). */
     auto forceElement = [&](Value & e, auto && trace) {
         try {
@@ -67,43 +40,6 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
             throw;
         }
     };
-
-    if (unforceSeenExact()) {
-        {
-            UnforceSeen keepWalked(walked);
-            UnforceBatch batch(state);
-            if (v.type() == nAttrs)
-                for (auto & i : *v.attrs()) {
-                    batch.open();
-                    forceElement(*i.value, [&](Error & e) {
-                        /* The trace `forceValueDeep` adds. */
-                        e.addTrace(
-                            state.positions[i.pos],
-                            HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
-                    });
-                    if (batch.full())
-                        batch.end();
-                }
-            else {
-                size_t index = 0;
-                for (auto v2 : v.listView()) {
-                    batch.open();
-                    forceElement(*v2, [&](Error & e) {
-                        e.addTrace(nullptr, HintFmt("while evaluating list element at index %1%", index));
-                    });
-                    index++;
-                    if (batch.full())
-                        batch.end();
-                }
-            }
-            batch.end();
-        }
-        /* As `forceValueDeep`'s set is gone before base prints. */
-        std::set<const void *>().swap(walked);
-        std::set<const void *> seen;
-        printAmbiguous(state, v, out, &seen, &context);
-        return;
-    }
 
     /* As `printAmbiguous` on the whole value, which marks the top level as
        seen before printing its elements, so that an element referring back
@@ -182,6 +118,134 @@ static void printStrictUnforced(EvalState & state, Value & v, std::ostream & out
     out << buffer.str();
 }
 
+/* The traces `forceValueDeep` adds to an error in an element, out of line:
+   their formatters are large, and `printStrictUnforced`'s frame is part of
+   the stack prefix (STACK-PARITY.md, R4). */
+[[gnu::noinline, gnu::cold]] static void addAttrTrace(EvalState & state, Error & e, const Attr & i)
+{
+    e.addTrace(state.positions[i.pos], HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
+}
+
+[[gnu::noinline, gnu::cold]] static void addListElemTrace(Error & e, size_t index)
+{
+    e.addTrace(nullptr, HintFmt("while evaluating list element at index %1%", index));
+}
+
+/**
+ * PROTOTYPE. `--strict` output with unforcing. As without unforcing, the
+ * value is forced deeply (`forceValueDeep`'s order, traces and depth: its
+ * top-level elements are walked one by one, sharing one set of walked
+ * cells, so that a cell is walked once, as one `forceValueDeep` of the whole
+ * value walks it) and then printed once, so nothing is printed if forcing
+ * fails. The elements are forced in batches, each unforcing what its
+ * elements forced except what they reach: the walked cells are kept forced
+ * and their addresses valid (`UnforceSeen`), so the value printed at the end
+ * is the value forced, with its sharing, and «repeated» is decided by
+ * `printAmbiguous` exactly as without unforcing. Peak memory is what the
+ * printed value needs (as without unforcing) plus a batch.
+ *
+ * Where walked cells cannot be kept (the mimalloc backend, or
+ * NIX_UNFORCE_SEEN=0), each batch's elements are printed before it ends, into
+ * buffers assembled at the end in printing order; a value shared between
+ * batches then prints in full instead of as «repeated»
+ * (`printStrictUnforcedBuffered`).
+ */
+[[gnu::noinline]] static void
+printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringContext & context)
+{
+    /* As `forceValueDeep`'s outermost level, so that call depth (and with it
+       where a stack overflow is reported) is the same. */
+    auto _level = state.addCallDepth(v.determinePos(noPos));
+    /* On the heap, as everything else of this function's: it is part of the
+       stack prefix below every level of the deep walk, which may be no
+       larger than base's (STACK-PARITY.md, R4). */
+    auto walked = std::make_unique<std::set<const void *>>();
+    walked->insert(&v);
+    state.forceValue(v, v.determinePos(noPos));
+    if ((v.type() == nAttrs || v.isList()) && !unforceSeenExact()) {
+        printStrictUnforcedBuffered(state, v, out, context, *walked);
+        return;
+    }
+    if (v.type() == nAttrs || v.isList()) {
+        auto keepWalked = std::make_unique<UnforceSeen>(*walked);
+        auto batch = std::make_unique<UnforceBatch>(state);
+        if (v.type() == nAttrs)
+            for (auto & i : *v.attrs()) {
+                batch->open();
+                try {
+                    state.forceValueDeep(*i.value, *walked);
+                } catch (Error & e) {
+                    addAttrTrace(state, e, i);
+                    throw;
+                }
+                if (batch->full())
+                    batch->end();
+            }
+        else {
+            size_t index = 0;
+            for (auto v2 : v.listView()) {
+                batch->open();
+                try {
+                    state.forceValueDeep(*v2, *walked);
+                } catch (Error & e) {
+                    addListElemTrace(e, index);
+                    throw;
+                }
+                index++;
+                if (batch->full())
+                    batch->end();
+            }
+        }
+        batch->end();
+        batch.reset();
+        keepWalked.reset();
+    }
+    /* As `forceValueDeep`'s set is gone before base prints. */
+    walked.reset();
+    std::set<const void *> seen;
+    printAmbiguous(state, v, out, &seen, &context);
+}
+
+/* The derivations' paths: out of line, so that its locals are not part of
+   processExpr's frame, below every level of the evaluation (STACK-PARITY.md,
+   R4). */
+[[gnu::noinline]] static void printDerivationPaths(EvalState & state, Value & v, const Bindings & autoArgs)
+{
+    /* PROTOTYPE: unforce each job once its .drv is written. */
+    bool unforce = unforceEnabled(state);
+    std::set<std::pair<StorePath, std::string>> seen;
+    forEachDerivation(
+        state,
+        v,
+        "",
+        autoArgs,
+        [&](PackageInfo & i) {
+            auto drvPath = i.requireDrvPath();
+            if (unforce && !seen.insert({drvPath, i.queryOutputName()}).second)
+                return;
+            auto drvPathS = state.store->printStorePath(drvPath);
+
+            /* What output do we want? */
+            std::string outputName = i.queryOutputName();
+            if (outputName == "")
+                throw Error("derivation '%1%' lacks an 'outputName' attribute", drvPathS);
+
+            if (gcRoot.empty())
+                printGCWarning();
+            else {
+                auto rootName = absPath(gcRoot);
+                if (++rootNr > 1)
+                    rootName += "-" + std::to_string(rootNr);
+                auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
+                if (store2)
+                    drvPathS = store2->addPermRoot(drvPath, rootName).string();
+            }
+            std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
+        },
+        unforce,
+        false);
+}
+
 void processExpr(
     EvalState & state,
     const Strings & attrPaths,
@@ -236,39 +300,7 @@ void processExpr(
                 std::cout << std::endl;
             }
         } else {
-            /* PROTOTYPE: unforce each job once its .drv is written. */
-            bool unforce = unforceEnabled(state);
-            std::set<std::pair<StorePath, std::string>> seen;
-            forEachDerivation(
-                state,
-                v,
-                "",
-                autoArgs,
-                [&](PackageInfo & i) {
-                    auto drvPath = i.requireDrvPath();
-                    if (unforce && !seen.insert({drvPath, i.queryOutputName()}).second)
-                        return;
-                    auto drvPathS = state.store->printStorePath(drvPath);
-
-                    /* What output do we want? */
-                    std::string outputName = i.queryOutputName();
-                    if (outputName == "")
-                        throw Error("derivation '%1%' lacks an 'outputName' attribute", drvPathS);
-
-                    if (gcRoot.empty())
-                        printGCWarning();
-                    else {
-                        auto rootName = absPath(gcRoot);
-                        if (++rootNr > 1)
-                            rootName += "-" + std::to_string(rootNr);
-                        auto store2 = state.store.dynamic_pointer_cast<LocalFSStore>();
-                        if (store2)
-                            drvPathS = store2->addPermRoot(drvPath, rootName).string();
-                    }
-                    std::cout << fmt("%s%s\n", drvPathS, (outputName != "out" ? "!" + outputName : ""));
-                },
-                unforce,
-                false);
+            printDerivationPaths(state, v, autoArgs);
         }
 
         state.ensureLazyPathsCopied(context);
