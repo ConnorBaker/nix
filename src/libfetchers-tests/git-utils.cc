@@ -3665,4 +3665,73 @@ TEST_F(GitUtilsTest, acquiredTreeKeepsProducerDiagnostics)
     EXPECT_FALSE(fs->showPath(CanonPath::root).ends_with('/'));
 }
 
+/* The retained producer only explains a miss. When it gains a path after
+   acquisition, every lookup of that path still misses, and none of the
+   producer's bytes, listings or link targets reach the caller. */
+TEST_F(GitUtilsTest, acquiredMissNeverBecomesSuccess)
+{
+    auto dir = tmpDir / "acquire-late";
+    createDirs(dir / "dir");
+    writeFile(dir / "dir" / "a", "a");
+    auto fs = makeFSSourceAccessor(dir);
+    auto memory = make_ref<MemorySourceAccessor>();
+    memory->addFile(CanonPath("/dir/a"), "a");
+    memory->setPathDisplay("«memory»");
+    /* A worktree whose late path is tracked: the filter admits it. */
+    auto tracked = AllowListSourceAccessor::create(fs, {CanonPath::root}, {}, [](const CanonPath & path) {
+        return RestrictedPathError("Path '%s' is not tracked by Git.", path.rel());
+    });
+    std::vector<std::pair<ref<SourceAccessor>, ref<SourceAccessor>>> cases;
+    for (auto producer : {fs, ref<SourceAccessor>(memory), ref<SourceAccessor>(tracked)})
+        for (bool explain : {false, true})
+            cases.emplace_back(producer, GitRepo::acquire(SourcePath{producer}, explain));
+
+    writeFile(dir / "late", "late");
+    writeFile(dir / "dir" / "late", "late");
+    createDirs(dir / "late-dir");
+    writeFile(dir / "late-dir" / "f", "late");
+    createSymlink("dir/a", dir / "late-link");
+    memory->addFile(CanonPath("/late"), "late");
+    memory->addFile(CanonPath("/dir/late"), "late");
+    memory->addFile(CanonPath("/late-dir/f"), "late");
+    MemorySink(*memory).createSymlink(CanonPath("/late-link"), "dir/a");
+
+    auto late = {
+        CanonPath("/late"),
+        CanonPath("/dir/late"),
+        CanonPath("/late-dir"),
+        CanonPath("/late-dir/f"),
+        CanonPath("/late-link")};
+    for (size_t i = 0; i < cases.size(); ++i) {
+        auto & [producer, acquired] = cases[i];
+        SCOPED_TRACE(fmt("producer=%s explain=%d", producer->showPath(CanonPath::root), i % 2));
+        /* The producer does have the paths now. */
+        EXPECT_EQ(producer->readFile(CanonPath("/late")), "late");
+        EXPECT_EQ(producer->readDirectory(CanonPath("/late-dir")).size(), 1u);
+        EXPECT_EQ(producer->readLink(CanonPath("/late-link")), "dir/a");
+        for (auto & path : late) {
+            SCOPED_TRACE(path.abs());
+            EXPECT_FALSE(acquired->pathExists(path));
+            EXPECT_EQ(acquired->maybeLstat(path), std::nullopt);
+            EXPECT_THAT(
+                [&] { acquired->lstat(path); },
+                ::testing::ThrowsMessage<FileNotFound>(
+                    testing::HasSubstrIgnoreANSIMatcher(fmt("path '%s' does not exist", acquired->showPath(path)))));
+            EXPECT_THROW(acquired->readFile(path), FileNotFound);
+            EXPECT_THROW(acquired->readDirectory(path), FileNotFound);
+            EXPECT_THROW(acquired->readLink(path), FileNotFound);
+        }
+        /* Listings and reads of the acquired paths are unchanged. */
+        auto names = [&](const CanonPath & path) {
+            std::vector<std::string> result;
+            for (auto & [name, type] : acquired->readDirectory(path))
+                result.push_back(name);
+            return result;
+        };
+        EXPECT_EQ(names(CanonPath::root), std::vector<std::string>{"dir"});
+        EXPECT_EQ(names(CanonPath("/dir")), std::vector<std::string>{"a"});
+        EXPECT_EQ(acquired->readFile(CanonPath("/dir/a")), "a");
+    }
+}
+
 } // namespace nix::fetchers
