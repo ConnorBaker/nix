@@ -12,9 +12,6 @@
 # an attribute set named z3..z0, from the review of markers v3, §1.2) are
 # top-level attribute sets whose Bindings order, in which
 # `nix-instantiate --strict` forces them, is not the printed order.
-#
-# Bump backend only: the mimalloc backend's nested scopes revert what every
-# printed container forced, so there shared values still print in full.
 
 source common.sh
 
@@ -43,13 +40,9 @@ for f in rep*.nix e-*.nix attr*.nix ae-*.nix; do
         if [[ $mode == instantiate && $expected != *'«repeated»'* ]]; then
             fail "$f: prints no «repeated» without unforcing: $expected"
         fi
-        out=$(NIX_UNFORCE_BACKEND=bump run "$mode" "$f" "${on[@]}")
+        out=$(run "$mode" "$f" "${on[@]}")
         [[ $out == "$expected" ]] \
             || fail "$f ($mode): got '$out', expected '$expected'"
-        # The owner closure's cross-check: it is the runtime backstop for
-        # ownerOf/candidate exactness (NIX_UNFORCE_DEBUG=owner-check).
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_DEBUG=owner-check run "$mode" "$f" "${on[@]}")
-        [[ $out != *"unforce owner check"* ]] || fail "$f ($mode): $out"
     done
 done
 
@@ -57,12 +50,12 @@ done
 # a batch).
 for mode in instantiate eval; do
     expected=$(run "$mode" attr-desc-batch.nix --option eval-unforce false)
-    out=$(NIX_UNFORCE_BACKEND=bump run "$mode" attr-desc-batch.nix --option eval-unforce true)
+    out=$(run "$mode" attr-desc-batch.nix --option eval-unforce true)
     [[ $out == "$expected" ]] || fail "attr-desc-batch.nix ($mode, defaults): got '$out', expected '$expected'"
 done
 
 # What was kept is counted.
-stats=$(NIX_UNFORCE_BACKEND=bump NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
+stats=$(NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
 [[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+)\ \(([0-9]+)\ KiB\)$ ]] \
     || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "rep.nix: nothing nominated: $stats"

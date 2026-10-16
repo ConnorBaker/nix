@@ -88,10 +88,8 @@ namespace {
 /* Whether unforcing happens at all is the `eval-unforce` setting, and
    `eval-unforce-batch-size` sizes its batches; those two are the only user
    settings. The fields below were experiments whose measured winners are now
-   hardcoded. A handful of NIX_UNFORCE_* variables remain, all HELD for the
-   separate markers investigation (markers, the walk budget and fallback),
-   plus the single hidden developer dial `NIX_UNFORCE_DEBUG` (see
-   `DebugDial`). */
+   hardcoded; the only remaining NIX_UNFORCE_* variable is the single hidden
+   developer dial `NIX_UNFORCE_DEBUG` (see `DebugDial`). */
 struct Settings
 {
     /* DECIDED winners (shipping): an all-types bump region holding the owner
@@ -124,15 +122,6 @@ struct Settings
        as the evaluator's own statistics (whose JSON already carries the
        unforce numbers); there is no separate NIX_UNFORCE_STATS. */
     bool stats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
-
-    /* HELD for the markers investigation — do not remove yet.
-       markers: how a job's promotion set is closed under "producer-of":
-       "on" or "off". The walk budget and fallback bound and steer the
-       markers closure. */
-    std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
-    uint64_t walkBudgetBase = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_BASE").value_or("1000000"));
-    uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("256"));
-    std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
 };
 
 const Settings & unforceSettings()
@@ -143,19 +132,14 @@ const Settings & unforceSettings()
 
 /* The single hidden developer dial. NIX_UNFORCE_DEBUG is a comma-separated
    list of flags, each enabling one cross-check or trace that used to have its
-   own NIX_UNFORCE_* variable; all default off (unset means none). The
-   oracle/cross-check logic (owner-check, closure-check) is the only runtime
-   backstop for `ownerOf`/`candidate` exactness, so it is kept here, just
-   behind this dial and default-off. */
+   own NIX_UNFORCE_* variable; all default off (unset means none). */
 struct DebugDial
 {
-    bool trace = false;        /* was NIX_UNFORCE_DEBUG: select tracing + registry */
-    bool verify = false;       /* was NIX_UNFORCE_VERIFY */
-    bool verifyDump = false;   /* was NIX_UNFORCE_VERIFY_DUMP */
-    bool tripwire = false;     /* was NIX_UNFORCE_TRIPWIRE */
-    bool ownerCheck = false;   /* was NIX_UNFORCE_OWNER_CHECK */
-    bool closureCheck = false; /* was NIX_UNFORCE_CLOSURE_CHECK */
-    bool failDecide = false;   /* was NIX_UNFORCE_FAIL_DECIDE */
+    bool trace = false;      /* was NIX_UNFORCE_DEBUG: select tracing + registry */
+    bool verify = false;     /* was NIX_UNFORCE_VERIFY */
+    bool verifyDump = false; /* was NIX_UNFORCE_VERIFY_DUMP */
+    bool tripwire = false;   /* was NIX_UNFORCE_TRIPWIRE */
+    bool failDecide = false; /* was NIX_UNFORCE_FAIL_DECIDE */
 };
 
 const DebugDial & unforceDebug()
@@ -179,10 +163,6 @@ const DebugDial & unforceDebug()
                 r.verifyDump = true;
             else if (tok == "tripwire")
                 r.tripwire = true;
-            else if (tok == "owner-check")
-                r.ownerCheck = true;
-            else if (tok == "closure-check")
-                r.closureCheck = true;
             else if (tok == "fail-decide")
                 r.failDecide = true;
             else
@@ -213,29 +193,18 @@ struct Stats
     size_t reforced = 0;
     /* Job memory released, summed over jobs. */
     size_t freedBytes = 0;
-    /* Force markers: promotions added by the producer closure, closure
-       rounds, budget steps the closure was charged, jobs whose closure
-       changed anything, and the bookkeeping: bytes the markers add to log
-       entries, and the largest transient bookkeeping of one job close
-       (estimated). */
-    size_t markerPromoted = 0, markerRounds = 0, markerSteps = 0, markerJobs = 0;
-    /* The closure's budget: jobs that ran out of it (and so promoted, or
-       reverted, every target), the most steps one job took, and the most
-       steps per KiB of job memory one job took. */
-    size_t budgetJobs = 0, maxJobSteps = 0, maxStepsPerKiB = 0;
+    /* The owner closure: promotions it added, and jobs whose closure
+       changed anything. */
+    size_t markerPromoted = 0, markerJobs = 0;
     /* The force counts: the most entries they held, and how often they
        were rebuilt from one job's targets for outgrowing their cap. */
     size_t countsPeak = 0, countsResets = 0;
     /* Counted targets on the thread's stack (stack slots the job restores),
        whose addresses a later job may reuse for another cell (P5). */
     size_t stackTargets = 0;
-    size_t markerLogBytes = 0, markerPeakBytes = 0;
     /* Jobs that promoted nothing because client code ran in them, and the
        cells reverted at their ends. */
     size_t clientJobs = 0, revertedInClientJobs = 0;
-    /* Cells reverted by nested scopes of the mimalloc backend, which never
-       promote (so these are reverted whatever the promotion threshold). */
-    size_t innerScopeReverts = 0;
     /* `UnforceSeen`: targets nominated because a printer printed the
        container they hold, and printers' `seen` entries rewritten to a
        copy's address at job ends. No entry is ever dropped: a job that
@@ -247,13 +216,9 @@ struct Stats
        (each looks up its owner), those that changed the owner, the most
        segments one job had, owner lookups at job ends (one per copied or
        marked identity-bearing object), jobs whose closure added promotions,
-       and consumers nominated. `ownerCheckExtra`: targets the owner closure
-       promoted that the markers closure did not (NIX_UNFORCE_DEBUG=owner-check;
-       must stay 0), and `ownerCheckFewer`, the converse (the markers walk's
-       false positives). */
+       and consumers nominated. */
     size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
-           ownerConsumerNominated = 0, ownerCheckExtra = 0, ownerCheckFewer = 0, ownerOverflowJobs = 0,
-           ownerConsumerPairsPeak = 0, ownerCopyLimitJobs = 0;
+           ownerConsumerNominated = 0, ownerOverflowJobs = 0, ownerConsumerPairsPeak = 0, ownerCopyLimitJobs = 0;
 } stats;
 
 /* This thread's stack, [low, high). */
@@ -287,10 +252,9 @@ static void printStatsAtExit()
         (std::atexit([] {
              std::cerr << fmt(
                  "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
-                 "largest scope %d MiB; reforced %d, freed %d MiB; markers %s: promoted %d, "
-                 "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
-                 "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
-                 "inner-scope reverts %d; seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
+                 "largest scope %d MiB; reforced %d, freed %d MiB; owner closure: promoted %d, jobs %d; "
+                 "counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d; "
+                 "seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
                  "jobs",
                  stats.jobs,
                  stats.logged,
@@ -302,23 +266,13 @@ static void printStatsAtExit()
                  stats.regionPeak >> 20,
                  stats.reforced,
                  stats.freedBytes >> 20,
-                 unforceSettings().markers,
                  stats.markerPromoted,
-                 stats.markerRounds,
-                 stats.markerSteps,
                  stats.markerJobs,
-                 stats.markerLogBytes >> 10,
-                 stats.markerPeakBytes >> 10,
-                 stats.budgetJobs,
-                 unforceSettings().walkFallback,
-                 stats.maxJobSteps,
-                 stats.maxStepsPerKiB,
                  stats.countsPeak,
                  stats.countsResets,
                  stats.stackTargets,
                  stats.clientJobs,
                  stats.revertedInClientJobs,
-                 stats.innerScopeReverts,
                  stats.seenNominated,
                  stats.seenKept,
                  stats.keptJobs,
@@ -738,7 +692,7 @@ static const Value * ownerCell(uint32_t o)
 static void openOwners(EvalState & state)
 {
     auto & cfg = unforceSettings();
-    ownersOn = cfg.identity == "owners" && cfg.markers != "off" && evalRegion.cur;
+    ownersOn = cfg.identity == "owners" && evalRegion.cur;
     ownersOverflowed = false;
     ownerConsumersOn = cfg.ownerConsumers;
     ownerConsumers.clear();
@@ -1520,16 +1474,14 @@ struct Stubber
    Reachability alone (option C) over-promotes every consumer; the interval
    test removes consumers that only read data allocated before they started.
 
-   Rule. Promote the candidates (NIX_UNFORCE_MARKERS=on): S is the least
-   superset of the count-nominated set S0 that satisfies OC under the
-   candidate test, computed by rounds until no reverted target is a
-   candidate; the promoted set is copied with one Evacuator, so the shared
-   objects keep one copy. The decision, copies included, runs before the
-   job's memory is released and writes no target (`decideJob`): with the
-   default budget fallback every target is copied as it joins S and the
-   copies mark Evac(S); with the "revert" fallback Evac(S) is marked by
-   walking and the copies follow the decision. The release then only
-   assigns, reverts and frees. The alternative,
+   Rule. Promote the candidates: S is the least superset of the
+   count-nominated set S0 that satisfies OC under the producer-of test
+   (`OwnerClosure`: owner(x) in S for every identity-bearing x in Evac(S)),
+   computed to a fixpoint; the promoted set is copied with one Evacuator, so
+   the shared objects keep one copy. The decision, copies included, runs
+   before the job's memory is released and writes no target (`decideJob`):
+   every target is copied as it joins S and the copies mark Evac(S). The
+   release then only assigns, reverts and frees. The alternative,
    refusing every member of S0 that reaches a candidate's cell (the
    greatest subset of S0 satisfying OC), retains less per job but can starve:
    a consumer that forces a producer's young thunks in the job where the
@@ -1619,65 +1571,6 @@ struct JobTargets
     const Value & preImage(size_t i) const
     {
         return log[first[i]].preImage;
-    }
-};
-
-/* The force intervals of one job (log entries [mark, size)), compiled for
-   the candidate test: per target, its first interval [s, e), whether it has
-   more, and the intervals of the first one's direct children, which are
-   disjoint and sorted. */
-struct ForceMarkers
-{
-    struct Span
-    {
-        uint64_t s, e;
-        bool single;
-        uint32_t c0, c1;
-    };
-
-    std::vector<Span> spans;
-    std::vector<std::pair<uint64_t, uint64_t>> childIntervals;
-
-    ForceMarkers(const decltype(EvalState::undoLog) & log, size_t mark, uint64_t jobEnd, const JobTargets & targets)
-    {
-        /* A force still open at job end (none should be) ends with the job. */
-        auto endOf = [&](size_t i) {
-            auto e = log[i].end;
-            return e == EvalState::UndoEntry::openForce ? jobEnd : e;
-        };
-        auto n = log.size() - mark;
-        std::vector<uint32_t> begin(n + 1);
-        for (auto j = mark; j < log.size(); ++j)
-            if (log[j].parent >= int64_t(mark))
-                begin[log[j].parent - mark + 1]++;
-        for (size_t i = 0; i < n; ++i)
-            begin[i + 1] += begin[i];
-        childIntervals.resize(begin[n]);
-        auto fill = begin;
-        /* Log order is start order, so each list comes out sorted. */
-        for (auto j = mark; j < log.size(); ++j)
-            if (log[j].parent >= int64_t(mark))
-                childIntervals[fill[log[j].parent - mark]++] = {log[j].start, endOf(j)};
-        for (size_t i = 0; i < targets.size(); ++i) {
-            auto f = targets.first[i];
-            spans.push_back({log[f].start, endOf(f), !targets.repeated[i], begin[f - mark], begin[f - mark + 1]});
-        }
-    }
-
-    /* allowed(t, a) of the comment above: whether target `t` (its span)
-       can own an object allocated at time `a`. Inside t's own interval,
-       innermost(a) is t unless a lies in one of its children's intervals
-       (the intervals form a forest). With several intervals, only a >= s
-       of the first is used. */
-    bool allowed(const Span & t, uint64_t a) const
-    {
-        if (a < t.s)
-            return false;
-        if (!t.single || a >= t.e)
-            return true;
-        auto b = childIntervals.begin() + t.c0, e = childIntervals.begin() + t.c1;
-        auto i = std::upper_bound(b, e, a, [](uint64_t a, const auto & c) { return a < c.first; });
-        return i == b || !(a < std::prev(i)->second);
     }
 };
 
@@ -1790,49 +1683,14 @@ struct RegionMarks
 struct OverBudget
 {};
 
-/* The producer closure of one job: walks of young object graphs along the
-   edges the Evacuator copies, without copying.
-
-   Cost. A job may take `budget` steps. A step is charged for every object
-   a walk pops (plus one per 16 attributes of a Bindings layer or slots of
-   an env whose children it scans), every element array it claims (plus
-   one per 16 elements it scans), every target a round tests, and the
-   bitmap clears of `dropMemos` in proportion to their size (review of v2, S1: a round tests every
-   reverted target, so before these were charged a chain found one target
-   per round, beside 300 000 targets whose walks pop nothing, cost 45 G
-   instructions without ever reaching the budget). So the budget bounds the
-   whole decision, not only its walks. These keep the count down:
-   - Evac(S) is marked once per object, by the copies themselves or by a
-     marking walk that stops at marked objects: linear in Evac(S).
-   - A list's element array is visited once per walk however many list
-     values share it.
-   - Memo. While Evac(S) does not change, a walk from target w that ends
-     without a hit has shown, for every object x it visited (pruned ones
-     included), that no identity-bearing object of Evac(S) is reachable
-     from x through objects with times >= θ, where θ = s(w), or e(w) if it
-     pruned an object inside its own interval (a child's); without such
-     prunes every object of time >= s(w) it met was allowed. A later walk u
-     never enters an object of time < s(u) (allowed(u, a) implies
-     a >= s(u)), so if s(u) >= θ, u can skip x: it would find no hit below
-     x. A round walks the targets in start order, so a memo with θ = s(w)
-     holds for every later walk of the round; one with θ = e(w) is held back
-     until a walk starts at or after e(w). Every round starts with no memos,
-     since it starts again from the earliest target. A walk that hits
-     leaves no memo (its target joins S).
-     Memos waiting for their θ hold at most `pendingCap` objects; beyond
-     that a memo is not kept, which only costs steps.
-   - `reached`. Every object visited by a walk that ends without a hit is
-     marked `reached` (and stays so for the job). The objects a reverted
-     target's walk can visit do not change while the job is decided (the
-     graph is fixed), and all of them are `reached` once it has been
-     walked: by its own walk, or by the earlier hit-free walk whose memo let
-     it skip them (a memo covers only objects that walk explored or
-     pruned). So when S grows and none of the objects newly added to
-     Evac(S) is `reached`, no reverted target already walked can have
-     become a candidate, and every memo still holds (a memo of x fails only
-     if a new Evac(S) object is reachable from x through objects its walk
-     explored). Only when a new object is `reached` are the memos dropped
-     and all targets walked again. */
+/* Marks Evac(S) for the owner closure: `mark(content)` adds R(content) —
+   every young object reachable from `content` without pruning — to Evac(S),
+   calling `onMark` for each identity-bearing object it adds (so the owner
+   closure can promote that object's owner). The marking is linear in Evac(S)
+   (each object marked once, string data excluded), charged against `budget`,
+   and bounded by `markedLimit` via `checkMarked` (the copy limit; exceeding
+   it throws `OverBudget` and the job is kept whole). A list's element array
+   is marked once however many list values share it. */
 template<typename Marks>
 struct Closure
 {
@@ -1848,19 +1706,6 @@ struct Closure
        (review of markers v4, B1-mem: a 4 M-element list took 64 MiB of
        stack). */
     std::vector<std::pair<Value * const *, size_t>> arrays;
-    /* Objects visited by the current walk. */
-    std::vector<const void *> touched;
-    /* Memos waiting for a walk that starts at or after their θ (a heap,
-       smallest θ first), and the objects they hold. */
-    std::vector<std::pair<uint64_t, std::vector<const void *>>> pending;
-    static constexpr auto laterTheta = [](const auto & a, const auto & b) { return a.first > b.first; };
-    size_t pendingSize = 0;
-    static constexpr size_t pendingCap = size_t(1) << 20;
-    /* Whether `mark` added an object some walk reached. */
-    bool reachedNew = false;
-    /* For the check (NIX_UNFORCE_DEBUG=closure-check): no memos, and every
-       promotion starts another round. */
-    bool memos = true;
     /* Steps taken in this job, and how many it may take. */
     uint64_t steps = 0, budget = UINT64_MAX;
     /* If set, `mark` calls it with every identity-bearing object it adds
@@ -1873,7 +1718,6 @@ struct Closure
     /* `mark` throws `OverBudget` once what it marked, with the marks
        themselves, exceeds this (the owner closure's copy limit). */
     size_t markedLimit = SIZE_MAX;
-    size_t peak = 0;
 
     void checkMarked()
     {
@@ -1881,12 +1725,6 @@ struct Closure
         if constexpr (requires { marks.allocated; })
             marksBytes = marks.allocated * sizeof(typename Marks::Piece);
         if (markedBytes + marksBytes > markedLimit) [[unlikely]]
-            throw OverBudget{};
-    }
-
-    void step()
-    {
-        if (++steps > budget) [[unlikely]]
             throw OverBudget{};
     }
 
@@ -2000,7 +1838,6 @@ struct Closure
                 return;
             auto old = marks.add(p, inEvac);
             if (!(old & inEvac)) {
-                reachedNew |= old & reached;
                 markedBytes += k == kValue ? sizeof(Value)
                                : k == kEnv ? sizeof(Env) + width(p, k) * sizeof(Value *)
                                            : sizeof(Bindings) + width(p, k) * sizeof(Attr);
@@ -2013,7 +1850,6 @@ struct Closure
         auto array = [&](Value * const * elems, size_t size) {
             auto old = marks.add(elems, inEvac);
             if (!(old & inEvac)) {
-                reachedNew |= old & reached;
                 markedBytes += size * sizeof(Value *);
                 checkMarked();
                 if (onMark)
@@ -2041,154 +1877,7 @@ struct Closure
         }
     }
 
-    /* Whether a walk from target t's content, pruned by `allowed`, reaches
-       an identity-bearing object of Evac(S): t is a candidate producer. */
-    bool candidate(const Value & content, const ForceMarkers & markers, const ForceMarkers::Span & t)
-    {
-        /* Testing the target at all, even if its walk pops nothing. */
-        step();
-
-        /* Memos of earlier walks that hold from here on. */
-        while (!pending.empty() && pending.front().first <= t.s) {
-            std::pop_heap(pending.begin(), pending.end(), laterTheta);
-            for (auto p : pending.back().second)
-                marks.add(p, memo);
-            pendingSize -= pending.back().second.size();
-            pending.pop_back();
-        }
-
-        stack.clear();
-        touched.clear();
-        auto push = [&](const void * p, Kind k) {
-            if (!p || !young(p) || !marks.claim(p))
-                return;
-            touched.push_back(p);
-            stack.emplace_back(p, k);
-        };
-        bool hit = false, ownPruned = false;
-        /* Whether `p` (not visited yet) is pruned for t. */
-        auto pruned = [&](const void * p) {
-            auto a = clock(p);
-            if (!a || markers.allowed(t, *a))
-                return false;
-            ownPruned |= *a >= t.s;
-            return true;
-        };
-        /* An element array is checked where it is reached: its elements
-           are pushed only if it is neither pruned nor a hit. */
-        auto array = [&](Value * const * elems, size_t size) {
-            if (hit || !marks.claim(elems))
-                return;
-            charge(1 + size / 16);
-            touched.push_back(elems);
-            if (pruned(elems))
-                return;
-            if (marks.get(elems) & inEvac) {
-                hit = true;
-                return;
-            }
-            for (size_t i = 0; i < size; ++i)
-                push(elems[i], kValue);
-        };
-        children(content, push, array);
-        while (!hit && !stack.empty()) {
-            auto [p, kind] = stack.back();
-            stack.pop_back();
-            step();
-            if (pruned(p))
-                continue;
-            /* Identity is observable on cells (`eqValues`) and on Bindings
-               (the printers' «repeated» tracking keys on the Bindings);
-               envs are never compared. */
-            if (kind != kEnv && marks.get(p) & inEvac) {
-                hit = true;
-                break;
-            }
-            charge(width(p, kind) / 16);
-            children(p, kind, push, array);
-        }
-
-        /* `reached` records the walks that leave their target reverted
-           (see `Closure`); a target that hit joins S. */
-        for (auto p : touched) {
-            marks.remove(p, visited);
-            if (!hit)
-                marks.add(p, reached);
-        }
-        notePeak();
-        if (!hit && memos) {
-            auto theta = ownPruned ? t.e : t.s;
-            if (theta <= t.s)
-                for (auto p : touched)
-                    marks.add(p, memo);
-            else if (pendingSize + touched.size() <= pendingCap) {
-                pendingSize += touched.size();
-                pending.emplace_back(theta, std::move(touched));
-                std::push_heap(pending.begin(), pending.end(), laterTheta);
-            }
-        }
-        return hit;
-    }
-
-    /* A round ended and S grew: the memos no longer hold. */
-    void dropMemos()
-    {
-        pending.clear();
-        pendingSize = 0;
-        charge(marks.removeAll(memo));
-    }
-
-    void notePeak()
-    {
-        auto bytes = marks.bytes() + stack.capacity() * sizeof(stack[0]) + arrays.capacity() * sizeof(arrays[0])
-                     + touched.capacity() * sizeof(void *) + pendingSize * sizeof(void *)
-                     + pending.capacity() * sizeof(pending[0]);
-        peak = std::max(peak, bytes);
-    }
 };
-
-/* The closure's rounds. Each round walks the reverted targets in start
-   order and promotes a candidate as soon as it is found: `join(i)` adds
-   target i's R(c) to Evac(S) (`mark`, or a copy that marks what it
-   copies), so the targets after it are tested against the larger Evac(S).
-   If what join added meets no object a reverted target's walk reached
-   (`reachedNew` false; see `Closure`), the memos stay valid and the targets
-   already tested stay non-candidates; otherwise the memos are dropped and
-   another round tests everything again. The candidate test is monotone in
-   S, so this reaches the least fixpoint. Returns the promotions added. */
-template<typename Marks, typename Join>
-size_t closePromotions(
-    Closure<Marks> & closure,
-    const JobTargets & targets,
-    const ForceMarkers & markers,
-    std::vector<bool> & promote,
-    Join && join)
-{
-    for (size_t i = 0; i < targets.size(); ++i)
-        if (promote[i])
-            join(i);
-    size_t added = 0;
-    for (bool again = true; again;) {
-        again = false;
-        stats.markerRounds++;
-        /* A memo holds only for walks that start after its own; a round
-           starts again from the earliest target. */
-        closure.dropMemos();
-        for (size_t i = 0; i < targets.size(); ++i) {
-            if (promote[i] || !closure.candidate(*targets.cells[i], markers, markers.spans[i]))
-                continue;
-            promote[i] = true;
-            added++;
-            closure.reachedNew = false;
-            join(i);
-            if (closure.reachedNew || !closure.memos) {
-                closure.dropMemos();
-                again = true;
-            }
-        }
-    }
-    return added;
-}
 
 /* Per target of a job, whether a live `UnforceSeen` set reported it
    (`reportedTargets`). */
@@ -2328,35 +2017,21 @@ struct OwnerClosure
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
    `counts` nominate, as do the targets `printed` marks (`UnforceSeen`; null
-   when the printers reported nothing in the job), and the
-   producer closure adds what identity needs (see above). This is the fallible step before the job's memory is released.
+   when the printers reported nothing in the job), and the owner closure
+   adds what identity needs (`OwnerClosure`, see above). This is the fallible
+   step before the job's memory is released.
    It writes no target, so the caller turns an allocation failure here into
    a fatal error before anything has changed, and the release that follows
    only assigns, reverts and frees. The caller pauses the region.
-   `youngBytes` is the memory the job allocated other than string data, which sets the closure's
-   step budget. Returns a flag per target.
+   `youngBytes` is the memory the job allocated other than string data.
+   Returns a flag per target.
 
-   The budget. The closure is a walk per reverted target per round, and
-   targets can share young structure that every one of them may reach, so
-   even with the memo it can take steps quadratic in the job's size (review
-   S1: walk-2000-100000 took 400 M steps before the memo; see
-   tmp/markers-v2's nested adversary for one the memo does not help). A job
-   that runs out of budget falls back to a promotion set that needs no walk
-   and keeps identity on its own:
-   - "promote" (the default): S = T. Every young cell's owner is a target
-     or nothing, so OC holds. This is what K = 1 does for every job: the
-     job keeps what it forced, as without unforcing, and its CPU cost is
-     the copy, linear in what is kept.
-   - "revert": S = {} (pure revert). Nothing is kept, so a hot producer is
-     rebuilt in later jobs; a workload that kept exceeding the budget
-     would recompute it every job.
-   Neither is partial: the fallback replaces the whole decision.
-
-   Evac(S). With the "promote" fallback S only grows, so every target that
-   joins S is copied at once and the Evacuator marks Evac(S) as it copies:
-   no copy is ever wasted, and Evac(S) costs no walk of its own. With the
-   "revert" fallback nothing may be copied before the decision is final, so
-   Evac(S) is marked by a walk (`Closure::mark`) and the copies follow. */
+   Evac(S). S only grows, so every target that joins S is copied at once and
+   the Evacuator marks Evac(S) as it copies (the owner closure promotes each
+   copied object's owner): no copy is ever wasted, and Evac(S) costs no walk
+   of its own. A printing or over-the-copy-limit job marks Evac(S) first
+   (`Closure::mark`) and copies only if it keeps less than half its memory;
+   otherwise it is kept whole (exact). */
 std::vector<bool> decideJob(
     EvalState & state,
     size_t mark,
@@ -2397,9 +2072,7 @@ std::vector<bool> decideJob(
     /* Cells reported to an `UnforceSeen` (holding a container a printer
        printed, or walked by `forceValueDeep` for a printer that prints
        later) are nominated like counted ones, so that what they hold stays
-       forced and keeps its identity for the rest of the print. With
-       NIX_UNFORCE_MARKERS=off they are promoted without the closure, as
-       counted ones are. */
+       forced and keeps its identity for the rest of the print. */
     if (printed && canCopy)
         for (size_t i = 0; i < targets.size(); ++i)
             if (!promote[i] && (*printed)[i]) {
@@ -2416,7 +2089,7 @@ std::vector<bool> decideJob(
     }
 
     bool any = std::find(promote.begin(), promote.end(), true) != promote.end();
-    if (!any || cfg.markers == "off" || !canCopy) {
+    if (!any || !canCopy) {
         copyPromoted();
         return promote;
     }
@@ -2432,7 +2105,6 @@ std::vector<bool> decideJob(
     }
 
     if (ownersOn) {
-        auto nominated = promote;
         OwnerClosure oc(targets, promote);
         /* As below: a printing job that may be kept whole marks Evac(S)
            first, and copies only if it keeps less than half its memory.
@@ -2464,10 +2136,8 @@ std::vector<bool> decideJob(
             else
                 copy(i);
         };
-        std::vector<bool> closed;
         try {
         oc.run(join);
-        closed = promote;
         /* Consumers of promoted targets (a heuristic, see the setting):
            nominate them and close again, until nothing changes. */
         std::vector<std::pair<uint32_t, uint32_t>> pairs;
@@ -2503,25 +2173,6 @@ std::vector<bool> decideJob(
         stats.markerPromoted += oc.added;
         if (oc.added)
             stats.markerJobs++, stats.ownerJobs++;
-        if (unforceDebug().ownerCheck) {
-            ForceMarkers fm(state.undoLog, mark, jobEnd, targets);
-            Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
-            plain.memos = false;
-            auto o = nominated;
-            closePromotions(plain, targets, fm, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
-            /* The closure proper, before consumer nominations. */
-            for (size_t i = 0; i < targets.size(); ++i) {
-                if (closed[i] && !o[i]) {
-                    stats.ownerCheckExtra++;
-                    std::cerr << fmt(
-                        "unforce owner check: job %d target %d: owner closure promotes, markers does not\n",
-                        stats.jobs,
-                        i);
-                }
-                if (!closed[i] && o[i])
-                    stats.ownerCheckFewer++;
-            }
-        }
         /* Markers' rule for printing jobs (it keeps the printer's «repeated»
            cheaply); a job that marked first only for the copy limit
            copies. */
@@ -2532,100 +2183,11 @@ std::vector<bool> decideJob(
         return promote;
     }
 
-    /* When every target is promoted (a printing job often nominates them
-       all), the closure has nothing to decide: only Evac(S) is needed. */
-    bool allPromoted = std::find(promote.begin(), promote.end(), false) == promote.end();
-    std::optional<ForceMarkers> markers;
-    if (!allPromoted)
-        markers.emplace(state.undoLog, mark, jobEnd, targets);
-    auto budget = cfg.walkBudgetBase + cfg.walkBudgetPerKiB * (youngBytes >> 10);
-    bool fallbackPromote = cfg.walkFallback != "revert";
-    uint64_t steps = 0;
-    size_t peak = 0;
-    auto nominated = promote;
-    /* A job that printers reported cells in (`UnforceSeen`) may keep most
-       of what it allocated: a job forcing one large printed value keeps all
-       of it. Copying that would double the job's memory at its end, so
-       Evac(S) is marked first, and if it is at least half the job's memory
-       (string data aside), or the closure runs out of budget, the job keeps
-       all its memory instead (`keepWhole`): no copy, and no more than
-       without unforcing (review of markers v4, B1-mem). */
-    bool markFirst = keepWhole && printed;
-    bool copyAsWeGo = fallbackPromote && !markFirst;
-    size_t markedBytes = 0;
-    auto decide = [&](auto & closure) {
-        closure.budget = budget;
-        if (copyAsWeGo)
-            evacuator.onForward = [&](const void * p) { closure.reachedNew |= closure.marks.add(p, inEvac) & reached; };
-        auto closed = promote;
-        try {
-            auto close = [&](auto && join) -> size_t {
-                if (allPromoted) {
-                    for (size_t i = 0; i < targets.size(); ++i)
-                        join(i);
-                    return 0;
-                }
-                return closePromotions(closure, targets, *markers, closed, join);
-            };
-            auto added = copyAsWeGo ? close(copy) : close([&](size_t i) { closure.mark(*targets.cells[i]); });
-            promote = std::move(closed);
-            stats.markerPromoted += added;
-            if (added)
-                stats.markerJobs++;
-        } catch (OverBudget &) {
-            stats.budgetJobs++;
-            if (markFirst)
-                *keepWhole = true;
-            promote.assign(targets.size(), fallbackPromote && !markFirst);
-        }
-        evacuator.onForward = nullptr;
-        closure.notePeak();
-        steps = closure.steps;
-        peak = closure.peak;
-        markedBytes = closure.markedBytes;
-    };
-    {
-        Closure<RegionMarks> closure{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
-        decide(closure);
-    }
-    if (unforceDebug().closureCheck && markers) {
-        /* Recompute the closure plainly (marking walks, no memos, a round
-           after every promotion) and compare. */
-        Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
-        plain.memos = false;
-        auto o = nominated;
-        bool over = false;
-        try {
-            closePromotions(plain, targets, *markers, o, [&](size_t i) { plain.mark(*targets.cells[i]); });
-        } catch (OverBudget &) {
-            over = true;
-        }
-        if (!over && o != promote)
-            for (size_t i = 0; i < targets.size(); ++i)
-                if (o[i] != promote[i])
-                    std::cerr << fmt(
-                        "unforce check: job %d target %d (start %d, end %d, %s): plain closure %s, decided %s\n",
-                        stats.jobs,
-                        i,
-                        markers->spans[i].s,
-                        markers->spans[i].e,
-                        markers->spans[i].single ? "single" : "repeated",
-                        o[i] ? "promotes" : "reverts",
-                        promote[i] ? "promotes" : "reverts");
-    }
-    if (markFirst && 2 * markedBytes >= youngBytes)
+    /* The owner timeline is the sole algorithm. If it is not on here (the
+       timeline could not be built, or there is no open region), the job is
+       kept whole, which is exact: nothing is promoted, reverted or freed. */
+    if (keepWhole)
         *keepWhole = true;
-    if (!keepWhole || !*keepWhole)
-        copyPromoted();
-
-    stats.markerSteps += steps;
-    stats.maxJobSteps = std::max<size_t>(stats.maxJobSteps, steps);
-    stats.maxStepsPerKiB = std::max<size_t>(stats.maxStepsPerKiB, steps / std::max<size_t>(1, youngBytes >> 10));
-    stats.markerPeakBytes = std::max(
-        stats.markerPeakBytes,
-        peak
-            + (markers ? markers->spans.capacity() * sizeof(markers->spans[0]) + markers->childIntervals.capacity() * 16
-                       : 0));
     return promote;
 }
 
@@ -2717,13 +2279,11 @@ std::string unforceStatsJSON()
         return "";
     return fmt(
         R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
-        R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markers":"%s","markerPromoted":%d,)"
-        R"("markerRounds":%d,"markerSteps":%d,"markerJobs":%d,"markerLogBytes":%d,"markerPeakBytes":%d,)"
-        R"("markerBudgetJobs":%d,"markerFallback":"%s","markerMaxJobSteps":%d,"markerMaxStepsPerKiB":%d,)"
+        R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markerPromoted":%d,"markerJobs":%d,)"
         R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
-        R"("revertedInClientJobs":%d,"innerScopeReverts":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
+        R"("revertedInClientJobs":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
         R"("keptJobBytes":%d,"identity":"%s","ownerLookups":%d,"ownerChanges":%d,"ownerSegsPeak":%d,)"
-        R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,"ownerCheckExtra":%d,"ownerCheckFewer":%d,)"
+        R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,)"
         R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
         stats.logged,
@@ -2736,23 +2296,13 @@ std::string unforceStatsJSON()
         stats.reforced,
         stats.copiedBytes,
         stats.freedBytes,
-        unforceSettings().markers,
         stats.markerPromoted,
-        stats.markerRounds,
-        stats.markerSteps,
         stats.markerJobs,
-        stats.markerLogBytes,
-        stats.markerPeakBytes,
-        stats.budgetJobs,
-        unforceSettings().walkFallback,
-        stats.maxJobSteps,
-        stats.maxStepsPerKiB,
         stats.countsPeak,
         stats.countsResets,
         stats.stackTargets,
         stats.clientJobs,
         stats.revertedInClientJobs,
-        stats.innerScopeReverts,
         stats.seenNominated,
         stats.seenKept,
         stats.keptJobs,
@@ -2764,8 +2314,6 @@ std::string unforceStatsJSON()
         stats.ownerJobLookups,
         stats.ownerJobs,
         stats.ownerConsumerNominated,
-        stats.ownerCheckExtra,
-        stats.ownerCheckFewer,
         stats.ownerOverflowJobs,
         stats.ownerConsumerPairsPeak,
         stats.ownerCopyLimitJobs);
@@ -3143,8 +2691,6 @@ bool unforceIsScopeStackSlot(const void * p)
     e.start = unforceClock();
     e.parent = activeForces.empty() ? -1 : int64_t(activeForces.back());
     undoLog.push_back(e);
-    if (statsObserved) [[unlikely]]
-        stats.markerLogBytes += sizeof(EvalState::UndoEntry) - offsetof(EvalState::UndoEntry, start);
     activeForces.push_back(index);
     *opens.t++ = {&v, (uint64_t(curOwner) << 1) | 1};
     *openLogIndices.t++ = index;

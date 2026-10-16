@@ -160,12 +160,11 @@ out=$(NIX_UNFORCE_DEBUG=fail-decide nix-instantiate "${batch0[@]}" --eval --stri
 [[ $out == *"out of memory while deciding"*"--option eval-unforce false"* ]] \
     || fail "no fatal message: $out"
 
-# The closure's step budget bounds the whole decision, not only its walks
-# (review of markers v2, S1): here a chain t1..t600 is found one target per
-# round (promoting t(i+1) puts t(i)'s list in the kept set), and every round
-# also tests 300 000 targets forced to integers, whose walks pop nothing.
-# Before rounds and targets were charged this took 600 rounds and about
-# 90 times base's instructions without reaching the budget.
+# The owner closure keeps identity on deep producer chains with no walk,
+# however deep: here a chain t1..t600 (promoting t(i+1) puts t(i)'s list in
+# the kept set), beside 300 000 targets forced to integers. The owner
+# timeline decides this in one pass per copied object; the output equals
+# base.
 {
     echo 'let'
     echo '  t1 = { v = [ 1 2 3 ]; w = null; };'
@@ -176,23 +175,11 @@ out=$(NIX_UNFORCE_DEBUG=fail-decide nix-instantiate "${batch0[@]}" --eval --stri
     echo '];'
     echo 'in builtins.seq zs [ (builtins.seq t600 true) (builtins.deepSeq ts (builtins.deepSeq zs true)) ]'
 } > "$TEST_ROOT/rounds.nix"
-# The owner closure (the default) takes no rounds and has no budget, however
-# deep the chain of producers rounds.nix builds.
-ownerStats() {
-    local stats
-    stats=$(NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${batch0[@]}" --eval --strict "$1" 2>&1 >/dev/null)
-    [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
-    (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] == 0 )) || fail "$1: the owner closure walked: $stats"
-}
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
     || fail "rounds.nix: wrong output"
-ownerStats "$TEST_ROOT/rounds.nix"
 
-# A walk is also charged for the width of what it scans (review of markers
-# v3, S1'): beside the chain of rounds.nix, one target holds a young
-# Bindings of 1 000 000 attributes pointing to old cells, which every round
-# scans. Before Bindings widths were charged, this took 600 rounds without
-# reaching the budget.
+# The same, beside one target holding a young Bindings of 1 000 000
+# attributes pointing to old cells.
 {
     echo 'let'
     echo '  old = builtins.listToAttrs (builtins.genList (i: { name = "a${toString i}"; value = i; }) 1000000);'
@@ -206,18 +193,14 @@ ownerStats "$TEST_ROOT/rounds.nix"
 } > "$TEST_ROOT/wide.nix"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix") == '[ true true ]' ]] \
     || fail "wide.nix: wrong output"
-ownerStats "$TEST_ROOT/wide.nix"
 
-# String data does not buy closure steps (review of markers v4, S1''): the
-# same job as wide.nix, plus a 32 MiB string built by doubling (64 MiB of
-# string data in all). When the budget grew with every young byte, the
-# string bought about 16 M steps, and the closure took over 300 rounds.
+# The same job as wide.nix, plus a 32 MiB string built by doubling (64 MiB
+# of string data in all): string data is never walked for identity.
 sed 's/^in builtins.seq old \[ (builtins.seq t600 true) (builtins.seq big /  dbl = s: n: if n == 0 then s else dbl (s + s) (n - 1);\n  pad = builtins.stringLength (dbl "x" 25);\n&(builtins.seq pad /; s/true)) ]$/true))) ]/' \
     "$TEST_ROOT/wide.nix" > "$TEST_ROOT/wide-pad.nix"
 grep -q 'seq pad' "$TEST_ROOT/wide-pad.nix" || fail "wide-pad.nix: no padding"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix") == '[ true true ]' ]] \
     || fail "wide-pad.nix: wrong output"
-ownerStats "$TEST_ROOT/wide-pad.nix"
 
 # Output equals base: the trace above is printed exactly once with a batch
 # per element too. Fails until replays are silent (effects design R); last,

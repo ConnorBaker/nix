@@ -2,9 +2,9 @@
 
 # PROTOTYPE (unforce): promotion must not split value identity. Each program
 # in eval-unforce-identity/ compares a value kept by a promoted cell with the
-# same value reached through a cell that a job reverted (see the force
-# markers in src/libexpr/unforce.cc). With a job per element, under each
-# backend, the output must match the output without unforcing.
+# same value reached through a cell that a job reverted (see the owner
+# timeline in src/libexpr/unforce.cc). With a job per element, the output
+# must match the output without unforcing.
 
 source common.sh
 
@@ -16,17 +16,9 @@ fi
 
 cd eval-unforce-identity
 
-backends=(bump)
-allocatorStats=$(NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout nix eval --expr 1 2>/dev/null || true)
-if [[ $allocatorStats == *'"mimallocVersion"'* ]]; then
-    backends+=(mimalloc)
-fi
-
 run() {
     local f=$1
     shift
-    # nested.nix is printed by `nix eval`, whose nested containers are
-    # scopes of their own with the mimalloc backend.
     # The exit status is part of the output.
     if [[ $f == nested.nix ]]; then
         nix eval "$@" --impure --file "$f" 2>&1 || echo "exit status $?"
@@ -36,16 +28,13 @@ run() {
 }
 
 # The shipping default (owner timeline, promote after 2 forces) must keep
-# identity on every program, under each backend, with a job per element.
+# identity on every program, with a job per element.
 for f in *.nix; do
     [[ $f == set.nix ]] && continue
     expected=$(run "$f" --option eval-unforce false)
-    for backend in "${backends[@]}"; do
-        out=$(NIX_UNFORCE_BACKEND=$backend \
-            run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
-        [[ $out == "$expected" ]] \
-            || fail "$f (backend $backend): got '$out', expected '$expected'"
-    done
+    out=$(run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
+    [[ $out == "$expected" ]] \
+        || fail "$f: got '$out', expected '$expected'"
 done
 
 # Generated schedules (from the epoch branch): each makes a count-only policy
@@ -62,27 +51,10 @@ schedule() {
 for k in 2 3 4 5; do
     expr=$(schedule "$k")
     expected=$(nix-instantiate --option eval-unforce false --eval --strict -E "$expr")
-    for backend in "${backends[@]}"; do
-        out=$(NIX_UNFORCE_BACKEND=$backend nix-instantiate \
-            --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict -E "$expr")
-        [[ $out == "$expected" ]] \
-            || fail "schedule for K=$k (backend $backend): got '$out', expected '$expected'"
-    done
-done
-
-# The owner closure (the default) promotes nothing that markers' plain
-# closure would not: markers' candidates include every true owner, so an
-# extra promotion would mean a misattributed owner. The owner-check dial
-# (NIX_UNFORCE_DEBUG=owner-check) computes both after every job and reports on
-# stderr. It is the runtime backstop for ownerOf/candidate exactness.
-for f in *.nix; do
-    [[ $f == set.nix || $f == nested.nix ]] && continue
-    out=$(NIX_UNFORCE_DEBUG=owner-check \
-        run "$f" --option eval-unforce true --option eval-unforce-batch-size 0)
-    [[ $out != *"unforce owner check"* ]] || fail "$f (owner check): $out"
-    expected=$(run "$f" --option eval-unforce false)
+    out=$(nix-instantiate \
+        --option eval-unforce true --option eval-unforce-batch-size 0 --eval --strict -E "$expr")
     [[ $out == "$expected" ]] \
-        || fail "$f (owner check): got '$out', expected '$expected'"
+        || fail "schedule for K=$k: got '$out', expected '$expected'"
 done
 
 # A young cell that a target owns, forced by the driver (here the JSON
