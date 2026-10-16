@@ -347,9 +347,9 @@ struct StaticEvalSymbols
 
 /**
  * PROTOTYPE (job regions). A bump region holding what one job (an outermost
- * unforce scope) allocates, released wholesale when the job ends. In
- * "values" mode only `Value` cells live here; in "all" mode every evaluator
- * object does, and each `Env` carries a size header so it can be copied out.
+ * unforce scope) allocates, released wholesale when the job ends. Every
+ * evaluator object lives here while the region is active, and each `Env`
+ * carries a size header so it can be copied out.
  * Single-threaded evaluation only.
  */
 void evalRegionNoteBigEnv(const void * env, size_t size);
@@ -361,9 +361,6 @@ struct EvalRegion
     char * end = nullptr;
     /** Allocate elsewhere for now: the data outlives the job. */
     bool paused = false;
-    bool allTypes = false;
-    /** The memory was used by an earlier job, so allocations must zero it. */
-    bool dirty = false;
     /** Bytes of string data allocated here, which the producer closure
         never walks: they do not count towards its step budget. */
     size_t stringBytes = 0;
@@ -417,8 +414,6 @@ struct EvalRegion
             throw std::bad_alloc();
         auto p = cur;
         cur += n;
-        if (dirty)
-            memset(p, 0, n);
         return p;
     }
 };

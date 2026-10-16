@@ -92,22 +92,19 @@ namespace {
 struct Settings
 {
     /* DECIDED winners (shipping): an all-types bump region holding the owner
-       timeline, promoting a cell forced in two jobs, nominating consumers,
-       and keeping printers' `seen` sets exact. The owner timeline closes each
-       job's promotion set under "producer-of" (`decideJob`), which makes
-       promotion pointer-equality-safe: a promoted cell keeps the address its
-       holders already compared, so eqValues' `&v1 == &v2` short-cut still
-       holds. At the 64 MiB default batch this is byte-identical to base,
-       ~1.12x its instructions, with 0 pointer-equality flips on 3491 real
-       Nixpkgs comparisons (notes/reviews/owner-timeline-perf-and-scale-freq.md).
-       Previously NIX_UNFORCE_REGION, _IDENTITY, _PROMOTE, _OWNER_CONSUMERS,
-       _SEEN, _REUSE, _STUB. */
-    std::string region = "all";
-    std::string identity = "owners";
+       timeline (both now hardcoded, not fields), promoting a cell forced in
+       two jobs, nominating consumers, and keeping printers' `seen` sets exact.
+       The owner timeline closes each job's promotion set under "producer-of"
+       (`decideJob`), which makes promotion pointer-equality-safe: a promoted
+       cell keeps the address its holders already compared, so eqValues'
+       `&v1 == &v2` short-cut still holds. At the 64 MiB default batch this is
+       byte-identical to base, ~1.12x its instructions, with 0 pointer-equality
+       flips on 3491 real Nixpkgs comparisons
+       (notes/reviews/owner-timeline-perf-and-scale-freq.md).
+       Previously NIX_UNFORCE_PROMOTE, _OWNER_CONSUMERS, _SEEN. */
     uint32_t promoteAfter = 2;
     bool ownerConsumers = true;
     bool keepSeen = true;
-    bool reuse = false;
     /* 0 derives these from the batch size (`eval-unforce-batch-size`):
        countsCap = max(256 Ki, batch / 256); ownerBudget and copyLimit =
        max(batch / 4, 4 MiB). Previously NIX_UNFORCE_COUNTS_CAP,
@@ -686,7 +683,7 @@ static const Value * ownerCell(uint32_t o)
 static void openOwners(EvalState & state)
 {
     auto & cfg = unforceSettings();
-    ownersOn = cfg.identity == "owners" && evalRegion.cur;
+    ownersOn = evalRegion.cur != nullptr;
     ownersOverflowed = false;
     ownerConsumersOn = cfg.ownerConsumers;
     ownerConsumers.clear();
@@ -758,9 +755,6 @@ void hookCollector()
     (void) hooked;
 #endif
 }
-
-/* With the `reuse` experiment, the region the next job reuses. */
-static char * regionSpare = nullptr;
 
 static size_t pageSize()
 {
@@ -850,37 +844,26 @@ static void leaveKeptMapping()
     keptStart = keptFloor = keptEnd = nullptr;
 }
 
-void openRegion(bool allTypes)
+void openRegion()
 {
     hookCollector();
     if (keptStart) {
         /* Continue above the kept jobs while at least half a region is left
-           (with the tripwire, released memory is not reused). */
+           (with the tripwire, released memory is not reused). The memory
+           released above the floor is zero pages, and the floor's own page is
+           zeroed above it (`releaseRegion`). */
         if (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
             evalRegion.base = evalRegion.cur = keptFloor;
             evalRegion.end = keptEnd;
-            evalRegion.allTypes = allTypes;
             useEnvSizeTable(keptStart);
-            /* Released above the floor as zero pages, and the floor's own
-               page zeroed above it (`releaseRegion`). */
-            evalRegion.dirty = false;
             return;
         }
         leaveKeptMapping();
     }
-    auto & spare = regionSpare;
-    bool dirty = false;
-    if (unforceSettings().reuse && spare)
-        dirty = true;
-    else
-        spare = (char *) mapArena(regionSize());
-    evalRegion.base = evalRegion.cur = spare;
+    auto base = (char *) mapArena(regionSize());
+    evalRegion.base = evalRegion.cur = base;
     evalRegion.end = evalRegion.base + regionSize();
-    evalRegion.allTypes = allTypes;
-    evalRegion.dirty = dirty;
-    useEnvSizeTable(spare);
-    if (!unforceSettings().reuse)
-        spare = nullptr;
+    useEnvSizeTable(base);
 }
 
 /* With NIX_UNFORCE_DEBUG=verify, check the invariant that makes releasing a
@@ -986,8 +969,6 @@ void releaseRegion()
             madvise(up, pageUp(cur) - up, MADV_DONTNEED);
         return;
     }
-    if (unforceSettings().reuse)
-        return;
     if (unforceDebug().tripwire) {
         mprotect(base, regionSize(), PROT_NONE);
         madvise(base, regionSize(), MADV_DONTNEED);
@@ -1015,8 +996,6 @@ static void retainRegion()
         keptFloor = cur;
         keptEnd = evalRegion.end;
     }
-    if (regionSpare == base)
-        regionSpare = nullptr;
     evalRegion = EvalRegion{};
 }
 
@@ -1840,7 +1819,6 @@ std::vector<bool> decideJob(
     EvalState & state,
     size_t mark,
     const JobTargets & targets,
-    bool canCopy,
     std::unordered_map<const Value *, uint32_t> & counts,
     const YoungSpace & young,
     const CellClock & clock,
@@ -1870,14 +1848,14 @@ std::vector<bool> decideJob(
                 copy(i);
     };
 
-    if (canCopy && cfg.promoteAfter)
+    if (cfg.promoteAfter)
         promote = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
 
     /* Cells reported to an `UnforceSeen` (holding a container a printer
        printed, or walked by `forceValueDeep` for a printer that prints
        later) are nominated like counted ones, so that what they hold stays
        forced and keeps its identity for the rest of the print. */
-    if (printed && canCopy)
+    if (printed)
         for (size_t i = 0; i < targets.size(); ++i)
             if (!promote[i] && (*printed)[i]) {
                 promote[i] = true;
@@ -1893,7 +1871,7 @@ std::vector<bool> decideJob(
     }
 
     bool any = std::find(promote.begin(), promote.end(), true) != promote.end();
-    if (!any || !canCopy) {
+    if (!any) {
         copyPromoted();
         return promote;
     }
@@ -2079,7 +2057,7 @@ std::string unforceStatsJSON()
         stats.seenKept,
         stats.keptJobs,
         stats.keptJobBytes,
-        unforceSettings().identity,
+        "owners",
         stats.ownerLookups + stats.ownerChanges,
         stats.ownerChanges,
         stats.ownerSegsPeak,
@@ -2559,8 +2537,8 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
        frames the caller enters from now on lie below it, its own locals at
        or above. */
     scopeStackMarks.push_back((const char *) (stackMark ? stackMark : __builtin_dwarf_cfa()));
-    if (!isolationDepth++ && !unforceSettings().region.empty()) {
-        openRegion(unforceSettings().region == "all");
+    if (!isolationDepth++) {
+        openRegion();
         openOwners(*this);
     }
     return undoLog.size();
@@ -2600,7 +2578,6 @@ void EvalState::endUnforceScope(size_t mark)
                 *this,
                 mark,
                 *jt,
-                evalRegion.allTypes,
                 forceCounts,
                 YoungSpace{},
                 CellClock{},

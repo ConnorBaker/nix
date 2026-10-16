@@ -18,7 +18,7 @@ inline void * EvalMemory::allocBytes(size_t n)
 #if !NIX_USE_BOEHMGC
     /* Unforcing (the only user of evalRegion) is never active on a Boehm
        build, so the region check is compiled out entirely there. */
-    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]]
+    if (evalRegion.active()) [[unlikely]]
         return evalRegion.alloc(n);
 #endif
     void * p;
@@ -97,11 +97,11 @@ Env & EvalMemory::allocEnv(size_t size)
     Env * env;
 
 #if !NIX_USE_BOEHMGC
-    /* In an all-types region, record each Env's size, so that it can be
+    /* While the region is active, record each Env's size, so that it can be
        copied out of the region: in the bump region's side table. Unforcing
        (the only user of evalRegion) is never active on a Boehm build, so
        this is compiled out there. */
-    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]] {
+    if (evalRegion.active()) [[unlikely]] {
         auto p = evalRegion.bump(sizeof(Env) + size * sizeof(Value *));
         evalRegion.noteEnvSize(p, size);
         return *(Env *) p;

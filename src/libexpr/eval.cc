@@ -93,7 +93,7 @@ StringData & StringData::alloc(EvalMemory & mem, size_t size)
 #if !NIX_USE_BOEHMGC
     /* Unforcing (the only user of evalRegion) is never active on a Boehm
        build, so this region check is compiled out there. */
-    if (evalRegion.allTypes && evalRegion.active()) [[unlikely]]
+    if (evalRegion.active()) [[unlikely]]
         evalRegion.stringBytes += size;
 #endif
     void * t = mem.allocBytes<char, sizeof(StringData) + 1>(size);
