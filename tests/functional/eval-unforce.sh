@@ -151,24 +151,10 @@ for opts in off on batch0; do
     [[ ! -s $out ]] || fail "nix-instantiate --strict ($opts) printed partial output: $(< "$out")"
 done
 
-# Promotion copies a list's element array once, however many promoted cells
-# hold that list: here 200 cells share one 50 000-element array, which is
-# 0.4 MB copied once and 80 MB copied per cell. With `--json`, which tracks
-# no «repeated» values: a printing job may keep its memory whole instead of
-# copying (`decideJob`).
-expr='let
-  S = { big = builtins.genList (i: i) 50000; };
-  ts = builtins.genList (i: { y = S.big; }) 200;
-in [ (builtins.seq ts true) (builtins.foldl'"'"' (a: t: builtins.seq (builtins.length t.y) a) true ts) ]'
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=1 nix-instantiate "${batch0[@]}" --eval --strict --json -E "$expr" 2>&1 >/dev/null)
-[[ $stats =~ promoted\ ([0-9]+).*copied\ ([0-9]+)\ MiB ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] >= 200 )) || fail "expected at least 200 promotions: $stats"
-(( BASH_REMATCH[2] < 16 )) || fail "a shared list array was copied per cell: $stats"
-
 # Running out of memory while deciding what to keep at the end of a batch is
 # fatal: a clear message, then abort(), before any value has changed.
 rc=0
-out=$(NIX_UNFORCE_FAIL_DECIDE=1 nix-instantiate "${batch0[@]}" --eval --strict \
+out=$(NIX_UNFORCE_DEBUG=fail-decide nix-instantiate "${batch0[@]}" --eval --strict \
     -E 'let s = { a = 1; }; in [ s.a s.a s.a ]' 2>&1) || rc=$?
 (( rc == 134 )) || fail "expected abort() (status 134), got $rc: $out"
 [[ $out == *"out of memory while deciding"*"--option eval-unforce false"* ]] \
@@ -190,41 +176,17 @@ out=$(NIX_UNFORCE_FAIL_DECIDE=1 nix-instantiate "${batch0[@]}" --eval --strict \
     echo '];'
     echo 'in builtins.seq zs [ (builtins.seq t600 true) (builtins.deepSeq ts (builtins.deepSeq zs true)) ]'
 } > "$TEST_ROOT/rounds.nix"
-# These budget checks exercise markers' walk, which the owner closure
-# replaces (NIX_UNFORCE_IDENTITY=markers keeps it for comparison); the owner
-# closure takes no rounds and has no budget (checked after each).
-stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix" 2>&1 >/dev/null)
-[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] <= 20 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
-(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
-[[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
-    || fail "rounds.nix: wrong output"
+# The owner closure (the default) takes no rounds and has no budget, however
+# deep the chain of producers rounds.nix builds.
 ownerStats() {
     local stats
-    stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$1" 2>&1 >/dev/null)
+    stats=$(NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${batch0[@]}" --eval --strict "$1" 2>&1 >/dev/null)
     [[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
     (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] == 0 )) || fail "$1: the owner closure walked: $stats"
 }
+[[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/rounds.nix") == '[ true true ]' ]] \
+    || fail "rounds.nix: wrong output"
 ownerStats "$TEST_ROOT/rounds.nix"
-
-# Rebuilding the force counts when they outgrow their cap keeps this job's
-# counts (review of markers v2, S2): each job here forces 3 000 fresh cells,
-# more than the cap of 1 000, and P. Dropping the whole map after every job
-# would keep P's count at 1, so P would never be promoted.
-expr='let
-  fib = n: if n < 2 then n else fib (n - 1) + fib (n - 2);
-  P = fib 15;
-  bigs = builtins.genList (k: builtins.genList (i: i) 3000) 10;
-  el = k: builtins.seq P (builtins.foldl'"'"' (a: x: builtins.seq x a) true (builtins.elemAt bigs k));
-in builtins.deepSeq (map builtins.length bigs) (builtins.genList el 10)'
-expected=$(nix-instantiate "${off[@]}" --eval --strict -E "$expr")
-stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr" 2>&1 >/dev/null)
-[[ $stats =~ jobs\ [0-9]+,\ logged\ [0-9]+,\ reverted\ [0-9]+,\ stubbed\ [0-9]+,\ promoted\ ([0-9]+).*counts\ resets\ ([0-9]+) ]] \
-    || fail "no unforce stats: $stats"
-(( BASH_REMATCH[2] >= 5 )) || fail "the force counts never outgrew their cap: $stats"
-(( BASH_REMATCH[1] >= 1 )) || fail "a cell forced in every job was never promoted: $stats"
-[[ $(NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch0[@]}" --eval --strict -E "$expr") == "$expected" ]] \
-    || fail "counts rebuilt: wrong output"
 
 # A walk is also charged for the width of what it scans (review of markers
 # v3, S1'): beside the chain of rounds.nix, one target holds a young
@@ -242,10 +204,6 @@ stats=$(NIX_UNFORCE_STATS=1 NIX_UNFORCE_COUNTS_CAP=1000 nix-instantiate "${batch
     echo '];'
     echo 'in builtins.seq old [ (builtins.seq t600 true) (builtins.seq big (builtins.deepSeq ts true)) ]'
 } > "$TEST_ROOT/wide.nix"
-stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix" 2>&1 >/dev/null)
-[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
-(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide.nix") == '[ true true ]' ]] \
     || fail "wide.nix: wrong output"
 ownerStats "$TEST_ROOT/wide.nix"
@@ -257,10 +215,6 @@ ownerStats "$TEST_ROOT/wide.nix"
 sed 's/^in builtins.seq old \[ (builtins.seq t600 true) (builtins.seq big /  dbl = s: n: if n == 0 then s else dbl (s + s) (n - 1);\n  pad = builtins.stringLength (dbl "x" 25);\n&(builtins.seq pad /; s/true)) ]$/true))) ]/' \
     "$TEST_ROOT/wide.nix" > "$TEST_ROOT/wide-pad.nix"
 grep -q 'seq pad' "$TEST_ROOT/wide-pad.nix" || fail "wide-pad.nix: no padding"
-stats=$(NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_STATS=1 NIX_UNFORCE_PROMOTE=2 nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix" 2>&1 >/dev/null)
-[[ $stats =~ rounds\ ([0-9]+).*over\ budget\ ([0-9]+) ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] <= 200 )) || fail "the closure took ${BASH_REMATCH[1]} rounds in one job: $stats"
-(( BASH_REMATCH[2] == 1 )) || fail "the closure did not run out of budget: $stats"
 [[ $(nix-instantiate "${batch0[@]}" --eval --strict "$TEST_ROOT/wide-pad.nix") == '[ true true ]' ]] \
     || fail "wide-pad.nix: wrong output"
 ownerStats "$TEST_ROOT/wide-pad.nix"

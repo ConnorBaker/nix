@@ -43,14 +43,12 @@ for f in rep*.nix e-*.nix attr*.nix ae-*.nix; do
         if [[ $mode == instantiate && $expected != *'«repeated»'* ]]; then
             fail "$f: prints no «repeated» without unforcing: $expected"
         fi
-        for k in 0 1 2 3 4 5; do
-            out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_PROMOTE=$k run "$mode" "$f" "${on[@]}")
-            [[ $out == "$expected" ]] \
-                || fail "$f ($mode, promotion after $k forces): got '$out', expected '$expected'"
-        done
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_CLOSURE_CHECK=1 run "$mode" "$f" "${on[@]}")
-        [[ $out != *"unforce check"* ]] || fail "$f ($mode): $out"
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_OWNER_CHECK=1 run "$mode" "$f" "${on[@]}")
+        out=$(NIX_UNFORCE_BACKEND=bump run "$mode" "$f" "${on[@]}")
+        [[ $out == "$expected" ]] \
+            || fail "$f ($mode): got '$out', expected '$expected'"
+        # The owner closure's cross-check: it is the runtime backstop for
+        # ownerOf/candidate exactness (NIX_UNFORCE_DEBUG=owner-check).
+        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_DEBUG=owner-check run "$mode" "$f" "${on[@]}")
         [[ $out != *"unforce owner check"* ]] || fail "$f ($mode): $out"
     done
 done
@@ -63,29 +61,8 @@ for mode in instantiate eval; do
     [[ $out == "$expected" ]] || fail "attr-desc-batch.nix ($mode, defaults): got '$out', expected '$expected'"
 done
 
-# A job whose decision would not keep a printed container (here the closure
-# falls back to reverting) keeps all its memory instead, so that the
-# container is still «repeated» later (review of markers v3, S4).
-for f in rep.nix attr-desc.nix e-X01-00000.nix; do
-    expected=$(run instantiate "$f" --option eval-unforce false)
-    for k in 0 2; do
-        out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_UNFORCE_PROMOTE=$k NIX_UNFORCE_WALK_BUDGET_BASE=0 \
-            NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert run instantiate "$f" "${on[@]}")
-        [[ $out == "$expected" ]] || fail "$f (revert fallback, promotion after $k forces): got '$out', expected '$expected'"
-    done
-done
-stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_IDENTITY=markers NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/stdout NIX_UNFORCE_WALK_BUDGET_BASE=0 \
-    NIX_UNFORCE_WALK_BUDGET_PER_KIB=0 NIX_UNFORCE_WALK_FALLBACK=revert nix-instantiate "${on[@]}" --eval --strict rep.nix 2>/dev/null)
-[[ $stats =~ \"keptJobs\":\ *([0-9]+) ]] || fail "no unforce stats: $stats"
-(( BASH_REMATCH[1] >= 1 )) || fail "rep.nix (revert fallback): no job was kept whole: $stats"
-
-# Negative control: forgetting what a job printed (NIX_UNFORCE_SEEN=0, as
-# before) prints shared values in full again.
-out=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_SEEN=0 run instantiate rep.nix "${on[@]}")
-[[ $out == '[ { a = 1; } { a = 1; } ]' ]] || fail "NIX_UNFORCE_SEEN=0 no longer forgets: $out"
-
 # What was kept is counted.
-stats=$(NIX_UNFORCE_BACKEND=bump NIX_UNFORCE_STATS=1 nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
+stats=$(NIX_UNFORCE_BACKEND=bump NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
 [[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+)\ \(([0-9]+)\ KiB\)$ ]] \
     || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "rep.nix: nothing nominated: $stats"

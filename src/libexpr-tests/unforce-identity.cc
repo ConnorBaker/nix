@@ -1,8 +1,8 @@
 /* PROTOTYPE (unforce): promotion must not break pointer identity, which
    `eqValues` short-circuits on. These tests drive jobs (outermost unforce
    scopes) by hand, around events that change the heap between jobs. With
-   the default NIX_UNFORCE_PROMOTE (2), a cell forced in two jobs is
-   nominated for promotion, and the producer closure (`decideJob` in
+   the shipping promotion threshold (a cell forced in two jobs is
+   nominated), the producer closure (`decideJob` in
    unforce.cc) must keep what it holds consistent. Ported from the epoch
    branch as identity regressions: they assert identity, not a policy. */
 

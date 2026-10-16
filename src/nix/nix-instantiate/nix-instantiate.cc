@@ -144,8 +144,8 @@ enum OutputKind { okPlain, okRaw, okXML, okJSON };
  * `printAmbiguous` exactly as without unforcing. Peak memory is what the
  * printed value needs (as without unforcing) plus a batch.
  *
- * Where walked cells cannot be kept (the mimalloc backend, or
- * NIX_UNFORCE_SEEN=0), each batch's elements are printed before it ends, into
+ * Where walked cells cannot be kept (the mimalloc backend), each batch's
+ * elements are printed before it ends, into
  * buffers assembled at the end in printing order; a value shared between
  * batches then prints in full instead of as «repeated»
  * (`printStrictUnforcedBuffered`).

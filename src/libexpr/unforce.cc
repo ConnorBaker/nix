@@ -85,87 +85,56 @@ void * BumpArena::refill(size_t n)
 
 namespace {
 
-/* Whether unforcing happens at all is the `eval-unforce` setting; these
-   NIX_UNFORCE_* variables are for experiments and debugging, and default to
-   the measured-best choices. */
+/* Whether unforcing happens at all is the `eval-unforce` setting, and
+   `eval-unforce-batch-size` sizes its batches; those two are the only user
+   settings. The fields below were experiments whose measured winners are now
+   hardcoded. A handful of NIX_UNFORCE_* variables remain, all HELD for the
+   separate mimalloc investigation (backend, markers, the walk budget and
+   fallback), plus the single hidden developer dial `NIX_UNFORCE_DEBUG` (see
+   `DebugDial`). */
 struct Settings
 {
-    /* "": log every forced cell, revert all, let Boehm reclaim.
-       "values": Values in a job region. "all": everything in it. */
-    std::string region = getEnv("NIX_UNFORCE_REGION").value_or("all");
-    bool tripwire = getEnv("NIX_UNFORCE_TRIPWIRE").value_or("0") != "0";
-    bool stubs = getEnv("NIX_UNFORCE_STUB").value_or("0") != "0";
-    /* Promote a cell forced in this many jobs (0: never). Needs "all".
+    /* DECIDED winners (shipping): an all-types bump region holding the owner
+       timeline, promoting a cell forced in two jobs, nominating consumers,
+       and keeping printers' `seen` sets exact. The owner timeline closes each
+       job's promotion set under "producer-of" (`decideJob`), which makes
+       promotion pointer-equality-safe: a promoted cell keeps the address its
+       holders already compared, so eqValues' `&v1 == &v2` short-cut still
+       holds. At the 64 MiB default batch this is byte-identical to base,
+       ~1.12x its instructions, with 0 pointer-equality flips on 3491 real
+       Nixpkgs comparisons (notes/reviews/owner-timeline-perf-and-scale-freq.md).
+       Previously NIX_UNFORCE_REGION, _IDENTITY, _PROMOTE, _OWNER_CONSUMERS,
+       _SEEN, _REUSE, _STUB. */
+    std::string region = "all";
+    std::string identity = "owners";
+    uint32_t promoteAfter = 2;
+    bool ownerConsumers = true;
+    bool keepSeen = true;
+    bool reuse = false;
+    bool stubs = false;
+    /* 0 derives these from the batch size (`eval-unforce-batch-size`):
+       countsCap = max(256 Ki, batch / 256); ownerBudget and copyLimit =
+       max(batch / 4, 4 MiB). Previously NIX_UNFORCE_COUNTS_CAP,
+       _OWNER_BUDGET, _COPY_LIMIT. */
+    uint64_t countsCap = 0;
+    size_t ownerBudget = 0;
+    size_t copyLimit = 0;
 
-       SHIPPING DEFAULT: 2, paired with the owner timeline (identity="owners",
-       below). The owner timeline closes each job's promotion set under
-       "producer-of" (see `decideJob`), which makes promotion
-       pointer-equality-safe: a promoted cell keeps the address its holders
-       already compared, so eqValues' `&v1 == &v2` short-cut (eval.cc, `case
-       nFunction`) still holds. At the 64 MiB default batch owner+promote2 is
-       byte-identical to base, ~1.12x its instructions, and beats both
-       revert-only and the lean promote=2 prototype; 0 pointer-equality flips
-       on 3491 real Nixpkgs comparisons. See
-       notes/reviews/owner-timeline-perf-and-scale-freq.md (Q1, Q2).
+    /* The statistics summary is requested with NIX_SHOW_STATS, the same dial
+       as the evaluator's own statistics (whose JSON already carries the
+       unforce numbers); there is no separate NIX_UNFORCE_STATS. */
+    bool stats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
 
-       NIX_UNFORCE_PROMOTE=0 is the REVERT-ONLY FALLBACK: it never copies, so
-       addresses are trivially preserved, but it re-forces shared cells every
-       job (~37x base instructions on Nixpkgs at this batch). The lean
-       prototype line (vibe-coding/unforce-master) has no owner timeline and
-       so defaults to 0 to stay pointer-equality-safe. */
-    uint32_t promoteAfter = std::stoul(getEnv("NIX_UNFORCE_PROMOTE").value_or("2"));
-    bool stats = getEnv("NIX_UNFORCE_STATS").value_or("0") != "0";
-    /* Keep one region mapped across jobs and zero on allocation, instead of
-       mapping fresh (kernel-zeroed) pages for every job. */
-    bool reuse = getEnv("NIX_UNFORCE_REUSE").value_or("0") != "0";
-    /* "bump": one flat region per outermost scope. "mimalloc": a mimalloc
-       heap per scope, in an exclusive arena; every scope frees its memory
-       when it ends, and only the outermost one promotes. */
+    /* HELD for the mimalloc investigation — do not remove yet.
+       backend: "bump" (one flat region per outermost scope) or "mimalloc" (a
+       mimalloc heap per scope, in an exclusive arena). markers: how a job's
+       promotion set is closed under "producer-of": "on" or "off". The walk
+       budget and fallback bound and steer the markers closure. */
     std::string backend = getEnv("NIX_UNFORCE_BACKEND").value_or("bump");
-    /* How a job's promotion set is closed under "producer-of" (see
-       `decideJob`): "on" (promote the producers), "off" (counts only, the
-       old behaviour; for negative controls). */
     std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
-    /* The closure's step budget per job (`decideJob`): a fixed allowance
-       plus a number of steps per KiB the job allocated. Dev overrides. The
-       comparison's realistic workloads take at most 57 steps per KiB in a
-       job (`nix search`), and 1 M steps is under 0.2 G instructions. */
     uint64_t walkBudgetBase = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_BASE").value_or("1000000"));
     uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("256"));
-    /* What a job whose closure runs out of budget does: "promote" every
-       target, or "revert" every target. Both keep identity. */
     std::string walkFallback = getEnv("NIX_UNFORCE_WALK_FALLBACK").value_or("promote");
-    /* Most entries the force counts may hold (`countTargets`); 0: the
-       default, max(256 Ki, eval-unforce-batch-size / 256). Dev override. */
-    uint64_t countsCap = std::stoull(getEnv("NIX_UNFORCE_COUNTS_CAP").value_or("0"));
-    /* Whether printers' `seen` sets are kept exact across jobs
-       (`UnforceSeen`). Dev override, for measurements and as a negative
-       control: "0" restores forgetting them. */
-    bool keepSeen = getEnv("NIX_UNFORCE_SEEN").value_or("1") != "0";
-    /* How the closure finds a young object's producer (bump backend):
-       "owners" (the owner timeline: exact, no walk) or "markers" (the
-       interval-pruned walks). The mimalloc backend always uses markers. */
-    std::string identity = getEnv("NIX_UNFORCE_IDENTITY").value_or("owners");
-    /* Dev: with "owners", also compute the markers closure and report
-       targets that the owner closure promotes and markers does not (there
-       must be none: markers' candidates include every true owner). */
-    bool ownerCheck = getEnv("NIX_UNFORCE_OWNER_CHECK").value_or("0") != "0";
-    /* With "owners": also nominate the consumers of promoted targets (a
-       target that forced a young cell another target owns), as markers'
-       candidate test does as a side effect. A heuristic for CPU (a consumer
-       of a hot producer is usually forced again); the closure keeps
-       identity either way. "0" turns it off. */
-    bool ownerConsumers = getEnv("NIX_UNFORCE_OWNER_CONSUMERS").value_or("1") != "0";
-    /* With "owners": the most a job's timeline may hold (segments and
-       consumer pairs), in bytes; 0 (the default) means a quarter of the
-       batch size, and at least 4 MiB. A job that needs more is kept whole.
-       Small values are for tests. */
-    size_t ownerBudget = string2Int<size_t>(getEnv("NIX_UNFORCE_OWNER_BUDGET").value_or("0")).value_or(0);
-    /* With "owners": the most of the young memory one job's decision may
-       copy (Evac(S), in bytes); 0 (the default) means a quarter of the
-       batch size, and at least 4 MiB. A job whose Evac(S) is larger is kept
-       whole instead. */
-    size_t copyLimit = string2Int<size_t>(getEnv("NIX_UNFORCE_COPY_LIMIT").value_or("0")).value_or(0);
 };
 
 const Settings & unforceSettings()
@@ -174,21 +143,69 @@ const Settings & unforceSettings()
     return s;
 }
 
-/* Whether the per-force statistics counters are ever observed. They feed
-   both the `NIX_UNFORCE_STATS` end-of-process summary and the
-   `NIX_SHOW_STATS` JSON dump, and only those two consumers read them, so
-   when neither is requested the hot in-job force path skips them entirely.
-   The env is read directly (not via Counter::enabled) to avoid a cross-TU
-   static-initialisation-order dependency. */
-static const bool statsObserved =
-    unforceSettings().stats || getEnv("NIX_SHOW_STATS").value_or("0") != "0";
+/* The single hidden developer dial. NIX_UNFORCE_DEBUG is a comma-separated
+   list of flags, each enabling one cross-check or trace that used to have its
+   own NIX_UNFORCE_* variable; all default off (unset means none). The
+   oracle/cross-check logic (owner-check, closure-check) is the only runtime
+   backstop for `ownerOf`/`candidate` exactness, so it is kept here, just
+   behind this dial and default-off. */
+struct DebugDial
+{
+    bool trace = false;        /* was NIX_UNFORCE_DEBUG: select tracing + registry */
+    bool verify = false;       /* was NIX_UNFORCE_VERIFY */
+    bool verifyDump = false;   /* was NIX_UNFORCE_VERIFY_DUMP */
+    bool tripwire = false;     /* was NIX_UNFORCE_TRIPWIRE */
+    bool ownerCheck = false;   /* was NIX_UNFORCE_OWNER_CHECK */
+    bool closureCheck = false; /* was NIX_UNFORCE_CLOSURE_CHECK */
+    bool failDecide = false;   /* was NIX_UNFORCE_FAIL_DECIDE */
+};
+
+const DebugDial & unforceDebug()
+{
+    static const DebugDial d = [] {
+        DebugDial r;
+        auto spec = getEnv("NIX_UNFORCE_DEBUG").value_or("");
+        for (size_t i = 0; i < spec.size();) {
+            auto j = spec.find(',', i);
+            if (j == std::string::npos)
+                j = spec.size();
+            auto tok = spec.substr(i, j - i);
+            i = j + 1;
+            if (tok.empty())
+                continue;
+            else if (tok == "trace")
+                r.trace = true;
+            else if (tok == "verify")
+                r.verify = true;
+            else if (tok == "verify-dump")
+                r.verifyDump = true;
+            else if (tok == "tripwire")
+                r.tripwire = true;
+            else if (tok == "owner-check")
+                r.ownerCheck = true;
+            else if (tok == "closure-check")
+                r.closureCheck = true;
+            else if (tok == "fail-decide")
+                r.failDecide = true;
+            else
+                std::cerr << fmt("unforce: unknown NIX_UNFORCE_DEBUG flag '%s'\n", tok);
+        }
+        return r;
+    }();
+    return d;
+}
+
+/* Whether the per-force statistics counters are ever observed: only the
+   NIX_SHOW_STATS summary and JSON dump read them, so when stats are off the
+   hot in-job force path skips them entirely. */
+static const bool statsObserved = unforceSettings().stats;
 
 /* The tripwire keeps every released region reserved, so it uses smaller
    ones: 64 GiB regions would exhaust a 48-bit address space after about
    4000 jobs. */
 size_t regionSize()
 {
-    return unforceSettings().tripwire ? size_t(4) << 30 : size_t(64) << 30;
+    return unforceDebug().tripwire ? size_t(4) << 30 : size_t(64) << 30;
 }
 
 struct Stats
@@ -233,7 +250,7 @@ struct Stats
        segments one job had, owner lookups at job ends (one per copied or
        marked identity-bearing object), jobs whose closure added promotions,
        and consumers nominated. `ownerCheckExtra`: targets the owner closure
-       promoted that the markers closure did not (NIX_UNFORCE_OWNER_CHECK;
+       promoted that the markers closure did not (NIX_UNFORCE_DEBUG=owner-check;
        must stay 0), and `ownerCheckFewer`, the converse (the markers walk's
        false positives). */
     size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
@@ -269,7 +286,7 @@ bool nested()
     return unforceSettings().backend == "mimalloc" && !unforceSettings().region.empty();
 }
 
-/* With NIX_UNFORCE_STATS: print a summary of all scopes when the process
+/* With NIX_SHOW_STATS: print a summary of all scopes when the process
    exits. */
 static void printStatsAtExit()
 {
@@ -379,7 +396,7 @@ static uint64_t unforceClock()
 static thread_local std::vector<size_t> activeForces;
 
 /* ---------------------------------------------------------------------------
-   The owner timeline (bump backend, NIX_UNFORCE_IDENTITY=owners).
+   The owner timeline (bump backend, identity = owners).
 
    owner(x) of a young object x (MARKERS.md §1.1, the policy comment below)
    is the first old cell on its creator chain: the target whose re-force is
@@ -604,7 +621,7 @@ static void clearOpens()
 }
 
 /* (consumer, producer) owner pairs: the target that was the owner when a
-   young cell of another target was forced (`NIX_UNFORCE_OWNER_CONSUMERS`),
+   young cell of another target was forced (the `ownerConsumers` winner),
    each once. Open addressing; `empty` marks a free slot (no pair has the
    driver as consumer). */
 struct PairSet
@@ -865,7 +882,7 @@ void hookCollector()
 #endif
 }
 
-/* With NIX_UNFORCE_REUSE, the region the next job reuses. */
+/* With the `reuse` experiment, the region the next job reuses. */
 static char * regionSpare = nullptr;
 
 static size_t pageSize()
@@ -965,7 +982,7 @@ void openRegion(bool allTypes)
     if (keptStart) {
         /* Continue above the kept jobs while at least half a region is left
            (with the tripwire, released memory is not reused). */
-        if (!unforceSettings().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
+        if (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
             evalRegion.base = evalRegion.cur = keptFloor;
             evalRegion.end = keptEnd;
             evalRegion.allTypes = allTypes;
@@ -992,7 +1009,7 @@ void openRegion(bool allTypes)
         spare = nullptr;
 }
 
-/* With NIX_UNFORCE_VERIFY, check the invariant that makes releasing a
+/* With NIX_UNFORCE_DEBUG=verify, check the invariant that makes releasing a
    region safe: no live object outside it still points into it. Every live
    mimalloc block is scanned word by word, so with Boehm disabled (and
    without NIX_NOGC_BUMP) this covers all long-lived evaluator objects; it is
@@ -1049,7 +1066,7 @@ void verifyNoEscapes()
                             (uintptr_t) block,
                             size,
                             i);
-                        if (getenv("NIX_UNFORCE_VERIFY_DUMP")) {
+                        if (unforceDebug().verifyDump) {
                             std::string line;
                             for (size_t j = 0; j < std::min<size_t>(size / 8, 40); ++j)
                                 line += fmt(" %016x", words[j]);
@@ -1079,7 +1096,7 @@ void verifyNoEscapes()
    escape faults instead of reading reused memory. */
 void releaseRegion()
 {
-    if (getenv("NIX_UNFORCE_VERIFY"))
+    if (unforceDebug().verify)
         verifyNoEscapes();
     auto base = evalRegion.base;
     auto cur = evalRegion.cur;
@@ -1098,7 +1115,7 @@ void releaseRegion()
     }
     if (unforceSettings().reuse)
         return;
-    if (unforceSettings().tripwire) {
+    if (unforceDebug().tripwire) {
         mprotect(base, regionSize(), PROT_NONE);
         madvise(base, regionSize(), MADV_DONTNEED);
     } else
@@ -1431,9 +1448,9 @@ struct Stubber
     {
         auto res = state.allocValue();
         res->mkApp(selector(name), source);
-        if (getenv("NIX_UNFORCE_DEBUG"))
+        if (unforceDebug().trace)
             selectRegistry[res] = {std::string(state.symbols[name]), source};
-        if (getenv("NIX_UNFORCE_DEBUG")) {
+        if (unforceDebug().trace) {
             std::set<const Value *> seen{res};
             size_t depth = 0;
             for (auto v = source; v; ++depth) {
@@ -1607,7 +1624,7 @@ struct Stubber
    Premises: A1–A4 of the review (every write to old memory is logged;
    old memory allocated during a job, i.e. fileEvalCache cells and C-API
    objects, is inert; no escapes; deterministic evaluation), and exceptions
-   carry no evaluator values. Derivation stubs (NIX_UNFORCE_STUB) change
+   carry no evaluator values. Derivation stubs (the `stubs` experiment) change
    identity by construction and are not covered. With the mimalloc backend
    only the outermost scope promotes (nested scopes revert everything), so
    the relogging of promoted cells into an enclosing scope cannot break OC.
@@ -1994,7 +2011,7 @@ struct Closure
     static constexpr size_t pendingCap = size_t(1) << 20;
     /* Whether `mark` added an object some walk reached. */
     bool reachedNew = false;
-    /* For the check (NIX_UNFORCE_CLOSURE_CHECK): no memos, and every
+    /* For the check (NIX_UNFORCE_DEBUG=closure-check): no memos, and every
        promotion starts another round. */
     bool memos = true;
     /* Steps taken in this job, and how many it may take. */
@@ -2283,12 +2300,6 @@ struct Closure
     }
 };
 
-/* Dev: compare every closure with a plain recomputation (slow). */
-static const bool checkClosure = getEnv("NIX_UNFORCE_CLOSURE_CHECK").value_or("0") != "0";
-
-/* For tests of the fatal path: fail the decision's allocations. */
-static const bool failDecide = getEnv("NIX_UNFORCE_FAIL_DECIDE").value_or("0") != "0";
-
 /* The closure's rounds. Each round walks the reverted targets in start
    order and promotes a candidate as soon as it is found: `join(i)` adds
    target i's R(c) to Evac(S) (`mark`, or a copy that marks what it
@@ -2341,7 +2352,7 @@ using Reported = std::vector<bool>;
    The map's cap. So that the counts do not grow with the length of a
    traversal (epoch v3 review S3: about 50 bytes per distinct target, never
    erased), when counting this job's targets would take the map past
-   max(256 Ki, batch size / 256) entries (NIX_UNFORCE_COUNTS_CAP), it is
+   max(256 Ki, batch size / 256) entries (the force-counts cap), it is
    first rebuilt from this job's targets: the counts of cells this job did
    not force are forgotten, so it never holds more than max(cap, this job's
    targets). Dropping the whole map instead would drop this job's counts as
@@ -2563,7 +2574,7 @@ std::vector<bool> decideJob(
         return promote;
     }
 
-    if (failDecide)
+    if (unforceDebug().failDecide)
         throw std::bad_alloc();
 
     /* The owner timeline ran out of budget: keep the job whole, which is
@@ -2645,7 +2656,7 @@ std::vector<bool> decideJob(
         stats.markerPromoted += oc.added;
         if (oc.added)
             stats.markerJobs++, stats.ownerJobs++;
-        if (cfg.ownerCheck) {
+        if (unforceDebug().ownerCheck) {
             ForceMarkers fm(state.undoLog, mark, jobEnd, targets);
             Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
             plain.memos = false;
@@ -2733,7 +2744,7 @@ std::vector<bool> decideJob(
         Closure<RegionMarks> closure{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
         decide(closure);
     }
-    if (checkClosure && !young.heap && markers) {
+    if (unforceDebug().closureCheck && !young.heap && markers) {
         /* Recompute the closure plainly (marking walks, no memos, a round
            after every promotion) and compare. */
         Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
@@ -3089,7 +3100,7 @@ void UnforceBatch::end()
 }
 
 #if NIX_UNFORCE_MIMALLOC
-/* With NIX_UNFORCE_VERIFY: before a scope heap is destroyed, check that no
+/* With NIX_UNFORCE_DEBUG=verify: before a scope heap is destroyed, check that no
    evaluator object outside it points into it. The enclosing scopes' heaps
    and the base arena hold evaluator objects only, so every word of them is
    checked against the dying heap. */
@@ -3246,7 +3257,7 @@ static void endHeapScope(EvalState & state, size_t mark)
     }
     stats.freedBytes += f.bytes;
     stats.regionPeak = std::max(stats.regionPeak, f.bytes);
-    if (getenv("NIX_UNFORCE_VERIFY"))
+    if (unforceDebug().verify)
         verifyHeapScope(f.heap);
     mi_heap_destroy((mi_heap_t *) f.heap);
 
@@ -3699,7 +3710,7 @@ void EvalState::endUnforceScope(size_t mark)
         closeOwners();
 
         /* The release: assigns, reverts and frees. Only derivation stubs
-           (NIX_UNFORCE_STUB, a dev mode) allocate here. */
+           (the `stubs` experiment, a dev mode) allocate here. */
         if (!keepWhole) {
             try {
                 Stubber stubber{*this, evacuator};
@@ -3718,7 +3729,7 @@ void EvalState::endUnforceScope(size_t mark)
                     if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
                         auto source = allocValue();
                         *source = pre;
-                        if (getenv("NIX_UNFORCE_DEBUG")) {
+                        if (unforceDebug().trace) {
                             auto n = target->attrs()->get(s.name);
                             sourceRegistry[source] =
                                 fmt("source for %s (job %d, pre-image %s)",
