@@ -95,7 +95,24 @@ struct Settings
     std::string region = getEnv("NIX_UNFORCE_REGION").value_or("all");
     bool tripwire = getEnv("NIX_UNFORCE_TRIPWIRE").value_or("0") != "0";
     bool stubs = getEnv("NIX_UNFORCE_STUB").value_or("0") != "0";
-    /* Promote a cell forced in this many jobs (0: never). Needs "all". */
+    /* Promote a cell forced in this many jobs (0: never). Needs "all".
+
+       SHIPPING DEFAULT: 2, paired with the owner timeline (identity="owners",
+       below). The owner timeline closes each job's promotion set under
+       "producer-of" (see `decideJob`), which makes promotion
+       pointer-equality-safe: a promoted cell keeps the address its holders
+       already compared, so eqValues' `&v1 == &v2` short-cut (eval.cc, `case
+       nFunction`) still holds. At the 64 MiB default batch owner+promote2 is
+       byte-identical to base, ~1.12x its instructions, and beats both
+       revert-only and the lean promote=2 prototype; 0 pointer-equality flips
+       on 3491 real Nixpkgs comparisons. See
+       notes/reviews/owner-timeline-perf-and-scale-freq.md (Q1, Q2).
+
+       NIX_UNFORCE_PROMOTE=0 is the REVERT-ONLY FALLBACK: it never copies, so
+       addresses are trivially preserved, but it re-forces shared cells every
+       job (~37x base instructions on Nixpkgs at this batch). The lean
+       prototype line (vibe-coding/unforce-master) has no owner timeline and
+       so defaults to 0 to stay pointer-equality-safe. */
     uint32_t promoteAfter = std::stoul(getEnv("NIX_UNFORCE_PROMOTE").value_or("2"));
     bool stats = getEnv("NIX_UNFORCE_STATS").value_or("0") != "0";
     /* Keep one region mapped across jobs and zero on allocation, instead of
