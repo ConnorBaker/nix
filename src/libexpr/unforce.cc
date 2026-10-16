@@ -89,8 +89,8 @@ namespace {
    `eval-unforce-batch-size` sizes its batches; those two are the only user
    settings. The fields below were experiments whose measured winners are now
    hardcoded. A handful of NIX_UNFORCE_* variables remain, all HELD for the
-   separate mimalloc investigation (backend, markers, the walk budget and
-   fallback), plus the single hidden developer dial `NIX_UNFORCE_DEBUG` (see
+   separate markers investigation (markers, the walk budget and fallback),
+   plus the single hidden developer dial `NIX_UNFORCE_DEBUG` (see
    `DebugDial`). */
 struct Settings
 {
@@ -125,12 +125,10 @@ struct Settings
        unforce numbers); there is no separate NIX_UNFORCE_STATS. */
     bool stats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
 
-    /* HELD for the mimalloc investigation — do not remove yet.
-       backend: "bump" (one flat region per outermost scope) or "mimalloc" (a
-       mimalloc heap per scope, in an exclusive arena). markers: how a job's
-       promotion set is closed under "producer-of": "on" or "off". The walk
-       budget and fallback bound and steer the markers closure. */
-    std::string backend = getEnv("NIX_UNFORCE_BACKEND").value_or("bump");
+    /* HELD for the markers investigation — do not remove yet.
+       markers: how a job's promotion set is closed under "producer-of":
+       "on" or "off". The walk budget and fallback bound and steer the
+       markers closure. */
     std::string markers = getEnv("NIX_UNFORCE_MARKERS").value_or("on");
     uint64_t walkBudgetBase = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_BASE").value_or("1000000"));
     uint64_t walkBudgetPerKiB = std::stoull(getEnv("NIX_UNFORCE_WALK_BUDGET_PER_KIB").value_or("256"));
@@ -281,11 +279,6 @@ static bool onThreadStack(const void * p)
    open. */
 thread_local bool clientCodeInJob = false;
 
-bool nested()
-{
-    return unforceSettings().backend == "mimalloc" && !unforceSettings().region.empty();
-}
-
 /* With NIX_SHOW_STATS: print a summary of all scopes when the process
    exits. */
 static void printStatsAtExit()
@@ -298,7 +291,7 @@ static void printStatsAtExit()
                  "rounds %d, steps %d, jobs %d, log %d KiB, peak %d KiB, over budget %d (%s), max job steps %d, "
                  "max steps per KiB %d; counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d, "
                  "inner-scope reverts %d; seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
-                 nested() ? "scopes" : "jobs",
+                 "jobs",
                  stats.jobs,
                  stats.logged,
                  stats.reverted,
@@ -334,61 +327,10 @@ static void printStatsAtExit()
          true);
 }
 
-/* One scope of the mimalloc backend. */
-struct Frame
-{
-    size_t logMark;
-    void * heap;
-    size_t bytes = 0;
-    /* Value cells are carved from chunks of the heap in allocation order,
-       so that a cell's address gives its allocation time (`CellClock`). */
-    std::vector<char *> chunks;
-    char * cellCur = nullptr;
-    char * cellEnd = nullptr;
-};
-
-/* Bytes per cell chunk of the mimalloc backend, and cells per chunk. */
-constexpr size_t cellChunkBytes = 32 << 10;
-constexpr size_t cellsPerChunk = cellChunkBytes / 16;
-
-std::vector<Frame> frames;
-
-#if NIX_UNFORCE_MIMALLOC
-mi_arena_id_t arenaId = nullptr;
-uintptr_t arenaLo = 0, arenaHi = 0;
-mi_theap_t * currentTheap = nullptr;
-
-bool inArena(const void * p)
-{
-    return (uintptr_t) p >= arenaLo && (uintptr_t) p < arenaHi;
-}
-
-bool inHeap(void * heap, const void * p)
-{
-    return inArena(p) && mi_heap_contains((mi_heap_t *) heap, p);
-}
-
-void setCurrentHeap(void * heap)
-{
-    evalRegion.heap = heap;
-    evalRegion.allTypes = heap != nullptr;
-    currentTheap = heap ? mi_heap_theap((mi_heap_t *) heap) : nullptr;
-}
-#endif
-
-/* The allocation clock of the innermost scope: the bump cursor, or with
-   the mimalloc backend the time of the next cell (see `CellClock`). It only
+/* The allocation clock of the innermost scope: the bump cursor. It only
    grows while a scope is open. */
 static uint64_t unforceClock()
 {
-#if NIX_UNFORCE_MIMALLOC
-    if (nested()) {
-        if (frames.empty() || frames.back().chunks.empty())
-            return 0;
-        auto & f = frames.back();
-        return (f.chunks.size() - 1) * cellsPerChunk + (f.cellCur - f.chunks.back()) / 16;
-    }
-#endif
     return (uintptr_t) evalRegion.cur;
 }
 
@@ -796,7 +738,7 @@ static const Value * ownerCell(uint32_t o)
 static void openOwners(EvalState & state)
 {
     auto & cfg = unforceSettings();
-    ownersOn = cfg.identity == "owners" && cfg.markers != "off" && evalRegion.cur && !nested();
+    ownersOn = cfg.identity == "owners" && cfg.markers != "off" && evalRegion.cur;
     ownersOverflowed = false;
     ownerConsumersOn = cfg.ownerConsumers;
     ownerConsumers.clear();
@@ -854,19 +796,6 @@ void pushRegionRoots()
         prevPushOtherRoots();
     if (evalRegion.cur)
         GC_push_all(evalRegion.base, evalRegion.cur);
-#  if NIX_UNFORCE_MIMALLOC
-    /* Push the committed part of each area of each scope heap. */
-    for (auto & f : frames)
-        mi_heap_visit_blocks(
-            (mi_heap_t *) f.heap,
-            false,
-            [](const mi_heap_t *, const mi_heap_area_t * area, void * block, size_t, void *) -> bool {
-                if (!block && area && area->committed)
-                    GC_push_all(area->blocks, (char *) area->blocks + area->committed);
-                return true;
-            },
-            nullptr);
-#  endif
 }
 #endif
 
@@ -920,12 +849,9 @@ static void noteBigEnv(const void * env, size_t size)
     bigEnvSizes[env] = size;
 }
 
-/* The size of a young Env: with the mimalloc backend from its prefix,
-   otherwise from the side table. */
-static size_t envSizeOf(const Env * e, bool heap)
+/* The size of a young Env, from the side table. */
+static size_t envSizeOf(const Env * e)
 {
-    if (heap)
-        return *(const size_t *) ((const char *) e - 16);
     auto s = envSizeTable[((const char *) e - envSizeMapping) >> 4];
     return s < 255 ? s : bigEnvSizes.at(e);
 }
@@ -1195,10 +1121,6 @@ struct Evacuator
     std::vector<Value *> values;
     std::vector<std::pair<Env *, size_t>> envs;
 
-    /* The scope being closed, for the mimalloc backend; its copies go to
-       wherever allocation currently goes (the enclosing scope's heap). */
-    void * youngHeap = nullptr;
-
     /* If set, called for every young object as it is copied. */
     std::function<void(const void *)> onForward;
 
@@ -1216,10 +1138,6 @@ struct Evacuator
 
     bool young(const void * p) const
     {
-#if NIX_UNFORCE_MIMALLOC
-        if (youngHeap)
-            return inHeap(youngHeap, p);
-#endif
         return evalRegion.contains(p);
     }
 
@@ -1260,7 +1178,7 @@ struct Evacuator
             return e;
         if (auto f = forwarded(e))
             return f;
-        auto size = envSizeOf(e, youngHeap != nullptr);
+        auto size = envSizeOf(e);
         auto & n = state.mem.allocEnv(size);
         stats.copiedBytes += sizeof(Env) + size * sizeof(Value *);
         n.up = e->up;
@@ -1625,32 +1543,15 @@ struct Stubber
    old memory allocated during a job, i.e. fileEvalCache cells and C-API
    objects, is inert; no escapes; deterministic evaluation), and exceptions
    carry no evaluator values. Derivation stubs (the `stubs` experiment) change
-   identity by construction and are not covered. With the mimalloc backend
-   only the outermost scope promotes (nested scopes revert everything), so
-   the relogging of promoted cells into an enclosing scope cannot break OC.
+   identity by construction and are not covered.
    --------------------------------------------------------------------------- */
 
-/* Times of young objects: the address in the bump region; for the mimalloc
-   backend, a cell's position in its scope's chunks (no time otherwise). */
+/* Times of young objects: the address in the bump region. */
 struct CellClock
 {
-    bool bump = true;
-    /* (chunk start, time of its first cell), sorted by address. */
-    std::vector<std::pair<uintptr_t, uint64_t>> chunks;
-
     std::optional<uint64_t> operator()(const void * p) const
     {
-        auto a = (uintptr_t) p;
-        if (bump)
-            return a;
-        auto i =
-            std::upper_bound(chunks.begin(), chunks.end(), a, [](uintptr_t a, const auto & c) { return a < c.first; });
-        if (i == chunks.begin())
-            return std::nullopt;
-        --i;
-        if (a >= i->first + cellChunkBytes)
-            return std::nullopt;
-        return i->second + (a - i->first) / 16;
+        return (uintptr_t) p;
     }
 };
 
@@ -1780,18 +1681,11 @@ struct ForceMarkers
     }
 };
 
-/* Which objects belong to the job: its bump region, or (mimalloc backend)
-   its scope heap. */
+/* Which objects belong to the job: its bump region. */
 struct YoungSpace
 {
-    void * heap = nullptr;
-
     bool operator()(const void * p) const
     {
-#if NIX_UNFORCE_MIMALLOC
-        if (heap)
-            return inHeap(heap, p);
-#endif
         return evalRegion.contains(p);
     }
 };
@@ -1889,53 +1783,6 @@ struct RegionMarks
     size_t bytes() const
     {
         return pieces.capacity() * sizeof(pieces[0]) + allocated * sizeof(Piece);
-    }
-};
-
-/* The same for the mimalloc backend, whose objects are not in one range. */
-struct HeapMarks
-{
-    std::unordered_map<const void *, uint8_t> flags;
-
-    uint8_t get(const void * p) const
-    {
-        auto i = flags.find(p);
-        return i == flags.end() ? 0 : i->second;
-    }
-
-    uint8_t add(const void * p, uint8_t f)
-    {
-        auto & b = flags[p];
-        auto old = b;
-        b |= f;
-        return old;
-    }
-
-    bool claim(const void * p)
-    {
-        auto & b = flags[p];
-        if (b & (visited | memo))
-            return false;
-        b |= visited;
-        return true;
-    }
-
-    void remove(const void * p, uint8_t f)
-    {
-        if (auto i = flags.find(p); i != flags.end())
-            i->second &= ~f;
-    }
-
-    uint64_t removeAll(uint8_t f)
-    {
-        for (auto & [p, b] : flags)
-            b &= ~f;
-        return 1 + flags.size() / 8;
-    }
-
-    size_t bytes() const
-    {
-        return flags.size() * 32 + flags.bucket_count() * sizeof(void *);
     }
 };
 
@@ -2111,7 +1958,7 @@ struct Closure
             break;
         case kEnv: {
             auto e = (const Env *) p;
-            auto size = envSizeOf(e, young.heap != nullptr);
+            auto size = envSizeOf(e);
             f(e->up, kEnv);
             for (size_t i = 0; i < size; ++i)
                 f(e->values[i], kValue);
@@ -2134,7 +1981,7 @@ struct Closure
     {
         switch (kind) {
         case kEnv:
-            return envSizeOf((const Env *) p, young.heap != nullptr);
+            return envSizeOf((const Env *) p);
         case kBindings:
             return ((const Bindings *) p)->layerSize();
         case kValue:
@@ -2584,7 +2431,7 @@ std::vector<bool> decideJob(
         return promote;
     }
 
-    if (ownersOn && !young.heap) {
+    if (ownersOn) {
         auto nominated = promote;
         OwnerClosure oc(targets, promote);
         /* As below: a printing job that may be kept whole marks Evac(S)
@@ -2737,14 +2584,11 @@ std::vector<bool> decideJob(
         peak = closure.peak;
         markedBytes = closure.markedBytes;
     };
-    if (young.heap) {
-        Closure<HeapMarks> closure{young, clock};
-        decide(closure);
-    } else {
+    {
         Closure<RegionMarks> closure{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
         decide(closure);
     }
-    if (unforceDebug().closureCheck && !young.heap && markers) {
+    if (unforceDebug().closureCheck && markers) {
         /* Recompute the closure plainly (marking walks, no memos, a round
            after every promotion) and compare. */
         Closure<RegionMarks> plain{young, clock, RegionMarks(evalRegion.base, evalRegion.cur)};
@@ -2844,21 +2688,6 @@ void unforceDebugChain(EvalState & state, const Value * v)
     }
 }
 
-void * evalRegionHeapAlloc(size_t n)
-{
-#if NIX_UNFORCE_MIMALLOC
-    /* Most evaluator objects are small (a Value is 16 bytes); mimalloc's
-       small path skips its size-class dispatch. */
-    auto p = n <= MI_SMALL_SIZE_MAX ? mi_theap_zalloc_small(currentTheap, n) : mi_theap_zalloc(currentTheap, n);
-    if (!p)
-        throw std::bad_alloc();
-    frames.back().bytes += n;
-    return p;
-#else
-    unreachable();
-#endif
-}
-
 #if !NIX_USE_BOEHMGC
 void * evalBaseAlloc(size_t n)
 {
@@ -2870,50 +2699,15 @@ void * evalBaseAlloc(size_t n)
 }
 #endif
 
-void * evalRegionHeapAllocCell()
-{
-#if NIX_UNFORCE_MIMALLOC
-    auto & f = frames.back();
-    if (f.cellCur == f.cellEnd) [[unlikely]] {
-        auto chunk = (char *) mi_theap_zalloc(currentTheap, cellChunkBytes);
-        if (!chunk)
-            throw std::bad_alloc();
-        f.chunks.push_back(chunk);
-        f.cellCur = chunk;
-        f.cellEnd = chunk + cellChunkBytes;
-        f.bytes += cellChunkBytes;
-    }
-    auto p = f.cellCur;
-    f.cellCur += 16;
-    return p;
-#else
-    unreachable();
-#endif
-}
-
 void evalRegionNoteBigEnv(const void * env, size_t size)
 {
     noteBigEnv(env, size);
-}
-
-bool evalRegionHeapContains(const void * p)
-{
-#if NIX_UNFORCE_MIMALLOC
-    return inHeap(evalRegion.heap, p);
-#else
-    unreachable();
-#endif
 }
 
 bool unforceMayHaveFreed(const void * p)
 {
     if (unforceSettings().region.empty())
         return true;
-#if NIX_UNFORCE_MIMALLOC
-    /* Destroyed heaps' pages go back to the arena for any later heap. */
-    if (nested())
-        return inArena(p);
-#endif
     return (uintptr_t) p >= lastReleased.first && (uintptr_t) p < lastReleased.second;
 }
 
@@ -3023,8 +2817,6 @@ size_t unforceGeneration()
 
 size_t unforceCurrentScopeBytes()
 {
-    if (!frames.empty())
-        return frames.back().bytes;
     return evalRegion.cur ? size_t(evalRegion.cur - evalRegion.base) : 0;
 }
 
@@ -3047,9 +2839,8 @@ UnforceBatch::~UnforceBatch()
 void UnforceBatch::openAt(const void * stackMark)
 {
     if (state && !mark) {
-        /* Only a scope that is not nested in another one is a job, except
-           with the mimalloc backend, where every scope is. */
-        job = nested() || state->isolationDepth == 0;
+        /* Only a scope that is not nested in another one is a job. */
+        job = state->isolationDepth == 0;
         mark = state->beginUnforceScope(stackMark);
     }
 }
@@ -3099,172 +2890,6 @@ void UnforceBatch::end()
         onEnd(job);
 }
 
-#if NIX_UNFORCE_MIMALLOC
-/* With NIX_UNFORCE_DEBUG=verify: before a scope heap is destroyed, check that no
-   evaluator object outside it points into it. The enclosing scopes' heaps
-   and the base arena hold evaluator objects only, so every word of them is
-   checked against the dying heap. */
-static void verifyHeapScope(void * dying)
-{
-    struct Scan
-    {
-        void * dying;
-        size_t blocks = 0, bytes = 0, hits = 0;
-
-        void words(const void * start, size_t size)
-        {
-            auto w = (const uintptr_t *) start;
-            for (size_t i = 0; i < size / sizeof(uintptr_t); ++i)
-                if (auto p = (const void *) (w[i] & ~uintptr_t(7)); inHeap(dying, p))
-                    if (hits++ < 5)
-                        std::cerr << fmt("unforce verify: word at %x points into the dying scope\n", (uintptr_t) &w[i]);
-        }
-    } scan{dying};
-
-    for (auto & f : frames)
-        mi_heap_visit_blocks(
-            (mi_heap_t *) f.heap,
-            true,
-            [](const mi_heap_t *, const mi_heap_area_t *, void * block, size_t size, void * arg) -> bool {
-                auto & scan = *(Scan *) arg;
-                if (block) {
-                    scan.blocks++;
-                    scan.bytes += size;
-                    scan.words(block, size);
-                }
-                return true;
-            },
-            &scan);
-    if (evalUseBaseArena)
-        for (auto [start, end] : evalBaseArena.chunks) {
-            if (evalBaseArena.cur >= start && evalBaseArena.cur <= end)
-                end = evalBaseArena.cur;
-            scan.bytes += end - start;
-            scan.words(start, end - start);
-        }
-    std::cerr << fmt(
-        "unforce verify: scope %d: scanned %d enclosing-scope blocks and the base arena (%d MiB), %d pointers into it\n",
-        stats.jobs,
-        scan.blocks,
-        scan.bytes >> 20,
-        scan.hits);
-}
-
-static void beginHeapScope(size_t logMark)
-{
-    hookCollector();
-    if (!arenaId) {
-        /* The arena bounds what all open scopes hold at once. It costs every
-           scope too: each heap other than the main one allocates and zeroes
-           page bitmaps for every arena it uses, 62 of them with a bit per
-           64 KiB slice (0.5 MiB for 4 GiB; mimalloc src/arena.c,
-           mi_arena_pages_alloc). Arenas above 16 GiB are split into children
-           (mimalloc d4881d33). mimalloc 3.5.1 also leaked those bitmaps once
-           they exceeded 512 KiB, i.e. for arenas above 4 GiB (fixed in
-           3.5.2, 6c45ba09). */
-        static const size_t arenaBytes = std::stoul(getEnv("NIX_UNFORCE_ARENA_GB").value_or("4")) << 30;
-        if (mi_reserve_os_memory_ex(arenaBytes, false, false, true, &arenaId) != 0)
-            throw Error("could not reserve the mimalloc arena for unforce scopes");
-        size_t size = 0;
-        arenaLo = (uintptr_t) mi_arena_area(arenaId, &size);
-        arenaHi = arenaLo + size;
-    }
-    auto heap = mi_heap_new_in_arena(arenaId);
-    if (!heap)
-        throw std::bad_alloc();
-    frames.push_back(Frame{.logMark = logMark, .heap = heap});
-    setCurrentHeap(heap);
-}
-
-/* Close the innermost heap scope: every cell older than it that it forced
-   is reverted, or, for the outermost scope, possibly promoted (copied out of
-   all scopes; see `decideJob`). Then the scope's heap is destroyed
-   wholesale. */
-static void endHeapScope(EvalState & state, size_t mark)
-{
-    auto & cfg = unforceSettings();
-    auto & log = state.undoLog;
-    auto jobEnd = unforceClock();
-    Frame f = std::move(frames.back());
-    frames.pop_back();
-    Frame * parent = frames.empty() ? nullptr : &frames.back();
-    stats.jobs++;
-    generation++;
-    stats.logged += log.size() - mark;
-    dropActiveForces(mark);
-
-    /* Copies go to wherever allocation goes once this scope is closed. */
-    setCurrentHeap(parent ? parent->heap : nullptr);
-    std::optional<JobTargets> jt;
-    std::vector<bool> promoted;
-    std::vector<Value> copies;
-    try {
-        jt.emplace(log, mark);
-        if (!parent) {
-            PauseRegion pause;
-            Evacuator evacuator{state};
-            evacuator.youngHeap = f.heap;
-            CellClock clock{.bump = false};
-            for (size_t i = 0; i < f.chunks.size(); ++i)
-                clock.chunks.emplace_back((uintptr_t) f.chunks[i], i * cellsPerChunk);
-            std::sort(clock.chunks.begin(), clock.chunks.end());
-            promoted = decideJob(
-                state,
-                mark,
-                *jt,
-                true,
-                state.forceCounts,
-                YoungSpace{f.heap},
-                clock,
-                jobEnd,
-                f.bytes,
-                evacuator,
-                copies);
-            pruneCounts(state.forceCounts, *jt, promoted);
-        }
-    } catch (std::bad_alloc &) {
-        unforceFatal("deciding which values to keep at the end of an unforce scope, and copying them");
-    }
-
-    if (parent) {
-        /* Only the outermost scope promotes, as with the bump backend: a
-           nested scope reverts everything it forced, which keeps identity
-           (pure revert), whereas a cell promoted into the enclosing scope
-           would be relogged there and could be reverted after a cell holding
-           a copy of its data was promoted. */
-        for (size_t i = 0; i < jt->size(); ++i) {
-            *jt->cells[i] = jt->preImage(i);
-            stats.reverted++;
-            stats.innerScopeReverts++;
-        }
-    } else
-        /* The release allocates nothing. */
-        for (size_t i = 0; i < jt->size(); ++i)
-            if (promoted[i]) {
-                *jt->cells[i] = copies[i];
-                stats.promoted++;
-            } else {
-                *jt->cells[i] = jt->preImage(i);
-                stats.reverted++;
-                if (clientCodeInJob)
-                    stats.revertedInClientJobs++;
-            }
-
-    log.resize(mark);
-    if (!parent) {
-        log.shrink_to_fit();
-        clientCodeInJob = false;
-    }
-    stats.freedBytes += f.bytes;
-    stats.regionPeak = std::max(stats.regionPeak, f.bytes);
-    if (unforceDebug().verify)
-        verifyHeapScope(f.heap);
-    mi_heap_destroy((mi_heap_t *) f.heap);
-
-    if (cfg.stats)
-        printStatsAtExit();
-}
-#endif
 
 /* Per open scope, the stack pointer of its opener (see
    `unforceIsScopeStackSlot`), and this thread's lowest stack address. */
@@ -3302,7 +2927,7 @@ UnforceSeen::~UnforceSeen()
 
 bool unforceSeenExact()
 {
-    return !nested() && unforceSettings().keepSeen;
+    return unforceSettings().keepSeen;
 }
 
 void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key)
@@ -3428,9 +3053,8 @@ bool unforceIsScopeStackSlot(const void * p)
 {
     if (scopeStackMarks.empty() || !stackLow)
         return false;
-    /* The scope that will restore the slot: every scope with the mimalloc
-       backend, only the job (the outermost scope) with the bump one. */
-    auto mark = nested() ? scopeStackMarks.back() : scopeStackMarks.front();
+    /* The scope that will restore the slot: the job (the outermost scope). */
+    auto mark = scopeStackMarks.front();
     return (const char *) p >= stackLow && (const char *) p < mark;
 }
 
@@ -3601,7 +3225,7 @@ void EvalState::endLoggedForceSlow(Value & v)
 }
 
 /* The EvalState whose job is open. The per-job state above is per thread,
-   but the region (`evalRegion`, the mimalloc frames, `lastReleased`) is
+   but the region (`evalRegion`, `lastReleased`) is
    process-wide, so at most one job may be open in the process, and every
    scope opened while it is must belong to its EvalState: another
    EvalState's job would take over the region, and the first job's
@@ -3622,13 +3246,6 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
        frames the caller enters from now on lie below it, its own locals at
        or above. */
     scopeStackMarks.push_back((const char *) (stackMark ? stackMark : __builtin_dwarf_cfa()));
-#if NIX_UNFORCE_MIMALLOC
-    if (nested()) {
-        isolationDepth++;
-        beginHeapScope(undoLog.size());
-        return undoLog.size();
-    }
-#endif
     if (!isolationDepth++ && !unforceSettings().region.empty()) {
         openRegion(unforceSettings().region == "all");
         openOwners(*this);
@@ -3639,15 +3256,6 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
 void EvalState::endUnforceScope(size_t mark)
 {
     scopeStackMarks.pop_back();
-#if NIX_UNFORCE_MIMALLOC
-    if (nested()) {
-        isolationDepth--;
-        endHeapScope(*this, mark);
-        if (!isolationDepth)
-            jobOwner = nullptr;
-        return;
-    }
-#endif
     /* Only the outermost scope is a job. */
     if (--isolationDepth)
         return;

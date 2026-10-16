@@ -352,12 +352,6 @@ struct StaticEvalSymbols
  * object does, and each `Env` carries a size header so it can be copied out.
  * Single-threaded evaluation only.
  */
-void * evalRegionHeapAlloc(size_t n);
-/** A `Value` cell from the innermost scope's heap, carved from chunks in
-    allocation order, so that a cell's address gives its allocation time
-    (see `unforceClock`). */
-void * evalRegionHeapAllocCell();
-bool evalRegionHeapContains(const void * p);
 void evalRegionNoteBigEnv(const void * env, size_t size);
 
 struct EvalRegion
@@ -365,9 +359,6 @@ struct EvalRegion
     char * base = nullptr;
     char * cur = nullptr;
     char * end = nullptr;
-    /** mimalloc backend (NIX_UNFORCE_BACKEND=mimalloc): the innermost
-        scope's `mi_heap_t`, instead of the bump range above. */
-    void * heap = nullptr;
     /** Allocate elsewhere for now: the data outlives the job. */
     bool paused = false;
     bool allTypes = false;
@@ -388,7 +379,7 @@ struct EvalRegion
 
     bool active() const noexcept
     {
-        return (cur || heap) && !paused;
+        return cur && !paused;
     }
 
     [[gnu::always_inline]] void noteEnvSize(const void * env, size_t size)
@@ -405,23 +396,17 @@ struct EvalRegion
     /** Whether `p` was allocated in the innermost scope. */
     bool contains(const void * p) const noexcept
     {
-        if (heap) [[unlikely]]
-            return evalRegionHeapContains(p);
         return (const char *) p >= base && (const char *) p < cur;
     }
 
     [[gnu::always_inline]] void * alloc(size_t n)
     {
-        if (heap) [[unlikely]]
-            return evalRegionHeapAlloc(n);
         return bump(n);
     }
 
     /** A `Value` cell. In the bump region, addresses are allocation order. */
     [[gnu::always_inline]] void * allocCell()
     {
-        if (heap) [[unlikely]]
-            return evalRegionHeapAllocCell();
         return bump(16);
     }
 
@@ -507,9 +492,6 @@ bool unforceMayHaveFreed(const void * p);
  * not be kept (client code ran in the job, or the closure fell back to
  * reverting), the job keeps all its memory instead: nothing is promoted,
  * reverted or freed, and the entries stay as they are.
- * With the bump backend only; with the mimalloc backend, whose nested
- * scopes revert everything, the printers forget what a freeing scope
- * added (`unforceMayHaveFreed`) as before.
  */
 struct UnforceSeen
 {
@@ -665,8 +647,7 @@ class UnforceBatch
 
 public:
     /** Called when a batch ends, with whether it freed anything (only a
-        batch that is not nested in another one does, except with the
-        mimalloc backend). */
+        batch that is not nested in another one does). */
     std::function<void(bool freed)> onEnd;
 
     UnforceBatch(EvalState & state, bool enabled = true);

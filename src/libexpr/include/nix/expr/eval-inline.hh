@@ -98,16 +98,10 @@ Env & EvalMemory::allocEnv(size_t size)
 
 #if !NIX_USE_BOEHMGC
     /* In an all-types region, record each Env's size, so that it can be
-       copied out of the region: in the bump region's side table, or with
-       the mimalloc backend as a prefix. Unforcing (the only user of
-       evalRegion) is never active on a Boehm build, so this is compiled out
-       there. */
+       copied out of the region: in the bump region's side table. Unforcing
+       (the only user of evalRegion) is never active on a Boehm build, so
+       this is compiled out there. */
     if (evalRegion.allTypes && evalRegion.active()) [[unlikely]] {
-        if (evalRegion.heap) [[unlikely]] {
-            auto p = (char *) evalRegion.alloc(16 + sizeof(Env) + size * sizeof(Value *));
-            *(size_t *) p = size;
-            return *(Env *) (p + 16);
-        }
         auto p = evalRegion.bump(sizeof(Env) + size * sizeof(Value *));
         evalRegion.noteEnvSize(p, size);
         return *(Env *) p;
