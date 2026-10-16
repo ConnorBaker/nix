@@ -174,6 +174,15 @@ const Settings & unforceSettings()
     return s;
 }
 
+/* Whether the per-force statistics counters are ever observed. They feed
+   both the `NIX_UNFORCE_STATS` end-of-process summary and the
+   `NIX_SHOW_STATS` JSON dump, and only those two consumers read them, so
+   when neither is requested the hot in-job force path skips them entirely.
+   The env is read directly (not via Counter::enabled) to avoid a cross-TU
+   static-initialisation-order dependency. */
+static const bool statsObserved =
+    unforceSettings().stats || getEnv("NIX_SHOW_STATS").value_or("0") != "0";
+
 /* The tripwire keeps every released region reserved, so it uses smaller
    ones: 64 GiB regions would exhaust a 48-bit address space after about
    4000 jobs. */
@@ -3451,7 +3460,8 @@ bool unforceIsScopeStackSlot(const void * p)
    so the hook needs no stack frame. */
 [[gnu::always_inline]] inline static void youngOwnerChange(const Value & v, uint32_t o)
 {
-    stats.ownerChanges++;
+    if (statsObserved) [[unlikely]]
+        stats.ownerChanges++;
     if (curOwner != noOwner && ownerConsumersOn) [[unlikely]]
         return youngConsumerChange(v, o);
     if (opens.t == opens.e) [[unlikely]]
@@ -3467,7 +3477,8 @@ bool unforceIsScopeStackSlot(const void * p)
     /* `ownerLookups` counts these forces; the common one changes the
        owner, so it is `ownerChanges` that the hot path counts. */
     if (o == curOwner) [[unlikely]] {
-        stats.ownerLookups++;
+        if (statsObserved) [[unlikely]]
+            stats.ownerLookups++;
         return;
     }
     youngOwnerChange(v, o);
@@ -3497,7 +3508,8 @@ bool unforceIsScopeStackSlot(const void * p)
     e.start = unforceClock();
     e.parent = activeForces.empty() ? -1 : int64_t(activeForces.back());
     undoLog.push_back(e);
-    stats.markerLogBytes += sizeof(EvalState::UndoEntry) - offsetof(EvalState::UndoEntry, start);
+    if (statsObserved) [[unlikely]]
+        stats.markerLogBytes += sizeof(EvalState::UndoEntry) - offsetof(EvalState::UndoEntry, start);
     activeForces.push_back(index);
     *opens.t++ = {&v, (uint64_t(curOwner) << 1) | 1};
     *openLogIndices.t++ = index;

@@ -15,8 +15,12 @@ namespace nix {
 [[gnu::always_inline]]
 inline void * EvalMemory::allocBytes(size_t n)
 {
+#if !NIX_USE_BOEHMGC
+    /* Unforcing (the only user of evalRegion) is never active on a Boehm
+       build, so the region check is compiled out entirely there. */
     if (evalRegion.allTypes && evalRegion.active()) [[unlikely]]
         return evalRegion.alloc(n);
+#endif
     void * p;
 #if NIX_USE_BOEHMGC
     p = GC_MALLOC(n);
@@ -46,10 +50,15 @@ inline void * EvalMemory::allocBytes(size_t count)
 [[gnu::always_inline]]
 Value * EvalMemory::allocValue()
 {
+#if !NIX_USE_BOEHMGC
+    /* Unforcing (the only user of evalRegion) is never active on a Boehm
+       build, so this region check is compiled out there: allocValue keeps
+       its original Boehm-build cost exactly. */
     if (evalRegion.active()) [[unlikely]] {
         stats.nrValues++;
         return (Value *) evalRegion.allocCell();
     }
+#endif
 #if NIX_USE_BOEHMGC
     /* Allocation cache for GC'd Value objects. Boehm GC is already a global resource, so thread_local is
        a natural solution. Multiple EvalState instances on the same thread will reuse the same cache. */
@@ -87,9 +96,12 @@ Env & EvalMemory::allocEnv(size_t size)
 
     Env * env;
 
+#if !NIX_USE_BOEHMGC
     /* In an all-types region, record each Env's size, so that it can be
        copied out of the region: in the bump region's side table, or with
-       the mimalloc backend as a prefix. */
+       the mimalloc backend as a prefix. Unforcing (the only user of
+       evalRegion) is never active on a Boehm build, so this is compiled out
+       there. */
     if (evalRegion.allTypes && evalRegion.active()) [[unlikely]] {
         if (evalRegion.heap) [[unlikely]] {
             auto p = (char *) evalRegion.alloc(16 + sizeof(Env) + size * sizeof(Value *));
@@ -100,6 +112,7 @@ Env & EvalMemory::allocEnv(size_t size)
         evalRegion.noteEnvSize(p, size);
         return *(Env *) p;
     }
+#endif
 
 #if NIX_USE_BOEHMGC
     if (size == 1) {
