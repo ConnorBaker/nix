@@ -110,7 +110,6 @@ struct Settings
     bool ownerConsumers = true;
     bool keepSeen = true;
     bool reuse = false;
-    bool stubs = false;
     /* 0 derives these from the batch size (`eval-unforce-batch-size`):
        countsCap = max(256 Ki, batch / 256); ownerBudget and copyLimit =
        max(batch / 4, 4 MiB). Previously NIX_UNFORCE_COUNTS_CAP,
@@ -1029,43 +1028,6 @@ static void retainRegion()
     evalRegion = EvalRegion{};
 }
 
-bool isScalar(const Value & v)
-{
-    switch (v.internalType()) {
-    case tInt:
-    case tBool:
-    case tNull:
-    case tFloat:
-    case tString:
-    case tPath:
-        return true;
-    case tUninitialized:
-    case tFailed:
-    case tExternal:
-    case tPrimOp:
-    case tAttrs:
-    case tListSmall:
-    case tPrimOpApp:
-    case tApp:
-    case tThunk:
-    case tLambda:
-    case tListN:
-    case tNumberOfInternalTypes:
-        return false;
-    }
-    return false;
-}
-
-/* Recognise a derivation without forcing anything, so that no new log
-   entries appear while a job is being closed. */
-bool isDerivationNoForce(EvalState & state, const Value & v)
-{
-    if (v.internalType() != tAttrs)
-        return false;
-    auto type = v.attrs()->get(state.s.type);
-    return type && type->value->internalType() == tString && type->value->string_view() == "derivation";
-}
-
 /* Copies a graph out of the job region, precisely: objects outside the
    region are shared, objects inside are copied once (sharing and cycles
    are preserved through the forwarding table). Callers pause the region. */
@@ -1287,85 +1249,6 @@ struct Evacuator
     }
 };
 
-std::unordered_map<const Value *, std::pair<std::string, const Value *>> selectRegistry;
-std::unordered_map<const Value *, std::string> sourceRegistry;
-
-/* Builds derivation stubs: forced scalars are kept (copied out of the
-   region), nested derivations (outputs) become stubs too, and every other
-   attribute becomes `getAttr name source`, where `source` recomputes the
-   whole derivation from a recipe outside the region. Callers pause the
-   region. */
-struct Stubber
-{
-    EvalState & state;
-    Evacuator & evacuator;
-    std::unordered_map<const Bindings *, Value *> memo;
-    std::unordered_map<uint32_t, Value *> selectors;
-    Value * getAttr = nullptr;
-
-    Value * selector(Symbol name)
-    {
-        auto & sel = selectors[name.getId()];
-        if (!sel) {
-            if (!getAttr)
-                getAttr = &state.getBuiltin("getAttr");
-            auto nameV = state.allocValue();
-            nameV->mkString(state.symbols[name], state.mem);
-            sel = state.allocValue();
-            sel->mkPrimOpApp(getAttr, nameV);
-        }
-        return sel;
-    }
-
-    Value * select(Value * source, Symbol name)
-    {
-        auto res = state.allocValue();
-        res->mkApp(selector(name), source);
-        if (unforceDebug().trace)
-            selectRegistry[res] = {std::string(state.symbols[name]), source};
-        if (unforceDebug().trace) {
-            std::set<const Value *> seen{res};
-            size_t depth = 0;
-            for (auto v = source; v; ++depth) {
-                if (!seen.insert(v).second) {
-                    std::cerr << fmt(
-                        "unforce debug: cycle selecting '%s' after %d steps\n", state.symbols[name], depth);
-                    break;
-                }
-                if (v->internalType() == tApp)
-                    v = v->app().right;
-                else
-                    break;
-            }
-            if (depth > 8)
-                std::cerr << fmt("unforce debug: selector chain depth %d for '%s'\n", depth, state.symbols[name]);
-        }
-        return res;
-    }
-
-    Value * stub(const Value & drv, Value * source, unsigned depth)
-    {
-        if (auto i = memo.find(drv.attrs()); i != memo.end())
-            return i->second;
-        auto res = state.allocValue();
-        memo.emplace(drv.attrs(), res);
-        auto attrs = state.buildBindings(drv.attrs()->size());
-        for (auto & a : *drv.attrs()) {
-            auto & v = *a.value;
-            Value * n;
-            if (isScalar(v))
-                n = evacuator.value(a.value);
-            else if (depth < 2 && isDerivationNoForce(state, v))
-                n = stub(v, select(source, a.name), depth + 1);
-            else
-                n = select(source, a.name);
-            attrs.insert(a.name, n, a.pos);
-        }
-        res->mkAttrs(attrs.alreadySorted());
-        return res;
-    }
-};
-
 /* ---------------------------------------------------------------------------
    Promotion correctness: closing a job's promotion set under "producer-of"
    (the policy comment; owner(x) is computed by the owner timeline above).
@@ -1481,8 +1364,7 @@ struct Stubber
    Premises: A1–A4 of the review (every write to old memory is logged;
    old memory allocated during a job, i.e. fileEvalCache cells and C-API
    objects, is inert; no escapes; deterministic evaluation), and exceptions
-   carry no evaluator values. Derivation stubs (the `stubs` experiment) change
-   identity by construction and are not covered.
+   carry no evaluator values.
    --------------------------------------------------------------------------- */
 
 /* Times of young objects: the address in the bump region. */
@@ -2213,30 +2095,6 @@ void pruneCounts(
 
 } // namespace
 
-void unforceDebugChain(EvalState & state, const Value * v)
-{
-    std::set<const Value *> seen;
-    for (int k = 0; k < 40 && v; ++k) {
-        bool again = !seen.insert(v).second;
-        auto t = v->internalType();
-        std::string what = t == tApp ? "app" : t == tThunk ? "thunk" : t == tAttrs ? "attrs" : fmt("type %d", (int) t);
-        if (auto i = sourceRegistry.find(v); i != sourceRegistry.end())
-            what += " [" + i->second + "]";
-        if (auto i = selectRegistry.find(v); i != selectRegistry.end()) {
-            std::cerr << fmt(
-                "  %d: %x select '%s' %s%s\n", k, (uintptr_t) v, i->second.first, what, again ? " (REPEAT)" : "");
-            if (again)
-                return;
-            v = i->second.second;
-            continue;
-        }
-        std::cerr << fmt("  %d: %x %s%s\n", k, (uintptr_t) v, what, again ? " (REPEAT)" : "");
-        if (again || t != tApp)
-            return;
-        v = v->app().right;
-    }
-}
-
 #if !NIX_USE_BOEHMGC
 void * evalBaseAlloc(size_t n)
 {
@@ -2850,54 +2708,22 @@ void EvalState::endUnforceScope(size_t mark)
         }
         closeOwners();
 
-        /* The release: assigns, reverts and frees. Only derivation stubs
-           (the `stubs` experiment, a dev mode) allocate here. */
+        /* The release: assigns, reverts and frees. Nothing is allocated. */
         if (!keepWhole) {
-            try {
-                Stubber stubber{*this, evacuator};
-                auto & targets = jt->cells;
-                for (size_t i = 0; i < targets.size(); ++i)
-                    if (promoted[i]) {
-                        *targets[i] = copies[i];
-                        stats.promoted++;
-                    }
-
-                for (size_t i = 0; i < targets.size(); ++i) {
-                    auto target = targets[i];
-                    if (promoted[i])
-                        continue;
-                    auto & pre = jt->preImage(i);
-                    if (cfg.stubs && evalRegion.cur && isDerivationNoForce(*this, *target)) {
-                        auto source = allocValue();
-                        *source = pre;
-                        if (unforceDebug().trace) {
-                            auto n = target->attrs()->get(s.name);
-                            sourceRegistry[source] =
-                                fmt("source for %s (job %d, pre-image %s)",
-                                    n && n->value->internalType() == tString ? std::string(n->value->string_view()) : "?",
-                                    stats.jobs,
-                                    pre.internalType() == tApp     ? "app"
-                                    : pre.internalType() == tThunk ? "thunk"
-                                                                   : "other");
-                        }
-                        /* Memoise within one stub only (outputs refer to each other).
-                           Another cell holding the same derivation, such as an alias
-                           whose recipe is `self.foo`, must not share this stub: its
-                           fallbacks would select from a recipe that evaluates to the
-                           stub itself. */
-                        stubber.memo.clear();
-                        *target = *stubber.stub(*target, source, 0);
-                        evacuator.drain();
-                        stats.stubbed++;
-                        continue;
-                    }
-                    *target = pre;
-                    stats.reverted++;
-                    if (clientCodeInJob)
-                        stats.revertedInClientJobs++;
+            auto & targets = jt->cells;
+            for (size_t i = 0; i < targets.size(); ++i)
+                if (promoted[i]) {
+                    *targets[i] = copies[i];
+                    stats.promoted++;
                 }
-            } catch (std::bad_alloc &) {
-                unforceFatal("building derivation stubs at the end of an unforce batch");
+
+            for (size_t i = 0; i < targets.size(); ++i) {
+                if (promoted[i])
+                    continue;
+                *targets[i] = jt->preImage(i);
+                stats.reverted++;
+                if (clientCodeInJob)
+                    stats.revertedInClientJobs++;
             }
         }
     }
