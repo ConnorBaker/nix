@@ -46,8 +46,6 @@ namespace nix {
 EvalRegion evalRegion;
 BumpArena evalBaseArena;
 
-/* The address range freed by the last region release. */
-static std::pair<uintptr_t, uintptr_t> lastReleased{0, 0};
 const bool evalUseBaseArena = [] {
     auto s = getenv("NIX_NOGC_BUMP");
     return s && std::string_view(s) != "0";
@@ -981,7 +979,6 @@ void releaseRegion()
     auto base = evalRegion.base;
     auto cur = evalRegion.cur;
     stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
-    lastReleased = {(uintptr_t) base, (uintptr_t) cur};
     evalRegion = EvalRegion{};
     dropEnvSizes(base, cur);
     if (keptStart && base == keptFloor) {
@@ -1024,7 +1021,6 @@ static void retainRegion()
     }
     if (regionSpare == base)
         regionSpare = nullptr;
-    lastReleased = {0, 0};
     evalRegion = EvalRegion{};
 }
 
@@ -2111,13 +2107,6 @@ void evalRegionNoteBigEnv(const void * env, size_t size)
     noteBigEnv(env, size);
 }
 
-bool unforceMayHaveFreed(const void * p)
-{
-    if (unforceSettings().region.empty())
-        return true;
-    return (uintptr_t) p >= lastReleased.first && (uintptr_t) p < lastReleased.second;
-}
-
 std::string unforceStatsJSON()
 {
     if (!stats.jobs)
@@ -2231,11 +2220,8 @@ UnforceBatch::~UnforceBatch()
 
 void UnforceBatch::openAt(const void * stackMark)
 {
-    if (state && !mark) {
-        /* Only a scope that is not nested in another one is a job. */
-        job = state->isolationDepth == 0;
+    if (state && !mark)
         mark = state->beginUnforceScope(stackMark);
-    }
 }
 
 void UnforceBatch::open()
@@ -2279,8 +2265,6 @@ void UnforceBatch::end()
     if (!mark)
         return;
     state->endUnforceScope(*std::exchange(mark, std::nullopt));
-    if (onEnd)
-        onEnd(job);
 }
 
 
@@ -2616,7 +2600,7 @@ void EvalState::endLoggedForceSlow(Value & v)
 }
 
 /* The EvalState whose job is open. The per-job state above is per thread,
-   but the region (`evalRegion`, `lastReleased`) is
+   but the region (`evalRegion`) is
    process-wide, so at most one job may be open in the process, and every
    scope opened while it is must belong to its EvalState: another
    EvalState's job would take over the region, and the first job's

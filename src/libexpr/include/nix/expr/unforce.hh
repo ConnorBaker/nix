@@ -31,14 +31,6 @@ struct PauseRegion
 };
 
 /**
- * PROTOTYPE. Whether an address recorded before the last unforce scope ended
- * may since have been freed (and so may be reused): true inside the last
- * released region, and always when unforcing without regions (Boehm reclaims
- * unforced values anywhere).
- */
-bool unforceMayHaveFreed(const void * p);
-
-/**
  * PROTOTYPE. Keeps a printer's address-keyed `seen` set (its «repeated»
  * tracking) as exact across the end of unforce jobs as without unforcing,
  * while this object lives: a container printed in one job and reached
@@ -91,8 +83,8 @@ bool unforceSeenExact();
 /**
  * PROTOTYPE. Counts unforce scopes that have freed memory. A pointer into
  * evaluator memory cached outside a scope (e.g. by an eval-cache cursor) is
- * stale if this has changed since it was cached and `unforceMayHaveFreed`
- * holds for it.
+ * stale once this has changed since it was cached: a scope has ended since,
+ * and may have freed what the pointer refers to.
  */
 size_t unforceGeneration();
 
@@ -142,13 +134,8 @@ class UnforceBatch
 {
     EvalState * state;
     std::optional<size_t> mark;
-    bool job = false;
 
 public:
-    /** Called when a batch ends, with whether it freed anything (only a
-        batch that is not nested in another one does). */
-    std::function<void(bool freed)> onEnd;
-
     UnforceBatch(EvalState & state, bool enabled = true);
     ~UnforceBatch();
     UnforceBatch(const UnforceBatch &) = delete;
@@ -156,11 +143,6 @@ public:
     bool enabled() const
     {
         return state;
-    }
-
-    bool isOpen() const
-    {
-        return mark.has_value();
     }
 
     /** Visit one element: opens a batch if none is open, and ends it when

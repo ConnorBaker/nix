@@ -165,9 +165,6 @@ private:
     PrintOptions options;
     NixStringContext * context;
     std::optional<ValuesSeen> seen;
-    /* What was added to `seen`, in order, so that an element's unforce scope
-       can forget the addresses it is about to free. */
-    std::vector<const void *> seenAdded;
     size_t totalAttrsPrinted = 0;
     size_t totalListItemsPrinted = 0;
     std::string indent;
@@ -333,32 +330,19 @@ private:
         return itemType == nList || itemType == nAttrs || itemType == nThunk;
     }
 
-    /* The unforce batch for the elements of one attribute set or list. When
-       it frees what they allocated, the addresses they added to `seen` are
-       forgotten, so that one reused for another value is not reported as
-       repeated. With the bump backend the job's end has already rewritten
-       them to the kept copies' addresses (`UnforceSeen`), so this finds
-       nothing to forget; with the mimalloc backend shared values may print
-       in full again. A batch that frees nothing (nested in another one)
-       leaves them for the enclosing batch. */
+    /* The unforce batch for the elements of one attribute set or list: what
+       they forced is unforced, and what they allocated freed, when the batch
+       ends (the memory bound). A batch that frees nothing (nested in another
+       one) leaves that to the enclosing batch. The printer's `seen` set stays
+       exact across the free: the job's end has already rewritten its entries
+       for the freed objects to the kept copies' addresses (`UnforceSeen`). */
     struct ElementBatch
     {
-        Printer & printer;
-        /* Before `batch`, whose destructor (ending the batch) uses it. */
-        size_t seenMark = 0;
         UnforceBatch batch;
 
         ElementBatch(Printer & printer)
-            : printer(printer)
-            , batch(printer.state, printer.options.unforce)
+            : batch(printer.state, printer.options.unforce)
         {
-            batch.onEnd = [this](bool freed) {
-                auto & p = this->printer;
-                if (freed)
-                    for (; p.seenAdded.size() > seenMark; p.seenAdded.pop_back())
-                        if (p.seen && unforceMayHaveFreed(p.seenAdded.back()))
-                            p.seen->erase(p.seenAdded.back());
-            };
         }
     };
 
@@ -368,8 +352,6 @@ private:
             print(v, depth);
             return;
         }
-        if (!elements.batch.isOpen())
-            elements.seenMark = seenAdded.size();
         UnforceBatch::Element element(elements.batch);
         print(v, depth);
     }
@@ -378,7 +360,6 @@ private:
     {
         if (!seen->insert(p).second)
             return false;
-        seenAdded.push_back(p);
         unforceNoteSeen(*seen, v, p);
         return true;
     }

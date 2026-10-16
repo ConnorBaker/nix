@@ -27,98 +27,6 @@ static int rootNr = 0;
 
 enum OutputKind { okPlain, okRaw, okXML, okJSON };
 
-/* `printStrictUnforced` where walked cells cannot be kept: each batch's
-   elements are printed before it ends (see below). */
-[[gnu::noinline]] static void printStrictUnforcedBuffered(
-    EvalState & state, Value & v, std::ostream & out, NixStringContext & context, std::set<const void *> & walked)
-{
-    /* Walk element `e` (with `forceValueDeep`'s trace for it). */
-    auto forceElement = [&](Value & e, auto && trace) {
-        try {
-            state.forceValueDeep(e, walked);
-        } catch (Error & err) {
-            trace(err);
-            throw;
-        }
-    };
-
-    /* As `printAmbiguous` on the whole value, which marks the top level as
-       seen before printing its elements, so that an element referring back
-       to it prints as «repeated». The top level was forced before any batch
-       opened, so no batch frees it: it stays seen. */
-    std::ostringstream buffer;
-    const void * top = v.type() == nAttrs ? (v.attrs()->empty() ? nullptr : (const void *) v.attrs())
-                                          : (v.listSize() ? (const void *) &v : nullptr);
-    std::set<const void *> seen;
-    auto seedSeen = [&]() {
-        if (top)
-            seen.insert(top);
-    };
-    seedSeen();
-    UnforceBatch batch(state);
-    batch.onEnd = [&](bool freed) {
-        if (freed) {
-            seen.clear();
-            seedSeen();
-            walked.clear();
-            walked.insert(&v);
-        }
-    };
-
-    if (v.type() == nAttrs) {
-        auto sorted = v.attrs()->lexicographicOrder(state.symbols);
-        std::map<const Attr *, size_t> rank;
-        for (auto [n, a] : enumerate(sorted))
-            rank[a] = n;
-        std::map<const Attr *, std::string> printed;
-        std::vector<const Attr *> pending;
-        auto printPending = [&]() {
-            std::sort(pending.begin(), pending.end(), [&](auto a, auto b) { return rank[a] < rank[b]; });
-            for (auto a : pending) {
-                std::ostringstream str;
-                printAmbiguous(state, *a->value, str, &seen, &context, 1);
-                printed[a] = str.str();
-            }
-            pending.clear();
-        };
-        for (auto & i : *v.attrs()) {
-            batch.open();
-            forceElement(*i.value, [&](Error & e) {
-                e.addTrace(
-                    state.positions[i.pos], HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
-            });
-            pending.push_back(&i);
-            if (batch.full()) {
-                printPending();
-                batch.end();
-            }
-        }
-        printPending();
-        batch.end();
-        buffer << "{ ";
-        for (auto i : sorted)
-            buffer << state.symbols[i->name] << " = " << printed[i] << "; ";
-        buffer << "}";
-    } else {
-        buffer << "[ ";
-        size_t index = 0;
-        for (auto v2 : v.listView()) {
-            batch.open();
-            forceElement(*v2, [&](Error & e) {
-                e.addTrace(nullptr, HintFmt("while evaluating list element at index %1%", index));
-            });
-            printAmbiguous(state, *v2, buffer, &seen, &context, 1);
-            buffer << " ";
-            index++;
-            if (batch.full())
-                batch.end();
-        }
-        batch.end();
-        buffer << "]";
-    }
-    out << buffer.str();
-}
-
 /* The traces `forceValueDeep` adds to an error in an element, out of line:
    their formatters are large, and `printStrictUnforced`'s frame is part of
    the stack prefix (STACK-PARITY.md, R4). */
@@ -144,12 +52,6 @@ enum OutputKind { okPlain, okRaw, okXML, okJSON };
  * is the value forced, with its sharing, and «repeated» is decided by
  * `printAmbiguous` exactly as without unforcing. Peak memory is what the
  * printed value needs (as without unforcing) plus a batch.
- *
- * Where walked cells cannot be kept (the mimalloc backend), each batch's
- * elements are printed before it ends, into
- * buffers assembled at the end in printing order; a value shared between
- * batches then prints in full instead of as «repeated»
- * (`printStrictUnforcedBuffered`).
  */
 [[gnu::noinline]] static void
 printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringContext & context)
@@ -163,10 +65,6 @@ printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringC
     auto walked = std::make_unique<std::set<const void *>>();
     walked->insert(&v);
     state.forceValue(v, v.determinePos(noPos));
-    if ((v.type() == nAttrs || v.isList()) && !unforceSeenExact()) {
-        printStrictUnforcedBuffered(state, v, out, context, *walked);
-        return;
-    }
     if (v.type() == nAttrs || v.isList()) {
         auto keepWalked = std::make_unique<UnforceSeen>(*walked);
         auto batch = std::make_unique<UnforceBatch>(state);
