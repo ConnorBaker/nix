@@ -2396,6 +2396,10 @@ static RegisterPrimOp primop_findFile(
       > ```
       >
       > makes `<nixpkgs>` refer to a particular branch of the `NixOS/nixpkgs` repository on GitHub.
+
+      Unless the entry is part of the configured lookup path, the flake reference must be locked in pure evaluation mode, and in restricted mode it must be allowed by `allowed-uris`.
+      This is stricter than [`builtins.fetchTree`](@docroot@/language/builtins.md#builtins-fetchTree), which accepts an unlocked input that has a NAR hash, with a warning: in pure evaluation mode, a `flake:` entry that is locked only by its NAR hash is refused.
+      If the entry, or the flake registry entry it resolves to, specifies a NAR hash, the contents must match it.
     )",
         .impl = prim_findFile,
     });
