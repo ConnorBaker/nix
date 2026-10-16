@@ -465,14 +465,57 @@ void ExprAttrs::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> 
     } else {
         auto inheritFromEnv = bindInheritSources(es, env);
 
-        for (auto & i : *attrs)
-            i.second.e->bindVars(es, i.second.chooseByKind(env, env, inheritFromEnv));
+        /* Non-recursive attr values are thunked against the already-fully-built
+           enclosing env, so their free vars can be safely snapshotted into a
+           flat capture (#8285 thunk half). Only Plain values are complex thunks;
+           inherited values are trivial. rec/let members are excluded because
+           their captured frame is still being populated incrementally. */
+        for (auto & i : *attrs) {
+            if (i.second.kind == AttrDef::Kind::Plain)
+                es.bindThunkCandidate(i.second.e, env);
+            else
+                i.second.e->bindVars(es, i.second.chooseByKind(env, env, inheritFromEnv));
+        }
 
         for (auto & i : *dynamicAttrs) {
             i.nameExpr->bindVars(es, env);
             i.valueExpr->bindVars(es, env);
         }
     }
+}
+
+void EvalState::bindThunkCandidate(Expr * e, const std::shared_ptr<const StaticEnv> & env)
+{
+    /* Flatten the thunk's capture iff: the feature is on, the debugger is off,
+       this expr actually allocates a thunk when lazy, and the capture is fully
+       static — no enclosing `with` (dynamic names) and no enclosing flat
+       boundary (keeps at most one boundary per chain, so the single-boundary
+       ExprVar logic stays exact). */
+    bool eligible = enableFlatThunks && !debugRepl && e->thunksWhenForced();
+    if (eligible)
+        for (auto * s = env.get(); s; s = s->up.get())
+            if (s->isWith || s->isFlatBoundary || s->noFlatten) {
+                eligible = false;
+                break;
+            }
+
+    if (!eligible) {
+        /* Clear any recipe a prior bind set (e.g. a leaf lambda's pass-1 bind,
+           before its own boundary was installed): the last bind's addressing is
+           authoritative and must match what maybeThunk does at runtime. */
+        e->flatThunk = nullptr;
+        e->bindVars(*this, env);
+        return;
+    }
+
+    FlatClosureBuilder builder;
+    auto boundary = std::make_shared<StaticEnv>(nullptr, env);
+    boundary->isFlatBoundary = true;
+    boundary->flatBuilder = &builder;
+    e->bindVars(*this, boundary);
+
+    flatThunkRecipes.push_back(FlatThunkRecipe{std::move(builder.captures)});
+    e->flatThunk = &flatThunkRecipes.back();
 }
 
 void ExprList::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env)

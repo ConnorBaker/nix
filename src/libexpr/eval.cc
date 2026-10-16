@@ -313,6 +313,7 @@ EvalState::EvalState(
     , buildStore(buildStore ? buildStore : store)
     , inputCache(fetchers::InputCache::create())
     , enableFlatClosures(getEnv("NIX_FLAT_CLOSURES").value_or("1") != "0")
+    , enableFlatThunks(getEnv("NIX_FLAT_THUNKS").value_or("1") != "0")
     , debugRepl(nullptr)
     , debugStop(false)
     , trylevel(0)
@@ -1069,7 +1070,24 @@ void EvalState::mkSingleDerivedPathString(const SingleDerivedPath & p, Value & v
 Value * Expr::maybeThunk(EvalState & state, Env & env)
 {
     Value * v = state.allocValue();
-    mkThunk(*v, env, this);
+    /* #8285 thunk half: a single predicted-not-taken branch on the hot thunk
+       path. When set (flat-thunks on, eligible non-rec attr value), build a
+       trimmed Env capturing exactly this expr's free vars from `env` — the same
+       Value* pointers, no copy/force — so a surviving thunk stops pinning the
+       whole enclosing chain. */
+    const FlatThunkRecipe * recipe = flatThunk;
+    if (recipe) [[unlikely]] {
+        Env & fe = state.mem.allocEnv(recipe->captures.size());
+        fe.up = nullptr;
+        for (size_t i = 0; i < recipe->captures.size(); ++i) {
+            Env * e = &env;
+            for (Level h = recipe->captures[i].first; h; --h)
+                e = e->up;
+            fe.values[i] = e->values[recipe->captures[i].second];
+        }
+        mkThunk(*v, fe, this);
+    } else
+        mkThunk(*v, env, this);
     return v;
 }
 

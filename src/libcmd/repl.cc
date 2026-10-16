@@ -140,6 +140,10 @@ NixRepl::NixRepl(
     , runNixPtr{runNix}
     , interacter(std::make_unique<ReadlineLikeInteracter>(getDataDir() / "repl-history"))
 {
+    /* #8285 thunk half: the REPL creates binding thunks with raw mkThunk (not
+       the flat-aware maybeThunk), so flat-thunk capture must be disabled for
+       expressions parsed in this scope. */
+    staticEnv->noFlatten = true;
 }
 
 static std::ostream & showDebugTrace(std::ostream & out, const PosTable & positions, const DebugTrace & dt)

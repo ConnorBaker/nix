@@ -24,6 +24,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
 
+#include <deque>
 #include <map>
 #include <optional>
 #include <functional>
@@ -466,6 +467,18 @@ public:
        (those whose body contains no nested lambda) — the surviving closures we
        flatten. Incremented once per lambda bound. */
     size_t lambdasBound = 0;
+
+    /* #8285 thunk half. Separate gate (NIX_FLAT_THUNKS, default on) so the hot
+       thunk-creation path can be A/B measured independently of flat lambdas.
+       Recipes are computed at parse time and owned here (deque = stable
+       addresses for the Expr::flatThunk pointers). */
+    const bool enableFlatThunks;
+    std::deque<FlatThunkRecipe> flatThunkRecipes;
+
+    /* Parse-time: bind `e` (a thunked child) against a flat-capture boundary
+       when eligible, recording its recipe on `e->flatThunk`; otherwise bind
+       normally. */
+    void bindThunkCandidate(Expr * e, const std::shared_ptr<const StaticEnv> & env);
 
     /**
      * Debugger

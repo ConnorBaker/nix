@@ -94,6 +94,11 @@ std::string showAttrSelectionPath(const SymbolTable & symbols, std::span<const A
 
 using UpdateQueue = SmallTemporaryValueVector<conservativeStackReservation>;
 
+/* Flat-capture recipe for thunks (#8285, thunk half). Computed once at parse
+   time; read at thunk creation to build a trimmed Env. Each entry is
+   (runtimeHops, displ) relative to the env the thunk is created in. */
+struct FlatThunkRecipe;
+
 /* Abstract syntax of Nix expressions. */
 
 struct Expr
@@ -104,6 +109,20 @@ struct Expr
     };
 
     static Counter nrExprs;
+
+    /* #8285 thunk half: when non-null, a thunk of this expr captures a flat Env
+       of exactly these free vars (up==nullptr) instead of the whole enclosing
+       chain. Set by bindVars only for thunked positions with a small static FV
+       set; null (the default) keeps the stock linked capture. */
+    const FlatThunkRecipe * flatThunk = nullptr;
+
+    /* Whether a lazy use of this expr actually allocates a ClosureThunk (the
+       default), as opposed to returning a value directly (vars, constants).
+       Only thunking exprs are eligible for flat-thunk capture. */
+    virtual bool thunksWhenForced() const
+    {
+        return true;
+    }
 
     Expr()
     {
@@ -168,6 +187,10 @@ struct ExprInt : Expr
     };
 
     Value * maybeThunk(EvalState & state, Env & env) override;
+    bool thunksWhenForced() const override
+    {
+        return false;
+    }
     COMMON_METHODS
 };
 
@@ -181,6 +204,10 @@ struct ExprFloat : Expr
     };
 
     Value * maybeThunk(EvalState & state, Env & env) override;
+    bool thunksWhenForced() const override
+    {
+        return false;
+    }
     COMMON_METHODS
 };
 
@@ -207,6 +234,10 @@ struct ExprString : Expr
     };
 
     Value * maybeThunk(EvalState & state, Env & env) override;
+    bool thunksWhenForced() const override
+    {
+        return false;
+    }
     COMMON_METHODS
 };
 
@@ -222,6 +253,10 @@ struct ExprPath : Expr
     }
 
     Value * maybeThunk(EvalState & state, Env & env) override;
+    bool thunksWhenForced() const override
+    {
+        return false;
+    }
     COMMON_METHODS
 };
 
@@ -255,6 +290,10 @@ struct ExprVar : Expr
         : pos(pos)
         , name(name) {};
     Value * maybeThunk(EvalState & state, Env & env) override;
+    bool thunksWhenForced() const override
+    {
+        return false;
+    }
 
     PosIdx getPos() const override
     {
@@ -924,6 +963,12 @@ struct FlatClosureBuilder
     }
 };
 
+/* Immutable flat-capture recipe stored on an Expr for the thunk half (#8285). */
+struct FlatThunkRecipe
+{
+    std::vector<std::pair<Level, Displacement>> captures;
+};
+
 struct StaticEnv
 {
     ExprWith * isWith;
@@ -934,6 +979,12 @@ struct StaticEnv
        redirects crossing references into `flatBuilder`. */
     bool isFlatBoundary = false;
     FlatClosureBuilder * flatBuilder = nullptr;
+
+    /* #8285 thunk half: set on a scope whose thunks are created outside the
+       flat-aware maybeThunk path (the REPL binds vars with raw mkThunk), so
+       rewriting their addressing for a flat env would be unsound. Disables
+       thunk-flattening for everything parsed under this scope. */
+    bool noFlatten = false;
 
     // Note: these must be in sorted order.
     typedef std::vector<std::pair<Symbol, Displacement>> Vars;
