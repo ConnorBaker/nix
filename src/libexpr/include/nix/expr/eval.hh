@@ -457,6 +457,16 @@ public:
 
     const ref<fetchers::InputCache> inputCache;
 
+    /* Flat-capture closure prototype (#8285). Gate at parse/eval time so the
+       same binary can A/B measure: NIX_FLAT_CLOSURES=0 forces the linked path,
+       reproducing stock behaviour exactly. Default on. */
+    const bool enableFlatClosures;
+
+    /* Parse-time counter used by ExprLambda::bindVars to detect "leaf" lambdas
+       (those whose body contains no nested lambda) — the surviving closures we
+       flatten. Incremented once per lambda bound. */
+    size_t lambdasBound = 0;
+
     /**
      * Debugger
      */

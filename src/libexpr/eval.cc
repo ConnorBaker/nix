@@ -312,6 +312,7 @@ EvalState::EvalState(
     , store(store)
     , buildStore(buildStore ? buildStore : store)
     , inputCache(fetchers::InputCache::create())
+    , enableFlatClosures(getEnv("NIX_FLAT_CLOSURES").value_or("1") != "0")
     , debugRepl(nullptr)
     , debugStop(false)
     , trylevel(0)
@@ -1570,6 +1571,23 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
 
 void ExprLambda::eval(EvalState & state, Env & env, Value & v)
 {
+    /* Flat-capture prototype (#8285): build a trimmed env holding exactly the
+       free variables of the body, with up==nullptr, so a surviving lambda no
+       longer pins the whole enclosing activation chain and its unused siblings.
+       Captures the *same* Value* pointers (no copy, no forcing) → laziness,
+       identity and output are preserved; only retention changes. */
+    if (flatten) {
+        Env & flat = state.mem.allocEnv(flatCaptures.size());
+        flat.up = nullptr;
+        for (size_t i = 0; i < flatCaptures.size(); ++i) {
+            Env * e = &env;
+            for (Level h = flatCaptures[i].first; h; --h)
+                e = e->up;
+            flat.values[i] = e->values[flatCaptures[i].second];
+        }
+        v.mkLambda(&flat, this);
+        return;
+    }
     v.mkLambda(&env, this);
 }
 

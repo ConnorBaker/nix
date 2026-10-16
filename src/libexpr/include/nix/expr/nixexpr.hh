@@ -542,6 +542,16 @@ public:
     Expr * body;
     DocComment docComment;
 
+    /* Closure/env trimming (flat-capture) prototype — upstream #8285.
+       When `flatten` is set, this lambda's value captures a flat Env holding
+       exactly the free variables its body reads (`flatCaptures`), with
+       `up == nullptr`, instead of the whole enclosing activation chain.
+       Each entry is (runtimeHops, displ): from the enclosing runtime env at
+       lambda-eval time, walk `runtimeHops` up-links then take `values[displ]`.
+       Decided statically in bindVars; empty/false means the usual linked path. */
+    bool flatten = false;
+    std::vector<std::pair<Level, Displacement>> flatCaptures;
+
     ExprLambda(
         const PosTable & positions,
         std::pmr::polymorphic_allocator<char> & alloc,
@@ -893,10 +903,37 @@ public:
 /* Static environments are used to map variable names onto (level,
    displacement) pairs used to obtain the value of the variable at
    runtime. */
+/* Closure/env trimming (flat-capture) prototype — upstream #8285.
+   During bindVars, a flattenable ExprLambda installs a "flat boundary"
+   StaticEnv between its argument frame and the real enclosing scope. Any
+   variable use whose resolution crosses this boundary (i.e. a free variable of
+   the lambda body) is interned here as a dense slot into the lambda's flat
+   capture record, and the ExprVar is rewritten to address that slot. */
+struct FlatClosureBuilder
+{
+    // slot index -> (runtimeHops from enclosing env, displ within that env)
+    std::vector<std::pair<Level, Displacement>> captures;
+
+    Displacement intern(Level runtimeHops, Displacement displ)
+    {
+        for (size_t s = 0; s < captures.size(); ++s)
+            if (captures[s].first == runtimeHops && captures[s].second == displ)
+                return (Displacement) s;
+        captures.emplace_back(runtimeHops, displ);
+        return (Displacement) (captures.size() - 1);
+    }
+};
+
 struct StaticEnv
 {
     ExprWith * isWith;
     std::shared_ptr<const StaticEnv> up;
+
+    /* Flat-capture prototype (#8285): when set, this level is the capture
+       boundary for an enclosing flattenable lambda; it owns no bindings and
+       redirects crossing references into `flatBuilder`. */
+    bool isFlatBoundary = false;
+    FlatClosureBuilder * flatBuilder = nullptr;
 
     // Note: these must be in sorted order.
     typedef std::vector<std::pair<Symbol, Displacement>> Vars;

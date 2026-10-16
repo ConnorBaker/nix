@@ -324,15 +324,41 @@ void ExprVar::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & 
     const StaticEnv * curEnv;
     Level level;
     int withLevel = -1;
+    /* Flat-capture prototype (#8285): the nearest enclosing lambda capture
+       boundary we have walked past, if any. A match found *above* it is a free
+       variable of that lambda: intern it as a flat slot and rewrite this use to
+       index the (collapsed) flat env sitting at the boundary level. */
+    int flatBoundaryLevel = -1;
+    FlatClosureBuilder * flatBuilder = nullptr;
     for (curEnv = env.get(), level = 0; curEnv; curEnv = curEnv->up.get(), level++) {
+        if (curEnv->isFlatBoundary) {
+            if (flatBoundaryLevel == -1) {
+                flatBoundaryLevel = level;
+                flatBuilder = curEnv->flatBuilder;
+            }
+            /* The boundary owns no bindings; keep searching the real scope. */
+            continue;
+        }
         if (curEnv->isWith) {
             if (withLevel == -1)
                 withLevel = level;
         } else {
             auto i = curEnv->find(name);
             if (i != curEnv->vars.end()) {
-                this->level = level;
-                displ = i->second;
+                if (flatBoundaryLevel != -1) {
+                    /* Captured free variable. At lambda-eval time the enclosing
+                       runtime env corresponds to the boundary's parent, so the
+                       value lives `level - flatBoundaryLevel - 1` up-links above
+                       it at `displ`. All crossing refs collapse onto the single
+                       flat env that replaces the chain at the boundary level. */
+                    Displacement slot =
+                        flatBuilder->intern((Level) (level - flatBoundaryLevel - 1), i->second);
+                    this->level = (Level) flatBoundaryLevel;
+                    this->displ = slot;
+                } else {
+                    this->level = level;
+                    displ = i->second;
+                }
                 return;
             }
         }
@@ -463,26 +489,74 @@ void ExprLambda::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv>
     if (es.debugRepl)
         es.exprEnvs.insert(std::make_pair(this, env));
 
-    auto newEnv =
-        std::make_shared<StaticEnv>(nullptr, env, (getFormals() ? getFormals()->formals.size() : 0) + (!arg ? 0 : 1));
+    /* Build this lambda's argument frame (arg + formals) over the given scope. */
+    auto makeArgEnv = [&](const std::shared_ptr<const StaticEnv> & up) {
+        auto e = std::make_shared<StaticEnv>(
+            nullptr, up, (getFormals() ? getFormals()->formals.size() : 0) + (!arg ? 0 : 1));
+        Displacement displ = 0;
+        if (arg)
+            e->vars.emplace_back(arg, displ++);
+        if (auto formals = getFormals()) {
+            for (auto & i : formals->formals)
+                e->vars.emplace_back(i.name, displ++);
+            e->sort();
+        }
+        return e;
+    };
 
-    Displacement displ = 0;
-
-    if (arg)
-        newEnv->vars.emplace_back(arg, displ++);
-
-    if (auto formals = getFormals()) {
-        for (auto & i : formals->formals)
-            newEnv->vars.emplace_back(i.name, displ++);
-
-        newEnv->sort();
-
+    /* Pass 1: resolve against the real enclosing scope, and detect whether this
+       lambda is a "leaf" (its body contains no nested lambda). We flatten only
+       leaf lambdas — these are the closures that actually survive and over-pin a
+       scope (e.g. the function returned by a `callPackage`/override/currying
+       chain). Flattening a leaf also guarantees at most one flat boundary per
+       static chain, so the single-boundary capture logic stays exact. */
+    size_t selfMark = ++es.lambdasBound;
+    auto argEnv = makeArgEnv(env);
+    if (auto formals = getFormals())
         for (auto & i : formals->formals)
             if (i.def)
-                i.def->bindVars(es, newEnv);
-    }
+                i.def->bindVars(es, argEnv);
+    body->bindVars(es, argEnv);
+    bool leaf = es.lambdasBound == selfMark;
 
-    body->bindVars(es, newEnv);
+    /* Flat-capture prototype (#8285). Eligible when:
+         - the feature is enabled and the debugger is off (it relies on the full
+           StaticEnv chain for introspection);
+         - this is a leaf lambda (no nested lambda to complicate capture);
+         - no enclosing `with` (its names are dynamic — not a static FV set) and
+           no enclosing flat boundary.
+       `rec`/large-`let` frames are untouched: we only trim lambda captures, so
+       those stay on the linked Env path exactly as #8285 prescribes. */
+    bool eligible = es.enableFlatClosures && !es.debugRepl && leaf;
+    if (eligible)
+        for (auto * e = env.get(); e; e = e->up.get())
+            if (e->isWith || e->isFlatBoundary) {
+                eligible = false;
+                break;
+            }
+
+    if (!eligible)
+        return;
+
+    /* Pass 2: re-resolve the body against a flat capture boundary inserted
+       between the argument frame and the enclosing scope. Every body reference
+       that reaches the enclosing scope is interned as a dense slot and the
+       ExprVar rewritten to index the single flat env that will replace the
+       chain at eval time. Re-binding is deterministic (same displacements) and
+       the one-time data moves it performs are idempotent. */
+    FlatClosureBuilder builder;
+    auto boundary = std::make_shared<StaticEnv>(nullptr, env);
+    boundary->isFlatBoundary = true;
+    boundary->flatBuilder = &builder;
+    auto argEnv2 = makeArgEnv(boundary);
+    if (auto formals = getFormals())
+        for (auto & i : formals->formals)
+            if (i.def)
+                i.def->bindVars(es, argEnv2);
+    body->bindVars(es, argEnv2);
+
+    flatten = true;
+    flatCaptures = std::move(builder.captures);
 }
 
 void ExprCall::moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc)
