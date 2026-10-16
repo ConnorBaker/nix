@@ -89,3 +89,6 @@ url="file://$TEST_ROOT/find-file-url.tar.gz"
 expectStderr 1 nix-instantiate --restrict-eval --eval -E "builtins.findFile [ { prefix = \"foo\"; path = \"flake:path:$TEST_ROOT/no-such-path\"; } ] \"foo\"" \
   | grepQuiet "access to URI 'path:$TEST_ROOT/no-such-path' is forbidden in restricted mode"
 [[ $(nix-instantiate --restrict-eval --eval -E 'import <foo>' -I foo="flake:path:$TEST_ROOT/find-file-url/foo") == 123 ]]
+
+# A URL given as the file to evaluate can be used in restricted mode too.
+[[ $(nix-instantiate --restrict-eval --eval "$url") == 123 ]]
