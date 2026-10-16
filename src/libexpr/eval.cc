@@ -3380,6 +3380,7 @@ EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAcces
         try {
             auto accessor = fetchers::downloadTarball(*store, fetchSettings, EvalSettings::resolvePseudoUrl(value));
             auto storePath = fetchToStore(fetchSettings, *store, SourcePath(accessor), FetchMode::Copy);
+            allowPath(storePath);
             return finish(this->storePath(storePath));
         } catch (Error & e) {
             logWarning({.msg = HintFmt("Nix search path entry '%1%' cannot be downloaded, ignoring", value)});
