@@ -31,11 +31,44 @@ EvalSettings evalSettings{
                 const auto & fetchSettings = state.fetchSettings;
                 experimentalFeatureSettings.require(Xp::Flakes);
                 auto flakeRef = parseFlakeRef(rest, {}, true, false);
+
+                /* The entry may come from Nix code via `builtins.findFile`, so
+                   apply the same lock and URI checks as `fetchTree`. Like
+                   `fetchTree`, don't consult the flake registries in pure
+                   mode. (Pure mode has no configured lookup path.) */
+                if (state.settings.pureEval && !flakeRef.input.isLocked(fetchSettings))
+                    state
+                        .error<EvalError>(
+                            "cannot fetch unlocked Nix search path entry 'flake:%s' in pure evaluation mode (use '--impure' to override)",
+                            rest)
+                        .debugThrow();
+
+                auto resolvedRef = state.settings.pureEval ? flakeRef : flakeRef.resolve(fetchSettings, *state.store);
+
+                /* Entries of the configured lookup path (`-I`, `NIX_PATH`,
+                   `nix-path`) are trusted. */
+                auto value = "flake:" + std::string(rest);
+                if (!std::ranges::any_of(
+                        state.getLookupPath().elements, [&](auto & elem) { return elem.path.s == value; }))
+                    state.checkURI(resolvedRef.input.toURLString());
+
                 debug("fetching flake search path element '%s''", rest);
-                auto [accessor, lockedRef] =
-                    flakeRef.resolve(fetchSettings, *state.store).lazyFetch(fetchSettings, *state.store);
-                auto storePath = nix::fetchToStore(
+                auto [accessor, lockedRef] = resolvedRef.lazyFetch(fetchSettings, *state.store);
+                auto [storePath, narHash] = nix::fetchToStore2(
                     fetchSettings, *state.store, SourcePath(accessor), FetchMode::Copy, lockedRef.input.getName());
+
+                /* Not all fetchers check the NAR hash themselves (e.g. the
+                   `path` fetcher doesn't), so check it here, like
+                   `EvalState::mountInput()` does for `fetchTree`. */
+                if (auto expectedNarHash = resolvedRef.input.getNarHash();
+                    expectedNarHash && narHash != *expectedNarHash)
+                    throw Error(
+                        (unsigned int) 102,
+                        "NAR hash mismatch in Nix search path entry 'flake:%s', expected '%s' but got '%s'",
+                        rest,
+                        expectedNarHash->to_string(HashFormat::SRI, true),
+                        narHash.to_string(HashFormat::SRI, true));
+
                 state.allowPath(storePath);
                 return state.storePath(storePath);
             },

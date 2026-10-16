@@ -52,3 +52,19 @@ expectStderr 0 nix eval --expr "some/relative/path" --impure \
 # must not be downloaded in pure mode.
 expectStderr 1 nix eval --expr 'builtins.findFile [ { prefix = "foo"; path = "https://example.invalid/foo.tar.gz"; } ] "foo"' \
   | grepQuiet "cannot download Nix search path entry 'https://example.invalid/foo.tar.gz' in pure evaluation mode"
+
+# The same goes for unlocked `flake:` entries.
+expectStderr 1 nix eval --expr "builtins.findFile [ { prefix = \"foo\"; path = \"flake:path:$TEST_ROOT/no-such-path\"; } ] \"foo\"" \
+  | grepQuiet "cannot fetch unlocked Nix search path entry 'flake:path:$TEST_ROOT/no-such-path' in pure evaluation mode"
+
+# The NAR hash of a `flake:` entry is verified.
+mkdir -p "$TEST_ROOT/find-file-flake/a" "$TEST_ROOT/find-file-flake/b"
+echo 456 > "$TEST_ROOT/find-file-flake/a/default.nix"
+echo 789 > "$TEST_ROOT/find-file-flake/b/default.nix"
+expectStderr 102 nix eval --expr "import (builtins.findFile [ { prefix = \"foo\"; path = \"flake:path:$TEST_ROOT/find-file-flake/a?narHash=sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=\"; } ] \"foo\")" \
+  | grepQuiet "NAR hash mismatch in Nix search path entry"
+
+# A locked `flake:` entry can be used in pure mode, without the flake registries.
+flakeRef="path:$TEST_ROOT/find-file-flake/a?narHash=$(nix hash path "$TEST_ROOT/find-file-flake/a")"
+nix registry add "$flakeRef" "path:$TEST_ROOT/find-file-flake/b"
+[[ $(nix eval --expr "import (builtins.findFile [ { prefix = \"foo\"; path = \"flake:$flakeRef\"; } ] \"foo\")") == 456 ]]

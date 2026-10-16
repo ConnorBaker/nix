@@ -2420,6 +2420,8 @@ static RegisterPrimOp primop_findFile(
       > ```
       >
       > makes `<nixpkgs>` refer to a particular branch of the `NixOS/nixpkgs` repository on GitHub.
+
+      As with [`builtins.fetchTree`](@docroot@/language/builtins.md#builtins-fetchTree), unless the entry is part of the configured lookup path, the flake reference must be locked in pure evaluation mode, and in restricted mode it must be allowed by `allowed-uris`.
     )",
         .impl = prim_findFile,
     });
