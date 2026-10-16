@@ -2376,6 +2376,8 @@ static RegisterPrimOp primop_findFile(
       The URLs of the tarballs from the official `nixos.org` channels can be abbreviated as `channel:<channel-name>`.
       See [documentation on `nix-channel`](@docroot@/command-ref/nix-channel.md) for details about channels.
 
+      Unless the entry is part of the lookup path configured with `-I`, [`NIX_PATH`](@docroot@/command-ref/env-common.md#env-NIX_PATH) or [`nix-path`](@docroot@/command-ref/conf-file.md#conf-nix-path), such URLs are rejected in [pure evaluation mode](@docroot@/command-ref/conf-file.md#conf-pure-eval), and in [restricted mode](@docroot@/command-ref/conf-file.md#conf-restrict-eval) they must be allowed by [`allowed-uris`](@docroot@/command-ref/conf-file.md#conf-allowed-uris).
+
       > **Example**
       >
       > These two search path entries are equivalent:

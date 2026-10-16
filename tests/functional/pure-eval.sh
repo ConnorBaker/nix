@@ -47,3 +47,8 @@ expectStderr 0 nix eval --expr "some/relative/path" \
 
 expectStderr 0 nix eval --expr "some/relative/path" --impure \
   | grepQuiet "$PWD/some/relative/path"
+
+# A URL in a lookup path passed to `builtins.findFile` can't be locked, so it
+# must not be downloaded in pure mode.
+expectStderr 1 nix eval --expr 'builtins.findFile [ { prefix = "foo"; path = "https://example.invalid/foo.tar.gz"; } ] "foo"' \
+  | grepQuiet "cannot download Nix search path entry 'https://example.invalid/foo.tar.gz' in pure evaluation mode"
