@@ -133,7 +133,6 @@ const Settings & unforceSettings()
    own NIX_UNFORCE_* variable; all default off (unset means none). */
 struct DebugDial
 {
-    bool trace = false;      /* was NIX_UNFORCE_DEBUG: select tracing + registry */
     bool verify = false;     /* was NIX_UNFORCE_VERIFY */
     bool verifyDump = false; /* was NIX_UNFORCE_VERIFY_DUMP */
     bool tripwire = false;   /* was NIX_UNFORCE_TRIPWIRE */
@@ -153,8 +152,6 @@ const DebugDial & unforceDebug()
             i = j + 1;
             if (tok.empty())
                 continue;
-            else if (tok == "trace")
-                r.trace = true;
             else if (tok == "verify")
                 r.verify = true;
             else if (tok == "verify-dump")
@@ -186,7 +183,7 @@ size_t regionSize()
 
 struct Stats
 {
-    size_t jobs = 0, logged = 0, reverted = 0, stubbed = 0, promoted = 0, copiedBytes = 0, regionPeak = 0, relogged = 0;
+    size_t jobs = 0, logged = 0, reverted = 0, stubbed = 0, promoted = 0, copiedBytes = 0, regionPeak = 0;
     /* Targets logged in a job that an earlier job had forced and reverted. */
     size_t reforced = 0;
     /* Job memory released, summed over jobs. */
@@ -249,7 +246,7 @@ static void printStatsAtExit()
     [[maybe_unused]] static bool registered =
         (std::atexit([] {
              std::cerr << fmt(
-                 "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d (relogged %d), copied %d MiB, "
+                 "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d, copied %d MiB, "
                  "largest scope %d MiB; reforced %d, freed %d MiB; owner closure: promoted %d, jobs %d; "
                  "counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d; "
                  "seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
@@ -259,7 +256,6 @@ static void printStatsAtExit()
                  stats.reverted,
                  stats.stubbed,
                  stats.promoted,
-                 stats.relogged,
                  stats.copiedBytes >> 20,
                  stats.regionPeak >> 20,
                  stats.reforced,
@@ -1034,9 +1030,6 @@ struct Evacuator
     std::vector<Value *> values;
     std::vector<std::pair<Env *, size_t>> envs;
 
-    /* If set, called for every young object as it is copied. */
-    std::function<void(const void *)> onForward;
-
     /* If set, called with every identity-bearing young object as it is
        copied (cells, Bindings layers, element arrays): the owner closure. */
     void (*onIdentity)(void *, const void *) = nullptr;
@@ -1045,8 +1038,6 @@ struct Evacuator
     void note(const void * p, void * n)
     {
         forward.emplace(p, n);
-        if (onForward)
-            onForward(p);
     }
 
     bool young(const void * p) const
@@ -1448,15 +1439,13 @@ struct YoungSpace
     }
 };
 
-/* Per young object, four flags of the closure (`Closure`): in Evac(S),
-   visited by the current walk, known to reach no Evac(S) cell from the
-   walks still to come (a memo), and reached by some walk of this job. */
-enum Flag : uint8_t { inEvac = 1, visited = 2, memo = 4, reached = 8 };
+/* The one closure flag per young object: whether it is in Evac(S). */
+enum Flag : uint8_t { inEvac = 1 };
 
-/* The flags of the bump region's objects: four bits per 16-byte granule
-   (bump allocations are 16-byte aligned), side by side so that one load
-   reads them all, in pieces covering 64 KiB of the region that are
-   allocated when first touched. At most 3.1 % of the job's memory. */
+/* The flag of each of the bump region's objects: a nibble per 16-byte
+   granule (bump allocations are 16-byte aligned; only `inEvac`, bit 0, is
+   used), in pieces covering 64 KiB of the region that are allocated when
+   first touched. At most 3.1 % of the job's memory. */
 struct RegionMarks
 {
     static constexpr size_t granuleShift = 4, pieceShift = 16;
@@ -1477,13 +1466,6 @@ struct RegionMarks
     {
     }
 
-    uint8_t get(const void * p) const
-    {
-        auto g = ((uintptr_t) p - base) >> granuleShift;
-        auto & piece = pieces[g >> (pieceShift - granuleShift)];
-        return piece ? (piece->nibbles[(g >> 4) % words] >> ((g & 15) * 4)) & 15 : 0;
-    }
-
     /* Set `flags` on `p`; returns the flags it had. */
     uint8_t add(const void * p, uint8_t flags)
     {
@@ -1498,49 +1480,6 @@ struct RegionMarks
         uint8_t old = (w >> shift) & 15;
         w |= uint64_t(flags) << shift;
         return old;
-    }
-
-    /* For a walk: if `p` is neither visited nor memo'd, mark it visited
-       and return true. One lookup. */
-    bool claim(const void * p)
-    {
-        auto g = ((uintptr_t) p - base) >> granuleShift;
-        auto & piece = pieces[g >> (pieceShift - granuleShift)];
-        if (!piece) [[unlikely]] {
-            piece = std::make_unique<Piece>();
-            allocated++;
-        }
-        auto & w = piece->nibbles[(g >> 4) % words];
-        auto shift = (g & 15) * 4;
-        if ((w >> shift) & (visited | memo))
-            return false;
-        w |= uint64_t(visited) << shift;
-        return true;
-    }
-
-    void remove(const void * p, uint8_t flags)
-    {
-        auto g = ((uintptr_t) p - base) >> granuleShift;
-        if (auto & piece = pieces[g >> (pieceShift - granuleShift)])
-            piece->nibbles[(g >> 4) % words] &= ~(uint64_t(flags) << ((g & 15) * 4));
-    }
-
-    /* Returns its cost in closure steps (`Closure::charge`), scaled so
-       that a step stands for about as much work as popping an object:
-       64 words cleared, or 64 empty pieces skipped. */
-    uint64_t removeAll(uint8_t flags)
-    {
-        auto mask = ~(uint64_t(flags) * 0x1111111111111111);
-        for (auto & piece : pieces)
-            if (piece)
-                for (auto & w : piece->nibbles)
-                    w &= mask;
-        return 1 + pieces.size() / 64 + allocated * (words / 64);
-    }
-
-    size_t bytes() const
-    {
-        return pieces.capacity() * sizeof(pieces[0]) + allocated * sizeof(Piece);
     }
 };
 
@@ -2112,7 +2051,7 @@ std::string unforceStatsJSON()
     if (!stats.jobs)
         return "";
     return fmt(
-        R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"relogged":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
+        R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
         R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markerPromoted":%d,"markerJobs":%d,)"
         R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
         R"("revertedInClientJobs":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
@@ -2124,7 +2063,6 @@ std::string unforceStatsJSON()
         stats.reverted,
         stats.stubbed,
         stats.promoted,
-        stats.relogged,
         stats.copiedBytes,
         stats.regionPeak,
         stats.reforced,
