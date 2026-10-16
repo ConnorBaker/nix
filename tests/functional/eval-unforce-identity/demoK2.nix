@@ -1,4 +1,4 @@
-# The demo1 schedule for promotion after 2 forces (review §1.3).
+# The demo1 schedule for promotion after 2 forces.
 let
   P = { a = { f = x: x; }; };
   R = P.a;

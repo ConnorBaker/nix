@@ -1,4 +1,4 @@
-# A lambda's environment slot is copied as a thunk (review §1.3).
+# A lambda's environment slot is copied as a thunk.
 let
   P =
     let

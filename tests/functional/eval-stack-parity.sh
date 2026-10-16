@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 
-# PROTOTYPE (unforce): stack parity with base Nix. Unforcing must not change
-# where Nix overflows the native stack: a program that base evaluates, or
-# stops with the catchable max-call-depth error, must do the same here, and
-# one that overflows in base must overflow here too, with and without
-# `eval-unforce` (see notes/identity/STACK-PARITY.md in the unforce work
-# notes). Larger frames in the evaluator (an inlined hook in `forceValue`,
-# say) or in a recursive traversal break the first; smaller ones the second.
+# Stack parity with base Nix. Unforcing must not change where Nix overflows
+# the native stack: a program that base evaluates, or stops with the
+# catchable max-call-depth error, must do the same here, and one that
+# overflows in base must overflow here too, with and without `eval-unforce`.
+# Larger frames in the evaluator (an inlined hook in `forceValue`, say) or in
+# a recursive traversal break the first; smaller ones the second.
 #
 # Base is not in the test suite, so its edges are pinned
 # (eval-stack-parity/edges.txt): for each program
@@ -23,8 +22,7 @@
 # configuration, so the test skips unless the build is the pinned one
 # (aarch64-linux, 4 KiB pages, GCC 15.2.0, debugoptimized, no LTO, no unity
 # build, no sanitizers, no Boehm GC). Other configurations are checked
-# against base built the same way, in the unforce work notes' CI
-# (notes/ci/stack-parity.nix), with the same programs.
+# against base built the same way, with the same programs.
 #
 # To re-pin, run this test against base (NIX_CLIENT_PACKAGE=<base, with
 # bin/nix and bin/nix-instantiate>) with STACK_PARITY_CALIBRATE=1, which

@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 
-# PROTOTYPE (unforce): a container printed in one job and reached again in a
-# later one prints as «repeated», as without unforcing: the printers keep
-# their `seen` sets exact across jobs (`UnforceSeen` in
-# src/libexpr/unforce.cc). With a job per top-level element, under every
-# promotion threshold, `nix-instantiate --eval --strict` and `nix eval` must
-# print what they print without unforcing. The e-*.nix programs are a sample
-# of the printing corpus of the review of markers v2 (§2.2, e2q), on which
-# every program where base prints «repeated» used to differ. The attr*.nix
-# programs and ae-*.nix (the same sample with the top-level list turned into
-# an attribute set named z3..z0, from the review of markers v3, §1.2) are
-# top-level attribute sets whose Bindings order, in which
-# `nix-instantiate --strict` forces them, is not the printed order.
+# A container printed in one job and reached again in a later one prints as
+# «repeated», as without unforcing: the printers keep their `seen` sets exact
+# across jobs (`UnforceSeen` in src/libexpr/unforce.cc). With a job per
+# top-level element, under every promotion threshold,
+# `nix-instantiate --eval --strict` and `nix eval` must print what they print
+# without unforcing. The e-*.nix and rep*.nix programs are top-level lists;
+# the attr*.nix and ae-*.nix programs are top-level attribute sets whose
+# Bindings order, in which `nix-instantiate --strict` forces them, is not the
+# printed order. e-corpus.nix / ae-corpus.nix each reach the same shared
+# values twice through a spread of value shapes (plain attrs, list, nested,
+# function closure, import, and the sets that mapAttrs / listToAttrs /
+# foldl' / genericClosure / partition build).
 
 source common.sh
 

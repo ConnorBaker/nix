@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# PROTOTYPE (unforce): promotion must not split value identity. Each program
+# Promotion must not split value identity. Each program
 # in eval-unforce-identity/ compares a value kept by a promoted cell with the
 # same value reached through a cell that a job reverted (see the owner
 # timeline in src/libexpr/unforce.cc). With a job per element, the output
@@ -37,7 +37,7 @@ for f in *.nix; do
         || fail "$f: got '$out', expected '$expected'"
 done
 
-# Generated schedules (from the epoch branch): each makes a count-only policy
+# Generated schedules: each makes a count-only policy
 # diverge at exactly one K. K-1 jobs force R (and P), one job forces P only,
 # so P is promoted with P.a copied unforced, then one job forces R alone,
 # which reaches K and is promoted holding a copy of P.a's value; P.a is
@@ -100,3 +100,28 @@ expr='let
 in [ c ]'
 pairs=$(ownerStat ownerConsumerPairsPeak "$expr")
 [[ -n $pairs ]] && (( pairs <= 4 )) || fail "an alternating consumer recorded ${pairs:-no} consumer pairs"
+
+# The two "keep the whole job" fallbacks are exercised and counted, each still
+# output-identical to base. A promoted job whose young closure to copy exceeds
+# the copy limit (a quarter of the batch, at least 4 MiB) is kept whole
+# instead of copied (ownerCopyLimitJobs); a job whose owner timeline exceeds
+# the same budget stops tracking owners and is kept whole (ownerOverflowJobs).
+cmpBase() { # EXPR
+    nix-instantiate --option eval-unforce true --option eval-unforce-batch-size 0 \
+        --eval --strict --json -E "$1" > "$TEST_ROOT/keep-on.json" 2>/dev/null
+    nix-instantiate --option eval-unforce false --eval --strict --json -E "$1" > "$TEST_ROOT/keep-off.json" 2>/dev/null
+    cmp -s "$TEST_ROOT/keep-on.json" "$TEST_ROOT/keep-off.json"
+}
+expr='let big = builtins.genList (i: { v = i; }) 500000; in [ big big ]'
+copyKept=$(ownerStat ownerCopyLimitJobs "$expr")
+[[ -n $copyKept ]] && (( copyKept >= 1 )) || fail "a promoted job over the copy limit was not kept whole (ownerCopyLimitJobs=${copyKept:-none})"
+cmpBase "$expr" || fail "the copy-limit kept-whole job's output differs from base"
+
+expr='let
+  n = 160000;
+  a = builtins.listToAttrs [ { name = "x"; value = builtins.genList (i: { v = [ i ]; }) n; } ];
+  b = builtins.listToAttrs [ { name = "x"; value = builtins.genList (i: { v = [ (i + 1) ]; }) n; } ];
+in [ a b (builtins.genList (i: builtins.head (builtins.elemAt a.x i).v + builtins.head (builtins.elemAt b.x i).v) n) a.x b.x ]'
+overflowKept=$(ownerStat ownerOverflowJobs "$expr")
+[[ -n $overflowKept ]] && (( overflowKept >= 1 )) || fail "a job over the owner budget did not overflow and keep whole (ownerOverflowJobs=${overflowKept:-none})"
+cmpBase "$expr" || fail "the owner-overflow kept-whole job's output differs from base"

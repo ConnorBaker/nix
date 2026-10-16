@@ -1,4 +1,4 @@
-# The fileEvalCache cell of an imported file (review §2.2(b)).
+# The fileEvalCache cell of an imported file.
 let
   P = import ./set.nix;
   R = P.a;

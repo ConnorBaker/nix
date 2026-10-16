@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# PROTOTYPE (unforce): output of traversals that unforce what they visit
+# Output of traversals that unforce what they visit
 # (`eval-unforce`) must match the output without unforcing.
 
 source common.sh

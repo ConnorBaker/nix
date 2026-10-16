@@ -1,4 +1,4 @@
-# Programs of eval-stack-parity.sh (and notes/ci/stack-parity.nix). Tab-separated:
+# Programs of eval-stack-parity.sh. Tab-separated:
 # name, tool, max-call-depth, class, class arguments, expression (@N@ stands for N). Classes:
 #   int E: prints the number E;  nat: prints a number;  fmt F E: prints F with %d replaced by E;
 #   has F E: some output line contains F with %d replaced by E;  count P E: E output lines contain P;

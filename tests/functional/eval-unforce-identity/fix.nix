@@ -1,4 +1,4 @@
-# A lib.fix-style self-reference (review §1.3 mapattrs.nix), without Nixpkgs.
+# A lib.fix-style self-reference, without Nixpkgs.
 let
   fix = f: let x = f x; in x;
   unique = builtins.foldl' (acc: e: if builtins.elem e acc then acc else acc ++ [ e ]) [ ];

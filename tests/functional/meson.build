@@ -24,7 +24,7 @@ dot = find_program('dot', native : true, required : false)
 
 nix_bin_dir = fs.parent(nix.full_path())
 
-# PROTOTYPE (unforce): the build configuration, for tests whose expectations
+# The build configuration, for tests whose expectations
 # hold for one configuration only (eval-stack-parity.sh pins stack depths).
 build_config = 'unknown'
 if add_languages('cpp', native : false, required : false)
