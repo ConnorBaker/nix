@@ -72,3 +72,8 @@ echo "$output" | grep "is forbidden"
 echo "$output" | grepInverse -F restricted-secret
 
 expectStderr 1 nix-instantiate --restrict-eval true ./dependencies.nix | grepQuiet "forbidden in restricted mode"
+
+# A URL in a lookup path passed to `builtins.findFile` must be allowed before it
+# is downloaded.
+expectStderr 1 nix-instantiate --restrict-eval --eval -E 'builtins.findFile [ { prefix = "foo"; path = "https://example.invalid/foo.tar.gz"; } ] "foo"' \
+  | grepQuiet "access to URI 'https://example.invalid/foo.tar.gz' is forbidden in restricted mode"
