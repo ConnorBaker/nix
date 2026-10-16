@@ -16,6 +16,7 @@
 #include "nix/expr/tests/nix_api_expr.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/expr/print.hh"
+#include "nix/expr/unforce.hh"
 
 #include <gtest/gtest.h>
 

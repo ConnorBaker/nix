@@ -2,6 +2,7 @@
 #include "nix/util/finally.hh"
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/util/signals.hh"
 
 #include <cstdlib>

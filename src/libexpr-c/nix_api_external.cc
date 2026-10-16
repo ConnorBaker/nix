@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/value.hh"
 
 #include "nix_api_expr.h"

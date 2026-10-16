@@ -3,6 +3,7 @@
 #include "nix/store/sqlite.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/globals.hh"
 // Need specialization involving `SymbolStr` just in this one module.

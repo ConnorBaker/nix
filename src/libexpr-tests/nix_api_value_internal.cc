@@ -10,6 +10,7 @@
 
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/unforce.hh"
 
 #include <gmock/gmock.h>
 #include <cstddef>

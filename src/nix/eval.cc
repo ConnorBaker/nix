@@ -4,6 +4,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/value-to-json.hh"
 
 #include <nlohmann/json.hpp>

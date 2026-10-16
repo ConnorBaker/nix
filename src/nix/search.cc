@@ -2,6 +2,7 @@
 #include "nix/store/globals.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/names.hh"
 #include "nix/main/common-args.hh"

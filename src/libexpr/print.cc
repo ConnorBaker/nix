@@ -8,6 +8,7 @@
 #include "nix/util/terminal.hh"
 #include "nix/util/english.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
 

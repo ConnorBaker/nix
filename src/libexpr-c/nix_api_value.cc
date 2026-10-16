@@ -1,6 +1,7 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/path.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/value.hh"

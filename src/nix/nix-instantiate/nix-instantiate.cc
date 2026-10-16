@@ -4,6 +4,7 @@
 #include "nix/main/shared.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/expr/value-to-xml.hh"

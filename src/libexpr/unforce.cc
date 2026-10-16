@@ -9,6 +9,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/value.hh"
@@ -1366,7 +1367,8 @@ struct Stubber
 };
 
 /* ---------------------------------------------------------------------------
-   Force markers: closing a job's promotion set under "producer-of".
+   Promotion correctness: closing a job's promotion set under "producer-of"
+   (the policy comment; owner(x) is computed by the owner timeline above).
 
    Promotion breaks the evaluator's pointer identity (`eqValues` short-cuts on
    `&v1 == &v2`; Nixpkgs relies on it for `hostPlatform == buildPlatform`)
@@ -1377,15 +1379,8 @@ struct Stubber
    before its producer), so the counts only nominate promotions; this closure
    makes them safe.
 
-   Definitions, for one job (outermost scope). Time is the job's allocation
-   clock (`unforceClock`): the bump cursor, or the cell clock of the mimalloc
-   backend's chunks; a young object's time a(x) is its address (bump), or its
-   chunk position (mimalloc cells; other mimalloc objects have no time).
-   - Targets T: old cells forced in the job (the undo log). Every logged force
-     of t has an interval [s, e) of times: s when it was logged, e when it
-     returned or threw (`endLoggedForce`). Forcing is LIFO, so the intervals
-     form a forest (`parent`), and innermost(a) is the deepest interval
-     containing time a.
+   Definitions, for one job (outermost scope).
+   - Targets T: old cells forced in the job (the undo log).
    - The creator of a young object x is the innermost cell (young or old)
      being forced when x was allocated; owner(x) is the first old cell on the
      creator chain x, creator(x), creator(creator(x)), ... (a target), or
@@ -1449,32 +1444,25 @@ struct Stubber
    from c(t) through the thunk's cell; another evaluation that reads c(t)
    copies pointers that are reachable from c(t) already.
 
-   Candidates. Let X ∈ Evac(S) be owned by t ∉ S. If t was running when X was
-   allocated, then innermost(a(X)) is t's interval (Lemma V: no nested target
-   was running); otherwise t had ended, a(X) ≥ e. Either way a(X) ≥ s, and
-   by Lemma C every object on the path from c(t) satisfies the same, so
-   allowed(t, a) := a ≥ s ∧ (a ≥ e ∨ innermost(a) is t's interval) holds
-   along it. So t is a candidate producer iff a walk of R(c(t)) that never
-   enters an object with ¬allowed(t, a(x)) reaches an identity-bearing object
-   of Evac(S) (Lemma C holds for every object t owns). For a
-   target with several intervals (forced again after an error) only a ≥ s
-   of the first interval is used. Objects without a time are never pruned:
-   that only adds candidates (with no times at all the walk is plain
-   reachability, option C's candidate set, which Lemma C also covers).
+   Computing owner(X). The owner timeline (the block above) records, for
+   every young address, the target that owned the allocation clock when it
+   was allocated; `ownerOf(X)` reads it off the closed/open segments with no
+   walk of R(c(t)) and no per-object stamp. The timeline is exact because the
+   current owner follows the creator chain: a logged force of an old cell t
+   makes t the owner, and a force of a young cell c makes owner(c) the owner,
+   so everything allocated then is attributed to the target whose re-force
+   rebuilds it. In particular a producer whose young thunk is forced inside a
+   later target still owns what that thunk builds (the "precedes"/"follows"
+   demos in tests/functional/eval-unforce-identity/, where the producer had
+   ended before X was allocated) -- an allocation-interval attribution (option
+   E of notes/research/identity-reliance.md, the innermost force interval
+   open at X's allocation time) misattributes those to the enclosing target
+   and is unsound; plain
+   reachability (option C) over-promotes every consumer that merely reads a
+   producer's surviving data. owner(X) names X's one producer, so neither
+   error occurs.
 
-   This is where the markers differ from allocation-interval attribution
-   (option E of notes/research/identity-reliance.md, rejected as unsound):
-   E names innermost(a(X)) as X's producer. That misses producers whose young
-   thunk is forced inside a later target's interval (the "precedes" and
-   "follows" demos in tests/functional/eval-unforce-identity/: the producer
-   ended before X was allocated). Here the interval only *rules out* targets
-   (those that started after X, or that were inside a nested target when X was
-   allocated), and reachability from the target's own content, which the
-   heap does preserve (Lemma C), supplies the producers that ended earlier.
-   Reachability alone (option C) over-promotes every consumer; the interval
-   test removes consumers that only read data allocated before they started.
-
-   Rule. Promote the candidates: S is the least superset of the
+   Rule. S is the least superset of the
    count-nominated set S0 that satisfies OC under the producer-of test
    (`OwnerClosure`: owner(x) in S for every identity-bearing x in Evac(S)),
    computed to a fixpoint; the promoted set is copied with one Evacuator, so
@@ -1482,12 +1470,11 @@ struct Stubber
    before the job's memory is released and writes no target (`decideJob`):
    every target is copied as it joins S and the copies mark Evac(S). The
    release then only assigns, reverts and frees. The alternative,
-   refusing every member of S0 that reaches a candidate's cell (the
-   greatest subset of S0 satisfying OC), retains less per job but can starve:
-   a consumer that forces a producer's young thunks in the job where the
-   producer is nominated is a candidate (the walk cannot tell whether that
-   young thunk was created before the consumer started), and in a Nixpkgs
-   traversal that recurs in every job, so the fixpoint would never be
+   refusing every member of S0 whose Evac(S) reaches a cell owned by an
+   un-promoted target (the greatest subset of S0 satisfying OC), retains less
+   per job but can starve: a consumer whose content reaches objects owned by
+   a producer nominated in the same job would be dropped, and in a Nixpkgs
+   traversal that recurs in every job, so the subset would never be
    promoted. The counts (K) stay a heuristic for which cells to consider;
    correctness depends only on the closure.
 
