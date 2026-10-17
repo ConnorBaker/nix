@@ -246,6 +246,16 @@
           # TODO probably should be `nix-cli`
           nix = nixComponentsFor.${system}.native.nix-everything;
           default = nixComponentsFor.${system}.native.nix-everything;
+          # `nix` built without Boehm GC (mimalloc stays on). This is the build
+          # that enables the evaluator's unforcing memory regime: `eval-unforce`
+          # defaults on here (it is compiled out under Boehm GC). Build with
+          # `nix build .#nix-nogc`.
+          nix-nogc =
+            (nixComponentsFor.${system}.native.overrideScope (
+              _: super: {
+                nix-expr = super.nix-expr.override { enableGC = false; };
+              }
+            )).nix-everything;
           inherit (nixComponentsFor.${system}.native)
             nix-manual
             nix-manual-manpages-only
