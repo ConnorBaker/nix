@@ -838,19 +838,71 @@ static char * pageUp(char * p)
     return (char *) (((uintptr_t) p + pageSize() - 1) & ~(uintptr_t) (pageSize() - 1));
 }
 
-/* Kept jobs (`retainRegion`) share one mapping: [keptStart, keptFloor) holds
-   their objects, which are ordinary memory from then on, and the jobs after
-   them allocate above it, up to keptEnd, so a kept job costs no page or
-   mapping of its own. */
-static char * keptStart = nullptr;
-static char * keptFloor = nullptr;
-static char * keptEnd = nullptr;
+/* ---------------------------------------------------------------------------
+   Per-task unforcing state (parallel-eval increment 1).
 
-/* The side table of Env sizes (`EvalRegion::envSizes`) of the bump
-   region's mapping `envSizeMapping`, and the sizes too large for it. */
-static uint8_t * envSizeTable = nullptr;
-static const char * envSizeMapping = nullptr;
-static std::unordered_map<const void *, size_t> bigEnvSizes;
+   The unforcing machinery keeps about a dozen groups of mutable state that
+   are logically PER-TASK (per outermost eval job), not truly global: under a
+   future thread-parallel evaluator each task would get its own copy. This
+   context collects the COLD per-task groups -- those touched only at job
+   boundaries, promotion and reclamation, and NEVER on the inlined
+   force/alloc hot path -- into one object. There is EXACTLY ONE instance
+   today (`rootTask`, the single root task), so moving a global in here is a
+   pure rename and single-threaded behaviour is byte-identical.
+
+   Deliberately LEFT global for now, because an indirection on the inlined
+   fast path would break the byte-identical hot-path contract; these move in
+   a later increment (see notes/research/PARALLEL-EVAL-UNFORCING.md Sec
+   5.2(b)/6.C, and notes/reviews/unforce-parallel-inc1.md):
+     - `evalRegion` / `evalBaseArena` and `stats`   -- read by
+       allocValue/allocEnv/allocBytes in eval-inline.hh;
+     - the owner-timeline statics (`ownerSegs`, `ownerSeg`, `curOwner`,
+       `ownersOn`, `ownersOverflowed`, `ownerConsumersOn`, `ownerBudget`,
+       `ownerLog`, `ownerHint`, `ownerConsumers`, `lastConsumerPair`) --
+       read/written by `ownerOf`/`setOwner`/`segStart`/`youngForce`;
+     - `opens` / `openLogIndices` and `EvalState::undoLog` -- the force log,
+       appended on the warm `logPreImage` path (undoLog is already an
+       EvalState member, i.e. already per-EvalState).
+   Also left: `jobOwner` -- the cross-task admission ARBITER, a redesign
+   (per-task admission) rather than a move; and `allocatorErrors` -- a
+   process-global mimalloc error counter, not per-task.
+*/
+struct TaskUnforceState
+{
+    /* Nursery / region recycling. Kept jobs (`retainRegion`) share one
+       mapping: [keptStart, keptFloor) holds their objects, which are
+       ordinary memory from then on, and the jobs after them allocate above
+       it, up to keptEnd, so a kept job costs no page or mapping of its own. */
+    char * keptStart = nullptr;
+    char * keptFloor = nullptr;
+    char * keptEnd = nullptr;
+
+    /* The side table of Env sizes (`EvalRegion::envSizes`) of the bump
+       region's mapping `envSizeMapping`, and the sizes too large for it
+       (`bigEnvSizes`, the one unlocked side map the note flags). */
+    uint8_t * envSizeTable = nullptr;
+    const char * envSizeMapping = nullptr;
+    std::unordered_map<const void *, size_t> bigEnvSizes;
+
+    /* Monotonic job counter, one tick per task at its join. Its cross-task
+       ordering is an open decision for a later increment; today it is a
+       single per-task counter, exactly as the global it replaces. */
+    size_t generation = 0;
+
+    /* Task-join / reclamation seam. Runs once today, at the root task's end
+       (`endUnforceScope`), where the single task reclaims its nursery
+       segment: a kept-whole job RETAINS it (its objects become ordinary old
+       memory and later jobs allocate above them), otherwise the segment is
+       RELEASED back to the stripe for reuse. Under a future thread-parallel
+       evaluator a child task calls this at ITS join to reclaim ITS segment
+       -- one call per task -- which is why reclamation lives on the per-task
+       context rather than inline in `endUnforceScope`. Defined out-of-line
+       below, after `retainRegion`/`releaseRegion`. */
+    void joinAndReclaim(bool keepWhole);
+};
+
+/* The single root task: one instance today, so this is a pure rename. */
+static TaskUnforceState rootTask;
 
 static size_t envSizeTableBytes()
 {
@@ -859,46 +911,46 @@ static size_t envSizeTableBytes()
 
 static void noteBigEnv(const void * env, size_t size)
 {
-    bigEnvSizes[env] = size;
+    rootTask.bigEnvSizes[env] = size;
 }
 
 /* The size of a young Env, from the side table. */
 static size_t envSizeOf(const Env * e)
 {
-    auto s = envSizeTable[((const char *) e - envSizeMapping) >> 4];
-    return s < 255 ? s : bigEnvSizes.at(e);
+    auto s = rootTask.envSizeTable[((const char *) e - rootTask.envSizeMapping) >> 4];
+    return s < 255 ? s : rootTask.bigEnvSizes.at(e);
 }
 
 static void unmapEnvSizeTable()
 {
-    if (envSizeTable)
-        munmap(envSizeTable, envSizeTableBytes());
-    envSizeTable = nullptr;
-    envSizeMapping = nullptr;
+    if (rootTask.envSizeTable)
+        munmap(rootTask.envSizeTable, envSizeTableBytes());
+    rootTask.envSizeTable = nullptr;
+    rootTask.envSizeMapping = nullptr;
 }
 
 /* Point the region at the side table of `mapping`, mapping one if it has
    none yet. */
 static void useEnvSizeTable(const char * mapping)
 {
-    if (envSizeMapping != mapping) {
+    if (rootTask.envSizeMapping != mapping) {
         unmapEnvSizeTable();
-        envSizeTable = (uint8_t *) mapArena(envSizeTableBytes());
-        envSizeMapping = mapping;
+        rootTask.envSizeTable = (uint8_t *) mapArena(envSizeTableBytes());
+        rootTask.envSizeMapping = mapping;
     }
-    evalRegion.envSizes = envSizeTable;
-    evalRegion.envSizesBase = envSizeMapping;
+    evalRegion.envSizes = rootTask.envSizeTable;
+    evalRegion.envSizesBase = rootTask.envSizeMapping;
 }
 
 /* At a job's end its Envs are copied or kept as old objects, or freed:
    none of their sizes is read again. */
 static void dropEnvSizes(const char * base, const char * cur)
 {
-    std::unordered_map<const void *, size_t>().swap(bigEnvSizes);
-    if (!envSizeTable || cur <= base)
+    std::unordered_map<const void *, size_t>().swap(rootTask.bigEnvSizes);
+    if (!rootTask.envSizeTable || cur <= base)
         return;
-    auto from = (uintptr_t) (envSizeTable + ((base - envSizeMapping) >> 4)) & ~(uintptr_t) (pageSize() - 1);
-    auto to = (char *) envSizeTable + ((cur - envSizeMapping + 15) >> 4);
+    auto from = (uintptr_t) (rootTask.envSizeTable + ((base - rootTask.envSizeMapping) >> 4)) & ~(uintptr_t) (pageSize() - 1);
+    auto to = (char *) rootTask.envSizeTable + ((cur - rootTask.envSizeMapping + 15) >> 4);
     /* Entries below `base` belong to kept jobs, those above `cur` to none
        yet: the whole pages can go. */
     madvise((void *) from, pageUp(to) - (char *) from, MADV_DONTNEED);
@@ -907,18 +959,18 @@ static void dropEnvSizes(const char * base, const char * cur)
 /* Stop allocating above the kept jobs: their mapping keeps only its prefix. */
 static void leaveKeptMapping()
 {
-    if (!keptStart)
+    if (!rootTask.keptStart)
         return;
-    auto tail = pageUp(keptFloor);
-    if (tail < keptEnd)
-        munmap(tail, keptEnd - tail);
-    keptStart = keptFloor = keptEnd = nullptr;
+    auto tail = pageUp(rootTask.keptFloor);
+    if (tail < rootTask.keptEnd)
+        munmap(tail, rootTask.keptEnd - tail);
+    rootTask.keptStart = rootTask.keptFloor = rootTask.keptEnd = nullptr;
 }
 
 void openRegion()
 {
     hookCollector();
-    if (useStripes() && !keptStart) {
+    if (useStripes() && !rootTask.keptStart) {
         /* First job: anchor the active worker's recyclable nursery at the base
            of its stripe, reserving the striped mapping. The nursery floor is
            `keptFloor`; kept jobs raise it (their objects stay in place below
@@ -929,32 +981,32 @@ void openRegion()
            (`leaveKeptMapping`): there is nowhere else to go, and a single eval
            never fills 32 GiB. Multi-stripe increments advance to the next
            stripe when a stripe fills. */
-        keptStart = keptFloor = stripeBase(activeStripe);
-        keptEnd = keptStart + stripeBytes;
+        rootTask.keptStart = rootTask.keptFloor = stripeBase(activeStripe);
+        rootTask.keptEnd = rootTask.keptStart + stripeBytes;
     }
-    if (keptStart) {
+    if (rootTask.keptStart) {
         /* Continue above the kept jobs. In stripe mode the whole stripe span
            is the nursery, so always continue there; otherwise (tripwire) only
            while at least half a region is left, and never under the tripwire
            (released memory is not reused). The memory released above the floor
            is zero pages, and the floor's own page is zeroed above it
            (`releaseRegion`). */
-        bool cont = useStripes() || (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2);
+        bool cont = useStripes() || (!unforceDebug().tripwire && size_t(rootTask.keptEnd - rootTask.keptFloor) >= regionSize() / 2);
         if (cont) {
-            evalRegion.base = evalRegion.cur = keptFloor;
-            evalRegion.end = keptEnd;
+            evalRegion.base = evalRegion.cur = rootTask.keptFloor;
+            evalRegion.end = rootTask.keptEnd;
             /* The HIGH level of the two-level clock, derived from the address:
                `(floor - stripesBase) >> stripeShift` is the worker's stripe.
                Single-threaded it is always the active stripe, and the whole
                nursery span [floor, end) stays within that one stripe (the LOW
                level, masked by `stripeMask`, never overflows into the next). */
-            auto d = (uintptr_t) (keptFloor - stripesBase);
+            auto d = (uintptr_t) (rootTask.keptFloor - stripesBase);
             evalRegion.arenaId = uint32_t(d >> stripeShift);
             assert(
                 evalRegion.arenaId == activeStripe
-                && ((uintptr_t) (keptEnd - 1 - stripesBase) >> stripeShift) == evalRegion.arenaId
+                && ((uintptr_t) (rootTask.keptEnd - 1 - stripesBase) >> stripeShift) == evalRegion.arenaId
                 && (d & stripeMask) == d - (uintptr_t(activeStripe) << stripeShift));
-            useEnvSizeTable(keptStart);
+            useEnvSizeTable(rootTask.keptStart);
             return;
         }
         leaveKeptMapping();
@@ -1061,7 +1113,7 @@ void releaseRegion()
     stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     evalRegion = EvalRegion{};
     dropEnvSizes(base, cur);
-    if (keptStart && base == keptFloor) {
+    if (rootTask.keptStart && base == rootTask.keptFloor) {
         /* Above kept jobs: free this job's pages, and zero what it used of
            the floor's page, which the kept objects share. */
         auto up = pageUp(base);
@@ -1075,7 +1127,7 @@ void releaseRegion()
         madvise(base, regionSize(), MADV_DONTNEED);
     } else
         munmap(base, regionSize());
-    if (envSizeMapping == base)
+    if (rootTask.envSizeMapping == base)
         unmapEnvSizeTable();
 }
 
@@ -1089,15 +1141,28 @@ static void retainRegion()
     stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     stats.keptJobBytes += cur - base;
     dropEnvSizes(base, cur);
-    if (keptStart && base == keptFloor)
-        keptFloor = cur;
+    if (rootTask.keptStart && base == rootTask.keptFloor)
+        rootTask.keptFloor = cur;
     else {
         leaveKeptMapping();
-        keptStart = base;
-        keptFloor = cur;
-        keptEnd = evalRegion.end;
+        rootTask.keptStart = base;
+        rootTask.keptFloor = cur;
+        rootTask.keptEnd = evalRegion.end;
     }
     evalRegion = EvalRegion{};
+}
+
+/* Task-join / reclamation seam (see TaskUnforceState). Today the single root
+   task calls this once, at `endUnforceScope`, to reclaim its nursery segment.
+   A future child task calls it at its own join to reclaim its own segment. */
+void TaskUnforceState::joinAndReclaim(bool keepWhole)
+{
+    if (!evalRegion.base)
+        return;
+    if (keepWhole)
+        retainRegion();
+    else
+        releaseRegion();
 }
 
 /* Copies a graph out of the job region, precisely: objects outside the
@@ -2158,11 +2223,9 @@ void initAllocator()
 #endif
 }
 
-static size_t generation = 0;
-
 size_t unforceGeneration()
 {
-    return generation;
+    return rootTask.generation;
 }
 
 size_t unforceCurrentScopeBytes()
@@ -2577,7 +2640,7 @@ void EvalState::endUnforceScope(size_t mark)
 
     auto & cfg = unforceSettings();
     stats.jobs++;
-    generation++;
+    rootTask.generation++;
     stats.logged += undoLog.size() - mark;
     dropOpenForces(mark);
 
@@ -2653,12 +2716,8 @@ void EvalState::endUnforceScope(size_t mark)
     clientCodeInJob = false;
     undoLog.resize(mark);
     undoLog.shrink_to_fit();
-    if (evalRegion.base) {
-        if (keepWhole)
-            retainRegion();
-        else
-            releaseRegion();
-    }
+    /* Task-join: the root task reclaims its nursery segment. */
+    rootTask.joinAndReclaim(keepWhole);
 
     if (cfg.stats)
         printStatsAtExit();
