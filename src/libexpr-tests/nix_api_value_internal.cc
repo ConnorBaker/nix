@@ -39,7 +39,7 @@ primop_fresh_set(void * user_data, nix_c_context * context, EvalState * state, n
     nix_gc_decref(context, f);
 }
 
-/* PROTOTYPE (unforce): a C primop's result is allocated outside the job's
+/* a C primop's result is allocated outside the job's
    region, so the producer closure cannot see it, yet a re-forced call builds
    a new one. demo1's schedule (tests/functional/eval-unforce-identity) with
    the inner set built by a C primop: R must stay identical to P.a when R is
@@ -95,7 +95,7 @@ static void print_external_as_json(
     nix_set_string_return(res, "42");
 }
 
-/* PROTOTYPE (unforce): an external value's JSON printer is client code like
+/* an external value's JSON printer is client code like
    a C primop: what it allocates is outside the job's region, so a job in
    which it ran promotes nothing (`unforceNoteClientCode`). */
 TEST_F(nix_api_expr_test, unforce_external_printer_is_client_code)

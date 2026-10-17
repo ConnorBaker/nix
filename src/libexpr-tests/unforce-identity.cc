@@ -1,4 +1,4 @@
-/* PROTOTYPE (unforce): promotion must not break pointer identity, which
+/* promotion must not break pointer identity, which
    `eqValues` short-circuits on. These tests drive jobs (outermost unforce
    scopes) by hand, around events that change the heap between jobs. With
    the shipping promotion threshold (a cell forced in two jobs is
