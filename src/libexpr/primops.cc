@@ -1318,10 +1318,21 @@ static RegisterPrimOp primop_deepSeq({
 static void prim_trace(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceValue(*args[0], noPos);
-    if (args[0]->type() == nString)
-        printError("trace: %1%", args[0]->string_view());
-    else
-        printError("trace: %1%", ValuePrinter(state, *args[0]));
+    /* Effects design R: a reverted cell re-forced in a later batch replays
+       its trace, which base prints once; suppress the replayed duplicate.
+       `unforceReplayDepth`/`unforceSawDiagnostic` are read/written as plain
+       TLS (no call, no allocation, nothing rendered), so prim_trace's stack
+       frame is unchanged and a deeply recursive `builtins.trace` keeps base's
+       stack edge (eval-stack-parity). When unforcing is off `unforceReplay
+       Depth` is always 0, so this is base's exact behaviour. */
+    if (state.isolationDepth) [[unlikely]]
+        unforceSawDiagnostic = true;
+    if (!unforceReplayDepth) {
+        if (args[0]->type() == nString)
+            printError("trace: %1%", args[0]->string_view());
+        else
+            printError("trace: %1%", ValuePrinter(state, *args[0]));
+    }
     if (state.settings.builtinsTraceDebugger) {
         state.runDebugRepl(nullptr);
     }
@@ -1353,7 +1364,11 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
     auto msgStr =
         state.forceString(*args[0], noPos, "while evaluating the first argument; the message passed to builtins.warn");
 
-    {
+    /* Effects design R: suppress this warning if it is replayed from a
+       reverted cell (see prim_trace). */
+    if (state.isolationDepth) [[unlikely]]
+        unforceSawDiagnostic = true;
+    if (!unforceReplayDepth) {
         ErrorInfo info{
             .level = lvlWarn,
             .msg = HintFmt(std::string(msgStr)),

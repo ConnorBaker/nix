@@ -516,6 +516,29 @@ private:
     Statistics stats;
 };
 
+/**
+ * Effects design R. Signals read on the hot `builtins.trace` /
+ * `builtins.warn` path, defined in unforce.cc. A reverted cell re-forced in a
+ * later batch replays its effects; base forces each cell once, so a diagnostic
+ * emitted inside such a re-force is a deterministic duplicate base never
+ * prints. `unforceReplayDepth` is non-zero exactly while re-forcing a reverted
+ * cell (the force hooks maintain it); the primop suppresses the line then.
+ * `unforceSawDiagnostic` is set the first time either fires, which is what
+ * arms any reverted-cell tracking: with no diagnostics nothing is tracked and
+ * the feature is byte- and allocation-identical to unforcing without it.
+ *
+ * `initial-exec` so each read is a TPIDR-relative load, not a `__tls_get_addr`
+ * call that would spill a live value and grow prim_trace's native stack frame,
+ * moving the stack edge of a deep recursive trace (eval-stack-parity).
+ */
+#if defined(__ELF__)
+#  define NIX_UNFORCE_TLS_MODEL __attribute__((tls_model("initial-exec")))
+#else
+#  define NIX_UNFORCE_TLS_MODEL
+#endif
+extern thread_local unsigned unforceReplayDepth NIX_UNFORCE_TLS_MODEL;
+extern thread_local bool unforceSawDiagnostic NIX_UNFORCE_TLS_MODEL;
+
 class EvalState : public std::enable_shared_from_this<EvalState>
 {
 public:

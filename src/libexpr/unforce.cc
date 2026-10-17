@@ -46,6 +46,17 @@ namespace nix {
 EvalRegion evalRegion;
 BumpArena evalBaseArena;
 
+/* Effects design R (declared in eval.hh). `unforceReplayDepth` is non-zero
+   exactly while re-forcing a reverted cell, so a `builtins.trace`/`warn` in it
+   is a duplicate base does not print; the primop reads it as initial-exec TLS
+   (no call) and suppresses the line. `unforceSawDiagnostic` is set the first
+   time either fires, which arms reverted-cell tracking: with no diagnostics
+   nothing is tracked and the feature is byte- and allocation-identical to
+   unforcing without it. Defined here, outside the anonymous namespace below,
+   so they have the external linkage the eval.hh declaration gives them. */
+thread_local unsigned unforceReplayDepth = 0;
+thread_local bool unforceSawDiagnostic = false;
+
 const bool evalUseBaseArena = [] {
     auto s = getenv("NIX_NOGC_BUMP");
     return s && std::string_view(s) != "0";
@@ -2349,6 +2360,58 @@ bool unforceIsScopeStackSlot(const void * p)
     youngOwnerChange(v, o);
 }
 
+/* ---------------------------------------------------------------------------
+   Effects design R: diagnostics are silent on a replay.
+
+   A reverted old cell re-forced in a later batch replays its effects
+   (`builtins.trace`, `builtins.warn`). Base forces each cell exactly once and
+   keeps it, so every diagnostic emitted inside the re-force of a reverted cell
+   is a duplicate that base never prints. A replay re-runs the same thunk
+   deterministically (its result is byte-identical, which is the whole premise
+   of reverting), so the duplicate line is identical to the one base printed:
+   we suppress it. Under the exactness contract (L2 + --pure-eval) a replay is
+   deterministic, so the scope of the re-force is a sound structural identity
+   on its own and a per-line journal would only confirm what determinism
+   already guarantees -- and building/hashing a key on every emit would deepen
+   the recursive `builtins.trace` call chain and move the native stack edge
+   (eval-stack-parity's `trace`), so it is deliberately not maintained.
+
+   `revertedCells` stays empty until the first diagnostic is emitted (the
+   `unforceSawDiagnostic` gate), so an effect-free evaluation tracks nothing
+   and is byte- and allocation-identical to one without this feature. It lives
+   for the whole process evaluation: a reverted cell's replay happens in a
+   later batch, possibly after `isolationDepth` has returned to 0 in between,
+   so it is never cleared at a scope boundary. Under the no-GC backend old-cell
+   addresses are never reused within an evaluation (OwnerClosure only frees the
+   young region), so a `Value *` is a stable identity for a reverted cell.
+
+   `unforceReplayDepth`/`unforceSawDiagnostic` (declared in eval.hh, read on
+   the hot trace/warn path) are defined at `nix::` scope at the top of this
+   file, outside this anonymous namespace. */
+static thread_local std::unordered_set<const Value *> revertedCells;
+
+/* A reverted cell was reverted at a batch end (the cold release loop). */
+static void noteRevertedForReplay(const Value * target)
+{
+    if (unforceSawDiagnostic)
+        revertedCells.insert(target);
+}
+
+/* Enter/leave the re-force of a reverted cell. Out of line and reached only
+   when `revertedCells` is non-empty (never, with no diagnostics), so the
+   logged-force start/end frames are unchanged in the common case. */
+[[gnu::noinline, gnu::cold]] static void unforceReplayEnter(const Value * cell)
+{
+    if (revertedCells.count(cell))
+        ++unforceReplayDepth;
+}
+
+[[gnu::noinline, gnu::cold]] static void unforceReplayLeave(const Value * cell)
+{
+    if (unforceReplayDepth && revertedCells.count(cell))
+        --unforceReplayDepth;
+}
+
 /* The start of a logged force: an old cell. Every container is reserved
    before anything is pushed, so a failed allocation changes nothing. */
 [[gnu::noinline]] static void logOldForce(EvalState & state, Value & v)
@@ -2369,6 +2432,12 @@ bool unforceIsScopeStackSlot(const void * p)
     *openLogIndices.t++ = index;
     if (ownersOn)
         setOwner(uint32_t(index));
+    /* Effects design R: if this old cell was reverted in an earlier batch, its
+       re-force is a replay; count it so a `trace`/`warn` in it is suppressed.
+       `revertedCells` is empty until the first diagnostic, so this is one test
+       otherwise. */
+    if (!revertedCells.empty()) [[unlikely]]
+        unforceReplayEnter(&v);
 }
 
 /* `logPreImageSlow` past its common cases. */
@@ -2414,8 +2483,19 @@ void EvalState::endLoggedForceSlow(Value & v)
     if (opens.t[-1].cell != &v) [[likely]]
         return;
     auto saved = opens.t[-1].saved;
-    if (saved & 1) [[unlikely]]
-        return endLoggedOpen();
+    if (saved & 1) [[unlikely]] {
+        endLoggedOpen();
+        /* Effects design R: this is the end of an old cell's logged force --
+           the structural close that matches `logOldForce`'s `unforceReplay
+           Enter`. (Pre-trim this lived at the tail of `endOldForce`, which the
+           interval-machinery removal deleted; the logged-open close is the same
+           event, keyed on the same `&v`.) Leave the replay it entered. A force
+           that a job end dropped (`dropOpenForces`) never reaches here, so
+           `endUnforceScope` also resets the depth. */
+        if (!revertedCells.empty()) [[unlikely]]
+            unforceReplayLeave(&v);
+        return;
+    }
     --opens.t;
     /* Only a young force that changed the owner pushes this; owners may
        have run out of budget since. */
@@ -2465,6 +2545,11 @@ void EvalState::endUnforceScope(size_t mark)
     generation++;
     stats.logged += undoLog.size() - mark;
     dropOpenForces(mark);
+    /* Effects design R: no force is active at a job end, so any replay the
+       hooks were counting has ended; clear it in case `dropOpenForces` cut an
+       entry whose logged-open close would have decremented it. `revertedCells`
+       persists (a cell reverted here is replayed in a later batch). */
+    unforceReplayDepth = 0;
 
     /* Before anything is released: decide what to promote, and copy it.
        The Evacuator, whose table is keyed by young addresses, goes before
@@ -2527,6 +2612,10 @@ void EvalState::endUnforceScope(size_t mark)
                 stats.reverted++;
                 if (clientCodeInJob)
                     stats.revertedInClientJobs++;
+                /* Effects design R: a reverted cell re-forced in a later batch
+                   replays its diagnostics; arm their suppression (a no-op until
+                   the first diagnostic fires). */
+                noteRevertedForReplay(targets[i]);
             }
         }
     }

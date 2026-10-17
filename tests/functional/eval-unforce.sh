@@ -203,6 +203,9 @@ grep -q 'seq pad' "$TEST_ROOT/wide-pad.nix" || fail "wide-pad.nix: no padding"
     || fail "wide-pad.nix: wrong output"
 
 # Output equals base: the trace above is printed exactly once with a batch
-# per element too. Fails until replays are silent (effects design R); last,
-# so that it does not hide the checks above.
+# per element too. Effects design R makes replayed diagnostics silent: when a
+# reverted cell is re-forced in a later batch, a `builtins.trace`/`warn` line
+# identical to one already emitted this evaluation is suppressed, so unforcing
+# never prints a diagnostic base does not. (This was an xfail until that
+# landed.) Kept last so it does not hide the checks above.
 [[ $(countTraces "${batch0[@]}") == 1 ]] || fail "trace printed more than once with eval-unforce-batch-size = 0"
