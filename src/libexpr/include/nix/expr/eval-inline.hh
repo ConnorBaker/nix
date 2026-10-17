@@ -137,75 +137,63 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    /* inc2b-1: ONE force site serves both eval-cores == 1 and > 1 -- there is
-       no `forcingArmed` guard on the hot path, so the inlined frame is inc2a's
-       on every recursion path (a per-force guard spilled a 16-byte Value slot
-       in register-tight primops such as prim_getAttr, pushing its edge sooner
-       than base; this reordering removes it). The disarmed path is behaviourally
-       byte-for-byte inc2a: `logPreImage` first, the same thunk reads, the same
-       blackhole CAS, the same `if (env) eval else <infinite-recursion>`, the
-       same catch, the app arm's `Value savedApp` + callFunction inline.
+    /* inc2b-1/2b-2: BOTH forceable arms (thunk and app -- both primary pdThunk)
+       run the same guard-free election: read word0, pre-check pending, CAS the
+       exact word we read to a pending word tagged with our thread id, dispatch
+       to expr->eval (thunk) / callFunction (app) on the win, wait on loss. There
+       is no `forcingArmed` guard, so the inlined frame stays inc2a's on every
+       recursion path (an earlier per-force guard spilled a 16-byte slot in
+       register-tight primops, pushing their edge sooner than base).
 
-       The one structural change vs inc2a -- reading word 0 BEFORE env/expr and
-       CASing that exact word -- is what lets the single path be race-safe
-       without a mode branch: a concurrent pending-mark makes the loser's CAS
-       fail, so the election has a unique winner and no thunk is ever
-       double-evaluated. Arming is consulted only in the cold, out-of-line
-       `forceValuePending` (self-cycle/own-recursion -> infinite recursion when
-       the executor is disabled; another worker's in-progress force -> wait when
-       enabled), never on the inlined hot path. At eval-cores == 1 there is no
-       contention: the CAS always wins and env==null is always a genuine
-       self-cycle, so this is exactly inc2a. `logPreImage` stays BEFORE the mark
-       (value-identical while the forcer is unique); the winner-only relocation
+       Race-safety comes from the word0-first order and the exact-word CAS: a
+       concurrent pending-mark makes the loser's CAS fail, so there is exactly one
+       winner and no cell (thunk OR app) is ever double-evaluated or plain-stored
+       by two threads. The thread id in the pending word lets a same-thread
+       re-entry (self-cycle) be told from a cross-thread wait. All the
+       cold/concurrency-only handling -- self-cycle diagnosis and waiting -- lives
+       in the out-of-line `forceValueOnPending` / `forceValuePending`, never on the
+       inlined hot path. At eval-cores == 1 the CAS always wins and a pending cell
+       is always our own self-cycle, so each arm is behaviourally inc2a (the thunk
+       arm byte-for-byte; the app arm adds only the never-taken election). The one
+       inline per-force cost over inc2a is reading `myEvalThreadId` (an
+       initial-exec TLS load) for the pending word; it does not grow the hot frame
+       past base. `logPreImage` stays BEFORE the mark; the winner-only relocation
        is inc2c. */
     if (v.isThunk()) {
         logPreImage(v);
-        uint64_t expected = v.fvWord0Plain();
-        if (Value::fvIsPendingTag(expected)) [[unlikely]] {
-            /* The cell is already pending. At eval-cores == 1 this is this
-               thread re-entering a thunk it is already forcing -- a self-cycle;
-               forceValueOnPending reproduces inc2a's env==null arm exactly
-               (throw infinite recursion, endLoggedForce +
-               handleEvalExceptionForThunk with env==null for the position fix-up
-               and mkFailed, then rethrow so the enclosing initial force adds the
-               "entering the infinite recursion" trace). At eval-cores > 1 another
-               worker is forcing it: wait. Handling pending HERE -- before
-               env/expr -- is what lets the won path below assume a real, non-null
-               env and drop inc2a's `if (env)`, so the inlined frame never exceeds
-               inc2a's on any recursion path (no arming guard; the only returning
-               wait is this cold, out-of-line call with nothing but `v` live). */
-            forceValueOnPending(v, pos);
+        /* electThunk runs the whole election out of line (word0 read, pending
+           pre-check, env/expr capture, CAS to a pending word tagged with our
+           thread id) and returns the captured env/expr. env==null means it was
+           already handled here (we waited for another worker, or lost the CAS and
+           waited); a self-cycle throws from within. Keeping the TLS read and the
+           env/expr-across-a-call out of line is what holds the inlined frame at
+           inc2a's. */
+        Value::ClosureThunk t = electThunk(v, pos);
+        if (!t.env) [[unlikely]]
             return;
-        }
-        Env * env = v.thunk().env;
-        Expr * expr = v.thunk().expr;
-        /* CAS the exact (real-thunk) word we read to pdPending. The word0-first
-           order makes this race-safe: if another worker marks the thunk pending
-           between our read and this CAS, the CAS fails and we wait rather than
-           double-evaluating. At eval-cores == 1 it cannot fail (no contention),
-           so this branch is inc2a's `assert(won)` -- never taken. */
-        if (!v.fvMarkPending(expected)) [[unlikely]] {
-            endLoggedForce(v);
-            forceValuePending(v);
-            return;
-        }
         try {
-            /* env is non-null: a real thunk was elected (pending was handled
-               above, and a lost CAS returned above). */
-            expr->eval(*this, *env, v);
+            t.expr->eval(*this, *t.env, v);
         } catch (...) {
             endLoggedForce(v);
-            handleEvalExceptionForThunk(env, expr, v, pos);
+            handleEvalExceptionForThunk(t.env, t.expr, v, pos);
             throw;
         }
         endLoggedForce(v);
     } else if (v.isApp()) {
+        /* Apps are forceable cells too (primary pdThunk, app subtag) and share
+           the SAME election via electApp: a shared tApp forced by two threads
+           must be evaluated once, not double-evaluated and plain-stored (2b-2
+           fix). left==null means already handled. */
         logPreImage(v);
-        Value savedApp = v;
+        Value::FunctionApplicationThunk a = electApp(v, pos);
+        if (!a.left) [[unlikely]]
+            return;
         try {
-            callFunction(*v.app().left, *v.app().right, v, pos);
+            callFunction(*a.left, *a.right, v, pos);
         } catch (...) {
             endLoggedForce(v);
+            Value savedApp;
+            savedApp.mkApp(a.left, a.right);
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }

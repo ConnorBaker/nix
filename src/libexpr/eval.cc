@@ -424,6 +424,16 @@ EvalState::EvalState(
             "eval-cores > 1 (parallel evaluation) is not yet compatible with eval-unforce; "
             "wiring unforcing through worker threads is deferred to increment 2c");
 
+    /* inc2b-2: the NIX_NOGC_BUMP bump allocator (BumpArena::alloc) advances its
+       cursor without a lock, so concurrent allocValue() calls from worker
+       threads would race and corrupt the heap. It is a non-default debug knob;
+       reject it with eval-cores > 1 rather than corrupt silently. The default
+       allocator (mimalloc, per-thread heaps) is thread-safe. */
+    if (Executor::getEvalCores(settings) > 1 && evalUseBaseArena)
+        throw Error(
+            "eval-cores > 1 (parallel evaluation) is not compatible with NIX_NOGC_BUMP, "
+            "whose bump allocator is not thread-safe; unset NIX_NOGC_BUMP");
+
     executor = std::make_unique<Executor>(settings);
 }
 
@@ -2376,23 +2386,13 @@ void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
 
 [[gnu::noinline, gnu::cold]] void EvalState::forceValuePending(Value & v)
 {
-    /* With eval-cores == 1 (the executor disabled) a pending cell can only be
-       this thread re-entering a thunk it is already forcing -- an infinite
-       recursion. Throw the raw error; the caller (forceValue's env==null arm)
-       is inside the same try/catch inc2a used, so endLoggedForce +
-       handleEvalExceptionForThunk run there and the diagnostic -- message,
-       position fix-up and the outer force's "entering the infinite recursion"
-       trace -- is byte-identical to inc2a/base. (The lost-election caller is
-       unreachable while the executor is disabled, since the CAS cannot fail
-       single-threaded.)
-
-       With eval-cores > 1 a pending cell is (almost always) another worker's
-       in-progress force, so we block until it publishes and surface any failure.
-       The tag does not record the forcing thread in inc2b-1, so a genuine
-       same-thread self-cycle under threads is not distinguished here and would
-       block rather than erroring -- an erroneous-program edge case on the
-       experimental multi-worker path, deferred to inc2c (which records the
-       forcing thread). */
+    /* Reached when our election CAS LOST: another worker marked the cell pending
+       (or already finished it) between our word0 read and our CAS. The winner is
+       by definition a DIFFERENT thread, so this is never a self-cycle -- we just
+       wait for its result. At eval-cores == 1 the CAS cannot fail (no
+       contention), so this path is unreachable there; the throw is a defensive
+       assert. (Same-thread self-cycles come through the pending PRE-check ->
+       forceValueOnPending, which distinguishes them by thread id.) */
     if (!executor->enabled)
         ExprBlackHole::throwInfiniteRecursionError(*this, v);
 
@@ -2407,44 +2407,88 @@ void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
         v.failed().rethrow();
 }
 
-[[gnu::noinline, gnu::cold]] void EvalState::forceValueOnPending(Value & v, const PosIdx pos)
+Value::ClosureThunk EvalState::electThunk(Value & v, const PosIdx pos)
+{
+    /* The whole thunk election, out of line, so the inlined force site pays no
+       `myEvalThreadId` TLS read and holds no env/expr live across a call -- both
+       would grow register-tight recursion drivers (prim_getAttr, callFunction)
+       past base and break stack-parity. Captures env/expr BEFORE the CAS (the CAS
+       overwrites word0, which holds env) and returns them in registers.
+
+       Returns {nullptr, nullptr} when the force was already HANDLED here (another
+       worker was/ is forcing it -> waited; or our CAS lost -> waited); a real
+       elected thunk always has a non-null env, so the caller uses env==null as
+       the "already handled, value is forced" signal. A same-thread self-cycle
+       throws from forceValueOnPending and propagates to the enclosing force. */
+    uint64_t expected = v.fvWord0Acquire();
+    if (Value::fvIsPendingTag(expected)) [[unlikely]] {
+        forceValueOnPending(v, pos, expected);
+        return {nullptr, nullptr};
+    }
+    Value::ClosureThunk t = v.thunk();
+    if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
+        endLoggedForce(v);
+        forceValuePending(v);
+        return {nullptr, nullptr};
+    }
+    return t;
+}
+
+Value::FunctionApplicationThunk EvalState::electApp(Value & v, const PosIdx pos)
+{
+    /* As electThunk, for the app arm (same pdThunk election; a shared tApp must
+       be evaluated once). left (the applied function) is never null for a real
+       app, so {nullptr, nullptr} is the "already handled" signal. */
+    uint64_t expected = v.fvWord0Acquire();
+    if (Value::fvIsPendingTag(expected)) [[unlikely]] {
+        forceValueOnPending(v, pos, expected);
+        return {nullptr, nullptr};
+    }
+    Value::FunctionApplicationThunk a = v.app();
+    if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
+        endLoggedForce(v);
+        forceValuePending(v);
+        return {nullptr, nullptr};
+    }
+    return a;
+}
+
+[[gnu::noinline, gnu::cold]] void EvalState::forceValueOnPending(Value & v, const PosIdx pos, uint64_t expected)
 {
     /* forceValue's pending pre-check lands here (word 0 was pdPending). It is
        out of line so the inlined force site keeps inc2a's frame on every
-       recursion path.
+       recursion path. `expected` is the pending word observed inline, whose
+       recorded thread id tells a same-thread self-cycle from a cross-thread wait.
 
-       eval-cores > 1: another worker is forcing this thunk (or finished between
-       our read and here). endLoggedForce balances the inline logPreImage, then
-       waitOnThunk blocks until the winner publishes and surfaces any failure.
-       (The forcing thread is not recorded in the tag in inc2b-1, so a genuine
-       same-thread self-cycle under threads blocks rather than erroring -- an
-       erroneous-program edge case deferred to inc2c.)
+       Self-cycle -- the executor is disabled (eval-cores == 1, where a pending
+       cell can only be our own re-entry) OR the pending word carries OUR thread
+       id (we are re-entering a thunk this very thread is forcing). Reproduce
+       inc2a's env==null arm BYTE-FOR-BYTE: throw the infinite-recursion error,
+       and in the catch run endLoggedForce + handleEvalExceptionForThunk with
+       env==null (blackhole position fix-up via `pos`, mkFailed), then rethrow so
+       the enclosing initial force (env != null) adds the "entering the infinite
+       recursion" trace. A same-thread id is authoritative: only this thread
+       publishes its own pending cell, and it has not yet done so.
 
-       eval-cores == 1 (executor disabled): the pending cell is THIS thread
-       re-entering a thunk it is already forcing -- a self-cycle. This reproduces
-       inc2a's env==null arm BYTE-FOR-BYTE: throw the infinite-recursion error
-       inside the force, and in the catch run endLoggedForce +
-       handleEvalExceptionForThunk with env==null (which does the blackhole
-       position fix-up via `pos` and marks the cell failed), then rethrow so the
-       enclosing initial force (env != null) adds the "entering the infinite
-       recursion" trace. */
-    if (executor->enabled) {
-        endLoggedForce(v);
-        uint64_t w0 = v.fvWord0Acquire();
-        if (Value::fvIsPendingTag(w0))
-            waitOnThunk(v, w0);
-        if (v.isFailed()) [[unlikely]]
-            v.failed().rethrow();
-        return;
+       Otherwise another worker is forcing it (or finished between our read and
+       here): endLoggedForce balances the inline logPreImage, then waitOnThunk
+       blocks until the winner publishes and surfaces any failure. */
+    if (!executor->enabled || Value::fvPendingThreadId(expected) == myEvalThreadId) {
+        try {
+            ExprBlackHole::throwInfiniteRecursionError(*this, v);
+        } catch (...) {
+            endLoggedForce(v);
+            handleEvalExceptionForThunk(nullptr, nullptr, v, pos);
+            throw;
+        }
     }
 
-    try {
-        ExprBlackHole::throwInfiniteRecursionError(*this, v);
-    } catch (...) {
-        endLoggedForce(v);
-        handleEvalExceptionForThunk(nullptr, nullptr, v, pos);
-        throw;
-    }
+    endLoggedForce(v);
+    uint64_t w0 = v.fvWord0Acquire();
+    if (Value::fvIsPendingTag(w0))
+        waitOnThunk(v, w0);
+    if (v.isFailed()) [[unlikely]]
+        v.failed().rethrow();
 }
 
 void EvalState::forceValueDeep(Value & v)

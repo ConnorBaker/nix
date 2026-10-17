@@ -862,19 +862,30 @@ protected:
        another worker raced us to this cell (it is now pending/awaited/finished),
        so the loser reads `expected` to decide whether to wait.
 
-       Note: this writes a bare pdPending (no forcing-thread id), byte-identical
-       to inc2a, so the inlined force site needs no thread-local read on the hot
-       path and keeps inc2a's stack-parity edge. The forcing thread is not
-       recorded in the tag in inc2b-1; distinguishing a same-thread self-cycle
-       from a cross-thread wait while threads run (eval-cores > 1) is deferred to
-       inc2c. At eval-cores == 1 a pending cell is always a self-cycle, detected
-       via the executor being disabled (see EvalState::forceValuePending). */
+       Note: this bare-pdPending variant (no forcing-thread id) is retained for
+       mkBlackhole and tests; the force site uses the `fvMarkPending(w0, tid)`
+       overload, which records the forcing thread so a same-thread self-cycle is
+       distinguished from a cross-thread wait (see EvalState::forceValueOnPending).
+       A pending word with a small tid untags to a non-null garbage "pointer" in
+       word0, but nothing dereferences a pending cell's word0 (getInternalType
+       reports tThunk -> determinePos returns pos; the force site reads env/expr
+       only before its CAS). */
     [[gnu::always_inline]]
     bool fpMarkPending(PackedPointer & expected) noexcept
     {
         return AtomicWord0(payloadWords[0])
             .compare_exchange_strong(
                 expected, static_cast<PackedPointer>(pdPending), std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    /* As fpMarkPending, but records the forcing thread's id in the pending word
+       (makePendingWord(tid)). Used by the force site; see the note above. */
+    [[gnu::always_inline]]
+    bool fpMarkPending(PackedPointer & expected, uint32_t tid) noexcept
+    {
+        return AtomicWord0(payloadWords[0])
+            .compare_exchange_strong(
+                expected, makePendingWord(tid), std::memory_order_acq_rel, std::memory_order_acquire);
     }
 
     /* Mark a pending cell as awaited (a waiter is about to block on it): CAS
@@ -1788,6 +1799,14 @@ public:
     [[gnu::always_inline]] bool fvMarkPending(uint64_t & w0) noexcept
     {
         return fpMarkPending(w0);
+    }
+    /* inc2b-1 (2b-2): elect the unique forcer, recording the forcing thread's id
+       in the pending word so a same-thread re-entry (self-cycle) can be told from
+       a cross-thread wait. CAS word0 from the captured thunk/app tag `w0` to
+       `makePendingWord(tid)`; on failure `w0` holds the live word0. */
+    [[gnu::always_inline]] bool fvMarkPending(uint64_t & w0, uint32_t tid) noexcept
+    {
+        return fpMarkPending(w0, tid);
     }
     /* inc2b-1: a waiter marks the pending cell as awaited before blocking. */
     [[gnu::always_inline]] bool fvCasAwaited(uint64_t & w0) noexcept

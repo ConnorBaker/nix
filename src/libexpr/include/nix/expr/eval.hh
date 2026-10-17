@@ -901,13 +901,26 @@ private:
     void forceValuePending(Value & v);
 
     /**
-     * inc2b-1: forceValue's pending pre-check (word 0 observed pdPending) lands
-     * here. eval-cores == 1: a self-cycle -- reproduces inc2a's env==null arm
-     * byte-for-byte (infinite-recursion throw, position fix-up via `pos`,
-     * mkFailed, rethrow). eval-cores > 1: waits for the forcing worker. Out of
-     * line so the inlined force site keeps inc2a's frame on every recursion path.
+     * inc2b-1/2b-2: forceValue's pending pre-check (word 0 observed pdPending,
+     * value `expected`) lands here. Self-cycle (executor disabled, or the pending
+     * word's thread id is ours) -> reproduces inc2a's env==null arm byte-for-byte
+     * (infinite-recursion throw, position fix-up via `pos`, mkFailed, rethrow).
+     * Otherwise -> waits for the forcing worker. Out of line so the inlined force
+     * site keeps inc2a's frame on every recursion path.
      */
-    void forceValueOnPending(Value & v, const PosIdx pos);
+    void forceValueOnPending(Value & v, const PosIdx pos, uint64_t expected);
+
+    /**
+     * inc2b-2: elect the unique forcer of a thunk/app cell, out of line -- read
+     * word0, pre-check pending (self-cycle throw / cross-thread wait), capture
+     * env/expr (resp. left/right) BEFORE the CAS, then CAS word0 to a pending
+     * word carrying this thread's id. Returns the captured pointers on a win;
+     * returns {null,null} when already handled here (waited). Out of line so the
+     * hot force site pays no `myEvalThreadId` TLS read and holds nothing across a
+     * call -- both would grow register-tight recursion drivers past base.
+     */
+    Value::ClosureThunk electThunk(Value & v, const PosIdx pos);
+    Value::FunctionApplicationThunk electApp(Value & v, const PosIdx pos);
 
     void tryFixupBlackHolePos(Value & v, PosIdx pos);
 
