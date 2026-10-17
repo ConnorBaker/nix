@@ -159,6 +159,21 @@ while read -r name _; do
     [[ -z "$name" || "$name" == "#"* ]] || inherited[$name]=1
 done < "$_NIX_TEST_SOURCE_DIR/eval-stack-parity/inherited.txt"
 
+# Contract mode (see the upper-check below). The DEFAULT is STRICT exact-edge --
+# identical to the shipping branch's copy of this test -- so that if this file
+# migrates toward shipping WITHOUT the marker, it fails SAFE (strict), which
+# mechanically enforces "the relaxed parallel-line contract must not migrate to
+# shipping." The relaxed "never overflow sooner than base" contract (lower-check
+# teeth kept, upper exact-edge check relaxed) engages ONLY when the committed
+# in-tree marker `.stack-parity-parallel-line` is present (it lives on the
+# parallel-eval line and is not copied to shipping). STACK_PARITY_EXACT_EDGE=1 is
+# a hard override that forces strict even when the marker is present.
+relaxedParity=
+if [[ -z "${STACK_PARITY_EXACT_EDGE:-}" && -f "$_NIX_TEST_SOURCE_DIR/.stack-parity-parallel-line" ]]; then
+    relaxedParity=1
+    echo "eval-stack-parity: parallel-line marker present -> relaxed 'never overflow sooner than base' contract (upper exact-edge check relaxed; lower-check teeth kept). STACK_PARITY_EXACT_EDGE=1 forces strict; absent marker is strict (shipping-safe)."
+fi
+
 calibrated=()
 for p in "${programs[@]}"; do
     IFS=$'\t' read -r -a f <<< "$p"
@@ -205,25 +220,23 @@ for p in "${programs[@]}"; do
             fi
         fi
         # Upper check (base overflows here -> this Nix must too) is the
-        # EXACT-EDGE half of the contract. On the PARALLEL line
-        # (vibe-coding/unforce-parallel-*) the contract is deliberately relaxed
-        # to "never overflow SOONER than single-threaded base": frames <= base
-        # on every recursion path, so this evaluator can never reject a program
-        # base accepts. Overflowing LATER than base (frames smaller) is then
+        # EXACT-EDGE half of the contract, and is the DEFAULT. On the PARALLEL
+        # line (marker `.stack-parity-parallel-line` present, see above) it is
+        # relaxed to "never overflow SOONER than single-threaded base": frames
+        # <= base on every recursion path, so this evaluator can never reject a
+        # program base accepts. Overflowing LATER (frames smaller) is then
         # allowed and must NOT fail. The dangerous direction -- overflowing
-        # SOONER (frames larger) -- is still caught by the lower check above
-        # (`runAt "$n"` at edge-lo fails when this Nix overflows below base's
-        # edge). See STACK-PARITY.md: this relaxation is parallel-line-only and
-        # must NOT migrate to the shipping branch (vibe-coding/unforce), which
-        # keeps strict exact-edge parity. User-approved (parallel inc2a review).
-        #
-        # STACK_PARITY_EXACT_EDGE=1 restores the strict upper check (used by the
-        # teeth self-check to prove a grown/sooner-overflow frame is flagged,
-        # and available for the shipping branch).
+        # SOONER (frames larger) -- is ALWAYS still caught by the lower check
+        # above (`runAt "$n"` at edge-lo fails when this Nix overflows below
+        # base's edge), in both modes. See STACK-PARITY.md: the relaxation is
+        # parallel-line-only; the shipping branch (no marker) stays strict
+        # exact-edge, and a migration of this file without the marker fails SAFE.
         n=$((edge[$name] + hi))
-        if [[ -n "${STACK_PARITY_EXACT_EDGE:-}" ]]; then
+        if [[ -z "$relaxedParity" ]]; then
+            # Strict exact-edge: default, shipping-safe, or forced by
+            # STACK_PARITY_EXACT_EDGE=1.
             ! runAt "$n" \
-                || fail "$name (eval-unforce = $mode): base overflows at $n (edge ${edge[$name]} + $hi), this Nix does not (exact-edge mode)"
+                || fail "$name (eval-unforce = $mode): base overflows at $n (edge ${edge[$name]} + $hi), this Nix does not (strict exact-edge)"
         elif runAt "$n"; then
             echo "$name (eval-unforce = $mode): base overflows at $n, this Nix does not -- allowed (parallel-line: frames <= base, overflows no sooner)"
         fi

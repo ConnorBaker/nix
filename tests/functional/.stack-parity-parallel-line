@@ -1,0 +1,16 @@
+Marker: this tree is on the parallel-eval line (vibe-coding/unforce-parallel-*).
+
+Its presence makes eval-stack-parity.sh use the RELAXED "never overflow sooner
+than single-threaded base" contract (lower-check teeth kept; upper exact-edge
+check relaxed so overflowing LATER than base, frames <= base, is allowed).
+
+This marker lives ONLY on the parallel-eval line and must NOT be copied to the
+shipping branch (vibe-coding/unforce). Without it, eval-stack-parity.sh defaults
+to STRICT exact-edge parity -- so if the test migrates toward shipping without
+this marker it fails SAFE (strict), mechanically enforcing that the relaxed
+parallel-line contract never reaches shipping.
+
+STACK_PARITY_EXACT_EDGE=1 forces strict even when this marker is present.
+
+See notes/identity/STACK-PARITY.md ("Parallel-line contract") and
+notes/reviews/unforce-parallel-inc2a.md. User-approved (parallel inc2a review).

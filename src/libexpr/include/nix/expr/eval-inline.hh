@@ -149,8 +149,9 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
        every recursion path -- the parallel-line stack-parity contract (frames
        never grow past base, so this evaluator never overflows sooner than
        single-threaded base). The winner-only "logPreImage after the CAS" move
-       (Risk R2) is deferred to 2c, where concurrent losers actually exist; at
-       threads=1 there are no losers, so the two orders are indistinguishable.
+       (Risk R2) is deferred to 2b, when worker threads enable concurrent
+       forcers -- hence CAS losers; at threads=1 there are no losers, so the two
+       orders are indistinguishable.
 
        A mid-force cell (blackhole) is pdPending, which still reports
        isThunk()==true, so it enters this same arm exactly as Inc1's env==null
