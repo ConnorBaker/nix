@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include <atomic>
 #include <bit>
 #include <cassert>
 #include <cstddef>
@@ -624,11 +625,31 @@ class alignas(16)
 
     using PackedPointer = typename PackedPointerTypeStruct<ptrSize>::type;
     using Payload = std::array<PackedPointer, 2>;
-#if defined(__x86_64__) && defined(__SSE2__)
-    __m128i payloadWords;
-#else
+    /* Inc2a: the 16-byte storage stays a plain two-word payload (word 0 = the
+       tag word "p0", word 1 = "p1"), so the ubiquitous readers/writers
+       (getInternalType / getStorage / setStorage via loadPayload/updatePayload)
+       keep Inc1's exact `ldp`/`stp` codegen -- no per-access cost and no
+       hot-path frame change.
+
+       The concurrent-forcing protocol reaches word 0 atomically through
+       `std::atomic_ref` ONLY at the force site: an acquire load to classify and
+       a compare-exchange to blackhole the cell (pdThunk -> pdPending). That is
+       DetSys's "two atomics per force", confined to the force path rather than
+       every value write. Word 0 sits at offset 0 of a 16-aligned Value, so it is
+       8-aligned and a valid atomic_ref target.
+
+       The old __m128i MOVAPS torn-read scheme (an x86-only defense against a
+       concurrent Boehm collector reading a half-written Value) is dropped: under
+       nogc+mimalloc the only concurrent reader is another eval worker, which
+       goes through this acquire/release protocol. On aarch64 (our build) Inc1
+       already used this plain path, so loadPayload/updatePayload are unchanged.
+
+       sizeof stays 16 / alignof 16 (Payload is two 8-byte words, class is
+       alignas(16)), so the two-level clock's `>>4` granule and the striped-arena
+       math are unchanged (asserted after Value -- Risk R1). */
     Payload payloadWords = {};
-#endif
+
+    using AtomicWord0 = std::atomic_ref<PackedPointer>;
 
     static constexpr int discriminatorBits = 3;
     static constexpr PackedPointer discriminatorMask = (PackedPointer(1) << discriminatorBits) - 1;
@@ -669,57 +690,103 @@ class alignas(16)
         pdListN, //< layout: Single untaggable field.
         pdString,
         pdPath,
-        pdPairOfPointers, //< layout: Pair of pointers payload
+        pdPairOfPointers, //< layout: Pair of pointers payload (tListSmall/tPrimOpApp/tLambda)
+        /* Inc2a: thunks/apps get their own primary discriminator so a single
+           atomic read of p0 decides "forceable", and the blackhole CAS flips
+           p0 pdThunk -> pdPending without touching p1. tThunk/tApp keep their
+           existing p1 subtag, decoded exactly like pdPairOfPointers. pdPending
+           is a cell mid-force (the cross-thread blackhole); at threads=1 it is
+           only ever the self-recursion sentinel. Eight primary discriminators
+           still fit in the 3 discriminator bits. */
+        pdThunk, //< layout: Pair of pointers payload (tThunk/tApp), forceable
+        pdPending, //< a cell currently being forced (blackhole)
     };
 
-#if defined(__x86_64__) && defined(__SSE2__)
-    /* Why do we even bother with hand-rolling these arch-specific intrinsics
-     * and don't use libatomic directly for 16 byte atomics? Here's why:
-     *  - https://gcc.gnu.org/legacy-ml/gcc/2018-02/msg00224.html
-     *  - https://gcc.gnu.org/bugzilla/show_bug.cgi?id=84563
-     *
-     * Basically, we don't really ever want to go through libatomic. As is
-     * so happens on x86_64 with AVX, MOVDQA/MOVAPS instructions (16-byte aligned
-     * 128-bit loads and stores) are atomic [^]. Note that
-     * these instructions are not part of AVX but rather SSE2, which is x86_64-v1.
-     * They are just not guaranteed to be atomic without AVX.
-     *
-     * For more details see:
-     *  - [^] Intel® 64 and IA-32 Architectures Software Developer’s Manual (10.1.1 Guaranteed Atomic Operations).
-     *  - https://patchwork.sourceware.org/project/gcc/patch/YhxkfzGEEQ9KHbBC@tucnak/
-     *  - https://ibraheem.ca/posts/128-bit-atomics/
-     *  - https://rigtorp.se/isatomic/
-     */
     [[gnu::always_inline]]
     void updatePayload(Payload payload) noexcept
     {
-        /* This intrinsic corresponds to MOVAPS. Note that Value (and thus the first member
-           payloadWords) is 16 bytes aligned. */
-        _mm_store_si128(&payloadWords, std::bit_cast<__m128i>(payload));
-    }
-
-    [[gnu::always_inline]]
-    Payload loadPayload() const noexcept
-    {
-        /* This intrinsic corresponds to MOVDQA. Note that Value (and thus the first member
-           payloadWords) is 16 bytes aligned. */
-        __m128i res = _mm_load_si128(&payloadWords);
-        return std::bit_cast<Payload>(res);
-    }
-#else
-    [[gnu::always_inline]]
-    void updatePayload(Payload payload) noexcept
-    {
+        /* Byte-identical to Inc1: a plain two-word store (stp). Value creation
+           and the force-result publish both go through here. At threads=1 no
+           reader races the write. Inc3's escape/notify seam makes the
+           force-completion publish a release store + old-tag check (via
+           AtomicWord0) once the Executor and waiters exist. */
         payloadWords = payload;
     }
 
     [[gnu::always_inline]]
     Payload loadPayload() const noexcept
     {
+        /* Byte-identical to Inc1: a plain two-word load (ldp). The force site
+           reads word 0 with the atomic acquire loader below for cross-thread
+           ordering. */
         return payloadWords;
     }
-#endif
 
+protected:
+    /* --- Inc2a concurrent-forcing protocol primitives (protected: called by
+       Value's public fv* wrappers). These reach word 0 (payloadWords[0], the
+       tag word) atomically via std::atomic_ref; everything else stays plain. */
+
+    /* The force site's single ordered read of the tag word. p1 (word 1) is read
+       after this (via fpWord1), so a release-published value is seen whole. */
+    [[gnu::always_inline]]
+    PackedPointer fpLoadWord0Acquire() noexcept
+    {
+        return AtomicWord0(payloadWords[0]).load(std::memory_order_acquire);
+    }
+
+    [[gnu::always_inline]]
+    PackedPointer fpWord0Plain() const noexcept
+    {
+        return payloadWords[0];
+    }
+
+    [[gnu::always_inline]]
+    PackedPointer fpWord1() const noexcept
+    {
+        return payloadWords[1];
+    }
+
+    static bool fpTagIsThunk(PackedPointer w0) noexcept
+    {
+        return (w0 & discriminatorMask) == pdThunk;
+    }
+
+    static bool fpTagIsPending(PackedPointer w0) noexcept
+    {
+        return (w0 & discriminatorMask) == pdPending;
+    }
+
+    static bool fpSubtagIsApp(PackedPointer w1) noexcept
+    {
+        return (w1 & discriminatorMask) == PackedPointer(tApp - tFirstPairOfPointers);
+    }
+
+    /* Elect the unique forcer: CAS word 0 from the captured thunk tag
+       `expected` to pdPending (the blackhole). `expected` is updated with the
+       live word 0 on failure. The thread id is 0 in Inc2a (no Executor); Inc3
+       packs (tid<<discriminatorBits). */
+    [[gnu::always_inline]]
+    bool fpMarkPending(PackedPointer & expected) noexcept
+    {
+        return AtomicWord0(payloadWords[0])
+            .compare_exchange_strong(
+                expected, static_cast<PackedPointer>(pdPending), std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    bool fpIsPendingTag() const noexcept
+    {
+        /* A relaxed/plain read of the tag suffices (single-threaded, or on an
+           already-published cell). */
+        return fpTagIsPending(payloadWords[0]);
+    }
+
+    void fpSetPending(PackedPointer p1bits) noexcept
+    {
+        updatePayload({static_cast<PackedPointer>(pdPending), p1bits});
+    }
+
+private:
     template<typename T>
         requires std::is_pointer_v<T>
     static T untagPointer(PackedPointer val) noexcept
@@ -765,10 +832,14 @@ class alignas(16)
     {
         Payload payload;
         static_assert(type >= tFirstPairOfPointers && type <= tLastPairOfPointers);
+        /* Inc2a: tThunk/tApp go under pdThunk so p0 alone marks a forceable
+           cell; the remaining pairs stay pdPairOfPointers. The p1 subtag is
+           identical in both, so getInternalType decodes them the same way. */
+        constexpr PrimaryDiscriminator primary = (type == tThunk || type == tApp) ? pdThunk : pdPairOfPointers;
         {
             auto firstFieldPayload = std::bit_cast<PackedPointer>(firstPtrField);
             assertAligned(firstFieldPayload);
-            payload[0] = static_cast<int>(pdPairOfPointers) | firstFieldPayload;
+            payload[0] = static_cast<int>(primary) | firstFieldPayload;
         }
         {
             auto secondFieldPayload = std::bit_cast<PackedPointer>(secondPtrField);
@@ -840,7 +911,16 @@ protected:
         case pdPath:
             return static_cast<InternalType>(tFirstSingleUntaggable + (pd - pdListN));
         case pdPairOfPointers:
+        case pdThunk:
+            /* pdThunk (tThunk/tApp) and pdPairOfPointers (tListSmall/
+               tPrimOpApp/tLambda) share the p1 subtag encoding, so they decode
+               the same way; only p0's primary tag distinguishes "forceable". */
             return static_cast<InternalType>(tFirstPairOfPointers + (payload[1] & discriminatorMask));
+        case pdPending:
+            /* A cell mid-force (blackhole). Reported as a thunk, exactly as the
+               old &eBlackHole sentinel thunk was, so type()/determinePos/
+               printing are unchanged. */
+            return tThunk;
         [[unlikely]] default:
             nixUnreachableWhenHardened();
         }
@@ -1556,6 +1636,37 @@ public:
         return getInternalType();
     }
 
+    /* --- Inc2a force-site protocol (used by EvalState::forceValue) --- */
+    static constexpr uint64_t fvPtrMask = ~uint64_t(0b111);
+    [[gnu::always_inline]] uint64_t fvWord0Acquire() noexcept
+    {
+        return fpLoadWord0Acquire();
+    }
+    [[gnu::always_inline]] uint64_t fvWord0Plain() const noexcept
+    {
+        return fpWord0Plain();
+    }
+    [[gnu::always_inline]] uint64_t fvWord1() const noexcept
+    {
+        return fpWord1();
+    }
+    [[gnu::always_inline]] static bool fvIsThunkTag(uint64_t w0) noexcept
+    {
+        return fpTagIsThunk(w0);
+    }
+    [[gnu::always_inline]] static bool fvIsPendingTag(uint64_t w0) noexcept
+    {
+        return fpTagIsPending(w0);
+    }
+    [[gnu::always_inline]] static bool fvIsAppSubtag(uint64_t w1) noexcept
+    {
+        return fpSubtagIsApp(w1);
+    }
+    [[gnu::always_inline]] bool fvMarkPending(uint64_t & w0) noexcept
+    {
+        return fpMarkPending(w0);
+    }
+
     const StringData * stringData() const noexcept
     {
         return getStorage<StringWithContext>().str;
@@ -1631,14 +1742,28 @@ public:
 
 extern ExprBlackHole eBlackHole;
 
+static_assert(
+    sizeof(Value) == 16,
+    "Inc2a/R1: Value must stay 16 bytes so the two-level clock's >>4 granule and the striped-arena math are unchanged.");
+static_assert(
+    alignof(Value) == 16, "Inc2a/R1: Value must stay 16-byte aligned (atomic p0 publish + arena cell layout).");
+
 bool Value::isBlackhole() const
 {
-    return isThunk() && thunk().expr == (Expr *) &eBlackHole;
+    /* The cross-thread blackhole is now the pdPending tag, not an &eBlackHole
+       sentinel thunk. Observers (printing, showType, tryFixupBlackHolePos)
+       are unchanged because a pending cell still reports type()==nThunk. */
+    return fpIsPendingTag();
 }
 
 void Value::mkBlackhole()
 {
-    mkThunk(nullptr, (Expr *) &eBlackHole);
+    /* Mark a cell as being forced (pdPending). Keep a thunk-shaped p1 pointing
+       at eBlackHole so any stray thunk()/determinePos read matches the old
+       sentinel. Only tests and the force-site recursion check build/observe one
+       now; the force site itself marks pending via the CAS (fvMarkPending). */
+    constexpr uint64_t subtag = uint64_t(tThunk - tFirstPairOfPointers);
+    fpSetPending(subtag | std::bit_cast<uint64_t>((Expr *) &eBlackHole));
 }
 
 typedef std::vector<Value *, traceable_allocator<Value *>> ValueVector;

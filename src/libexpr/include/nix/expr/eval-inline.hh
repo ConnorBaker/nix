@@ -137,25 +137,60 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
+    /* Inc2a: structured exactly as Inc1/master's force site (same isThunk /
+       isBlackhole / thunk() / isApp / isFailed accessors, same frame), with
+       only two changes: the in-place blackhole store `v.mkBlackhole()` becomes
+       the blackhole CAS (`fvMarkPending`, pdThunk -> pdPending, which elects
+       the unique forcer), and `logPreImage` moves to AFTER the CAS win,
+       recording the captured pre-image (winner-only -- Risk R2). A blackhole
+       (pdPending) now reports isThunk()==true and isBlackhole()==true, so the
+       old thunk arm's env==null / isBlackhole branch is reached as before. */
     if (v.isThunk()) {
-        /* Unforcing: a logged force gets start and end markers. Logged
-           before anything is loaded, so that nothing is live across it. */
-        logPreImage(v);
-        Env * env = v.thunk().env;
-        assert(env || v.isBlackhole());
-        Expr * expr = v.thunk().expr;
-        try {
-            v.mkBlackhole();
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
-        } catch (...) {
+        if (!v.isBlackhole()) [[likely]] {
+            /* A real, not-yet-forced thunk (pdThunk). */
+            Value savedThunk = v;
+            Env * env = v.thunk().env;
+            Expr * expr = v.thunk().expr;
+            /* Elect the unique forcer and blackhole the cell. At threads=1 the
+               CAS always wins immediately -> behaviour identical to the old
+               mkBlackhole() store. The pre-image was captured in `savedThunk`
+               before the CAS; it is appended only after the win. The comparand
+               is the thunk's own tag word (read plainly from the captured
+               pre-image); the CAS (acq_rel) provides the ordered read, so no
+               separate acquire load is needed. */
+            uint64_t expected = savedThunk.fvWord0Plain();
+            [[maybe_unused]] bool won = v.fvMarkPending(expected);
+            assert(won && "Inc2a/R2: forceValue blackhole CAS must win at threads=1");
+            logPreImageCaptured(v, savedThunk);
+            try {
+                if (env) [[likely]]
+                    expr->eval(*this, *env, v);
+                else
+                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
+            } catch (...) {
+                endLoggedForce(v);
+                handleEvalExceptionForThunk(env, expr, v, pos);
+                throw;
+            }
             endLoggedForce(v);
-            handleEvalExceptionForThunk(env, expr, v, pos);
-            throw;
+        } else {
+            /* A cell already being forced on this stack (pdPending): the old
+               env==null blackhole arm -> single-thread infinite recursion. */
+            logPreImage(v);
+            Env * env = v.thunk().env;
+            Expr * expr = v.thunk().expr;
+            try {
+                if (env) [[unlikely]]
+                    expr->eval(*this, *env, v);
+                else
+                    ExprBlackHole::throwInfiniteRecursionError(*this, v);
+            } catch (...) {
+                endLoggedForce(v);
+                handleEvalExceptionForThunk(env, expr, v, pos);
+                throw;
+            }
+            endLoggedForce(v);
         }
-        endLoggedForce(v);
     } else if (v.isApp()) {
         logPreImage(v);
         Value savedApp = v;
