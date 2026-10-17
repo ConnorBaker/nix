@@ -43,8 +43,18 @@
 
 namespace nix {
 
-EvalRegion evalRegion;
+/* inc2c-1: per-worker bump region (initial-exec, constant-initialized -- see the
+   extern declaration in eval.hh). `evalBaseArena` stays a plain global: it is the
+   NIX_NOGC_BUMP debug allocator, which the EvalState ctor rejects with
+   eval-cores > 1 (its cursor is unlocked and never thread-safe), and it holds a
+   std::vector (non-trivial ctor) that would put a TLS-init guard on the alloc
+   fallback -- so there is no reason to make it thread_local. */
+[[gnu::tls_model("initial-exec")]] thread_local EvalRegion evalRegion;
 BumpArena evalBaseArena;
+
+/* inc2c-1: the per-worker undo buffer (declared in eval.hh as nix::undoLog).
+   See EvalState::isolationDepth / the undoLog note in eval.hh. */
+[[gnu::tls_model("initial-exec")]] thread_local EvalUndoLog undoLog;
 
 const bool evalUseBaseArena = [] {
     auto s = getenv("NIX_NOGC_BUMP");
@@ -230,8 +240,12 @@ static const size_t nStripes = [] {
 /* The single reserved striped mapping; stripe `id` is at base + id*stripeBytes. */
 static char * stripesBase = nullptr;
 
-/* This thread's stripe (its worker id). Single-threaded: always 0. */
-static const size_t activeStripe = 0;
+/* inc2c-1: this worker's stripe (its worker id). Per-worker (initial-exec,
+   constant-initialized). At eval-cores == 1 there is one worker and it is
+   always 0, exactly as the former `static const activeStripe`; binding it to
+   `myEvalThreadId` for cores > 1 is inc2c-3's step (when `nStripes` also
+   becomes `evalCores`). */
+[[gnu::tls_model("initial-exec")]] static thread_local uint32_t myStripe = 0;
 
 /* Whether allocation comes from the striped reservation (always, except under
    the tripwire dial). */
@@ -285,7 +299,13 @@ struct Stats
        and consumers nominated. */
     size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
            ownerConsumerNominated = 0, ownerOverflowJobs = 0, ownerConsumerPairsPeak = 0, ownerCopyLimitJobs = 0;
-} stats;
+};
+/* inc2c-1: per-worker counters (incremented on the warm owner-timeline hooks
+   and at job ends, never on the inlined hot path). initial-exec +
+   constant-initialized. At eval-cores == 1 one worker accumulates everything,
+   so the NIX_SHOW_STATS/NIX_UNFORCE_STATS counters are unchanged; summing
+   across workers at teardown is inc2c-3's step. */
+[[gnu::tls_model("initial-exec")]] thread_local Stats stats;
 
 /* This thread's stack, [low, high). */
 static thread_local const std::pair<const char *, const char *> threadStack = [] {
@@ -414,13 +434,25 @@ static constexpr uint32_t noOwner = UINT32_MAX;
 static constexpr OwnerSeg segSentinel{UINT32_MAX, UINT32_MAX - 1};
 static constexpr size_t ownerBudgetMin = 4 << 20;
 
-/* Process-wide, like `evalRegion` (one job per process: `jobOwner`). Not
-   thread_local: libnixexpr's thread_local variables use the general dynamic
-   TLS model, a __tls_get_addr call per access. */
+/* inc2c-1: the owner-timeline state below is per-worker (`thread_local`), so
+   each worker tracks owners on its own stripe with no cross-worker contention.
+   They use the initial-exec TLS model: a single TP-relative load, not the
+   general-dynamic `__tls_get_addr` call the default model would pay (valid
+   because libnixexpr is linked at startup, not dlopen'd). The scalar statics
+   are constant-initialized (no TLS-init guard); the few with non-trivial
+   initializers (`ownerSegs`, `opens`, `openLogIndices`, `ownerConsumers`) are
+   dynamically initialized, but every access is on a WARM out-of-line symbol
+   (`setOwner`, `logPreImageSlow`, `endLoggedForceSlow`, ...), never on the
+   inlined `forceValue`/alloc path, so the TLS-init guard cannot reach a
+   stack-parity-critical frame. At eval-cores == 1 there is one worker, so all
+   of this is a pure relocation of where the state lives. The owner timeline is
+   defined with the scope-admission comment near `beginUnforceScope` below. */
 
 /* The closed segments: a reserved mapping, so pushes never move them or
    allocate (`limit`: the budget). Until a job maps it, and whenever owners
-   are off, it is `segBottom`: the sentinel alone. */
+   are off, it is `segBottom`: the sentinel alone. Shared read-only across
+   workers (the "owners off" sentinel is never written while `b == segBottom`),
+   so it stays a plain static. */
 static OwnerSeg segBottom[1] = {segSentinel};
 
 struct SegStack
@@ -477,16 +509,16 @@ struct SegStack
     }
 };
 
-static SegStack ownerSegs;
-static char * ownerSeg = nullptr;
-static uint32_t curOwner = noOwner;
-static bool ownersOn = false;
+[[gnu::tls_model("initial-exec")]] thread_local SegStack ownerSegs;
+[[gnu::tls_model("initial-exec")]] thread_local char * ownerSeg = nullptr;
+[[gnu::tls_model("initial-exec")]] thread_local uint32_t curOwner = noOwner;
+[[gnu::tls_model("initial-exec")]] thread_local bool ownersOn = false;
 /* This job's timeline ran out of budget: keep the job whole. */
-static bool ownersOverflowed = false;
-static bool ownerConsumersOn = false;
-static size_t ownerBudget = 0;
+[[gnu::tls_model("initial-exec")]] thread_local bool ownersOverflowed = false;
+[[gnu::tls_model("initial-exec")]] thread_local bool ownerConsumersOn = false;
+[[gnu::tls_model("initial-exec")]] thread_local size_t ownerBudget = 0;
 /* The undo log, whose indices name owners. */
-static const decltype(EvalState::undoLog) * ownerLog = nullptr;
+[[gnu::tls_model("initial-exec")]] thread_local const EvalUndoLog * ownerLog = nullptr;
 
 /* A stack whose push is a compare and a store, for the hooks. `reserve`
    before an update that must not fail halfway. */
@@ -543,14 +575,14 @@ struct OpenForce
 };
 
 static_assert(std::is_trivially_copyable_v<OpenForce>);
-static HookStack<OpenForce> opens = [] {
+[[gnu::tls_model("initial-exec")]] thread_local HookStack<OpenForce> opens = [] {
     HookStack<OpenForce> s;
     s.grow();
     *s.t++ = {nullptr, 0};
     return s;
 }();
 /* The log index of each logged force on `opens`, innermost last. */
-static HookStack<size_t> openLogIndices;
+[[gnu::tls_model("initial-exec")]] thread_local HookStack<size_t> openLogIndices;
 
 static bool opensEmpty()
 {
@@ -649,9 +681,9 @@ struct PairSet
     }
 };
 
-static PairSet ownerConsumers;
+[[gnu::tls_model("initial-exec")]] thread_local PairSet ownerConsumers;
 /* The last pair recorded, which most consumer forces repeat. */
-static uint64_t lastConsumerPair = PairSet::empty;
+[[gnu::tls_model("initial-exec")]] thread_local uint64_t lastConsumerPair = PairSet::empty;
 
 /* Bytes of this job's timeline, for the batch's bookkeeping. */
 size_t unforceOwnerBytes()
@@ -726,7 +758,7 @@ static void setOwner(uint32_t o);
    level, the within-stripe offset `(p - evalRegion.base) >> 4`, is what the
    map keys on. Hot path unchanged from the pre-striping clock: one
    subtraction, one shift. */
-static size_t ownerHint = 0;
+[[gnu::tls_model("initial-exec")]] thread_local size_t ownerHint = 0;
 
 [[gnu::always_inline]] inline static uint32_t ownerOf(const void * p)
 {
@@ -763,7 +795,7 @@ static void openOwners(EvalState & state)
     lastConsumerPair = PairSet::empty;
     curOwner = noOwner;
     ownerHint = 0;
-    ownerLog = &state.undoLog;
+    ownerLog = &undoLog;
     ownerSeg = evalRegion.base;
     ownerSegs.bottom();
     if (!ownersOn)
@@ -850,22 +882,25 @@ static char * pageUp(char * p)
    today (`rootTask`, the single root task), so moving a global in here is a
    pure rename and single-threaded behaviour is byte-identical.
 
-   Deliberately LEFT global for now, because an indirection on the inlined
-   fast path would break the byte-identical hot-path contract; these move in
-   a later increment (see notes/research/PARALLEL-EVAL-UNFORCING.md Sec
-   5.2(b)/6.C, and notes/reviews/unforce-parallel-inc1.md):
-     - `evalRegion` / `evalBaseArena` and `stats`   -- read by
-       allocValue/allocEnv/allocBytes in eval-inline.hh;
-     - the owner-timeline statics (`ownerSegs`, `ownerSeg`, `curOwner`,
-       `ownersOn`, `ownersOverflowed`, `ownerConsumersOn`, `ownerBudget`,
-       `ownerLog`, `ownerHint`, `ownerConsumers`, `lastConsumerPair`) --
-       read/written by `ownerOf`/`setOwner`/`segStart`/`youngForce`;
-     - `opens` / `openLogIndices` and `EvalState::undoLog` -- the force log,
-       appended on the warm `logPreImage` path (undoLog is already an
-       EvalState member, i.e. already per-EvalState).
-   Also left: `jobOwner` -- the cross-task admission ARBITER, a redesign
-   (per-task admission) rather than a move; and `allocatorErrors` -- a
-   process-global mimalloc error counter, not per-task.
+   inc2c-1 made the hot owner-timeline state per-worker (`thread_local`,
+   initial-exec) -- `evalRegion`, the owner-timeline statics (`ownerSegs`,
+   `ownerSeg`, `curOwner`, `ownersOn`, `ownersOverflowed`, `ownerConsumersOn`,
+   `ownerBudget`, `ownerLog`, `ownerHint`, `ownerConsumers`, `lastConsumerPair`),
+   `opens`/`openLogIndices`, the undo buffer (`nix::undoLog`), `stats` and
+   `isolationDepth`/`myStripe`. Still LEFT global in inc2c-1 (each for a reason
+   that does not bite at eval-cores == 1):
+     - `EvalMemory::stats` (nrValues/nrEnvs/...) -- an EvalMemory MEMBER read by
+       allocValue/allocEnv/allocBytes; moving it would add a TLS load to the
+       inlined alloc path for no eval-cores == 1 benefit (per-worker/summed in
+       inc2c-3 when threads turn on). Not a NIX_SHOW_STATS owner counter.
+     - `evalBaseArena` / `evalUseBaseArena` -- the NIX_NOGC_BUMP debug arena,
+       rejected with eval-cores > 1 by the EvalState ctor; a std::vector member
+       would put a TLS-init guard on the alloc fallback.
+     - `jobOwner` -- the cross-task admission ARBITER, a redesign (per-task
+       admission) rather than a move; deferred to inc2c-2.
+     - `allocatorErrors` -- a process-global mimalloc error counter, not
+       per-task.
+   See notes/research/PARALLEL-EVAL-INC2C-DESIGN.md Sec 1/6.
 */
 struct TaskUnforceState
 {
@@ -981,7 +1016,7 @@ void openRegion()
            (`leaveKeptMapping`): there is nowhere else to go, and a single eval
            never fills 32 GiB. Multi-stripe increments advance to the next
            stripe when a stripe fills. */
-        rootTask.keptStart = rootTask.keptFloor = stripeBase(activeStripe);
+        rootTask.keptStart = rootTask.keptFloor = stripeBase(myStripe);
         rootTask.keptEnd = rootTask.keptStart + stripeBytes;
     }
     if (rootTask.keptStart) {
@@ -1003,9 +1038,9 @@ void openRegion()
             auto d = (uintptr_t) (rootTask.keptFloor - stripesBase);
             evalRegion.arenaId = uint32_t(d >> stripeShift);
             assert(
-                evalRegion.arenaId == activeStripe
+                evalRegion.arenaId == myStripe
                 && ((uintptr_t) (rootTask.keptEnd - 1 - stripesBase) >> stripeShift) == evalRegion.arenaId
-                && (d & stripeMask) == d - (uintptr_t(activeStripe) << stripeShift));
+                && (d & stripeMask) == d - (uintptr_t(myStripe) << stripeShift));
             useEnvSizeTable(rootTask.keptStart);
             return;
         }
@@ -1474,13 +1509,13 @@ struct Evacuator
    took about 70 bytes per target, more than the log itself). */
 struct JobTargets
 {
-    const decltype(EvalState::undoLog) & log;
+    const EvalUndoLog & log;
     std::vector<Value *> cells;
     /* The log index of each target's first entry, and whether it has more. */
     std::vector<size_t> first;
     std::vector<bool> repeated;
 
-    JobTargets(const decltype(EvalState::undoLog) & log, size_t mark)
+    JobTargets(const EvalUndoLog & log, size_t mark)
         : log(log)
     {
         auto n = log.size() - mark;
@@ -2270,7 +2305,7 @@ bool UnforceBatch::full() const
        per entry). The batch bounds those too, so that a job that forces
        many cells while allocating little stays within about one batch of
        memory beyond what it keeps. */
-    auto & log = state->undoLog;
+    auto & log = undoLog;
     auto bookkeeping =
         (log.capacity() - *mark) * sizeof(EvalState::UndoEntry) + (log.size() - *mark) * 2 * sizeof(void *);
     /* So does the owner timeline. */
@@ -2529,11 +2564,10 @@ bool unforceIsScopeStackSlot(const void * p)
 
 /* The start of a logged force: an old cell. Every container is reserved
    before anything is pushed, so a failed allocation changes nothing. */
-[[gnu::noinline]] static void logOldForce(EvalState & state, Value & v)
+[[gnu::noinline]] static void logOldForce(EvalState & state, Value & v, const Value & preImage)
 {
     if (unforceIsScopeStackSlot(&v))
         return;
-    auto & undoLog = state.undoLog;
     if (undoLog.size() == undoLog.capacity())
         undoLog.reserve(std::max<size_t>(16, 2 * undoLog.capacity()));
     opens.reserve();
@@ -2542,24 +2576,32 @@ bool unforceIsScopeStackSlot(const void * p)
     /* An owner's name must fit, and differ from the sentinel's. */
     if (ownersOn && index >= segSentinel.owner) [[unlikely]]
         overflowOwners();
-    undoLog.push_back({&v, v});
+    /* inc2c-1: record the CAPTURED pre-image, not a re-read of `v`. The force
+       site elected the forcer and CAS'd word0 to the pending word before
+       calling here, so `v` is no longer its original thunk/app; the election
+       passed the pre-CAS Value down as `preImage`. (The single-argument
+       `logPreImageSlow` passes `v` itself, which is still intact for its
+       callers.) */
+    undoLog.push_back({&v, preImage});
     *opens.t++ = {&v, (uint64_t(curOwner) << 1) | 1};
     *openLogIndices.t++ = index;
     if (ownersOn)
         setOwner(uint32_t(index));
 }
 
-/* `logPreImageSlow` past its common cases. */
-[[gnu::noinline]] static void logPreImageRest(EvalState & state, Value & v)
+/* `logPreImageSlow` past its common cases. Only the old-cell branch records
+   contents, so only it needs the captured pre-image. */
+[[gnu::noinline]] static void logPreImageRest(EvalState & state, Value & v, const Value & preImage)
 {
     if (!evalRegion.contains(&v))
-        return logOldForce(state, v);
-    /* Young, but not of the current owner segment. */
+        return logOldForce(state, v, preImage);
+    /* Young, but not of the current owner segment. The owner timeline is keyed
+       by address, so the pre-image is not needed here. */
     if (ownersOn)
         youngForce(v);
 }
 
-void EvalState::logPreImageSlow(Value & v)
+void EvalState::logPreImageSlow(Value & v, const Value & preImage)
 {
     auto p = (const char *) &v;
     /* A young cell of the open segment keeps the owner, and needs no log
@@ -2572,7 +2614,14 @@ void EvalState::logPreImageSlow(Value & v)
        sentinel, which no address reaches. */
     if (p >= segStart(ownerSegs.t[-1]) && p < ownerSeg)
         return youngOwnerChange(v, ownerSegs.t[-1].owner);
-    return logPreImageRest(*this, v);
+    return logPreImageRest(*this, v, preImage);
+}
+
+/* Single-argument callers (`handleEvalFailed`) have not overwritten `v` yet,
+   so `v` is its own pre-image. */
+void EvalState::logPreImageSlow(Value & v)
+{
+    logPreImageSlow(v, v);
 }
 
 /* The end of a force whose start pushed a logged entry on `opens` (the

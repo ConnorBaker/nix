@@ -439,7 +439,14 @@ struct EvalRegion
     }
 };
 
-extern EvalRegion evalRegion;
+/* inc2c-1: per-worker. Each worker bumps within its own stripe, giving it an
+   independent address clock (the two-level owner-timeline clock's low level).
+   initial-exec so the inlined alloc path (allocBytes/allocValue/allocEnv) pays
+   one TP-relative load, not a general-dynamic __tls_get_addr call. All member
+   initializers are constant, so this is constant-initialized (no TLS-init
+   guard on the hot access). At eval-cores == 1 there is one worker, so this is
+   a pure relocation of where the region lives. */
+[[gnu::tls_model("initial-exec")]] extern thread_local EvalRegion evalRegion;
 
 #if !NIX_USE_BOEHMGC
 /** Zeroed evaluator memory outside unforce scopes, without Boehm
@@ -1236,8 +1243,22 @@ public:
         uint64_t reserved_[3] = {};
     };
 
-    std::vector<UndoEntry, traceable_allocator<UndoEntry>> undoLog;
-    unsigned isolationDepth = 0;
+    /* inc2c-1: the undo buffer is per-worker (a thread_local global,
+       `nix::undoLog` declared after this class), not an EvalState member: the
+       DetSys model shares one EvalState across workers, so a single member
+       would be a cross-worker contention point and would re-entangle the
+       revert proof across threads. Appended only on the warm `logPreImageSlow`
+       path (winner-only since inc2c-1), never on the inlined hot path, so the
+       (dynamic-init) TLS access never reaches a stack-parity-critical frame.
+       At eval-cores == 1 there is one worker, so this is a pure relocation. */
+
+    /* inc2c-1: per-worker force-nesting depth. Checked on the warm hooks
+       (logPreImage/endLoggedForce inline guards, forceValueDeep) and in
+       begin/endUnforceScope. A single shared member would race across workers;
+       per-worker is correct and, with winner-only logPreImage, the only inlined
+       read on the force site is endLoggedForce's guard. initial-exec +
+       constant-initialized: a single TP-relative load, frame-neutral. */
+    [[gnu::tls_model("initial-exec")]] static thread_local unsigned isolationDepth;
 
     /** Policy only: in how many jobs each old cell was forced. */
     std::unordered_map<const Value *, uint32_t> forceCounts;
@@ -1269,8 +1290,20 @@ public:
     }
 
     /**
+     * inc2c-1: winner-only variant. The force-site election
+     * (`electThunk`/`electApp`) overwrites word 0 with the pending word before
+     * the force runs, so the pre-image can no longer be re-read from `v`; the
+     * election captures the original Value and passes it here, on the CAS win
+     * only. (The force site reads `isolationDepth` itself and calls the slow
+     * path directly, so there is no inline variant of this on the hot path.)
+     */
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, const Value & preImage);
+
+    /**
      * The out-of-line part of `logPreImage`: log `v` with the
-     * start marker of its force.
+     * start marker of its force. Records `v`'s current contents as the
+     * pre-image (the single-argument callers overwrite `v` only after the
+     * force, e.g. `handleEvalFailed`).
      */
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
 
@@ -1513,6 +1546,15 @@ private:
     friend struct Value;
     friend class ListBuilder;
 };
+
+/* inc2c-1: the per-worker undo buffer (see EvalState::isolationDepth / the
+   `undoLog` note inside EvalState). thread_local so each worker appends its own
+   force log; recorded by `logPreImageSlow`, consumed at the scope's end on the
+   same worker. initial-exec keeps the (warm-path) access to a TP-relative load.
+   Named `undoLog` so the former `EvalState::undoLog` spellings resolve to it
+   unchanged inside the evaluator's methods and free functions. */
+using EvalUndoLog = std::vector<EvalState::UndoEntry, traceable_allocator<EvalState::UndoEntry>>;
+[[gnu::tls_model("initial-exec")]] extern thread_local EvalUndoLog undoLog;
 
 struct DebugTraceStacker
 {

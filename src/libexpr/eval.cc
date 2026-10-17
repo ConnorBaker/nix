@@ -252,6 +252,11 @@ EvalMemory::EvalMemory()
 /* inc2b-1: per-thread call-depth counter (see eval.hh). */
 [[gnu::tls_model("initial-exec")]] thread_local size_t EvalState::callDepth = 0;
 
+/* inc2c-1: per-worker force-nesting depth (was a plain EvalState member).
+   initial-exec + constant-initialized (= 0): a single TP-relative load on the
+   warm unforce hooks, frame-neutral. */
+[[gnu::tls_model("initial-exec")]] thread_local unsigned EvalState::isolationDepth = 0;
+
 [[gnu::noinline]] CallDepth EvalState::addCallDepth(const PosIdx pos)
 {
     if (callDepth > settings.maxCallDepth)
@@ -2433,13 +2438,30 @@ Value::ClosureThunk EvalState::electThunk(Value & v, const PosIdx pos)
            CAS the finished word0 back to pending (it only checks word0==expected),
            resurrecting a finished cell and eval'ing garbage. Return "handled":
            the value is already forced, and this acquire read happens-after the
-           publisher's release, so the caller's reads see the whole value. */
-        endLoggedForce(v);
+           publisher's release, so the caller's reads see the whole value.
+           inc2c-1: no `endLoggedForce` here -- with winner-only `logPreImage`
+           (below) a lost/finished cell never pushed anything to balance. */
         return {nullptr, nullptr};
     }
     Value::ClosureThunk t = v.thunk();
+    /* inc2c-1: winner-only `logPreImage`, relocated from the inlined force site.
+       Capture the pre-image BEFORE the CAS (which overwrites word0 with the
+       pending word, so `v` can no longer be re-read as a thunk), then log it
+       only on the CAS WIN. The out-of-scope fast path (isolationDepth == 0:
+       e.g. eval-unforce off, or eval outside a scope) captures nothing, so its
+       frame and cost match a bare CAS+return -- the force log is driven purely
+       off the thread-local nesting depth. At eval-cores == 1 the CAS always
+       wins, so this is behaviourally identical to logging before the mark. */
+    if (isolationDepth) [[unlikely]] {
+        Value preImage = v;
+        if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
+            forceValuePending(v);
+            return {nullptr, nullptr};
+        }
+        logPreImageSlow(v, preImage);
+        return t;
+    }
     if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
-        endLoggedForce(v);
         forceValuePending(v);
         return {nullptr, nullptr};
     }
@@ -2458,13 +2480,22 @@ Value::FunctionApplicationThunk EvalState::electApp(Value & v, const PosIdx pos)
     }
     if (!Value::fvIsThunkTag(expected)) [[unlikely]] {
         /* pd==pdThunk dispatch -- see electThunk. A finished (non-thunk) word0
-           must NOT be CASed back to pending; return "handled" (already forced). */
-        endLoggedForce(v);
+           must NOT be CASed back to pending; return "handled" (already forced).
+           inc2c-1: no `endLoggedForce` (winner-only logPreImage). */
         return {nullptr, nullptr};
     }
     Value::FunctionApplicationThunk a = v.app();
+    /* inc2c-1: winner-only `logPreImage` (see electThunk). */
+    if (isolationDepth) [[unlikely]] {
+        Value preImage = v;
+        if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
+            forceValuePending(v);
+            return {nullptr, nullptr};
+        }
+        logPreImageSlow(v, preImage);
+        return a;
+    }
     if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
-        endLoggedForce(v);
         forceValuePending(v);
         return {nullptr, nullptr};
     }
@@ -2489,19 +2520,19 @@ Value::FunctionApplicationThunk EvalState::electApp(Value & v, const PosIdx pos)
        publishes its own pending cell, and it has not yet done so.
 
        Otherwise another worker is forcing it (or finished between our read and
-       here): endLoggedForce balances the inline logPreImage, then waitOnThunk
-       blocks until the winner publishes and surfaces any failure. */
+       here): waitOnThunk blocks until the winner publishes and surfaces any
+       failure. inc2c-1: no `endLoggedForce` on either arm -- the force that
+       landed on this pending cell never reached the winner-only `logPreImage`
+       (it is not the elected forcer), so there is nothing on `opens` to pop. */
     if (!executor->enabled || Value::fvPendingThreadId(expected) == myEvalThreadId) {
         try {
             ExprBlackHole::throwInfiniteRecursionError(*this, v);
         } catch (...) {
-            endLoggedForce(v);
             handleEvalExceptionForThunk(nullptr, nullptr, v, pos);
             throw;
         }
     }
 
-    endLoggedForce(v);
     uint64_t w0 = v.fvWord0Acquire();
     if (Value::fvIsPendingTag(w0))
         waitOnThunk(v, w0);

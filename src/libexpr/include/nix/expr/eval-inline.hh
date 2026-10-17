@@ -157,10 +157,13 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
        arm byte-for-byte; the app arm adds only the never-taken election). The one
        inline per-force cost over inc2a is reading `myEvalThreadId` (an
        initial-exec TLS load) for the pending word; it does not grow the hot frame
-       past base. `logPreImage` stays BEFORE the mark; the winner-only relocation
-       is inc2c. */
+       past base. inc2c-1: `logPreImage` is RELOCATED into the election
+       (`electThunk`/`electApp`), appended winner-only on the CAS win using the
+       captured pre-image. That removes the inline `logPreImage` call (and its
+       `isolationDepth` read) from BOTH force arms here, so the inlined force
+       frame is <= inc2b-2's on every recursion path; the only inline unforce
+       read left on the force site is `endLoggedForce`'s `isolationDepth` guard. */
     if (v.isThunk()) {
-        logPreImage(v);
         /* electThunk runs the whole election out of line (word0 read, pending
            pre-check, env/expr capture, CAS to a pending word tagged with our
            thread id) and returns the captured env/expr. env==null means it was
@@ -183,8 +186,8 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         /* Apps are forceable cells too (primary pdThunk, app subtag) and share
            the SAME election via electApp: a shared tApp forced by two threads
            must be evaluated once, not double-evaluated and plain-stored (2b-2
-           fix). left==null means already handled. */
-        logPreImage(v);
+           fix). left==null means already handled. inc2c-1: `logPreImage`
+           relocated into electApp (winner-only). */
         Value::FunctionApplicationThunk a = electApp(v, pos);
         if (!a.left) [[unlikely]]
             return;
