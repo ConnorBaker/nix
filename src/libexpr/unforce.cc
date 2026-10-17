@@ -1240,85 +1240,48 @@ struct Evacuator
      and strings are never compared by address.
 
    Invariant (OC, ownership closure): every young identity-bearing object X
-   ∈ Evac(S) has owner(X) ∈ S or no owner. (Until 2026-10-15 OC covered
-   cells only, and a promoted cell could keep a copy of a reverted
-   producer's Bindings that held only old cells: base prints the second
-   occurrence as «repeated», markers printed it in full; review
-   notes/reviews/identity-comparison.md §2.2, B1.)
-
-   OC is sufficient: a reverted target t re-forced later builds only cells
-   that t owns, which are fresh: none of them survives, because a survivor is
-   in Evac(S) and is owned by a member of S, and t ∉ S. A surviving copy is
-   never rebuilt, because its owner is promoted (it is a value and is not
-   re-forced), and every cell on a creator chain below an owner is built only
-   by re-running the owner. So each cell of the evaluation without unforcing
-   has at most one counterpart alive at any time, and the history-independence
-   argument for pure revert (notes/reviews/identity-reliance-review.md §3.2)
-   applies to the heap at the next job's start. OC is also necessary in
-   general: a cell X ∈ Evac(S) owned by a reverted t is rebuilt as X' when t
-   is re-forced, and `X == X'` is observable whenever X holds a function.
+   ∈ Evac(S) has owner(X) ∈ S or no owner. OC is sufficient for
+   pointer-identity safety (a reverted target re-forced later rebuilds only
+   fresh cells it owns, none of which survives) and, in general, necessary
+   (a surviving X owned by a reverted t is rebuilt as X', and `X == X'` is
+   observable when X holds a function).
 
    Lemma V (no upward visibility). While t is being forced, cells owned by t
    are accessible only to t's own evaluation and to forces of young cells
-   owned by t. Reason: a target u forced inside t starts from its pre-image,
-   which refers only to old memory (old cells are written only by their own
-   logged forces, A1/A3 of the review); u gains access to young objects only
-   by allocating them (owned by u or below) or by reading the contents of
-   completed forces, and t's content does not exist until t ends. A young
-   cell forced inside t but created before t started (not owned by t)
-   likewise runs on its own closure. Hence no cell owned by t is allocated
-   while a target nested in t is running.
+   owned by t.
 
    Lemma C (closed region). If t owns X and X is reachable at job end from a
    promoted r ≠ t, then X ∈ R(c(t)), along a path whose interior consists of
-   objects owned by t. Reason: before t ends, no object not owned by t points
-   at an object owned by t (Lemma V; containers are immutable, a cell is
-   written only by its own force, whose evaluation is closed over its creator's
-   data). After t ends, t's evaluation has no frame left, and objects owned by
-   t are found only through c(t): forcing a young thunk owned by t (found in
-   c(t), or through the environment of a lambda in c(t)) puts what it builds
-   into that thunk's own content, which is owned by t and stays reachable
-   from c(t) through the thunk's cell; another evaluation that reads c(t)
-   copies pointers that are reachable from c(t) already.
+   objects owned by t.
 
    Computing owner(X). The owner timeline (the block above) records, for
    every young address, the target that owned the allocation clock when it
    was allocated; `ownerOf(X)` reads it off the closed/open segments with no
    walk of R(c(t)) and no per-object stamp. The timeline is exact because the
-   current owner follows the creator chain: a logged force of an old cell t
-   makes t the owner, and a force of a young cell c makes owner(c) the owner,
-   so everything allocated then is attributed to the target whose re-force
-   rebuilds it. In particular a producer whose young thunk is forced inside a
-   later target still owns what that thunk builds (the "precedes"/"follows"
-   demos in tests/functional/eval-unforce-identity/, where the producer had
-   ended before X was allocated) -- an allocation-interval attribution (option
-   E of notes/research/identity-reliance.md, the innermost force interval
-   open at X's allocation time) misattributes those to the enclosing target
-   and is unsound; plain
-   reachability (option C) over-promotes every consumer that merely reads a
-   producer's surviving data. owner(X) names X's one producer, so neither
-   error occurs.
+   current owner follows the creator chain, so owner(X) names X's one
+   producer -- unlike an allocation-interval attribution (unsound) or plain
+   reachability (over-promotes every consumer that reads a producer's data).
 
-   Rule. S is the least superset of the
-   count-nominated set S0 that satisfies OC under the producer-of test
-   (`OwnerClosure`: owner(x) in S for every identity-bearing x in Evac(S)),
-   computed to a fixpoint; the promoted set is copied with one Evacuator, so
-   the shared objects keep one copy. The decision, copies included, runs
-   before the job's memory is released and writes no target (`decideJob`):
-   every target is copied as it joins S and the copies mark Evac(S). The
-   release then only assigns, reverts and frees. The alternative,
-   refusing every member of S0 whose Evac(S) reaches a cell owned by an
-   un-promoted target (the greatest subset of S0 satisfying OC), retains less
-   per job but can starve: a consumer whose content reaches objects owned by
-   a producer nominated in the same job would be dropped, and in a Nixpkgs
-   traversal that recurs in every job, so the subset would never be
-   promoted. The counts (K) stay a heuristic for which cells to consider;
-   correctness depends only on the closure.
+   Rule. S is the least superset of the count-nominated set S0 that satisfies
+   OC under the producer-of test (`OwnerClosure`: owner(x) ∈ S for every
+   identity-bearing x in Evac(S)), computed to a fixpoint; the promoted set is
+   copied with one Evacuator, so shared objects keep one copy. The decision,
+   copies included, runs before the job's memory is released and writes no
+   target (`decideJob`); the release then only assigns, reverts and frees. The
+   counts (K) stay a heuristic for which cells to consider; correctness
+   depends only on the closure.
 
    Premises: A1–A4 of the review (every write to old memory is logged;
    old memory allocated during a job, i.e. fileEvalCache cells and C-API
    objects, is inert; no escapes; deterministic evaluation), and exceptions
    carry no evaluator values.
+
+   The full proofs -- OC sufficiency and necessity, the Lemma V and C
+   reasoning, the option-C (reachability) / option-E (interval) comparison,
+   and the greatest-subset starvation argument for the Rule -- are in
+   notes/reviews/identity-owners-v1.md and notes/reviews/identity-comparison.md
+   (the text moved out of this comment is also preserved in
+   notes/reviews/unforce-trim-src.md, P10).
    --------------------------------------------------------------------------- */
 
 /* A job's targets, in the order of their first log entries (= the order
