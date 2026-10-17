@@ -2529,7 +2529,7 @@ bool unforceIsScopeStackSlot(const void * p)
 
 /* The start of a logged force: an old cell. Every container is reserved
    before anything is pushed, so a failed allocation changes nothing. */
-[[gnu::noinline]] static void logOldForce(EvalState & state, Value & v, const Value & preImage)
+[[gnu::noinline]] static void logOldForce(EvalState & state, Value & v)
 {
     if (unforceIsScopeStackSlot(&v))
         return;
@@ -2542,7 +2542,7 @@ bool unforceIsScopeStackSlot(const void * p)
     /* An owner's name must fit, and differ from the sentinel's. */
     if (ownersOn && index >= segSentinel.owner) [[unlikely]]
         overflowOwners();
-    undoLog.push_back({&v, preImage});
+    undoLog.push_back({&v, v});
     *opens.t++ = {&v, (uint64_t(curOwner) << 1) | 1};
     *openLogIndices.t++ = index;
     if (ownersOn)
@@ -2550,16 +2550,16 @@ bool unforceIsScopeStackSlot(const void * p)
 }
 
 /* `logPreImageSlow` past its common cases. */
-[[gnu::noinline]] static void logPreImageRest(EvalState & state, Value & v, const Value & preImage)
+[[gnu::noinline]] static void logPreImageRest(EvalState & state, Value & v)
 {
     if (!evalRegion.contains(&v))
-        return logOldForce(state, v, preImage);
+        return logOldForce(state, v);
     /* Young, but not of the current owner segment. */
     if (ownersOn)
         youngForce(v);
 }
 
-void EvalState::logPreImageSlow(Value & v, const Value & preImage)
+void EvalState::logPreImageSlow(Value & v)
 {
     auto p = (const char *) &v;
     /* A young cell of the open segment keeps the owner, and needs no log
@@ -2572,7 +2572,7 @@ void EvalState::logPreImageSlow(Value & v, const Value & preImage)
        sentinel, which no address reaches. */
     if (p >= segStart(ownerSegs.t[-1]) && p < ownerSeg)
         return youngOwnerChange(v, ownerSegs.t[-1].owner);
-    return logPreImageRest(*this, v, preImage);
+    return logPreImageRest(*this, v);
 }
 
 /* The end of a force whose start pushed a logged entry on `opens` (the

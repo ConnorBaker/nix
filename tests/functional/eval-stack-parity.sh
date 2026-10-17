@@ -204,9 +204,29 @@ for p in "${programs[@]}"; do
                 diff -u "$exp" "$spDir/err.cmp" || fail "$name (eval-unforce = $mode): error differs from base's"
             fi
         fi
+        # Upper check (base overflows here -> this Nix must too) is the
+        # EXACT-EDGE half of the contract. On the PARALLEL line
+        # (vibe-coding/unforce-parallel-*) the contract is deliberately relaxed
+        # to "never overflow SOONER than single-threaded base": frames <= base
+        # on every recursion path, so this evaluator can never reject a program
+        # base accepts. Overflowing LATER than base (frames smaller) is then
+        # allowed and must NOT fail. The dangerous direction -- overflowing
+        # SOONER (frames larger) -- is still caught by the lower check above
+        # (`runAt "$n"` at edge-lo fails when this Nix overflows below base's
+        # edge). See STACK-PARITY.md: this relaxation is parallel-line-only and
+        # must NOT migrate to the shipping branch (vibe-coding/unforce), which
+        # keeps strict exact-edge parity. User-approved (parallel inc2a review).
+        #
+        # STACK_PARITY_EXACT_EDGE=1 restores the strict upper check (used by the
+        # teeth self-check to prove a grown/sooner-overflow frame is flagged,
+        # and available for the shipping branch).
         n=$((edge[$name] + hi))
-        ! runAt "$n" \
-            || fail "$name (eval-unforce = $mode): base overflows at $n (edge ${edge[$name]} + $hi), this Nix does not: its frames are smaller than base's"
+        if [[ -n "${STACK_PARITY_EXACT_EDGE:-}" ]]; then
+            ! runAt "$n" \
+                || fail "$name (eval-unforce = $mode): base overflows at $n (edge ${edge[$name]} + $hi), this Nix does not (exact-edge mode)"
+        elif runAt "$n"; then
+            echo "$name (eval-unforce = $mode): base overflows at $n, this Nix does not -- allowed (parallel-line: frames <= base, overflows no sooner)"
+        fi
     done
 done
 

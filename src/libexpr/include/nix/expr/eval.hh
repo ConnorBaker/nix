@@ -1183,31 +1183,14 @@ public:
     [[gnu::always_inline]] void logPreImage(Value & v)
     {
         if (isolationDepth) [[unlikely]]
-            logPreImageSlow(v, v);
+            logPreImageSlow(v);
     }
 
     /**
-     * Inc2a: the thunk force site captures the pre-image into `preImage`
-     * (`Value preImage = v`) BEFORE the blackhole CAS and appends it only
-     * AFTER the CAS win (winner-only logging, Risk R2). `preImage` is the
-     * ORIGINAL thunk, not v's now-pending contents; all owner-timeline / opens
-     * work keys on `&v` exactly as `logPreImage` does, so at threads=1 the undo
-     * log and every counter are byte-identical. The captured `Value` also
-     * keeps the force site's inlined frame the same 16-byte-slot size as Inc1's
-     * mkBlackhole/thunk() temporary, preserving stack parity (Risk R3).
+     * The out-of-line part of `logPreImage`: log `v` with the
+     * start marker of its force.
      */
-    [[gnu::always_inline]] void logPreImageCaptured(Value & v, const Value & preImage)
-    {
-        if (isolationDepth) [[unlikely]]
-            logPreImageSlow(v, preImage);
-    }
-
-    /**
-     * The out-of-line part of `logPreImage`: log `v` against the pre-image
-     * `preImage` with the start marker of its force. (`preImage` is `v` for
-     * the ordinary hook; the captured-thunk hook passes the original thunk.)
-     */
-    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, const Value & preImage);
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
 
     /**
      * After a force of `v`, however it ended: record the end
