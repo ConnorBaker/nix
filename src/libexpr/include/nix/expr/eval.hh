@@ -1135,16 +1135,15 @@ public:
     {
         Value * target;
         Value preImage;
-        /**
-         * Force markers: the job's allocation clock (`unforceClock`) when
-         * this force of `target` started and ended (`openForce` until it
-         * ends), and the log index of the innermost logged force that was
-         * running when it started (-1: none). Forcing is LIFO, so these
-         * intervals nest or are disjoint.
-         */
-        uint64_t start = 0, end = openForce;
-        int64_t parent = -1;
-        static constexpr uint64_t openForce = ~uint64_t(0);
+        /* Vestigial. The interval "force marker" algorithm that used these
+           24 bytes (per-force start/end allocation clock and parent log
+           index) is gone; they are reserved only so the undo log keeps its
+           per-entry footprint, and thus `UnforceBatch::full`'s batch-size
+           heuristic -- and every NIX_SHOW_STATS owner counter -- stays
+           identical. Dropping them is byte-identical in output but shifts
+           `ownerConsumerNominated` by one (a batch-packing micro-shift);
+           deferred as a separate decision. */
+        uint64_t reserved_[3] = {};
     };
 
     std::vector<UndoEntry, traceable_allocator<UndoEntry>> undoLog;

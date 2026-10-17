@@ -272,16 +272,6 @@ static void printStatsAtExit()
          true);
 }
 
-/* The allocation clock of the innermost scope: the bump cursor. It only
-   grows while a scope is open. */
-static uint64_t unforceClock()
-{
-    return (uintptr_t) evalRegion.cur;
-}
-
-/* Log indices of the logged forces that are running, innermost last. */
-static thread_local std::vector<size_t> activeForces;
-
 /* ---------------------------------------------------------------------------
    The owner timeline (bump backend, identity = owners).
 
@@ -716,13 +706,11 @@ static void closeOwners()
     curOwner = noOwner;
 }
 
-/* Forget running forces logged at or after `mark` (none should be). */
-static void dropActiveForces(size_t mark)
+/* Drop the `opens` entries of running forces logged at or after `mark`
+   (none should be; logged ones are pushed whatever the identity mode, so
+   that `endLoggedForce` finds them). */
+static void dropOpenForces(size_t mark)
 {
-    while (!activeForces.empty() && activeForces.back() >= mark)
-        activeForces.pop_back();
-    /* Their `opens` entries (logged ones are pushed whatever the identity
-       mode, so that `endLoggedForce` finds them). */
     while (!opensEmpty() && (!(opens.back().saved & 1) || openLogIndices.back() >= mark)) {
         if (opens.back().saved & 1)
             openLogIndices.pop();
@@ -1333,15 +1321,6 @@ struct Evacuator
    carry no evaluator values.
    --------------------------------------------------------------------------- */
 
-/* Times of young objects: the address in the bump region. */
-struct CellClock
-{
-    std::optional<uint64_t> operator()(const void * p) const
-    {
-        return (uintptr_t) p;
-    }
-};
-
 /* A job's targets, in the order of their first log entries (= the order
    their first forces started). A cell may have been forced more than once
    (after a recoverable error); its oldest pre-image is the one from before
@@ -1480,7 +1459,6 @@ struct Closure
     enum Kind : uint8_t { kValue, kEnv, kBindings };
 
     const YoungSpace & young;
-    const CellClock & clock;
     Marks marks;
     std::vector<std::pair<const void *, Kind>> stack;
     /* `mark`'s element arrays whose elements are still to be added, and
@@ -1821,8 +1799,6 @@ std::vector<bool> decideJob(
     const JobTargets & targets,
     std::unordered_map<const Value *, uint32_t> & counts,
     const YoungSpace & young,
-    const CellClock & clock,
-    uint64_t jobEnd,
     size_t youngBytes,
     Evacuator & evacuator,
     std::vector<Value> & copies,
@@ -1904,7 +1880,7 @@ std::vector<bool> decideJob(
         bool markFirst = keepWhole && (printed || youngBytes > copyLimit);
         std::optional<Closure<RegionMarks>> marker;
         if (markFirst) {
-            marker.emplace(young, clock, RegionMarks(evalRegion.base, evalRegion.cur));
+            marker.emplace(young, RegionMarks(evalRegion.base, evalRegion.cur));
             marker->onMark = &OwnerClosure::note;
             marker->onMarkCtx = &oc;
             marker->markedLimit = copyLimit;
@@ -2420,23 +2396,15 @@ bool unforceIsScopeStackSlot(const void * p)
     if (unforceIsScopeStackSlot(&v))
         return;
     auto & undoLog = state.undoLog;
-    auto room = [](auto & vec) {
-        if (vec.size() == vec.capacity())
-            vec.reserve(std::max<size_t>(16, 2 * vec.capacity()));
-    };
-    room(undoLog);
-    room(activeForces);
+    if (undoLog.size() == undoLog.capacity())
+        undoLog.reserve(std::max<size_t>(16, 2 * undoLog.capacity()));
     opens.reserve();
     openLogIndices.reserve();
     auto index = undoLog.size();
     /* An owner's name must fit, and differ from the sentinel's. */
     if (ownersOn && index >= segSentinel.owner) [[unlikely]]
         overflowOwners();
-    EvalState::UndoEntry e{&v, v};
-    e.start = unforceClock();
-    e.parent = activeForces.empty() ? -1 : int64_t(activeForces.back());
-    undoLog.push_back(e);
-    activeForces.push_back(index);
+    undoLog.push_back({&v, v});
     *opens.t++ = {&v, (uint64_t(curOwner) << 1) | 1};
     *openLogIndices.t++ = index;
     if (ownersOn)
@@ -2469,35 +2437,15 @@ void EvalState::logPreImageSlow(Value & v)
     return logPreImageRest(*this, v);
 }
 
-/* The end of a logged force. */
-[[gnu::noinline]] static void endOldForce(EvalState & state, Value & v)
-{
-    /* Every logged force ends here, innermost first, so the innermost open
-       one is `v`'s if `v`'s start was logged. One that a job's end dropped
-       (`dropActiveForces`) is not found. */
-    if (activeForces.empty())
-        return;
-    auto i = activeForces.back();
-    if (i >= state.undoLog.size()) {
-        activeForces.pop_back();
-        return;
-    }
-    if (state.undoLog[i].target != &v)
-        return;
-    activeForces.pop_back();
-    state.undoLog[i].end = unforceClock();
-}
-
 /* The end of a force whose start pushed a logged entry on `opens` (the
    top). */
-[[gnu::noinline]] static void endLoggedOpen(EvalState & state, Value & v)
+[[gnu::noinline]] static void endLoggedOpen()
 {
     auto saved = opens.back().saved;
     opens.pop();
     openLogIndices.pop();
     if (ownersOn)
         setOwner(uint32_t(saved >> 1));
-    endOldForce(state, v);
 }
 
 void EvalState::endLoggedForceSlow(Value & v)
@@ -2507,7 +2455,7 @@ void EvalState::endLoggedForceSlow(Value & v)
         return;
     auto saved = opens.t[-1].saved;
     if (saved & 1) [[unlikely]]
-        return endLoggedOpen(*this, v);
+        return endLoggedOpen();
     --opens.t;
     /* Only a young force that changed the owner pushes this; owners may
        have run out of budget since. */
@@ -2556,8 +2504,7 @@ void EvalState::endUnforceScope(size_t mark)
     stats.jobs++;
     generation++;
     stats.logged += undoLog.size() - mark;
-    auto jobEnd = unforceClock();
-    dropActiveForces(mark);
+    dropOpenForces(mark);
 
     /* Before anything is released: decide what to promote, and copy it.
        The Evacuator, whose table is keyed by young addresses, goes before
@@ -2580,8 +2527,6 @@ void EvalState::endUnforceScope(size_t mark)
                 *jt,
                 forceCounts,
                 YoungSpace{},
-                CellClock{},
-                jobEnd,
                 /* String data is never walked: a long string must not buy
                    the closure steps (review of markers v4, S1''). */
                 size_t(evalRegion.cur - evalRegion.base)
