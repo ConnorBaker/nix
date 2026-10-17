@@ -2361,7 +2361,7 @@ void EvalState::forceValueDeep(Value & v, std::set<const void *> & seen)
         if (!seen.insert(&v).second)
             return;
         /* Out of line and behind one test, so that this level's frame is
-           base's (STACK-PARITY.md, R1). */
+           base's. */
         if (state.isolationDepth) [[unlikely]]
             unforceNoteSeen(seen, v, &v);
 
@@ -3183,7 +3183,7 @@ void EvalState::printStatistics()
         {"cycles", gcCycles},
     };
 #endif
-    /* PROTOTYPE: allocator and unforcing statistics. */
+    /* Allocator and unforcing statistics. */
     if (auto s = unforceStatsJSON(); !s.empty())
         topObj["unforce"] = json::parse(s);
     if (auto s = allocatorStatsJSON(); !s.empty())

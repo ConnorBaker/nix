@@ -1,7 +1,7 @@
 #pragma once
 ///@file
 
-/* PROTOTYPE (unforcing). Declarations for the cold, out-of-line unforcing
+/* Declarations for the cold, out-of-line unforcing
    surface: the job-region pause guard, the «seen»-set and traversal-batch
    helpers, and the free functions that only cold call sites (unforce.cc and
    its consumers) use. The hot inlined pieces that `eval-inline.hh` needs --
@@ -31,7 +31,7 @@ struct PauseRegion
 };
 
 /**
- * PROTOTYPE. Keeps a printer's address-keyed `seen` set (its «repeated»
+ * Keeps a printer's address-keyed `seen` set (its «repeated»
  * tracking) as exact across the end of unforce jobs as without unforcing,
  * while this object lives: a container printed in one job and reached
  * again in a later one must still print as «repeated».
@@ -67,21 +67,21 @@ struct UnforceSeen
 };
 
 /**
- * PROTOTYPE. `key` (a Bindings, or a list's cell) of the container that
+ * `key` (a Bindings, or a list's cell) of the container that
  * `cell` holds was just added to `seen`. Does nothing unless an
  * `UnforceSeen` for `seen` is alive and a job is open.
  */
 [[gnu::noinline, gnu::cold]] void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key);
 
 /**
- * PROTOTYPE. Whether the open unforce jobs keep `UnforceSeen` sets exact
+ * Whether the open unforce jobs keep `UnforceSeen` sets exact
  * (the bump backend), so that a printer need not forget what a freeing
  * job added.
  */
 bool unforceSeenExact();
 
 /**
- * PROTOTYPE. Counts unforce scopes that have freed memory. A pointer into
+ * Counts unforce scopes that have freed memory. A pointer into
  * evaluator memory cached outside a scope (e.g. by an eval-cache cursor) is
  * stale once this has changed since it was cached: a scope has ended since,
  * and may have freed what the pointer refers to.
@@ -89,7 +89,7 @@ bool unforceSeenExact();
 size_t unforceGeneration();
 
 /**
- * PROTOTYPE. Whether `p` is on this thread's stack below the stack pointer
+ * Whether `p` is on this thread's stack below the stack pointer
  * that the innermost unforce scope's opener had: a slot of a frame entered
  * since, which will have returned when the scope ends, so it must not be
  * restored then. (Stacks other than the thread's, e.g. coroutines', are not
@@ -98,29 +98,29 @@ size_t unforceGeneration();
 bool unforceIsScopeStackSlot(const void * p);
 
 /**
- * PROTOTYPE. Client code (a C API primop) is about to run. If an unforce
+ * Client code (a C API primop) is about to run. If an unforce
  * scope is open, the job promotes nothing: what the client builds is
  * allocated outside the job's region, where the producer closure cannot see
  * it, and a re-forced call builds it anew.
  */
 void unforceNoteClientCode();
 
-/** PROTOTYPE. Bytes allocated so far in the innermost unforce scope. */
+/** Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();
 
-/** PROTOTYPE. NIX_SHOW_STATS sections as JSON text, or empty. */
+/** NIX_SHOW_STATS sections as JSON text, or empty. */
 std::string unforceStatsJSON();
 std::string allocatorStatsJSON();
 
 /**
- * PROTOTYPE. Whether traversals unforce what they visit: the `eval-unforce`
+ * Whether traversals unforce what they visit: the `eval-unforce`
  * setting, unless the debugger is active (its traces refer to environments
  * that unforcing frees).
  */
 bool unforceEnabled(const EvalState & state);
 
 /**
- * PROTOTYPE. Unforcing for a traversal that visits each element once
+ * Unforcing for a traversal that visits each element once
  * (printing or serialising a value, searching, checking): what visiting its
  * elements forced is unforced, and what it allocated freed, when their batch
  * ends. Consecutive elements share a batch until it has allocated

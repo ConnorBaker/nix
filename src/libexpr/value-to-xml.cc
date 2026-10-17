@@ -26,7 +26,7 @@ static void printValueAsXML(
     StringSet & drvsSeen,
     const PosIdx pos);
 
-/* PROTOTYPE: whether the current render unforces each element (see the public
+/* Whether the current render unforces each element (see the public
    `printValueAsXML`). */
 static thread_local bool unforceElements = false;
 

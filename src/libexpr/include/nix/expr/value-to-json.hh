@@ -11,7 +11,7 @@
 namespace nix {
 
 /**
- * @param unforce PROTOTYPE: unforce each attribute and list element once it
+ * @param unforce unforce each attribute and list element once it
  * is serialised. Only for callers that are done with `v` afterwards (command
  * output), never for builtins.
  */

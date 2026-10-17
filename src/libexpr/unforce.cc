@@ -1,4 +1,4 @@
-/* PROTOTYPE: unforcing thunks between jobs.
+/* Unforcing thunks between jobs.
 
    Thunk update in `forceValue` is the evaluator's only mutation of existing
    cells. While a job (an outermost unforce scope) runs, the pre-image of
@@ -99,8 +99,7 @@ struct Settings
        cell keeps the address its holders already compared, so eqValues'
        `&v1 == &v2` short-cut still holds. At the 64 MiB default batch this is
        byte-identical to base, ~1.12x its instructions, with 0 pointer-equality
-       flips on 3491 real Nixpkgs comparisons
-       (notes/reviews/owner-timeline-perf-and-scale-freq.md).
+       flips on 3491 real Nixpkgs comparisons.
        Previously NIX_UNFORCE_PROMOTE, _OWNER_CONSUMERS, _SEEN. */
     uint32_t promoteAfter = 2;
     bool ownerConsumers = true;
@@ -275,7 +274,7 @@ static void printStatsAtExit()
 /* ---------------------------------------------------------------------------
    The owner timeline (bump backend, identity = owners).
 
-   owner(x) of a young object x (MARKERS.md §1.1, the policy comment below)
+   owner(x) of a young object x (the policy comment below)
    is the first old cell on its creator chain: the target whose re-force is
    the only thing that can build x again, or none (the driver). It is a
    function of allocation time: at any moment one force is the innermost
@@ -296,18 +295,17 @@ static void printStatsAtExit()
    segment just below takes that segment back. Owners are named by the log
    index of their logged force (`noOwner`: the driver).
 
-   The hooks keep markers' inline shape (STACK-PARITY.md, R1: one test of
-   `isolationDepth`, one cold out-of-line call; review identity-owners-v1,
-   B1); every test below runs in the out-of-line part. A force that pushes
+   The hooks keep markers' inline shape (one test of
+   `isolationDepth`, one cold out-of-line call); every test below runs in
+   the out-of-line part. A force that pushes
    something (a logged force, or a young force that changed the owner)
    pushes `v` on `opens`, and its end pops it when the top is `v`'s. An end
    is matched by the innermost frame that sees its cell on top: an infinite
    recursion's inner frame may pop the outer one's entry first, which is
    harmless because nothing is allocated in the region between the two
-   frames' ends, and the error cannot be caught in the language (review
-   identity-owners-v1, N1).
+   frames' ends, and the error cannot be caught in the language.
 
-   Memory (review identity-owners-v1, SF1). The closed segments, 8 bytes
+   Memory. The closed segments, 8 bytes
    each, live in a reserved mapping, so they never move or reallocate; the
    consumer pairs are a set, so a pair costs once. Together they stay
    within the timeline's budget (a quarter of the batch size, at least
@@ -442,7 +440,7 @@ struct HookStack
 
     /* Free the storage if it holds more than `keep` entries, so that one
        large job's high-water mark does not stay allocated for the rest of
-       the run (review of effects v5, B4). The caller then refills it. */
+       the run. The caller then refills it. */
     void shrink(size_t keep)
     {
         if (size_t(e - b) > keep) {
@@ -758,7 +756,7 @@ static char * pageUp(char * p)
 /* Kept jobs (`retainRegion`) share one mapping: [keptStart, keptFloor) holds
    their objects, which are ordinary memory from then on, and the jobs after
    them allocate above it, up to keptEnd, so a kept job costs no page or
-   mapping of its own (review of markers v4, S4). */
+   mapping of its own. */
 static char * keptStart = nullptr;
 static char * keptFloor = nullptr;
 static char * keptEnd = nullptr;
@@ -1292,7 +1290,7 @@ struct Evacuator
    Memory. Built at every job's end, beside the log, so it is kept small:
    the pre-images stay in the log (which lives until the release), and the
    repeated cells are found by sorting the log indices by cell, not with a
-   hash map (review of markers v4, B1-mem: the map and copied pre-images
+   hash map (the map and copied pre-images
    took about 70 bytes per target, more than the log itself). */
 struct JobTargets
 {
@@ -1427,7 +1425,7 @@ struct Closure
     /* `mark`'s element arrays whose elements are still to be added, and
        how many: taken one element at a time once `stack` is empty, so that
        marking a list of n young elements does not push n entries at once
-       (review of markers v4, B1-mem: a 4 M-element list took 64 MiB of
+       (a 4 M-element list took 64 MiB of
        stack). */
     std::vector<std::pair<Value * const *, size_t>> arrays;
     /* Steps taken in this job, and how many it may take. */
@@ -1537,7 +1535,7 @@ struct Closure
 
     /* How many children `children(p, kind, ...)` scans beyond a value's
        few: an env's slots, a Bindings layer's attributes. A walk is charged
-       one step per 16 of them (review of markers v3, S1': a 2 M-attribute
+       one step per 16 of them (a 2 M-attribute
        Bindings cost one step per round). */
     size_t width(const void * p, Kind kind) const
     {
@@ -1610,15 +1608,15 @@ using Reported = std::vector<bool>;
 /* Count a job's forces of its targets; returns whether each reached K.
 
    The map's cap. So that the counts do not grow with the length of a
-   traversal (epoch v3 review S3: about 50 bytes per distinct target, never
+   traversal (about 50 bytes per distinct target, never
    erased), when counting this job's targets would take the map past
    max(256 Ki, batch size / 256) entries (the force-counts cap), it is
    first rebuilt from this job's targets: the counts of cells this job did
    not force are forgotten, so it never holds more than max(cap, this job's
    targets). Dropping the whole map instead would drop this job's counts as
    well, and if every job outgrew the cap, a cell forced in every job would
-   never reach K and would be recomputed in every job (review of markers
-   v2, S2). A cell forced only in jobs that are not consecutive can still
+   never reach K and would be recomputed in every job. A cell forced only
+   in jobs that are not consecutive can still
    lose its count that way; the closure does not depend on the counts. The
    old counts are read out before the old map is freed and the new one
    built, so the two never coexist. */
@@ -1836,7 +1834,7 @@ std::vector<bool> decideJob(
            is reverted), because the copies and the Evacuator's table would
            exceed the batch while the region is still mapped. A job no
            larger than the limit cannot copy more, so it copies at once
-           (review identity-owners-v1 follow-up: print-meta-200 copied
+           (e.g. print-meta-200 copied
            1 101 MiB in one job). */
         auto copyLimit =
             cfg.copyLimit ? cfg.copyLimit : std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
@@ -1927,7 +1925,7 @@ void pruneCounts(
 }
 
 /* An allocation failed at the end of a job. Nothing can be released
-   partially, so this is fatal (REDESIGN-memory L7). */
+   partially, so this is fatal. */
 [[noreturn]] void unforceFatal(const char * what) noexcept
 {
     struct rlimit rl;
@@ -2093,11 +2091,11 @@ bool UnforceBatch::full() const
        capacity it has grown to) and its targets (`JobTargets`, two words
        per entry). The batch bounds those too, so that a job that forces
        many cells while allocating little stays within about one batch of
-       memory beyond what it keeps (review of markers v4, B1-mem). */
+       memory beyond what it keeps. */
     auto & log = state->undoLog;
     auto bookkeeping =
         (log.capacity() - *mark) * sizeof(EvalState::UndoEntry) + (log.size() - *mark) * 2 * sizeof(void *);
-    /* So does the owner timeline (review identity-owners-v1, SF1). */
+    /* So does the owner timeline. */
     bookkeeping += unforceOwnerBytes();
     return unforceCurrentScopeBytes() + bookkeeping >= state->settings.unforceBatchSize;
 }
@@ -2352,8 +2350,7 @@ bool unforceIsScopeStackSlot(const void * p)
 }
 
 /* The start of a logged force: an old cell. Every container is reserved
-   before anything is pushed, so a failed allocation changes nothing
-   (review identity-owners-v1, N2). */
+   before anything is pushed, so a failed allocation changes nothing. */
 [[gnu::noinline]] static void logOldForce(EvalState & state, Value & v)
 {
     if (unforceIsScopeStackSlot(&v))
@@ -2431,8 +2428,8 @@ void EvalState::endLoggedForceSlow(Value & v)
    process-wide, so at most one job may be open in the process, and every
    scope opened while it is must belong to its EvalState: another
    EvalState's job would take over the region, and the first job's
-   decision would then see none of what it allocated (review of markers
-   v2, N2). Nothing opens jobs that way today (only the CLI's traversals
+   decision would then see none of what it allocated. Nothing opens jobs
+   that way today (only the CLI's traversals
    open jobs, on one thread with one EvalState); this checks it. */
 static std::atomic<const EvalState *> jobOwner = nullptr;
 
@@ -2491,7 +2488,7 @@ void EvalState::endUnforceScope(size_t mark)
                 forceCounts,
                 YoungSpace{},
                 /* String data is never walked: a long string must not buy
-                   the closure steps (review of markers v4, S1''). */
+                   the closure steps. */
                 size_t(evalRegion.cur - evalRegion.base)
                     - std::min(evalRegion.stringBytes, size_t(evalRegion.cur - evalRegion.base)),
                 evacuator,
@@ -2502,9 +2499,8 @@ void EvalState::endUnforceScope(size_t mark)
                not keep (client code ran in the job, or the closure fell back
                to reverting) would be lost, and the object, rebuilt later,
                printed in full. Keep the whole job instead: nothing is
-               promoted, reverted or freed, as without unforcing (review of
-               markers v3, S4). The decision may also have chosen that
-               (`decideJob`). */
+               promoted, reverted or freed, as without unforcing. The
+               decision may also have chosen that (`decideJob`). */
             keepWhole = keepWhole || !seenAllKept(evacuator, promoted, printed ? &*printed : nullptr);
             if (!keepWhole)
                 translateSeen(evacuator);

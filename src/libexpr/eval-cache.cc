@@ -376,7 +376,7 @@ EvalCache::EvalCache(
 {
 }
 
-/* PROTOTYPE. A Value * cached inside an unforce scope (e.g. a child's
+/* A Value * cached inside an unforce scope (e.g. a child's
    first evaluation, when the database answered for its parent) may be freed
    when a scope ends, so record the generation and derive it again once that
    changes. One cached outside any scope stays valid: scopes free only what

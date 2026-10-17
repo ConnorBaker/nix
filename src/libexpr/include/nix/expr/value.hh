@@ -1549,7 +1549,7 @@ public:
         return getStorage<Lambda>();
     }
 
-    /* PROTOTYPE (unforce): raw payload access for copying values out of a
+    /* Raw payload access for copying values out of a
        job region. */
     InternalType internalType() const noexcept
     {

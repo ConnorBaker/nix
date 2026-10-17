@@ -122,7 +122,7 @@ private:
 
 public:
     /**
-     * PROTOTYPE (unforce). A copy of this one layer in @p mem, with each
+     * A copy of this one layer in @p mem, with each
      * value and the base layer passed through the given maps.
      */
     template<typename MapValue, typename MapBase>
@@ -144,7 +144,7 @@ public:
         return numAttrs;
     }
 
-    /** PROTOTYPE (unforce). Visit the values of this one layer. */
+    /** Visit the values of this one layer. */
     template<typename F>
     void forEachLayerValue(F && f) const
     {

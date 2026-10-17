@@ -26,7 +26,7 @@ static nix::Value & check_value_out(nix_value * value)
 
 static nix_value * new_nix_value(nix::Value * v, nix::EvalMemory & mem)
 {
-    /* PROTOTYPE (unforce): the handle belongs to the client, so it must not
+    /* the handle belongs to the client, so it must not
        be freed when an unforce scope ends. */
     nix::PauseRegion pause;
     nix_value * ret = new (mem.allocBytes(sizeof(nix_value))) nix_value{
@@ -66,7 +66,7 @@ static void nix_c_primop_wrapper(
     // or maybe something to make blackholes work better; we don't know).
     nix::Value vTmp;
 
-    /* PROTOTYPE (unforce): a C primop called inside an unforce scope (by a
+    /* a C primop called inside an unforce scope (by a
        traversal of the `nix` CLI) allocates outside it, so that nothing the C
        code creates or keeps is freed when the scope ends. Its arguments may
        still be younger than the scope; the C code must not keep them beyond
@@ -169,7 +169,7 @@ nix_value * nix_alloc_value(nix_c_context * context, EvalState * state)
     try {
         nix::Value * value;
         {
-            /* PROTOTYPE (unforce): client-owned, see `new_nix_value`; the
+            /* client-owned, see `new_nix_value`; the
                job, if one is open, then promotes nothing. */
             nix::PauseRegion pause;
             nix::unforceNoteClientCode();

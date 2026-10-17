@@ -43,7 +43,7 @@ class EvalCache : public std::enable_shared_from_this<EvalCache>
     RootLoader rootLoader;
     RootValue value;
     /**
-     * PROTOTYPE. If `value` was loaded inside an unforce scope, the
+     * If `value` was loaded inside an unforce scope, the
      * `unforceGeneration()` then: once a scope has ended since, the value
      * may have been freed, so it is loaded again.
      */
@@ -113,7 +113,7 @@ class AttrCursor : public std::enable_shared_from_this<AttrCursor>
     Parent parent;
     RootValue _value;
     /**
-     * PROTOTYPE. As `EvalCache::valueGeneration`, for `_value`, which is
+     * As `EvalCache::valueGeneration`, for `_value`, which is
      * derived again from the parent once stale.
      */
     std::optional<size_t> _valueGeneration;

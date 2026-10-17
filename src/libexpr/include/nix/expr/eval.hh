@@ -346,7 +346,7 @@ struct StaticEvalSymbols
 };
 
 /**
- * PROTOTYPE (job regions). A bump region holding what one job (an outermost
+ * A bump region holding what one job (an outermost
  * unforce scope) allocates, released wholesale when the job ends. Every
  * evaluator object lives here while the region is active, and each `Env`
  * carries a size header so it can be copied out.
@@ -369,8 +369,7 @@ struct EvalRegion
         see `evalRegionNoteBigEnv`). Copying an Env out of the region needs
         its size, which the Env does not hold; a side table, released at
         the job's end, keeps the Envs themselves as small as without
-        unforcing, so a job that keeps its memory keeps no size prefixes
-        (review of markers v4, B1-mem). */
+        unforcing, so a job that keeps its memory keeps no size prefixes. */
     uint8_t * envSizes = nullptr;
     const char * envSizesBase = nullptr;
 
@@ -421,13 +420,13 @@ struct EvalRegion
 extern EvalRegion evalRegion;
 
 #if !NIX_USE_BOEHMGC
-/** PROTOTYPE. Zeroed evaluator memory outside unforce scopes, without Boehm
+/** Zeroed evaluator memory outside unforce scopes, without Boehm
     GC: from mimalloc's default heap when available. Never freed. */
 void * evalBaseAlloc(size_t n);
 #endif
 
 /**
- * PROTOTYPE. A never-freed bump arena for evaluator objects outside job
+ * A never-freed bump arena for evaluator objects outside job
  * regions, used instead of `calloc` when Boehm GC is disabled and
  * `NIX_NOGC_BUMP` is set. Memory is zero because it comes fresh from mmap.
  */
@@ -848,7 +847,7 @@ public:
     void forceValueDeep(Value & v);
 
     /**
-     * PROTOTYPE (unforce). The same, skipping cells already in `seen`
+     * The same, skipping cells already in `seen`
      * and adding the cells it walks: several calls with one `seen` walk
      * what one call on a value containing all of them walks. The cells are
      * reported with `unforceNoteSeen`, so an `UnforceSeen` for `seen` keeps
@@ -1126,7 +1125,7 @@ private:
 public:
 
     /**
-     * PROTOTYPE (thunk rollback). While `isolationDepth > 0`, every thunk
+     * While `isolationDepth > 0`, every thunk
      * update records the thunk's pre-image here, so that the unforce scope's
      * end can restore it. Traceable: the log keeps each target alive, so a
      * restore never writes into reused memory.
@@ -1153,7 +1152,7 @@ public:
     std::unordered_map<const Value *, uint32_t> forceCounts;
 
     /**
-     * PROTOTYPE. Open an unforce scope: thunks updated until the matching
+     * Open an unforce scope: thunks updated until the matching
      * `endUnforceScope` are recorded. Returns the log mark to pass back.
      * `stackMark` bounds the frames that the scope outlives (see
      * `unforceIsScopeStackSlot`): the stack pointer of the function whose
@@ -1163,11 +1162,11 @@ public:
     [[gnu::noinline]] size_t beginUnforceScope(const void * stackMark = nullptr);
 
     /**
-     * PROTOTYPE. Record `v`'s current contents before it is overwritten, if
+     * Record `v`'s current contents before it is overwritten, if
      * an unforce scope must restore it: `v` is older than the scope, and not
      * a stack slot of a frame that will have returned when the scope ends.
      *
-     * Shaped for the evaluator's stack frames (STACK-PARITY.md, R1): one
+     * Shaped for the evaluator's stack frames: one
      * test, one out-of-line call, and nothing returned and kept across the
      * evaluation. The start of the force goes on a thread-local stack, and
      * `endLoggedForce` matches it by `&v`.
@@ -1179,13 +1178,13 @@ public:
     }
 
     /**
-     * PROTOTYPE. The out-of-line part of `logPreImage`: log `v` with the
+     * The out-of-line part of `logPreImage`: log `v` with the
      * start marker of its force.
      */
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
 
     /**
-     * PROTOTYPE. After a force of `v`, however it ended: record the end
+     * After a force of `v`, however it ended: record the end
      * marker of its logged start, if the innermost open one is `v`'s.
      * `isolationDepth` may have changed during the force; a start that was
      * not logged, or that a job's end dropped, is simply not found.
@@ -1199,7 +1198,7 @@ public:
     [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
 
     /**
-     * PROTOTYPE. Close an unforce scope and unforce every thunk updated
+     * Close an unforce scope and unforce every thunk updated
      * inside it (except pinned ones). Only call it when nothing forced in
      * the scope is still referenced by C++ code that expects it forced.
      */

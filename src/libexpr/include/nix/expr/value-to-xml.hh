@@ -10,7 +10,7 @@
 namespace nix {
 
 /**
- * @param unforce PROTOTYPE: with `strict`, unforce each attribute and list
+ * @param unforce with `strict`, unforce each attribute and list
  * element once it is printed. Only for callers that are done with `v`
  * afterwards (command output).
  */

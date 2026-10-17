@@ -29,7 +29,7 @@ enum OutputKind { okPlain, okRaw, okXML, okJSON };
 
 /* The traces `forceValueDeep` adds to an error in an element, out of line:
    their formatters are large, and `printStrictUnforced`'s frame is part of
-   the stack prefix (STACK-PARITY.md, R4). */
+   the stack prefix. */
 [[gnu::noinline, gnu::cold]] static void addAttrTrace(EvalState & state, Error & e, const Attr & i)
 {
     e.addTrace(state.positions[i.pos], HintFmt("while evaluating the attribute '%1%'", state.symbols[i.name]));
@@ -41,7 +41,7 @@ enum OutputKind { okPlain, okRaw, okXML, okJSON };
 }
 
 /**
- * PROTOTYPE. `--strict` output with unforcing. As without unforcing, the
+ * `--strict` output with unforcing. As without unforcing, the
  * value is forced deeply (`forceValueDeep`'s order, traces and depth: its
  * top-level elements are walked one by one, sharing one set of walked
  * cells, so that a cell is walked once, as one `forceValueDeep` of the whole
@@ -61,7 +61,7 @@ printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringC
     auto _level = state.addCallDepth(v.determinePos(noPos));
     /* On the heap, as everything else of this function's: it is part of the
        stack prefix below every level of the deep walk, which may be no
-       larger than base's (STACK-PARITY.md, R4). */
+       larger than base's. */
     auto walked = std::make_unique<std::set<const void *>>();
     walked->insert(&v);
     state.forceValue(v, v.determinePos(noPos));
@@ -106,11 +106,10 @@ printStrictUnforced(EvalState & state, Value & v, std::ostream & out, NixStringC
 }
 
 /* The derivations' paths: out of line, so that its locals are not part of
-   processExpr's frame, below every level of the evaluation (STACK-PARITY.md,
-   R4). */
+   processExpr's frame, below every level of the evaluation. */
 [[gnu::noinline]] static void printDerivationPaths(EvalState & state, Value & v, const Bindings & autoArgs)
 {
-    /* PROTOTYPE: unforce each job once its .drv is written. */
+    /* Unforce each job once its .drv is written. */
     bool unforce = unforceEnabled(state);
     std::set<std::pair<StorePath, std::string>> seen;
     forEachDerivation(

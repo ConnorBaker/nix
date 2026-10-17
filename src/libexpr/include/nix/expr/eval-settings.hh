@@ -489,7 +489,7 @@ public:
           where memory is scarce, the default is a large value to reduce the amount of allocations.
     )"};
 
-    /* PROTOTYPE. Never with Boehm GC: a collection may free an old cell
+    /* Never with Boehm GC: a collection may free an old cell
        and hand its address to a new one, and nothing here has been built
        or tested against that (the force counts are keyed by address). */
     Setting<bool> unforce{

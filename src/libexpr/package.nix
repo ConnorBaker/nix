@@ -33,7 +33,7 @@
   # symbol is missing during linking.
   enableGC ? !stdenv.hostPlatform.isWindows,
 
-  # PROTOTYPE (unforce): allocate evaluator memory from mimalloc heaps, as
+  # Allocate evaluator memory from mimalloc heaps, as
   # the development build (where meson finds mimalloc) does. Packaged
   # builds enable every auto feature, so the dependency must be present.
   withMimalloc ? !stdenv.hostPlatform.isWindows,

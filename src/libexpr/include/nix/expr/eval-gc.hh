@@ -83,7 +83,7 @@ void initGC();
 void assertGCInitialized();
 
 /**
- * PROTOTYPE. Allocator setup at startup (mimalloc options, error hook).
+ * Allocator setup at startup (mimalloc options, error hook).
  */
 void initAllocator();
 
