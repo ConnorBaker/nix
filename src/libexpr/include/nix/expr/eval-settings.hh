@@ -489,6 +489,25 @@ public:
           where memory is scarce, the default is a large value to reduce the amount of allocations.
     )"};
 
+    /* inc2b-1 (parallel eval): number of evaluator worker threads. The default
+       is 1 (serial), which keeps the executor present but idle -- effectively
+       serial evaluation, byte-identical to the non-parallel path. A value of 0
+       means "auto" (min(32, nproc)); any value > 1 enables multi-threaded
+       evaluation. Multiple workers are not yet compatible with eval-unforce
+       (increment 2c); constructing an EvalState with eval-cores > 1 while
+       eval-unforce is on is rejected. */
+    Setting<unsigned int> evalCores{
+        this,
+        1,
+        "eval-cores",
+        R"(
+          The number of threads used to evaluate Nix expressions in parallel.
+          The default of `1` evaluates serially. A value of `0` means one thread
+          per CPU core (capped at 32). Values greater than `1` require the
+          [`parallel-eval`](@docroot@/development/experimental-features.md#xp-feature-parallel-eval)
+          experimental feature and are not yet compatible with `eval-unforce`.
+        )"};
+
     /* Never with Boehm GC: a collection may free an old cell
        and hand its address to a new one, and nothing here has been built
        or tested against that (the force counts are keyed by address). */

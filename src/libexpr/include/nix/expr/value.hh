@@ -601,6 +601,21 @@ namespace detail {
 template<std::size_t ptrSize>
 inline constexpr bool useBitPackedValueStorage = (ptrSize == 8) && (__STDCPP_DEFAULT_NEW_ALIGNMENT__ >= 16);
 
+/* inc2b-1 (parallel eval): armed iff an Executor with eval-cores > 1 exists.
+   While disarmed (eval-cores == 1, the default and the inc2b-1 gate) every
+   value write is a plain store -- byte-identical to inc2a, zero added atomics,
+   no waiters can exist. When armed, the write that *completes a concurrent
+   force* (the one landing on a pdPending cell) is published with a release
+   exchange so a waiter's acquire-load sees the whole value, and awaiters are
+   woken. A relaxed load + predicted-not-taken branch is the only cost on the
+   disarmed hot path. */
+extern std::atomic<bool> parallelForcingArmed;
+
+/* Wake any threads blocked in `EvalState::waitOnThunk` on the value at
+   `valueAddr`. Defined in parallel-eval.cc; declared here so the storage's
+   completion-publish can call it without pulling in the executor headers. */
+void notifyValueWaiters(void * valueAddr) noexcept;
+
 } // namespace detail
 
 /**
@@ -653,6 +668,21 @@ class alignas(16)
 
     static constexpr int discriminatorBits = 3;
     static constexpr PackedPointer discriminatorMask = (PackedPointer(1) << discriminatorBits) - 1;
+
+    /* inc2b-1: a pending (being-forced) cell packs the forcing thread's id in
+       the word above the discriminator bits, and carries "a waiter is blocked
+       on this cell" as the top bit. There is no `pdAwaited` primary
+       discriminator (all eight 3-bit slots are taken, see below), so awaited is
+       a flag on the pdPending word rather than a distinct tag. Both pending and
+       awaited therefore still read `pd == pdPending` in the low bits, so every
+       blackhole/pending observer (isBlackhole, getInternalType) is unchanged.
+
+         pending, no waiter :  pdPending | (tid << discriminatorBits)
+         pending, awaited   :  pdPending | (tid << discriminatorBits) | awaitedBit
+
+       tid is small (<= eval-cores + 1, i.e. a few bits), so it never reaches
+       awaitedBit. */
+    static constexpr PackedPointer awaitedBit = PackedPointer(1) << 63;
 
     /**
      * The value is stored as a pair of 8-byte double words. All pointers are assumed
@@ -722,6 +752,54 @@ class alignas(16)
         return payloadWords;
     }
 
+    /* inc2b-1: the store used by the mk* / setStorage result-producing writes
+       (NOT by the copy/move/default constructors, which keep the plain
+       `updatePayload`). This is where a concurrently-forced thunk's result is
+       published.
+
+       Fast path (disarmed, i.e. eval-cores == 1, the inc2b-1 gate): a plain
+       two-word store (`stp`) -- byte-identical to inc2a. The only addition is a
+       relaxed bool load + a predicted-not-taken branch.
+
+       Slow path (armed AND the cell is currently pdPending, i.e. this write
+       completes a concurrent force): write word 1 first, then publish word 0
+       with a release exchange so a waiter's acquire-load of word 0 orders the
+       plain read of word 1 after it. The exchange returns the old word 0; if it
+       had the awaited bit, a waiter is blocked and is woken.
+
+       This stays correct because a fresh cell is zero-initialised (mi_zalloc /
+       the zeroed arena), so its word 0 is pdUninitialised (0) and never
+       spuriously reads as pdPending; only a cell the force site marked pending
+       takes the publish branch. */
+    [[gnu::always_inline]]
+    void publishOrStorePayload(Payload payload) noexcept
+    {
+        /* Keep the inlined footprint minimal (this is in every mk* or assignment,
+           so it affects the stack frame of every value-producing eval): just a
+           relaxed bool load + predicted-not-taken branch, then the plain store.
+           The armed completion (atomic release exchange + wake) is out of line. */
+        if (detail::parallelForcingArmed.load(std::memory_order_relaxed)) [[unlikely]] {
+            if ((payloadWords[0] & discriminatorMask) == pdPending) {
+                publishCompletionSlow(payload);
+                return;
+            }
+        }
+        payloadWords = payload;
+    }
+
+    [[gnu::noinline]]
+    void publishCompletionSlow(Payload payload) noexcept
+    {
+        /* This write completes a concurrently-forced thunk. Publish word 1 then
+           word 0 with a release exchange so a waiter's acquire-load of word 0
+           orders its plain read of word 1 after it; wake an awaiter if one is
+           flagged. */
+        payloadWords[1] = payload[1];
+        PackedPointer old = AtomicWord0(payloadWords[0]).exchange(payload[0], std::memory_order_release);
+        if (old & awaitedBit)
+            detail::notifyValueWaiters(this);
+    }
+
 protected:
     /* --- Inc2a concurrent-forcing protocol primitives (protected: called by
        Value's public fv* wrappers). These reach word 0 (payloadWords[0], the
@@ -757,21 +835,60 @@ protected:
         return (w0 & discriminatorMask) == pdPending;
     }
 
+    /* inc2b-1 pending-word encoding helpers (see awaitedBit above). */
+    static PackedPointer makePendingWord(uint32_t threadId) noexcept
+    {
+        return static_cast<PackedPointer>(pdPending) | (PackedPointer(threadId) << discriminatorBits);
+    }
+
+    static uint32_t pendingThreadId(PackedPointer w0) noexcept
+    {
+        return static_cast<uint32_t>((w0 & ~awaitedBit) >> discriminatorBits);
+    }
+
+    static bool tagIsAwaited(PackedPointer w0) noexcept
+    {
+        return (w0 & awaitedBit) != 0;
+    }
+
     static bool fpSubtagIsApp(PackedPointer w1) noexcept
     {
         return (w1 & discriminatorMask) == PackedPointer(tApp - tFirstPairOfPointers);
     }
 
     /* Elect the unique forcer: CAS word 0 from the captured thunk tag
-       `expected` to pdPending (the blackhole). `expected` is updated with the
-       live word 0 on failure. The thread id is 0 in Inc2a (no Executor); Inc3
-       packs (tid<<discriminatorBits). */
+       `expected` (a genuine pdThunk word) to pdPending (the blackhole).
+       `expected` is updated with the live word 0 on failure -- a failure means
+       another worker raced us to this cell (it is now pending/awaited/finished),
+       so the loser reads `expected` to decide whether to wait.
+
+       Note: this writes a bare pdPending (no forcing-thread id), byte-identical
+       to inc2a, so the inlined force site needs no thread-local read on the hot
+       path and keeps inc2a's stack-parity edge. The forcing thread is not
+       recorded in the tag in inc2b-1; distinguishing a same-thread self-cycle
+       from a cross-thread wait while threads run (eval-cores > 1) is deferred to
+       inc2c. At eval-cores == 1 a pending cell is always a self-cycle, detected
+       via the executor being disabled (see EvalState::forceValuePending). */
     [[gnu::always_inline]]
     bool fpMarkPending(PackedPointer & expected) noexcept
     {
         return AtomicWord0(payloadWords[0])
             .compare_exchange_strong(
                 expected, static_cast<PackedPointer>(pdPending), std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+
+    /* Mark a pending cell as awaited (a waiter is about to block on it): CAS
+       word 0 from `expected` (pdPending, not yet awaited) to the same word with
+       `awaitedBit` set. On failure `expected` holds the live word 0 (either the
+       cell was finished in the meantime, or another waiter already set awaited).
+       Acquire on both so a success/finished-observation orders the value read
+       after it. */
+    [[gnu::always_inline]]
+    bool fpCasPendingToAwaited(PackedPointer & expected) noexcept
+    {
+        return AtomicWord0(payloadWords[0])
+            .compare_exchange_strong(
+                expected, expected | awaitedBit, std::memory_order_acquire, std::memory_order_acquire);
     }
 
     bool fpIsPendingTag() const noexcept
@@ -812,7 +929,7 @@ private:
            used only for the discriminator. */
         payload[0] = static_cast<int>(pdSingleDWord) | (static_cast<int>(type) << discriminatorBits);
         payload[1] = untaggedVal;
-        updatePayload(payload);
+        publishOrStorePayload(payload);
     }
 
     template<PrimaryDiscriminator discriminator, typename T, typename U>
@@ -824,7 +941,7 @@ private:
         assertAligned(firstFieldPayload);
         payload[0] = static_cast<int>(discriminator) | firstFieldPayload;
         payload[1] = std::bit_cast<PackedPointer>(untaggableField);
-        updatePayload(payload);
+        publishOrStorePayload(payload);
     }
 
     template<InternalType type, typename T, typename U>
@@ -846,7 +963,7 @@ private:
             assertAligned(secondFieldPayload);
             payload[1] = (type - tFirstPairOfPointers) | secondFieldPayload;
         }
-        updatePayload(payload);
+        publishOrStorePayload(payload);
     }
 
     template<typename T, typename U>
@@ -871,7 +988,12 @@ public:
 
     ValueStorage & operator=(const ValueStorage & other)
     {
-        updatePayload(other.loadPayload());
+        /* inc2b-1: many eval paths complete a force via `v = *other` (copy
+           assignment) rather than a mk*, so the completion-publish must cover
+           it too. `this` is a live object (valid, zero-inited word 0), so the
+           pdPending check is safe here (unlike the copy *constructor*, whose
+           `this` is uninitialised and stays on the plain path). */
+        publishOrStorePayload(other.loadPayload());
         return *this;
     }
 
@@ -883,7 +1005,7 @@ public:
 
     ValueStorage & operator=(ValueStorage && other) noexcept
     {
-        updatePayload(other.loadPayload());
+        publishOrStorePayload(other.loadPayload());
         other.updatePayload({}); // Zero out rhs
         return *this;
     }
@@ -1662,9 +1784,38 @@ public:
     {
         return fpSubtagIsApp(w1);
     }
+    /* inc2b-1: elect the unique forcer (CAS the thunk tag to pdPending). */
     [[gnu::always_inline]] bool fvMarkPending(uint64_t & w0) noexcept
     {
         return fpMarkPending(w0);
+    }
+    /* inc2b-1: a waiter marks the pending cell as awaited before blocking. */
+    [[gnu::always_inline]] bool fvCasAwaited(uint64_t & w0) noexcept
+    {
+        return fpCasPendingToAwaited(w0);
+    }
+    [[gnu::always_inline]] static uint32_t fvPendingThreadId(uint64_t w0) noexcept
+    {
+        return pendingThreadId(w0);
+    }
+    [[gnu::always_inline]] static bool fvIsAwaited(uint64_t w0) noexcept
+    {
+        return tagIsAwaited(w0);
+    }
+    /* Wake threads blocked in waitOnThunk on this value (used by the slow
+       completion path and by notifyWaiters callers). */
+    [[gnu::always_inline]] void fvNotifyWaiters() noexcept
+    {
+        detail::notifyValueWaiters(this);
+    }
+    /* A value is "finished" once it is no longer a thunk/app/pending cell --
+       i.e. it has reached WHNF (or tFailed). Used by builtins.__parallel to
+       skip values that are already evaluated. A pending (being-forced) cell
+       reports internalType()==tThunk, so it is correctly treated as unfinished. */
+    [[gnu::always_inline]] bool isFinished() const noexcept
+    {
+        auto it = getInternalType();
+        return it != tThunk && it != tApp;
     }
 
     const StringData * stringData() const noexcept

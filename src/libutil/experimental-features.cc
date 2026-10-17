@@ -27,7 +27,7 @@ void MissingExperimentalFeature::anchor() {}
  * feature, we either have no issue at all if few features are not added
  * at the end of the list, or a proper merge conflict if they are.
  */
-constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::BLAKE3Hashes);
+constexpr size_t numXpFeatures = 1 + static_cast<size_t>(Xp::ParallelEval);
 
 constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails = {{
     {
@@ -280,6 +280,16 @@ constexpr std::array<ExperimentalFeatureDetails, numXpFeatures> xpFeatureDetails
             Enables support for BLAKE3 hashes.
         )",
         .trackingUrl = "https://github.com/NixOS/nix/milestone/60",
+    },
+    {
+        .tag = Xp::ParallelEval,
+        .name = "parallel-eval",
+        .description = R"(
+            Enables multi-threaded Nix expression evaluation (the `eval-cores`
+            setting and the `builtins.__parallel` primop). Experimental and
+            work-in-progress.
+        )",
+        .trackingUrl = "https://github.com/NixOS/nix/milestone/65",
     },
 }};
 

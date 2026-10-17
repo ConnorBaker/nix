@@ -38,6 +38,7 @@ headers = [ config_pub_h ] + files(
   'unforce.hh',
   'value-to-json.hh',
   'value-to-xml.hh',
+  'parallel-eval.hh',
   'value.hh',
   'value/context.hh',
 )

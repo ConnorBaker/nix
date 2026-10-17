@@ -49,8 +49,21 @@ struct Input;
 } // namespace fetchers
 struct EvalSettings;
 class EvalState;
+struct Executor;
 class StorePath;
 struct SingleDerivedPath;
+
+/**
+ * inc2b-1 (parallel eval): per-eval-thread identifier, handed out lazily (the
+ * main thread is 1, each worker gets the next value). Packed into a pending
+ * value's tag word (above the discriminator bits) so `EvalState::waitOnThunk`
+ * can tell a cross-thread wait from a same-thread self-cycle (reported as
+ * infinite recursion rather than deadlocking). Declared here (rather than in
+ * parallel-eval.hh) so the inlined force site can read it without pulling the
+ * executor/boost headers into every translation unit. Defined in
+ * parallel-eval.cc.
+ */
+[[gnu::tls_model("initial-exec")]] extern thread_local uint32_t myEvalThreadId;
 enum RepairFlag : bool;
 struct MemorySourceAccessor;
 struct MountedSourceAccessor;
@@ -539,6 +552,33 @@ public:
     EvalMemory mem;
 
     /**
+     * inc2b-1 (parallel eval): the worker-thread pool. Always constructed; at
+     * `eval-cores = 1` (the default) it holds a single idle worker and
+     * `executor->enabled` is false, so `builtins.__parallel` never dispatches
+     * work and evaluation stays serial. Enabling multiple workers is inc2b-2.
+     */
+    std::unique_ptr<Executor> executor;
+
+    /**
+     * inc2b-1: statistics for the blackhole wait/notify path. All are only
+     * touched when a thread actually blocks on a concurrently-forced thunk,
+     * i.e. never at `eval-cores = 1`.
+     */
+    std::atomic<uint64_t> nrThunksAwaited{0};
+    std::atomic<uint64_t> nrThunksAwaitedSlow{0};
+    std::atomic<uint64_t> currentlyWaiting{0};
+    std::atomic<uint64_t> maxWaiting{0};
+    std::atomic<uint64_t> microsecondsWaiting{0};
+    std::atomic<uint64_t> nrSpuriousWakeups{0};
+
+    /**
+     * inc2b-1: block until another thread finishes forcing `v`. `expectedP0` is
+     * the pending word 0 observed by the caller (its thread-id field selects
+     * self-cycle vs. cross-thread wait). Defined in parallel-eval.cc.
+     */
+    void waitOnThunk(Value & v, uint64_t expectedP0);
+
+    /**
      * If set, force copying files to the Nix store even if they
      * already exist there.
      */
@@ -845,6 +885,30 @@ private:
 
     void handleEvalFailed(Value & v, PosIdx pos);
 
+    /**
+     * inc2b-1: slow path of forceValue for a cell already being forced
+     * (pdPending). Either this thread is re-entering its own in-progress force
+     * (a cycle, reported as infinite recursion byte-identically to inc2a/base),
+     * or -- only with eval-cores > 1 -- another worker is forcing it, in which
+     * case we block in `waitOnThunk` until it finishes (rethrowing if it
+     * failed). `w0` is the pending word observed by the caller.
+     *
+     * Factored out of the inlined hot path. Takes only `v` (re-reading its tag
+     * word itself) so the inlined caller need not keep extra values live across
+     * the cold call -- this preserves inc2a's force-site frame size and thus the
+     * stack-parity edge.
+     */
+    void forceValuePending(Value & v);
+
+    /**
+     * inc2b-1: forceValue's pending pre-check (word 0 observed pdPending) lands
+     * here. eval-cores == 1: a self-cycle -- reproduces inc2a's env==null arm
+     * byte-for-byte (infinite-recursion throw, position fix-up via `pos`,
+     * mkFailed, rethrow). eval-cores > 1: waits for the forcing worker. Out of
+     * line so the inlined force site keeps inc2a's frame on every recursion path.
+     */
+    void forceValueOnPending(Value & v, const PosIdx pos);
+
     void tryFixupBlackHolePos(Value & v, PosIdx pos);
 
 public:
@@ -1129,7 +1193,12 @@ private:
      * Current Nix call stack depth, used with `max-call-depth` setting to throw stack overflow hopefully before we run
      * out of system stack.
      */
-    size_t callDepth = 0;
+    /* inc2b-1: per-thread (DetSys commit 9b814c454). Each worker has its own
+       native stack, so the max-call-depth guard must track depth per worker; a
+       shared counter races (non-atomic ++/--), drifts upward from lost
+       decrements, and eventually throws a spurious "max-call-depth exceeded".
+       initial-exec TLS keeps the access to a direct offset. */
+    [[gnu::tls_model("initial-exec")]] static thread_local size_t callDepth;
 
 public:
 
@@ -1216,7 +1285,13 @@ public:
     /**
      * Check that the call depth is within limits, and increment it, until the returned object is destroyed.
      */
-    inline CallDepth addCallDepth(const PosIdx pos);
+    /* inc2b-1: out of line so the thread_local `callDepth` TLS access (read +
+       limit check + increment) lives in this frame, not in hot recursion
+       drivers like callFunction. That keeps their inlined frames -- and the
+       stack-parity edges -- byte-identical to inc2a, while the returned
+       CallDepth's inlined destructor decrements through the already-resolved
+       pointer (no TLS access on the hot path). */
+    CallDepth addCallDepth(const PosIdx pos);
 
     /**
      * Do a deep equality test between two values.  That is, list

@@ -137,43 +137,62 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    /* Inc2a: byte-for-byte Inc1/master's force site -- same `logPreImage(v)`
-       FIRST, same `v.thunk()` reads, same one unified thunk arm, same `if (env)
-       eval else throw`, same catch -- with EXACTLY ONE change: the in-place
-       blackhole store `v.mkBlackhole()` becomes the blackhole CAS
-       (`fvMarkPending`, word0 pdThunk -> pdPending, electing the unique forcer).
+    /* inc2b-1: ONE force site serves both eval-cores == 1 and > 1 -- there is
+       no `forcingArmed` guard on the hot path, so the inlined frame is inc2a's
+       on every recursion path (a per-force guard spilled a 16-byte Value slot
+       in register-tight primops such as prim_getAttr, pushing its edge sooner
+       than base; this reordering removes it). The disarmed path is behaviourally
+       byte-for-byte inc2a: `logPreImage` first, the same thunk reads, the same
+       blackhole CAS, the same `if (env) eval else <infinite-recursion>`, the
+       same catch, the app arm's `Value savedApp` + callFunction inline.
 
-       Keeping the Inc1 structure (including `logPreImage` BEFORE the mark, which
-       at threads=1 logs the same thunk pre-image and is value-identical because
-       the forcer is trivially unique) is what keeps the inlined frame <= base on
-       every recursion path -- the parallel-line stack-parity contract (frames
-       never grow past base, so this evaluator never overflows sooner than
-       single-threaded base). The winner-only "logPreImage after the CAS" move
-       (Risk R2) is deferred to 2c: it bites only once worker threads create CAS
-       losers AND unforcing is logging (revert on). In 2b unforcing is off, so
-       logPreImage never runs even with losers; at threads=1 there are no losers.
-       Only in 2c (threads + unforcing on) could a loser push a spurious undo
-       entry, so the relocation belongs there.
-
-       A mid-force cell (blackhole) is pdPending, which still reports
-       isThunk()==true, so it enters this same arm exactly as Inc1's env==null
-       blackhole did: word0 is pdPending (env untags to null), the CAS
-       `expected==pdPending -> pdPending` is a no-op success, and `if (env)` is
-       false so it throws the infinite-recursion error. */
+       The one structural change vs inc2a -- reading word 0 BEFORE env/expr and
+       CASing that exact word -- is what lets the single path be race-safe
+       without a mode branch: a concurrent pending-mark makes the loser's CAS
+       fail, so the election has a unique winner and no thunk is ever
+       double-evaluated. Arming is consulted only in the cold, out-of-line
+       `forceValuePending` (self-cycle/own-recursion -> infinite recursion when
+       the executor is disabled; another worker's in-progress force -> wait when
+       enabled), never on the inlined hot path. At eval-cores == 1 there is no
+       contention: the CAS always wins and env==null is always a genuine
+       self-cycle, so this is exactly inc2a. `logPreImage` stays BEFORE the mark
+       (value-identical while the forcer is unique); the winner-only relocation
+       is inc2c. */
     if (v.isThunk()) {
         logPreImage(v);
+        uint64_t expected = v.fvWord0Plain();
+        if (Value::fvIsPendingTag(expected)) [[unlikely]] {
+            /* The cell is already pending. At eval-cores == 1 this is this
+               thread re-entering a thunk it is already forcing -- a self-cycle;
+               forceValueOnPending reproduces inc2a's env==null arm exactly
+               (throw infinite recursion, endLoggedForce +
+               handleEvalExceptionForThunk with env==null for the position fix-up
+               and mkFailed, then rethrow so the enclosing initial force adds the
+               "entering the infinite recursion" trace). At eval-cores > 1 another
+               worker is forcing it: wait. Handling pending HERE -- before
+               env/expr -- is what lets the won path below assume a real, non-null
+               env and drop inc2a's `if (env)`, so the inlined frame never exceeds
+               inc2a's on any recursion path (no arming guard; the only returning
+               wait is this cold, out-of-line call with nothing but `v` live). */
+            forceValueOnPending(v, pos);
+            return;
+        }
         Env * env = v.thunk().env;
         Expr * expr = v.thunk().expr;
-        uint64_t expected = v.fvWord0Plain();
-        [[maybe_unused]] bool won = v.fvMarkPending(expected);
-        /* R2: the CAS elects the unique forcer. At threads=1 it cannot fail (a
-           real thunk is elected; a pending cell CASes pdPending->pdPending). */
-        assert(won && "Inc2a/R2: forceValue blackhole CAS must win at threads=1");
+        /* CAS the exact (real-thunk) word we read to pdPending. The word0-first
+           order makes this race-safe: if another worker marks the thunk pending
+           between our read and this CAS, the CAS fails and we wait rather than
+           double-evaluating. At eval-cores == 1 it cannot fail (no contention),
+           so this branch is inc2a's `assert(won)` -- never taken. */
+        if (!v.fvMarkPending(expected)) [[unlikely]] {
+            endLoggedForce(v);
+            forceValuePending(v);
+            return;
+        }
         try {
-            if (env) [[likely]]
-                expr->eval(*this, *env, v);
-            else
-                ExprBlackHole::throwInfiniteRecursionError(*this, v);
+            /* env is non-null: a real thunk was elected (pending was handled
+               above, and a lost CAS returned above). */
+            expr->eval(*this, *env, v);
         } catch (...) {
             endLoggedForce(v);
             handleEvalExceptionForThunk(env, expr, v, pos);
@@ -225,15 +244,6 @@ inline void EvalState::forceList(Value & v, const PosIdx pos, std::string_view e
             .debugThrow();
     }
 }
-
-[[gnu::always_inline]]
-inline CallDepth EvalState::addCallDepth(const PosIdx pos)
-{
-    if (callDepth > settings.maxCallDepth)
-        error<StackOverflowError>().atPos(pos).debugThrow();
-
-    return CallDepth(callDepth);
-};
 
 template<typename Cb>
 std::invoke_result_t<Cb, Value *, bool>

@@ -170,6 +170,7 @@ sources = files(
   'nixexpr.cc',
   'paths.cc',
   'primops.cc',
+  'parallel-eval.cc',
   'print-ambiguous.cc',
   'print.cc',
   'register-library-versions.cc',

@@ -169,6 +169,20 @@ private:
     size_t totalListItemsPrinted = 0;
     std::string indent;
 
+    /* Force a value out of line, so the printer's recursive frames
+       (print/printAttrs/printList) do not inline `forceValue` and are therefore
+       independent of the force site's inlined frame size. This keeps the deeply
+       recursive printers at or below base's stack-parity edges even though the
+       inc2b-1 force site carries a concurrent wait path (which, being able to
+       return after blocking on another worker, is one 16-byte slot larger than
+       base's all-noreturn abnormal arms when inlined). A printed sub-value may
+       legitimately be mid-forced by a worker under eval-cores > 1, so the wait
+       path is still needed here -- only moved into its own frame. */
+    [[gnu::noinline]] void forceForPrint(Value & v, PosIdx pos)
+    {
+        state.forceValue(v, pos);
+    }
+
     void increaseIndent()
     {
         if (options.shouldPrettyPrint()) {
@@ -322,7 +336,7 @@ private:
         }
 
         // It is ok to force the item(s) here, because they will be printed anyway.
-        state.forceValue(*item, item->determinePos(noPos));
+        forceForPrint(*item, item->determinePos(noPos));
 
         // Pretty-print single-item attrsets only if they contain nested
         // structures.
@@ -435,7 +449,7 @@ private:
         }
 
         // It is ok to force the item(s) here, because they will be printed anyway.
-        state.forceValue(*item, item->determinePos(noPos));
+        forceForPrint(*item, item->determinePos(noPos));
 
         // Pretty-print single-item lists only if they contain nested
         // structures.
@@ -598,7 +612,7 @@ private:
 
         try {
             if (options.force) {
-                state.forceValue(v, v.determinePos(noPos));
+                forceForPrint(v, v.determinePos(noPos));
             }
 
             switch (v.type()) {
