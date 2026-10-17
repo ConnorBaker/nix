@@ -2425,6 +2425,18 @@ Value::ClosureThunk EvalState::electThunk(Value & v, const PosIdx pos)
         forceValueOnPending(v, pos, expected);
         return {nullptr, nullptr};
     }
+    if (!Value::fvIsThunkTag(expected)) [[unlikely]] {
+        /* DetSys's pd==pdThunk dispatch. The inline `isThunk()` and this acquire
+           read are two separate loads; between them another worker can WIN,
+           evaluate and FINISH the cell. `expected` is then a WHNF value, not a
+           thunk -- env/expr would be garbage and `fvMarkPending` would wrongly
+           CAS the finished word0 back to pending (it only checks word0==expected),
+           resurrecting a finished cell and eval'ing garbage. Return "handled":
+           the value is already forced, and this acquire read happens-after the
+           publisher's release, so the caller's reads see the whole value. */
+        endLoggedForce(v);
+        return {nullptr, nullptr};
+    }
     Value::ClosureThunk t = v.thunk();
     if (!v.fvMarkPending(expected, myEvalThreadId)) [[unlikely]] {
         endLoggedForce(v);
@@ -2442,6 +2454,12 @@ Value::FunctionApplicationThunk EvalState::electApp(Value & v, const PosIdx pos)
     uint64_t expected = v.fvWord0Acquire();
     if (Value::fvIsPendingTag(expected)) [[unlikely]] {
         forceValueOnPending(v, pos, expected);
+        return {nullptr, nullptr};
+    }
+    if (!Value::fvIsThunkTag(expected)) [[unlikely]] {
+        /* pd==pdThunk dispatch -- see electThunk. A finished (non-thunk) word0
+           must NOT be CASed back to pending; return "handled" (already forced). */
+        endLoggedForce(v);
         return {nullptr, nullptr};
     }
     Value::FunctionApplicationThunk a = v.app();
