@@ -372,6 +372,15 @@ struct EvalRegion
         unforcing, so a job that keeps its memory keeps no size prefixes. */
     uint8_t * envSizes = nullptr;
     const char * envSizesBase = nullptr;
+    /** PROTOTYPE (parallel-eval increment 0). The striped reserved arena this
+        region occupies: the id of its worker's stripe. Single-threaded
+        evaluation runs one worker in one active stripe (0). This is the HIGH
+        level of the two-level owner-timeline clock `(arena_id, offset)`; it is
+        constant across a single-threaded job (every cell is in the one active
+        stripe), so `ownerOf` needs only the low level (the within-stripe
+        offset, `(p - base) >> 4`). Set when the region opens. A cold field: it
+        must stay after the hot bump fields so their offsets are unchanged. */
+    uint32_t arenaId = 0;
 
     bool active() const noexcept
     {

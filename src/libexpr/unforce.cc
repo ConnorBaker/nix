@@ -177,6 +177,81 @@ size_t regionSize()
     return unforceDebug().tripwire ? size_t(4) << 30 : size_t(64) << 30;
 }
 
+/* ---------------------------------------------------------------------------
+   Striped arena (parallel-eval increment 0).
+
+   The reserved value arena is subdivided into `nStripes` equal power-of-two
+   stripes, one per worker thread, carved from a single MAP_NORESERVE
+   reservation `stripesBase`. Single-threaded evaluation runs ONE worker in ONE
+   active stripe, so the layout is behaviour-identical to the single bump arena
+   it replaces (with one stripe the reservation is exactly `regionSize()` bytes,
+   as the pre-striping per-job mapping was). The striping exists so the
+   owner-timeline clock can be TWO-LEVEL -- `(arena_id, offset)`, the high and
+   low halves of one `p - stripesBase` subtraction -- which decouples a worker's
+   allocation timeline from the single global address order ahead of any
+   concurrency. One stripe spans a whole 64 GiB region, so the within-stripe
+   offset `(p - evalRegion.base) >> 4` is exactly the pre-striping clock. See
+   notes/research/PARALLEL-EVAL-UNFORCING.md Section 6.C.
+
+   The HIGH level is `EvalRegion::arenaId`, a cold field set when the region
+   opens; the LOW level is the within-stripe offset that `ownerOf`/`segStart`/
+   `setOwner` already compute (one subtraction, one shift) -- the hot path is
+   unchanged. (The trimmed base deleted the vestigial `CellClock` struct, which
+   only ever named the raw address and was never read; there is no standalone
+   clock object to repackage. The two-level clock is expressed entirely by
+   `arenaId` plus that offset arithmetic.)
+
+   The nursery recycles within the active stripe: a job allocates above the
+   stripe's kept floor and `releaseRegion` returns `[floor, cur)` to the kernel
+   (MADV_DONTNEED, which re-zeroes it), so a later job reuses the same
+   addresses -- the per-job owner timeline keys on offsets, so address reuse
+   does not change any decision. Kept jobs raise the floor; their objects stay
+   in place below it. `releaseRegion`/`retainRegion` are unchanged: the
+   per-stripe recycling falls out of the existing kept-mapping floor branch.
+
+   Not used under the `tripwire` debug dial, which keeps per-job standalone
+   mappings so a missed escape faults on freed addresses rather than reading
+   reused memory; that path is unchanged. --------------------------------------
+*/
+static constexpr size_t stripeShift = 36; /* 64 GiB per stripe */
+static constexpr size_t stripeBytes = size_t(1) << stripeShift;
+static constexpr uintptr_t stripeMask = stripeBytes - 1;
+
+/* Reserved worker stripes. One for now (single-threaded); the parallel
+   increments raise this to `evalCores` and give each worker a stripe. A dev
+   override (`NIX_UNFORCE_STRIPES`) enlarges the reservation to prove the
+   striped layout; the active worker is still 0, so behaviour is unchanged. */
+static const size_t nStripes = [] {
+    auto s = getenv("NIX_UNFORCE_STRIPES");
+    size_t n = s ? strtoul(s, nullptr, 10) : 1;
+    return std::max<size_t>(1, n);
+}();
+
+/* The single reserved striped mapping; stripe `id` is at base + id*stripeBytes. */
+static char * stripesBase = nullptr;
+
+/* This thread's stripe (its worker id). Single-threaded: always 0. */
+static const size_t activeStripe = 0;
+
+/* Whether allocation comes from the striped reservation (always, except under
+   the tripwire dial). */
+static bool useStripes()
+{
+    return !unforceDebug().tripwire;
+}
+
+/* The base of stripe `id`, reserving the striped mapping on first use. With
+   one stripe this reserves exactly `regionSize()` (64 GiB), as the pre-striping
+   per-job mapping did. */
+static char * stripeBase(size_t id)
+{
+    if (!stripesBase) {
+        assert(stripeBytes == regionSize());
+        stripesBase = (char *) mapArena(nStripes << stripeShift);
+    }
+    return stripesBase + (id << stripeShift);
+}
+
 struct Stats
 {
     size_t jobs = 0, logged = 0, reverted = 0, stubbed = 0, promoted = 0, copiedBytes = 0, regionPeak = 0;
@@ -584,6 +659,9 @@ size_t unforceOwnerBytes()
     return ownerSegs.usedBytes() + ownerConsumers.bytes();
 }
 
+/* The start address a segment offset names. The offset is the within-stripe
+   granule of the active region's base; `arena_id` (`evalRegion.arenaId`) is
+   implicit -- every segment of an open job is in the one active stripe. */
 [[gnu::always_inline]] inline static char * segStart(const OwnerSeg & s)
 {
     return evalRegion.base + (size_t(s.off) << 4);
@@ -640,7 +718,14 @@ static void setOwner(uint32_t o);
     setOwnerLast(o);
 }
 
-/* The owner of the young object at `p` (an address in [base, cur)). */
+/* The owner of the young object at `p` (an address in the active stripe's open
+   region [base, cur)). `p`'s two-level clock is `(arena_id, offset)`: the high
+   level `arena_id = evalRegion.arenaId` is constant across a single-threaded
+   job (every young cell is in the one active stripe), so it is not needed to
+   disambiguate cells here -- the segment map is per active stripe. The low
+   level, the within-stripe offset `(p - evalRegion.base) >> 4`, is what the
+   map keys on. Hot path unchanged from the pre-striping clock: one
+   subtraction, one shift. */
 static size_t ownerHint = 0;
 
 [[gnu::always_inline]] inline static uint32_t ownerOf(const void * p)
@@ -833,22 +918,52 @@ static void leaveKeptMapping()
 void openRegion()
 {
     hookCollector();
+    if (useStripes() && !keptStart) {
+        /* First job: anchor the active worker's recyclable nursery at the base
+           of its stripe, reserving the striped mapping. The nursery floor is
+           `keptFloor`; kept jobs raise it (their objects stay in place below
+           it), non-kept jobs recycle `[keptFloor, cur)`. The kept-mapping
+           bookkeeping (`keptStart`/`keptFloor`/`keptEnd`) thus drives recycling
+           within the one stripe, so `releaseRegion`/`retainRegion` need no
+           change. With one stripe the nursery is never abandoned
+           (`leaveKeptMapping`): there is nowhere else to go, and a single eval
+           never fills 32 GiB. Multi-stripe increments advance to the next
+           stripe when a stripe fills. */
+        keptStart = keptFloor = stripeBase(activeStripe);
+        keptEnd = keptStart + stripeBytes;
+    }
     if (keptStart) {
-        /* Continue above the kept jobs while at least half a region is left
-           (with the tripwire, released memory is not reused). The memory
-           released above the floor is zero pages, and the floor's own page is
-           zeroed above it (`releaseRegion`). */
-        if (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
+        /* Continue above the kept jobs. In stripe mode the whole stripe span
+           is the nursery, so always continue there; otherwise (tripwire) only
+           while at least half a region is left, and never under the tripwire
+           (released memory is not reused). The memory released above the floor
+           is zero pages, and the floor's own page is zeroed above it
+           (`releaseRegion`). */
+        bool cont = useStripes() || (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2);
+        if (cont) {
             evalRegion.base = evalRegion.cur = keptFloor;
             evalRegion.end = keptEnd;
+            /* The HIGH level of the two-level clock, derived from the address:
+               `(floor - stripesBase) >> stripeShift` is the worker's stripe.
+               Single-threaded it is always the active stripe, and the whole
+               nursery span [floor, end) stays within that one stripe (the LOW
+               level, masked by `stripeMask`, never overflows into the next). */
+            auto d = (uintptr_t) (keptFloor - stripesBase);
+            evalRegion.arenaId = uint32_t(d >> stripeShift);
+            assert(
+                evalRegion.arenaId == activeStripe
+                && ((uintptr_t) (keptEnd - 1 - stripesBase) >> stripeShift) == evalRegion.arenaId
+                && (d & stripeMask) == d - (uintptr_t(activeStripe) << stripeShift));
             useEnvSizeTable(keptStart);
             return;
         }
         leaveKeptMapping();
     }
+    /* Tripwire fallback: a fresh standalone region per job (no striping). */
     auto base = (char *) mapArena(regionSize());
     evalRegion.base = evalRegion.cur = base;
     evalRegion.end = evalRegion.base + regionSize();
+    evalRegion.arenaId = 0;
     useEnvSizeTable(base);
 }
 
