@@ -96,10 +96,7 @@ Executor::Executor(EvalState & evalState)
     : evalCores(getEvalCores(evalState.settings))
     , enabled(evalCores > 1)
     , evalState(&evalState)
-    , interruptCallback(createInterruptCallback([&]() {
-        for (auto & domain : waiterDomainsStorage())
-            domain.lock()->cv.notify_all();
-    }))
+    , interruptCallback(createInterruptCallback([this]() { wakeAllWaiterDomains(); }))
 {
     debug("executor using %d threads", evalCores);
 
@@ -159,11 +156,38 @@ Executor::~Executor()
        `checkInterrupt` -> `quit` -> throws `Interrupted`, unwinding cooperatively.
        (The Executor's own interrupt callback wakes these domains too, but only on
        an actual SIGINT; teardown is the no-signal case.) */
-    for (auto & domain : waiterDomainsStorage())
-        domain.lock()->cv.notify_all();
+    wakeAllWaiterDomains();
 
     for (auto & thr : threads)
         pthread_join(thr, nullptr);
+}
+
+void Executor::wakeAllWaiterDomains() noexcept
+{
+    for (auto & domain : waiterDomainsStorage())
+        domain.lock()->cv.notify_all();
+}
+
+void Executor::releaseOutstanding(uint64_t n) noexcept
+{
+    if (n == 0)
+        return;
+    /* On the edge that empties the pool, take the lock before notifying so a
+       waiter that saw a non-zero count observes the notify (no lost wakeup). */
+    if (globalOutstanding.fetch_sub(n, std::memory_order_acq_rel) == n) {
+        std::lock_guard<std::mutex> lk(idleMutex);
+        idleCv.notify_all();
+    }
+}
+
+void Executor::awaitExecutorIdle()
+{
+    /* Inc3 S4-b-a0 (F1): block until the pool is globally quiescent. The
+       `idleMutex` makes a waiter that saw a non-zero count observe the 1->0
+       notify (no lost wakeup), mirroring `Completion::finish`. Nothing calls
+       this on a live path in a0; it is the primitive the S4-b-a1 barrier uses. */
+    std::unique_lock<std::mutex> lk(idleMutex);
+    idleCv.wait(lk, [this]() { return globalOutstanding.load(std::memory_order_acquire) == 0; });
 }
 
 /* pthread entry trampoline: run the worker loop, swallowing any exception that
@@ -224,7 +248,18 @@ void Executor::worker()
        join builds on: a per-scope cancel token consulted here the same way lets
        a wave (and all work it transitively spawned) be cancelled/awaited at the
        scope boundary without tearing down the whole pool. */
-    unix::interruptCheck = [this]() noexcept { return quit.load(std::memory_order_acquire); };
+    /* Inc3 S4-b-a0 (§2.5): also consult the ambient wave's cancel token, so a
+       wave (and all work it transitively spawned) can be cancelled without
+       tearing down the whole pool. `currentWave` is this worker's thread_local,
+       set per item (F2); when running a wave item it points at that wave, else
+       null. Reads are acquire to pair with `requestCancel`'s release store.
+       S4-b-b: a wave-cancel Interrupted should NOT set `quit` (that tears down
+       the pool); the worker's Interrupted catch below will be refined to
+       distinguish a wave cancel from a teardown/signal. */
+    unix::interruptCheck = [this]() noexcept {
+        return quit.load(std::memory_order_acquire)
+               || (currentWave && currentWave->cancel.load(std::memory_order_acquire));
+    };
     Finally clearInterruptCheck([]() noexcept { unix::interruptCheck = {}; });
 
     /* inc2c-2: per-worker unforce scope (Inc3 scaffolding). A worker that
@@ -256,10 +291,15 @@ void Executor::worker()
                    that any `FutureVector::finishAll()` wakes up and reports a
                    nice error. */
                 auto ex = std::make_exception_ptr(Interrupted("interrupted by the user"));
+                size_t dropped = state->queue.size();
                 for (auto & item : state->queue)
                     if (item.second.completion)
                         item.second.completion->finish(ex);
                 state->queue.clear();
+                /* Inc3 S4-b-a0 (F1): these items were counted at spawn but will
+                   never run -- release them from the global count (and signal
+                   idle if that empties the pool). */
+                releaseOutstanding(dropped);
                 return;
             }
             if (!state->queue.empty()) {
@@ -292,6 +332,9 @@ void Executor::worker()
         }
         if (item.completion)
             item.completion->finish(std::move(ex));
+        /* Inc3 S4-b-a0 (F1): the item ran (or threw) -- release it from the
+           global count. For EVERY item, not just completion-bearing ones. */
+        releaseOutstanding(1);
     }
 }
 
@@ -299,6 +342,12 @@ void Executor::spawn(WorkItems && items, std::shared_ptr<Completion> completion)
 {
     if (items.empty())
         return;
+
+    /* Inc3 S4-b-a0 (F1): count these items in the GLOBAL outstanding work BEFORE
+       queueing (increment-before-queue, so a worker can't dequeue + decrement
+       before the increment is visible). The one spawn chokepoint every producer
+       funnels through, so the count is self-enforcing. */
+    globalOutstanding.fetch_add(items.size(), std::memory_order_relaxed);
 
     {
         auto state(state_.lock());
@@ -399,6 +448,35 @@ void WaveScope::barrier()
             ignoreExceptionExceptInterrupt();
         }
     }
+}
+
+void WaveScope::requestCancel()
+{
+    /* Inc3 S4-b-a0 (§2.5): set the token (release, paired with the worker's
+       acquire read in `interruptCheck`), THEN wake every waiter domain so a
+       worker parked in `waitOnThunk` on a cell produced by a cancelled sibling
+       re-checks and unwinds at its next `checkInterrupt` poll. Order matters:
+       set-then-wake, so a woken worker sees the token. */
+    cancel.store(true, std::memory_order_release);
+    executor.wakeAllWaiterDomains();
+}
+
+void WaveScope::barrierThenReclaim(const std::function<void()> & reclaim)
+{
+    /* Inc3 S4-b-a0 (F3): the reclamation runs AFTER the barrier and EVEN IF the
+       barrier rethrows -- a `Finally`, not a straight-line `barrier(); reclaim();`
+       (which would skip reclaim on a rethrow, leaking the wave's stripes). The
+       caller must have set `cancel` (via `requestCancel`) before this on the
+       error path so the barrier does not block on a runaway sibling.
+       // S4-b-b: `reclaim` carries the single-writer reclamation (munmap/revert +
+       // the F4a registry copy-in / TLS write-back + the F4c per-wave region
+       // reset). It is an empty placeholder until revert flips on; in a0 the only
+       // caller is a unit test. It must be noexcept (it runs from the Finally). */
+    Finally doReclaim([&]() noexcept {
+        if (reclaim)
+            reclaim();
+    });
+    barrier();
 }
 
 /* ------------------------------------------------------------------ *

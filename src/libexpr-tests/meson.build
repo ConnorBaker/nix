@@ -67,6 +67,7 @@ sources = files(
   'value/print.cc',
   'value/value.cc',
   'wave-quiescence.cc',
+  'wave-s4ba.cc',
 )
 
 include_dirs = [ include_directories('.') ]

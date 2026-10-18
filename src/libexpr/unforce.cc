@@ -1198,6 +1198,11 @@ struct WaveController
         elementIndex = 0;
     }
 
+    /* Park the live stripe into the registry at its GLOBAL stripe id (Inc3
+       S4-b-a0 F4b: sparse-capable, so `stripes[waveStripeOf(p)]` indexes by
+       global id for real sparse worker stripes; byte-identical for the dense
+       pseudo-stripe path where id == push order). */
+    void parkLiveStripe();
     /* Park the live stripe and open the next one fresh (force phase). */
     void advanceStripe(EvalState & state);
     /* Reclaim all parked + the live stripe together (barrier). Returns the
@@ -1231,8 +1236,16 @@ static void swapWaveContext(WaveStripe & w)
 
 static size_t waveStripeSpan()
 {
-    /* All stripes the wave has opened are contiguous from `stripesBase`. */
-    return (g_wave ? (g_wave->stripes.size()) : 1) << stripeShift;
+    /* Inc3 S4-b-a0 (F4b): the wave's stripes are carved from one contiguous
+       reservation at `stripesBase`, indexed by GLOBAL stripe id. Real worker
+       stripes are SPARSE (main = 0, workers in [1, evalCores]; a wave may use a
+       non-contiguous subset), so the span must cover the max possible id, i.e.
+       the FULL `nStripes` reservation -- NOT `stripes.size()` (the count of
+       participating stripes), which undercounts when a high global id
+       participates and would misclassify its young cells as OLD in `youngW`.
+       Byte-identical for the dense pseudo-stripe path (eval-cores == 1 dev
+       knob): there `nStripes == waveM == stripes.size()` at the barrier. */
+    return (g_wave ? nStripes.load(std::memory_order_relaxed) : 1) << stripeShift;
 }
 
 /* Routed owner id: `noOwner`, else `(stripe << waveOwnerShift) | local`. */
@@ -2745,6 +2758,61 @@ void pruneCounts(
 
 } // namespace
 
+/* ---------------------------------------------------------------------------
+   Inc3 S4-b-a0 (F4b) test hook. Exercises the stripe-classification MATH
+   (`waveStripeOf` / `youngW` / `waveStripeSpan`) against a SYNTHETIC sparse wave,
+   proving the global-stripe-id indexing is correct for sparse worker ids WITHOUT
+   allocating a real arena or freeing anything. It saves and restores the
+   file-local stripe globals (reachable here by unqualified lookup -- same TU --
+   even though they live in the anonymous namespace above), so it does not
+   disturb production state; `g_wave` points at a dummy controller (these
+   functions never deref its `stripes`). NO production path reaches this; it has
+   external linkage (named `nix::unforce_test`) only so the unit test can call
+   it. Single-threaded test use only.
+   --------------------------------------------------------------------------- */
+namespace unforce_test {
+
+static WaveController syntheticWaveDummy;
+static char * savedStripesBase = nullptr;
+static size_t savedNStripes = 0;
+static WaveController * savedWave = nullptr;
+
+void beginSyntheticWave(const void * base, size_t n)
+{
+    savedStripesBase = stripesBase;
+    savedNStripes = nStripes.load(std::memory_order_relaxed);
+    savedWave = g_wave;
+    stripesBase = (char *) const_cast<void *>(base);
+    nStripes.store(n, std::memory_order_relaxed);
+    g_wave = &syntheticWaveDummy;
+}
+
+void endSyntheticWave()
+{
+    g_wave = savedWave;
+    nStripes.store(savedNStripes, std::memory_order_relaxed);
+    stripesBase = savedStripesBase;
+}
+
+size_t waveStripeOfForTest(const void * p)
+{
+    return waveStripeOf(p);
+}
+bool youngWForTest(const void * p)
+{
+    return youngW(p);
+}
+size_t waveStripeSpanForTest()
+{
+    return waveStripeSpan();
+}
+size_t stripeShiftForTest()
+{
+    return stripeShift;
+}
+
+} // namespace unforce_test
+
 #if !NIX_USE_BOEHMGC
 void * evalBaseAlloc(size_t n)
 {
@@ -2884,15 +2952,26 @@ void UnforceBatch::open()
 /* The wave in progress on the main thread (eval-cores == 1). */
 static WaveController theWave;
 
+/* Park the live stripe at its GLOBAL stripe id (`myStripe`), growing the
+   registry so non-participating ids stay empty (region.base == nullptr). For the
+   dense pseudo-stripe path the id IS the push-order index, so the registry and
+   its iteration order are byte-identical to the former `emplace_back`. */
+void WaveController::parkLiveStripe()
+{
+    size_t id = myStripe;
+    if (stripes.size() <= id)
+        stripes.resize(id + 1);
+    stripes[id].firstElement = id == 0 ? 0 : stripes[id - 1].lastElement;
+    stripes[id].lastElement = elementIndex;
+    swapWaveContext(stripes[id]);
+}
+
 /* Park the live stripe and open the next one (force phase). */
 void WaveController::advanceStripe(EvalState & state)
 {
     /* Park the live stripe: its region, timeline, undo log and nursery move
        into the registry, leaving a clean default in the globals. */
-    stripes.emplace_back();
-    stripes.back().firstElement = active == 0 ? 0 : stripes[active - 1].lastElement;
-    stripes.back().lastElement = elementIndex;
-    swapWaveContext(stripes.back());
+    parkLiveStripe();
     /* Open the next stripe fresh (its own disjoint arena + timeline). */
     active++;
     myStripe = uint32_t(active);
@@ -2909,26 +2988,34 @@ void WaveController::barrier(EvalState & state)
 {
     /* Park the live (last) stripe; now every stripe is in the registry and the
        globals are a clean default. */
-    stripes.emplace_back();
-    stripes.back().firstElement = active == 0 ? 0 : stripes[active - 1].lastElement;
-    stripes.back().lastElement = elementIndex;
-    swapWaveContext(stripes.back());
+    parkLiveStripe();
 
     /* The merged undo log: every stripe's targets, in stripe order. The owner
        ids the barrier routes (`ownerOfW`) name cells in a specific stripe's
        log; `ownerCellW` resolves them, and every such cell is also a target
-       here, so the owner closure's `indexOf` finds it. */
+       here, so the owner closure's `indexOf` finds it. Inc3 S4-b-a0 (F4b): the
+       registry is now indexed by global stripe id, so non-participating ids are
+       empty slots (region.base == nullptr) -- skip them. (No empty slots exist
+       on the dense pseudo-stripe path, so this is byte-identical there.) */
     EvalUndoLog merged;
     size_t total = 0;
-    for (auto & st : stripes)
+    for (auto & st : stripes) {
+        if (!st.region.base)
+            continue;
         total += st.undoLog.size();
+    }
     merged.reserve(total);
-    for (auto & st : stripes)
+    for (auto & st : stripes) {
+        if (!st.region.base)
+            continue;
         for (auto & e : st.undoLog)
             merged.push_back(e);
+    }
 
     size_t youngBytes = 0, youngTotal = 0;
     for (auto & st : stripes) {
+        if (!st.region.base)
+            continue;
         size_t span = size_t(st.region.cur - st.region.base);
         youngTotal += span;
         youngBytes += span - std::min(st.region.stringBytes, span);
@@ -2994,8 +3081,11 @@ void WaveController::barrier(EvalState & state)
     }
 
     /* Free every stripe's arena + owner-segment / env-size mappings, by
-       bringing each back into the globals for the shipped release helpers. */
+       bringing each back into the globals for the shipped release helpers.
+       Inc3 S4-b-a0 (F4b): skip empty (non-participating) slots. */
     for (auto & st : stripes) {
+        if (!st.region.base)
+            continue;
         swapWaveContext(st);
         closeOwners();
         if (ownerSegs.map) {

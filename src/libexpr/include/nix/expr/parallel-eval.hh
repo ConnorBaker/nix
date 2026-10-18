@@ -9,6 +9,7 @@
 #include <atomic>
 #include <random>
 #include <condition_variable>
+#include <mutex>
 
 #include <pthread.h>
 
@@ -138,6 +139,21 @@ struct Executor
 
     std::condition_variable wakeup;
 
+    /* Inc3 S4-b-a0 (F1): the GLOBAL outstanding-work count across the whole pool
+       -- the self-enforcing executor-idle guard. Incremented at the ONE spawn
+       chokepoint (`Executor::spawn`, by items.size(), before queueing) and
+       decremented when a work item finishes (the worker loop, after `work()`)
+       OR is dropped unrun on teardown -- for EVERY item, fire-and-forget or
+       completion-bearing. The (S4-b-b) wave barrier blocks on `awaitExecutorIdle`
+       (global == 0) IN ADDITION to the wave's own `pending`, so ANY spawn --
+       including a future producer that forgot to register into a wave -- is
+       awaited before a stripe is freed. SPAWN-SITE + COMPLETION ONLY: nothing on
+       the inlined force path (forceValue/allocValue/ownerOf/youngW/ownerOfW)
+       touches it. Nothing blocks on it in a0; it is infra + a unit test. */
+    std::atomic<uint64_t> globalOutstanding{0};
+    std::mutex idleMutex;        /* guards the idle-cv notify (no lost wakeup) */
+    std::condition_variable idleCv;
+
     static unsigned int getEvalCores(const EvalSettings & evalSettings);
 
     Executor(EvalState & evalState);
@@ -156,6 +172,29 @@ struct Executor
      * items are fire-and-forget.
      */
     void spawn(WorkItems && items, std::shared_ptr<Completion> completion = {});
+
+    /* Inc3 S4-b-a0 (F1): the global executor-idle query + wait primitive the
+       wave barrier will block on. `outstandingWork() == 0` means the pool is
+       quiescent (no item queued or running). `awaitExecutorIdle()` blocks until
+       then. Nothing in a0 calls `awaitExecutorIdle` on a live path -- it is the
+       infra S4-b-a1's barrier uses. */
+    uint64_t outstandingWork() const
+    {
+        return globalOutstanding.load(std::memory_order_acquire);
+    }
+    void awaitExecutorIdle();
+
+    /* Inc3 S4-b-a0 (F1): release `n` items from the global count (decrement),
+       signalling idle if it reaches zero. Called from the worker loop (1 per
+       finished item; `n` for items dropped unrun on teardown). */
+    void releaseOutstanding(uint64_t n) noexcept;
+
+    /* Wake every blackhole waiter domain (the teardown pattern). Factored out so
+       `~Executor`, the SIGINT interrupt callback, AND the Inc3 wave cancel
+       (§2.5, `WaveScope::requestCancel`) share one implementation: a worker
+       parked in `waitOnThunk` on a cell whose producer was cancelled re-checks
+       and observes the cancel at its next `checkInterrupt` poll. */
+    void wakeAllWaiterDomains() noexcept;
 
     /* constinit so cross-TU users (EvalState::addCallDepth) see it is
        constant-initialized and elide the TLS-init guard on the serial path. */
@@ -218,10 +257,12 @@ struct WaveScope
 
     std::shared_ptr<Executor::Completion> completion{std::make_shared<Executor::Completion>()};
 
-    /* S4-b: the per-wave cancel token (Item-1 generalized). Declared now so the
-       scope's shape is stable; the cancel WIRING (wake all waiter domains + the
-       worker `interruptCheck` consulting it so a worker parked in `waitOnThunk`
-       on a cancelled producer's cell is woken) is S4-b. Unused in S4-a. */
+    /* The per-wave cancel token (Item-1 generalized). Inc3 S4-b-a0 (§2.5) wires
+       it: the worker `interruptCheck` consults `currentWave->cancel` in addition
+       to `quit`, and `requestCancel()` sets it + wakes all waiter domains, so a
+       worker parked in `waitOnThunk` on a cancelled sibling's cell is woken and
+       unwinds at its next `checkInterrupt` poll. Nothing sets it in a0 (no
+       cancel happens); it is wiring + a unit test. */
     std::atomic<bool> cancel{false};
 
     explicit WaveScope(Executor & executor)
@@ -254,6 +295,27 @@ struct WaveScope
      * the single-writer reclamation.
      */
     void barrier();
+
+    /**
+     * Inc3 S4-b-a0 (§2.5): request cancellation of this wave. Sets `cancel` (so
+     * the worker `interruptCheck` observes it) and wakes all waiter domains (so a
+     * worker parked in `waitOnThunk` on a cancelled sibling's cell re-checks and
+     * unwinds at its next poll). Abandoning a wave's warm work is safe (pure
+     * hint). Nothing calls this in a0; it is wiring + a unit test.
+     */
+    void requestCancel();
+
+    /**
+     * Inc3 S4-b-a0 (F3): the reclamation-ORDERING shell. Runs `reclaim` AFTER the
+     * barrier, and EVEN IF the barrier rethrows (a `Finally`, not a straight-line
+     * statement), so a thrown wave never leaks its stripes / leaves reclamation
+     * state dirty. The caller sets `cancel` (via `requestCancel`) BEFORE calling
+     * this on the error path so the barrier does not block on a runaway sibling.
+     * In S4-b-a0 the only caller is a unit test; the drv-set driver wires it in
+     * S4-b-a1 and `reclaim` stays an empty placeholder until S4-b-b flips revert
+     * on. `reclaim` must be noexcept (it runs from a `Finally`).
+     */
+    void barrierThenReclaim(const std::function<void()> & reclaim);
 };
 
 } // namespace nix
