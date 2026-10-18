@@ -394,12 +394,20 @@ static bool isStale(const std::optional<size_t> & generation)
 
 Value * EvalCache::getRootValue()
 {
-    if (!value || isStale(valueGeneration)) {
+    /* The root loader runs under the lock: concurrent root cursors (e.g.
+       `packages` and `legacyPackages`, fanned out as separate work items)
+       must not both evaluate it, and the result must be published atomically
+       with its generation. The loader does not re-enter this eval cache, so
+       holding the lock across it cannot deadlock. At eval-cores == 1 the lock
+       is uncontended and this is byte-identical to the previous unlocked
+       field access. */
+    auto v(rootValue.lock());
+    if (!v->value || isStale(v->generation)) {
         debug("getting root value");
-        value = allocRootValue(rootLoader());
-        valueGeneration = cacheGeneration(state);
+        v->value = allocRootValue(rootLoader());
+        v->generation = cacheGeneration(state);
     }
-    return *value;
+    return *v->value;
 }
 
 ref<AttrCursor> EvalCache::getRoot()
@@ -414,8 +422,9 @@ AttrCursor::AttrCursor(
     , cachedValue(std::move(cachedValue))
 {
     if (value) {
-        _value = allocRootValue(value);
-        _valueGeneration = cacheGeneration(root->state);
+        auto v(_value.lock());
+        v->value = allocRootValue(value);
+        v->generation = cacheGeneration(root->state);
     }
 }
 
@@ -432,19 +441,38 @@ AttrKey AttrCursor::getKey()
 
 Value & AttrCursor::getValue()
 {
-    if (!_value || isStale(_valueGeneration)) {
-        if (parent) {
-            auto & vParent = parent->first->getValue();
-            root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
-            auto attr = vParent.attrs()->get(parent->second);
-            if (!attr)
-                throw Error("attribute '%s' is unexpectedly missing", getAttrPathStr());
-            _value = allocRootValue(attr->value);
-        } else
-            _value = allocRootValue(root->getRootValue());
-        _valueGeneration = cacheGeneration(root->state);
+    {
+        auto v(_value.lock());
+        if (v->value && !isStale(v->generation))
+            return **v->value;
     }
-    return **_value;
+
+    /* Derive the value WITHOUT holding our lock. On a cache miss several
+       child workers may reach this for the same (shared parent) cursor
+       concurrently; each walks up to the parent (whose `getValue` is itself
+       synchronised) and re-forces, which the evaluator's concurrent-forcing
+       protocol deduplicates, and looks up the same attribute, which is
+       idempotent. Under 2c-3 revert-off the attribute pointer is stable
+       (nothing is freed or reverted), so every worker derives an equivalent
+       pointer. Holding our own lock across the force is unnecessary (there
+       are no fibers to deadlock) and would needlessly serialise siblings. */
+    Value * vp;
+    if (parent) {
+        auto & vParent = parent->first->getValue();
+        root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
+        auto attr = vParent.attrs()->get(parent->second);
+        if (!attr)
+            throw Error("attribute '%s' is unexpectedly missing", getAttrPathStr());
+        vp = attr->value;
+    } else
+        vp = root->getRootValue();
+
+    auto v(_value.lock());
+    if (!v->value || isStale(v->generation)) {
+        v->value = allocRootValue(vp);
+        v->generation = cacheGeneration(root->state);
+    }
+    return **v->value;
 }
 
 void AttrCursor::fetchCachedValue()

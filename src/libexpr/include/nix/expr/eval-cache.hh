@@ -14,6 +14,33 @@ namespace nix::eval_cache {
 struct AttrDb;
 class AttrCursor;
 
+/**
+ * A lazily-materialised pointer to an evaluator value (a cursor's
+ * `_value`, or the eval cache's root value), together with the unforce
+ * generation it was materialised in (see `cacheGeneration`/`isStale` in
+ * eval-cache.cc).
+ *
+ * Thread-safety (parallel-eval, eval-cores > 1): under worker-thread
+ * fan-out several workers may request the same (shared parent / root)
+ * cursor's value concurrently. Both the `RootValue` and the generation it
+ * was cached in are therefore held behind a `Sync<>` so that every read and
+ * publish is race-free. The field is lazily published and then only
+ * re-published when stale; the lock is NOT held across the (possibly long)
+ * evaluation that derives the value, only across the check and the publish
+ * (see `AttrCursor::getValue`). `value` is falsy until first materialised.
+ *
+ * Under 2c-3 revert-off nothing in evaluator memory is freed or reverted, so
+ * a once-published pointer stays valid; a per-worker generation only causes a
+ * harmless re-derivation of the same pointer. At eval-cores == 1 the lock is
+ * uncontended and the staleness/generation logic is byte-identical to the
+ * pre-parallel cursor.
+ */
+struct CachedRootValue
+{
+    RootValue value;
+    std::optional<size_t> generation;
+};
+
 struct CachedEvalError : CloneableError<CachedEvalError, EvalError>
 {
 private:
@@ -41,13 +68,16 @@ class EvalCache : public std::enable_shared_from_this<EvalCache>
     EvalState & state;
     typedef fun<Value *()> RootLoader;
     RootLoader rootLoader;
-    RootValue value;
     /**
-     * If `value` was loaded inside an unforce scope, the
-     * `unforceGeneration()` then: once a scope has ended since, the value
-     * may have been freed, so it is loaded again.
+     * The cache's root value and the generation it was loaded in. If it
+     * was loaded inside an unforce scope, once a scope has ended since,
+     * the value may have been freed (serial / revert-on only), so it is
+     * loaded again. Behind a `Sync<>` so concurrent root cursors (e.g.
+     * `packages` and `legacyPackages` fanned out as separate work items)
+     * can materialise it race-free; the root loader runs under the lock so
+     * concurrent requests do not both evaluate it.
      */
-    std::optional<size_t> valueGeneration;
+    Sync<CachedRootValue> rootValue;
 
     Value * getRootValue();
 
@@ -111,12 +141,37 @@ class AttrCursor : public std::enable_shared_from_this<AttrCursor>
     ref<EvalCache> root;
     using Parent = std::optional<std::pair<ref<AttrCursor>, Symbol>>;
     Parent parent;
-    RootValue _value;
     /**
-     * As `EvalCache::valueGeneration`, for `_value`, which is
-     * derived again from the parent once stale.
+     * This cursor's value and the generation it was derived in, derived
+     * again from the parent once stale. Behind a `Sync<>`: on a cache miss
+     * several child workers may force a shared parent cursor's value
+     * concurrently (`getValue` walks up to the parent), so both the pointer
+     * and its generation must be published atomically. See `getValue`.
      */
-    std::optional<size_t> _valueGeneration;
+    Sync<CachedRootValue> _value;
+    /**
+     * The database row id and decoded value for this cursor's attribute.
+     *
+     * NOT behind a lock, and NOT made race-free by the cursor itself: the
+     * cursor relies on its CONSUMER to expand each cursor to a single writer
+     * and to fully publish a cursor's children before handing that cursor (or
+     * its children) to other threads. `nix search` honours this: a cursor is
+     * "expanded" (its children enumerated via `getAttrs`/`maybeGetAttr`, which
+     * is what writes `cachedValue`) by exactly one task, and that expansion
+     * completes BEFORE any child work item is spawned. The spawn (Executor
+     * queue enqueue, a mutex release) and the worker's dequeue (acquire) then
+     * establish a happens-before edge, so a child reading its parent's
+     * `cachedValue` via `getKey` sees the fully-written, thereafter-immutable
+     * value. Under that discipline `cachedValue` is immutable-after-publish
+     * across workers and concurrent reads are safe.
+     *
+     * A future parallel consumer that spawns work on a cursor's children
+     * BEFORE that cursor's `cachedValue` is fully published (e.g. fanning out
+     * while still enumerating, or re-expanding a cursor from two tasks) WOULD
+     * race on this field and must guard it (e.g. `Sync<>` like `_value`) or
+     * preserve the expand-before-spawn invariant. (See the field survey in
+     * notes/reviews/unforce-parallel-evalcache-threadsafe.md.)
+     */
     std::optional<std::pair<AttrId, AttrValue>> cachedValue;
 
     AttrKey getKey();
