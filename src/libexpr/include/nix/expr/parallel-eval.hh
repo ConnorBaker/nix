@@ -146,7 +146,9 @@ struct Executor
      */
     void spawn(WorkItems && items, std::shared_ptr<Completion> completion = {});
 
-    [[gnu::tls_model("initial-exec")]] static thread_local bool amWorkerThread;
+    /* constinit so cross-TU users (EvalState::addCallDepth) see it is
+       constant-initialized and elide the TLS-init guard on the serial path. */
+    [[gnu::tls_model("initial-exec")]] static constinit thread_local bool amWorkerThread;
 };
 
 struct FutureVector

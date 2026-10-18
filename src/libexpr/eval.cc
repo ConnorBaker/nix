@@ -257,10 +257,67 @@ EvalMemory::EvalMemory()
    warm unforce hooks, frame-neutral. */
 [[gnu::tls_model("initial-exec")]] thread_local unsigned EvalState::isolationDepth = 0;
 
+/* Worker-only cancellation poll tick (parallel-eval teardown cancellation).
+   initial-exec + `constinit` (guaranteed constant init, no dynamic init and so
+   no cross-TU TLS-init guard), like `callDepth`/`isolationDepth`: a single
+   TP-relative load/store, never a `__tls_get_addr` call. Touched only on worker
+   threads, from the cold helper below. */
+[[gnu::tls_model("initial-exec")]] constinit static thread_local uint32_t workerCancelPollTick = 0;
+
+/* Out-of-line COLD actual interrupt poll (Item 1), reached ~1/4096 worker calls.
+   The `checkInterrupt` call (an indirect `interruptCheck` call plus the throw
+   path) lives here rather than inline in `addCallDepth` so the worker common path
+   makes no call and the throttle stays cheap. (It does NOT make `addCallDepth`
+   frameless -- see the frame note there.) */
+[[gnu::noinline, gnu::cold]] static void workerCancelCheck()
+{
+    checkInterrupt();
+}
+
 [[gnu::noinline]] CallDepth EvalState::addCallDepth(const PosIdx pos)
 {
-    if (callDepth > settings.maxCallDepth)
+    if (callDepth > settings.maxCallDepth) [[unlikely]]
         error<StackOverflowError>().atPos(pos).debugThrow();
+
+    /* Parallel-eval structured cancellation (Item 1). Fire-and-forget "warm"
+       work on the Executor (builtins.__parallel, toJSON / `nix eval --json`
+       auto-fan-out) is a pure optimisation hint: it only pre-forces values the
+       serial/driver pass would force itself, so abandoning it at teardown never
+       changes the result. But a worker forcing pure arithmetic (e.g. a runaway
+       `fib` sibling the serial pass skips after an earlier sibling threw) never
+       otherwise touches `checkInterrupt`, so neither the Executor teardown
+       (`quit`) nor a SIGTERM/Ctrl-C could make it unwind -- `~Executor`'s join
+       blocked indefinitely and ignored signals. We give workers a cancel poll
+       here, at the single call-depth chokepoint every force/apply recursion
+       passes through. It rides the EXISTING `checkInterrupt` mechanism: a worker
+       installs a thread-local `interruptCheck` tied to the Executor's `quit`
+       flag (see `Executor::worker`), and SIGTERM/SIGINT set the global
+       interrupt flag; either makes `checkInterrupt` throw `Interrupted` on the
+       worker's next poll, which unwinds the warm work via the ordinary
+       force-exception path.
+
+       Serial cost (measured, eval-cores == 1 vs base 9c908f15b, perf stat
+       instructions:u, 6 reps, taskset big core, nixpkgs ~3.5k drvs): see the
+       review note for the exact delta. It is gated on `amWorkerThread`, which is
+       `constinit` so cross-TU users pay NO `_ZTH` TLS-init guard (that guard,
+       present before constinit, was the bulk of the original regression). The
+       actual `checkInterrupt` is out of line (`workerCancelCheck`), so the worker
+       common path makes no call. Over base the serial fast path adds: one
+       initial-exec TLS load of `amWorkerThread` + a predicted-not-taken branch,
+       AND a small entry frame -- GCC 15 will NOT shrink-wrap `addCallDepth`'s
+       frame away here, because the worker cold-branch shares the function's
+       register-zeroing (`-fzero-call-used-regs`) return epilogue, which it
+       refuses to duplicate (a `musttail` tail-call is also rejected, since
+       `CallDepth` is returned in memory/sret). The frame is acceptable: this
+       function is noinline and returns BEFORE `callFunction` recurses, so its
+       frame is transient and does NOT affect the stack-parity depth (unlike
+       `callFunction`'s own frame, which is why the check is NOT placed there).
+       Nothing is added to the inlined forceValue/allocValue/ownerOf hot path. At
+       eval-cores == 1 no worker ever runs work, so this is dead and the result is
+       byte-identical to base. */
+    if (Executor::amWorkerThread) [[unlikely]]
+        if ((++workerCancelPollTick & 0xFFFU) == 0) [[unlikely]]
+            workerCancelCheck();
 
     return CallDepth(callDepth);
 }

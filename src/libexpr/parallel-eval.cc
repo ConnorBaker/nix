@@ -72,7 +72,10 @@ void notifyValueWaiters(void * valueAddr) noexcept
  * Executor
  * ------------------------------------------------------------------ */
 
-[[gnu::tls_model("initial-exec")]] thread_local bool Executor::amWorkerThread{false};
+/* `constinit`: guaranteed constant initialization, so no dynamic-init guard is
+   emitted and cross-TU users (notably `EvalState::addCallDepth`) access it with a
+   plain initial-exec TLS load, no `_ZTH`/TLS-wrapper call on the serial path. */
+[[gnu::tls_model("initial-exec")]] constinit thread_local bool Executor::amWorkerThread = false;
 
 unsigned int Executor::getEvalCores(const EvalSettings & evalSettings)
 {
@@ -135,7 +138,24 @@ Executor::~Executor()
         debug("executor shutting down with %d items left", state->queue.size());
     }
 
+    /* Wake idle workers waiting for queue items (they observe `quit` and drop
+       the remaining queued-but-not-started work). */
     wakeup.notify_all();
+
+    /* Belt-and-suspenders: wake every blackhole waiter domain so no worker is
+       left parked in `waitOnThunk` at teardown. Normally a cancelled producer
+       DOES wake its waiters -- `mkFailed` -> `publishOrStorePayload` ->
+       `publishCompletionSlow` release-exchanges the pending cell and notifies an
+       awaited waiter. This one-shot wake covers the residual case where that
+       path can't fire promptly: a waiter parked on a cell whose producer is
+       stuck in a long, non-pollable builtin (so the producer has not reached a
+       `checkInterrupt` poll to be cancelled and republish the cell). After the
+       wake the waiter re-checks, sees the cell still pending, and polls
+       `checkInterrupt` -> `quit` -> throws `Interrupted`, unwinding cooperatively.
+       (The Executor's own interrupt callback wakes these domains too, but only on
+       an actual SIGINT; teardown is the no-signal case.) */
+    for (auto & domain : waiterDomainsStorage())
+        domain.lock()->cv.notify_all();
 
     for (auto & thr : threads)
         pthread_join(thr, nullptr);
@@ -176,6 +196,31 @@ void Executor::worker()
     ReceiveInterrupts receiveInterrupts;
 
     amWorkerThread = true;
+
+    /* Structured cancellation (Item 1): make this worker's `checkInterrupt`
+       polls consult the Executor's `quit` flag. `interruptCheck` is
+       thread-local (`nix::unix::interruptCheck`), so installing it here NEVER
+       changes the main thread's interrupt semantics -- it only lets outstanding
+       fire-and-forget "warm" work running on THIS worker observe a cooperative
+       cancel. Abandoning warm work is always safe: it is a pure optimisation
+       hint (it only pre-forces values the serial/driver pass re-forces on
+       demand; forcing is idempotent), so cancelling it never changes a result.
+
+       On teardown, `~Executor` sets `quit`; the worker-gated poll in
+       `EvalState::addCallDepth` (and the existing polls in `waitOnThunk` and the
+       value-to-json recursion) then throws `Interrupted`, unwinding the warm
+       work via the ordinary force-exception path so the teardown join returns
+       promptly instead of waiting out a runaway worker. A SIGTERM/SIGINT
+       arriving while the main thread is blocked in that join independently sets
+       the GLOBAL interrupt flag (`unix::_isInterrupted`), which the same
+       `checkInterrupt` observes -- so signals abort the worker too.
+
+       This is the reusable cancellation primitive Inc3's wave-scoped quiescence
+       join builds on: a per-scope cancel token consulted here the same way lets
+       a wave (and all work it transitively spawned) be cancelled/awaited at the
+       scope boundary without tearing down the whole pool. */
+    unix::interruptCheck = [this]() noexcept { return quit.load(std::memory_order_acquire); };
+    Finally clearInterruptCheck([]() noexcept { unix::interruptCheck = {}; });
 
     /* inc2c-2: per-worker unforce scope (Inc3 scaffolding). A worker that
        forces under unforcing binds its own stripe + owner timeline here
