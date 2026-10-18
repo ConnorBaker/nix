@@ -1882,6 +1882,275 @@ struct Closure
 
 };
 
+/* --------------------------------------------------------------------------
+   Inc3-S2: the reachability-DFS promotion trigger for the drv-set wave barrier.
+
+   Replaces the force-count nomination (`countTargets`, `promoteAfter >= 2`) on
+   the drv-set driver's single-threaded wave (eval-cores == 1, M == 1). The
+   driver records each output element's root in `state.waveElementRoots`; at the
+   quiescent barrier, BEFORE any revert, this DFS-walks each element's young
+   result closure over a dense side table keyed by `(p - evalRegion.base) >> 4`
+   (every young object is 16-byte aligned, so the start address is a unique
+   slot). A young object first reached by element E is tagged E; when a
+   DIFFERENT element reaches it, it is SHARED (reachable from >= 2 elements) and
+   its producer -- `ownerOf(p)`, the target that forced it -- is nominated for
+   promotion. PRIVATE (one element) and UNREACHED (no element) young foam is
+   left un-nominated, i.e. reverted.
+
+   The nomination is ONLY a heuristic for which targets to consider: the
+   `OwnerClosure` that `decideJob` runs over it (unchanged) closes it to the
+   ownership-closure invariant, so pointer-identity is preserved for ANY
+   nomination -- the shipped single-thread guarantee (see the policy comment
+   above `JobTargets`). So this changes only the promoted/reverted SPLIT, never
+   the values; a missed share costs a reforce, an over-nomination costs
+   retention, neither a wrong value. The edge set mirrors `Closure::children`
+   (identity-bearing objects -- cells, Bindings, list element arrays -- are
+   nominated; Envs are traversed but never nominated, as the owner closure does
+   not nominate Env owners). The walk stops at OLD/spine cells
+   (`!evalRegion.contains`), which are already stable.
+
+   Single-threaded only (the side-table statics are not synchronised); reached
+   only on the eval-cores == 1 reclamation path, where `state.waveElementRoots`
+   is non-empty and the owner timeline is on. */
+
+enum ReachKind : uint8_t { rkValue, rkEnv, rkBindings, rkElems };
+
+struct ReachTask
+{
+    const void * p;
+    ReachKind kind;
+    size_t aux; /* rkElems: element count */
+};
+
+/* Dense side table over the active region (keyed by `(p - base) >> 4`):
+   0 = untagged, 1 = SHARED, >= 2 = owned by element (tag - 2). A single
+   MAP_NORESERVE mapping sized to one region, reused across barriers (lazily
+   backed, so a huge element does not eagerly commit it); the slots a barrier
+   sets are recorded in `elemTouched` and cleared at its end, so the base may
+   change (the nursery floor rises) between barriers without stale marks. */
+static uint32_t * elemTag = nullptr;
+static size_t elemTagSlots = 0;
+static std::vector<size_t> elemTouched;
+static constexpr uint32_t kElemShared = 1;
+
+/* When set, drop the design's second nomination disjunct (persistent-root /
+   force-count reuse), nominating by within-wave reachability (deg >= 2) alone.
+   A tuning knob for the memory/reforce trade; read once. */
+static bool reachDeg2Only()
+{
+    static bool v = getenv("NIX_UNFORCE_S2_DEG2_ONLY") != nullptr;
+    return v;
+}
+
+struct ReachNominator
+{
+    const char * base;
+    std::vector<bool> & promote;
+    const std::vector<std::pair<const Value *, uint32_t>> & byCell;
+    std::vector<ReachTask> stack;
+    uint32_t curElem = 0;
+
+    std::optional<size_t> indexOf(const Value * c) const
+    {
+        auto i = std::lower_bound(
+            byCell.begin(), byCell.end(), c, [](const auto & e, const Value * c) {
+                return std::less<const Value *>{}(e.first, c);
+            });
+        if (i == byCell.end() || i->first != c)
+            return std::nullopt;
+        return i->second;
+    }
+
+    /* A shared identity-bearing object's producer must be promoted. */
+    void nominate(const void * p)
+    {
+        auto o = ownerOf(p);
+        if (o == noOwner)
+            return;
+        /* `ownerOf` names a cell logged this job; it may not be a target if it
+           was driver-allocated -- then there is nothing to nominate. */
+        if (auto t = indexOf(ownerCell(o)))
+            promote[*t] = true;
+    }
+
+    /* The own-mode state machine: tag `p` for `curElem` (walk its children),
+       or mark it SHARED and nominate its producer if another element already
+       owns it. The owner closure in `decideJob` pulls in the rest of a shared
+       object's subtree, so a shared object is not re-walked here. */
+    bool enter(const void * p, bool identityBearing)
+    {
+        if (!p || !evalRegion.contains(p))
+            return false;
+        size_t idx = size_t((const char *) p - base) >> 4;
+        uint32_t & slot = elemTag[idx];
+        if (slot == curElem || slot == kElemShared)
+            return false;
+        if (slot == 0) {
+            slot = curElem;
+            elemTouched.push_back(idx);
+            return true;
+        }
+        /* Owned by another element -> shared (already in `elemTouched`). */
+        slot = kElemShared;
+        if (identityBearing)
+            nominate(p);
+        return false;
+    }
+
+    void visitValue(const Value * v)
+    {
+        if (enter(v, true))
+            stack.push_back({v, rkValue, 0});
+    }
+    void visitEnv(const Env * e)
+    {
+        if (enter(e, false))
+            stack.push_back({e, rkEnv, 0});
+    }
+    void visitBindings(const Bindings * b)
+    {
+        if (enter(b, true))
+            stack.push_back({b, rkBindings, 0});
+    }
+    void visitElems(Value * const * elems, size_t size)
+    {
+        if (enter(elems, true))
+            stack.push_back({elems, rkElems, size});
+    }
+
+    /* Enumerate a tagged object's children (mirrors `Closure::children`). */
+    void scan(const ReachTask & t)
+    {
+        switch (t.kind) {
+        case rkValue: {
+            const Value & v = *(const Value *) t.p;
+            switch (v.internalType()) {
+            case tAttrs:
+                visitBindings(v.attrs());
+                break;
+            case tListSmall: {
+                auto l = v.rawSmallList();
+                visitValue(l[0]);
+                visitValue(l[1]);
+                break;
+            }
+            case tListN: {
+                auto l = v.rawList();
+                visitElems(l.elems, l.size);
+                break;
+            }
+            case tThunk:
+                visitEnv(v.thunk().env);
+                break;
+            case tApp:
+                visitValue(v.app().left);
+                visitValue(v.app().right);
+                break;
+            case tPrimOpApp:
+                visitValue(v.primOpApp().left);
+                visitValue(v.primOpApp().right);
+                break;
+            case tLambda:
+                visitEnv(v.lambda().env);
+                break;
+            case tFailed:
+                visitValue(v.failed().recoveryValue);
+                break;
+            case tUninitialized:
+            case tInt:
+            case tBool:
+            case tNull:
+            case tFloat:
+            case tString:
+            case tPath:
+            case tExternal:
+            case tPrimOp:
+            case tNumberOfInternalTypes:
+                break;
+            }
+            break;
+        }
+        case rkEnv: {
+            auto e = (const Env *) t.p;
+            auto n = envSizeOf(e);
+            visitEnv(e->up);
+            for (size_t i = 0; i < n; ++i)
+                visitValue(e->values[i]);
+            break;
+        }
+        case rkBindings: {
+            auto b = (const Bindings *) t.p;
+            b->forEachLayerValue([&](const Value * v) { visitValue(v); });
+            visitBindings(b->layerBase());
+            break;
+        }
+        case rkElems: {
+            auto elems = (Value * const *) t.p;
+            for (size_t i = 0; i < t.aux; ++i)
+                visitValue(elems[i]);
+            break;
+        }
+        }
+    }
+
+    /* Walk one element's result closure from `root`. */
+    void walk(const Value * root, uint32_t elem)
+    {
+        curElem = elem;
+        if (evalRegion.contains(root))
+            visitValue(root);
+        else
+            /* The root cell is OLD (a persistent attr); walk its young forced
+               contents directly. */
+            scan(ReachTask{root, rkValue, 0});
+        while (!stack.empty()) {
+            auto t = stack.back();
+            stack.pop_back();
+            scan(t);
+        }
+    }
+};
+
+/* Build the reachability nomination for the open wave. Returns nullopt when it
+   cannot run (the owner timeline is off -- overflow / no region -- or the side
+   table could not be mapped), so the caller falls back to the force-count
+   nomination and reproduces the shipped behaviour exactly in those cases. */
+static std::optional<std::vector<bool>> reachabilityNominate(EvalState & state, const JobTargets & targets)
+{
+    if (!ownersOn || !evalRegion.base || !evalRegion.cur)
+        return std::nullopt;
+
+    if (!elemTag) {
+        elemTagSlots = regionSize() >> 4;
+        elemTag = (uint32_t *) mmap(
+            nullptr, elemTagSlots * sizeof(uint32_t), PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (elemTag == MAP_FAILED) {
+            elemTag = nullptr;
+            elemTagSlots = 0;
+            return std::nullopt;
+        }
+    }
+
+    std::vector<bool> promote(targets.size());
+    std::vector<std::pair<const Value *, uint32_t>> byCell;
+    byCell.reserve(targets.size());
+    for (uint32_t i = 0; i < targets.cells.size(); ++i)
+        byCell.emplace_back(targets.cells[i], i);
+    std::sort(byCell.begin(), byCell.end());
+
+    ReachNominator nom{evalRegion.base, promote, byCell};
+    auto & roots = state.waveElementRoots;
+    for (size_t i = 0; i < roots.size(); ++i)
+        if (roots[i])
+            nom.walk(roots[i], uint32_t(i + 2));
+
+    for (auto idx : elemTouched)
+        elemTag[idx] = 0;
+    elemTouched.clear();
+    return promote;
+}
+
 /* Per target of a job, whether a live `UnforceSeen` set reported it
    (`reportedTargets`). */
 using Reported = std::vector<bool>;
@@ -2066,7 +2335,32 @@ std::vector<bool> decideJob(
                 copy(i);
     };
 
-    if (cfg.promoteAfter)
+    /* Inc3-S2: the drv-set wave barrier nominates by the design's full rule --
+       a target is promoted iff its producer owns a young object reachable from
+       >= 2 wave elements (`reachabilityNominate`), OR it is persistent-root
+       reachable, i.e. reused across waves. The second disjunct is realised by
+       the force-count map (`countTargets`, `promoteAfter`): a cell forced in
+       >= 2 jobs is exactly one a later wave re-navigates to from the
+       persistent roots (fileEvalCache / flake evalCaches / baseEnv), the
+       cross-batch spine that must stay in OLD to avoid reforce. The two are
+       UNIONED; the owner closure below closes either, so identity holds for the
+       union and only the promoted/reverted split differs from shipping -- the
+       values are byte-identical. Drivers that record no roots, and the fallback
+       cases where reachability cannot run (owner timeline off), keep the
+       shipped force-count behaviour exactly. `NIX_UNFORCE_S2_DEG2_ONLY` drops
+       the second disjunct (a tuning knob: lower RSS, more reforce). */
+    std::optional<std::vector<bool>> reach;
+    if (!state.waveElementRoots.empty())
+        reach = reachabilityNominate(state, targets);
+    if (reach) {
+        promote = std::move(*reach);
+        if (cfg.promoteAfter) {
+            auto counted = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
+            if (!reachDeg2Only())
+                for (size_t i = 0; i < promote.size(); ++i)
+                    promote[i] = promote[i] || counted[i];
+        }
+    } else if (cfg.promoteAfter)
         promote = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
 
     /* Cells reported to an `UnforceSeen` (holding a container a printer
@@ -2826,6 +3120,7 @@ void EvalState::endUnforceScope(size_t mark)
         rootTask.joinAndReclaim(/*keepWhole=*/true);
         curTask->escaped.clear();
         curTask = nullptr;
+        waveElementRoots.clear();
         if (cfg.stats)
             printStatsAtExit();
         return;
@@ -2915,6 +3210,9 @@ void EvalState::endUnforceScope(size_t mark)
        -- `escaped` is never appended to, so nothing to pin). */
     curTask->escaped.clear();
     curTask = nullptr;
+    /* Inc3-S2: the wave's element roots were consumed by `decideJob`'s
+       reachability nomination above; drop them before the next wave. */
+    waveElementRoots.clear();
 
     if (cfg.stats)
         printStatsAtExit();
@@ -2948,6 +3246,7 @@ void EvalState::endUnforceScopeRetaining()
     rootTask.joinAndReclaim(/*keepWhole=*/true);
     curTask->escaped.clear();
     curTask = nullptr;
+    waveElementRoots.clear();
 }
 
 } // namespace nix

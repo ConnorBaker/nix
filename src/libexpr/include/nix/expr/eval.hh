@@ -1279,6 +1279,30 @@ public:
     /** Policy only: in how many jobs each old cell was forced. */
     std::unordered_map<const Value *, uint32_t> forceCounts;
 
+    /** Inc3-S2: the roots of the output elements in the open wave -- one per
+        `UnforceBatch::Element` the drv-set driver visits. At the quiescent
+        wave barrier the reclamation runs a per-element reachability DFS over
+        these to classify the young foam -- a cell reachable from >= 2 elements
+        is SHARED (promote), from <= 1 is PRIVATE/UNREACHED (revert) -- which
+        replaces the force-count (`promoteAfter >= 2`) nomination for the
+        drv-set path. Empty for drivers that record no roots (print / json /
+        xml / search), which keep the force-count trigger unchanged. The
+        nomination is only a heuristic; the owner closure keeps identity for
+        any nomination, so this changes the promoted/reverted split, never the
+        values. Single-threaded in S2 (eval-cores == 1, M == 1); S3 moves it
+        per task. Consumed and cleared at the barrier (`endUnforceScope`). */
+    std::vector<const Value *> waveElementRoots;
+
+    /** Inc3-S2: record an output element's root for the wave barrier's
+        reachability-DFS promotion trigger. Cold: only the drv-set driver
+        calls it, guarded by its `unforce` flag; a no-op outside an open
+        scope. */
+    void noteWaveElementRoot(const Value * root)
+    {
+        if (isolationDepth) [[unlikely]]
+            waveElementRoots.push_back(root);
+    }
+
     /**
      * Open an unforce scope: thunks updated until the matching
      * `endUnforceScope` are recorded. Returns the log mark to pass back.

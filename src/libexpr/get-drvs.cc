@@ -436,6 +436,11 @@ static void getDerivations(
         for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
             std::string_view symbol{state.symbols[i->name]};
             UnforceBatch::Element element(batch);
+            /* Inc3-S2: the wave barrier classifies this element's result
+               closure by cross-element reachability (see
+               `EvalState::waveElementRoots`). */
+            if (drvs.unforce)
+                state.noteWaveElementRoot(i->value);
             try {
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
@@ -469,6 +474,10 @@ static void getDerivations(
         for (auto [n, elem] : enumerate(listView)) {
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
             UnforceBatch::Element element(batch);
+            /* Inc3-S2: record this element's root for the wave barrier's
+               reachability-DFS promotion trigger. */
+            if (drvs.unforce)
+                state.noteWaveElementRoot(elem);
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *elem, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
         }
