@@ -567,6 +567,16 @@ public:
     std::unique_ptr<Executor> executor;
 
     /**
+     * inc3-S1: whether the parallel Executor is enabled (eval-cores > 1, after
+     * the auto-cores resolution the Executor ctor performs). Out-of-line
+     * (defined in eval.cc) because `Executor` is only forward-declared in this
+     * header; lets cold out-of-libexpr persistent-root populate sites (the
+     * flake eval-cache rootLoader) gate their force-into-old on the threaded
+     * regime without pulling the executor/boost headers in.
+     */
+    bool parallelEnabled() const;
+
+    /**
      * inc2b-1: statistics for the blackhole wait/notify path. All are only
      * touched when a thread actually blocks on a concurrently-forced thunk,
      * i.e. never at `eval-cores = 1`.
@@ -928,6 +938,12 @@ private:
      */
     Value::ClosureThunk electThunk(Value & v, const PosIdx pos);
     Value::FunctionApplicationThunk electApp(Value & v, const PosIdx pos);
+
+    /* inc3-S1: the rethrow-parity test drives electThunk/electApp on a cell
+       already FINISHED (FAILED), the finished-election arm that a single-threaded
+       forceValue can never reach. Runtime-inert (friendship changes no layout or
+       codegen; the build stays byte-identical). */
+    friend class ElectionRethrowTest;
 
     void tryFixupBlackHolePos(Value & v, PosIdx pos);
 

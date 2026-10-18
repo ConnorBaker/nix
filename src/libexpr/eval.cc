@@ -1269,6 +1269,16 @@ struct ExprParseFile : Expr, gc
 
 } // namespace
 
+bool EvalState::parallelEnabled() const
+{
+    /* inc3-S1: see eval.hh. Defined here where Executor is complete. Null-safe:
+       `executor` is assigned late in the EvalState ctor, AFTER createBaseEnv
+       (which calls evalFile) has run; during base-env construction there is no
+       executor and no unforce scope (allocations already land in the base/OLD
+       arena), so FIO is correctly skipped. */
+    return executor && executor->enabled;
+}
+
 void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
 {
     auto resolvedPath = getConcurrent(*importResolutionCache, path);
@@ -1279,7 +1289,23 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
     }
 
     if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
-        forceValue(**v2, noPos);
+        /* inc3-S1 FIO: the fileEvalCache is a persistent root read lock-free
+           across waves (eval.cc getConcurrent above, no sync on a forced hit);
+           under the threaded regime force its result into OLD so the cell never
+           lives in a reclaimable stripe -- a concurrent caller reaching an
+           as-yet-unforced cached thunk here would otherwise be the first to
+           force it and land the result in its own stripe. Gated on
+           executor->enabled: at eval-cores==1 there is no concurrent cache
+           reader and the owner-timeline reclamation already keeps identity, so
+           the PauseRegion is not entered and behaviour is byte-identical to
+           base (including revert-on bs=0 identity). Inert under revert-off
+           (threads, retain-only): only changes which arena the cells live in. */
+        {
+            std::optional<PauseRegion> fioPause;
+            if (parallelEnabled())
+                fioPause.emplace();
+            forceValue(**v2, noPos);
+        }
         v = **v2;
         return;
     }
@@ -1303,7 +1329,20 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         },
         [&](auto & i) { vExpr = i.second; });
 
-    forceValue(*vExpr, noPos);
+    /* inc3-S1 FIO: force the imported-file WHNF into OLD (same persistent-root
+       reasoning and the same executor->enabled gating as the cache-hit path
+       above). The thunk alloc is already paused (the cvisit above); under
+       threads pausing the result force keeps the whole WHNF shell at a stable
+       OLD address, never moved/reverted, so cross-wave lock-free cache reads
+       stay valid. Bounded by laziness: only the WHNF shell + its (still lazy)
+       attribute thunks land OLD, not the transitive package graph. Byte-identical
+       to base at eval-cores==1 (PauseRegion not entered); inert under revert-off. */
+    {
+        std::optional<PauseRegion> fioPause;
+        if (parallelEnabled())
+            fioPause.emplace();
+        forceValue(*vExpr, noPos);
+    }
 
     v = *vExpr;
 }
@@ -2500,6 +2539,17 @@ Value::ClosureThunk EvalState::electThunk(Value & v, const PosIdx pos)
            publisher's release, so the caller's reads see the whole value.
            inc2c-1: no `endLoggedForce` here -- with winner-only `logPreImage`
            (below) a lost/finished cell never pushed anything to balance. */
+        /* inc3-S1 rethrow parity: the concurrent winner may have finished the
+           cell as a FAILED value. The sibling waited paths (forceValuePending
+           eval.cc:2470, forceValueOnPending eval.cc:2598) rethrow it; this
+           finished-election arm must too, else a concurrently-failed elected
+           cell is silently treated as a valid WHNF (dropped error). The acquire
+           read above happens-after the publisher's release, so `isFailed()` is a
+           safe read. Unreachable at eval-cores==1 (no concurrent finisher
+           between the inline isThunk() read and this acquire read) -> inert and
+           byte-identical there; a pure error-path correctness add under threads. */
+        if (v.isFailed()) [[unlikely]]
+            v.failed().rethrow();
         return {nullptr, nullptr};
     }
     Value::ClosureThunk t = v.thunk();
@@ -2541,6 +2591,11 @@ Value::FunctionApplicationThunk EvalState::electApp(Value & v, const PosIdx pos)
         /* pd==pdThunk dispatch -- see electThunk. A finished (non-thunk) word0
            must NOT be CASed back to pending; return "handled" (already forced).
            inc2c-1: no `endLoggedForce` (winner-only logPreImage). */
+        /* inc3-S1 rethrow parity: as electThunk -- a cell finished as FAILED by
+           the concurrent winner must rethrow here, matching the sibling waited
+           paths. Unreachable at eval-cores==1 (inert/byte-identical there). */
+        if (v.isFailed()) [[unlikely]]
+            v.failed().rethrow();
         return {nullptr, nullptr};
     }
     Value::FunctionApplicationThunk a = v.app();

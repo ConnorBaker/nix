@@ -27,6 +27,7 @@
 #include "nix/expr/eval-settings.hh"
 #include "nix/flake/lockfile.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/store-api.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/finally.hh"
@@ -1031,6 +1032,18 @@ ref<eval_cache::EvalCache> openEvalCache(EvalState & state, ref<const LockedFlak
         if (getEnv("NIX_ALLOW_EVAL").value_or("1") == "0")
             throw Error("not everything is cached, but evaluation is not allowed");
 
+        /* inc3-S1 FIO: this is the flake eval-cache's persistent root -- the
+           EvalCache reads the returned value (and navigates it via cursors)
+           lock-free across waves. Under the threaded regime force the flake
+           shell into OLD so the root never lives in a reclaimable stripe,
+           matching the fileEvalCache FIO in EvalState::evalFile. Gated on
+           executor->enabled so eval-cores==1 is byte-identical to base.
+           Bounded by laziness: only the flake attrset shell + its attribute
+           thunks (outputs still lazy) land OLD, not the transitive outputs
+           graph. Inert under revert-off (threads, retain-only). */
+        std::optional<PauseRegion> fioPause;
+        if (state.parallelEnabled())
+            fioPause.emplace();
         auto vFlake = state.allocValue();
         callFlake(state, *lockedFlake, *vFlake);
 

@@ -48,6 +48,7 @@ subdir('nix-meson-build-support/common')
 
 sources = files(
   'derived-path.cc',
+  'election-rethrow.cc',
   'error_traces.cc',
   'eval.cc',
   'json.cc',
