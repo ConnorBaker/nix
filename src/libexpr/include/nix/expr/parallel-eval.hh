@@ -21,6 +21,7 @@
 namespace nix {
 
 struct EvalSettings;
+struct EvalState;
 
 /**
  * Worker-thread stack size (parallel-eval line, inc2b-1).
@@ -113,6 +114,13 @@ struct Executor
     const unsigned int evalCores;
 
     const bool enabled;
+
+    /* inc2c-2: the EvalState that owns this executor (1:1), set right after
+       construction. Used only by `worker()` to open a per-worker unforce scope
+       when unforcing runs under threads (Inc3 scaffolding). INERT until 2c-3:
+       `enabled` implies eval-cores > 1, which the EvalState ctor guard forbids
+       together with unforce, so the worker-scope branch is never taken yet. */
+    EvalState * evalState = nullptr;
 
     const std::unique_ptr<InterruptCallback> interruptCallback;
 

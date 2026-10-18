@@ -9,6 +9,7 @@
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/parallel-eval.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/attr-set.hh"
@@ -227,24 +228,42 @@ static constexpr size_t stripeShift = 36; /* 64 GiB per stripe */
 static constexpr size_t stripeBytes = size_t(1) << stripeShift;
 static constexpr uintptr_t stripeMask = stripeBytes - 1;
 
-/* Reserved worker stripes. One for now (single-threaded); the parallel
-   increments raise this to `evalCores` and give each worker a stripe. A dev
-   override (`NIX_UNFORCE_STRIPES`) enlarges the reservation to prove the
-   striped layout; the active worker is still 0, so behaviour is unchanged. */
-static const size_t nStripes = [] {
+/* Reserved worker stripes, one per worker thread. inc2c-2 binds this to the
+   eval's `eval-cores` at the first scope open (`bindStripeCount`): at
+   eval-cores == 1 it is 1 (a single 64 GiB reservation, exactly as the
+   pre-striping per-job mapping), and the cores > 1 case is reserved for 2c-3
+   (the EvalState ctor still rejects eval-cores > 1 with unforce until then). A
+   dev override (`NIX_UNFORCE_STRIPES`), if set, wins and is fixed at static
+   init. `nStripes == 0` means "not yet bound": its only reader is `stripeBase`,
+   which is not reached until a scope opens (after `bindStripeCount`). */
+static const size_t stripeOverride = [] {
     auto s = getenv("NIX_UNFORCE_STRIPES");
-    size_t n = s ? strtoul(s, nullptr, 10) : 1;
-    return std::max<size_t>(1, n);
+    size_t n = s ? strtoul(s, nullptr, 10) : 0;
+    return n ? std::max<size_t>(1, n) : size_t(0);
 }();
+static size_t nStripes = stripeOverride;
+
+/* Bind `nStripes` to this eval's `eval-cores` at the first scope open, unless
+   the dev override already fixed it. Idempotent (the bound value is the same
+   for every worker of one eval, and the reservation is made once, after this).
+   NOTE for 2c-3: with `evalCores` workers plus the main thread there are up to
+   `evalCores + 1` forcing threads (ids [0, evalCores]); giving the main thread
+   its own stripe therefore needs `nStripes >= evalCores + 1` (or sharing stripe
+   0). Moot in 2c-2 (eval-cores == 1 while unforce is on), flagged for 2c-3. */
+static void bindStripeCount(size_t evalCores)
+{
+    if (!stripeOverride)
+        nStripes = std::max<size_t>(1, evalCores);
+}
 
 /* The single reserved striped mapping; stripe `id` is at base + id*stripeBytes. */
 static char * stripesBase = nullptr;
 
-/* inc2c-1: this worker's stripe (its worker id). Per-worker (initial-exec,
-   constant-initialized). At eval-cores == 1 there is one worker and it is
-   always 0, exactly as the former `static const activeStripe`; binding it to
-   `myEvalThreadId` for cores > 1 is inc2c-3's step (when `nStripes` also
-   becomes `evalCores`). */
+/* inc2c-1/2c-2: this worker's stripe. Per-worker (initial-exec,
+   constant-initialized); bound to `myEvalThreadId` at the first scope open
+   (`beginUnforceScope`). At eval-cores == 1 the one (main) worker has
+   `myEvalThreadId == 0`, so this is 0 -- the whole arena, exactly as the former
+   `static const activeStripe`. */
 [[gnu::tls_model("initial-exec")]] static thread_local uint32_t myStripe = 0;
 
 /* Whether allocation comes from the striped reservation (always, except under
@@ -261,6 +280,9 @@ static char * stripeBase(size_t id)
 {
     if (!stripesBase) {
         assert(stripeBytes == regionSize());
+        /* `bindStripeCount` runs before the first scope's `openRegion` reaches
+           here, so the count is bound (>= 1). */
+        assert(nStripes >= 1 && id < nStripes);
         stripesBase = (char *) mapArena(nStripes << stripeShift);
     }
     return stripesBase + (id << stripeShift);
@@ -896,10 +918,12 @@ static char * pageUp(char * p)
      - `evalBaseArena` / `evalUseBaseArena` -- the NIX_NOGC_BUMP debug arena,
        rejected with eval-cores > 1 by the EvalState ctor; a std::vector member
        would put a TLS-init guard on the alloc fallback.
-     - `jobOwner` -- the cross-task admission ARBITER, a redesign (per-task
-       admission) rather than a move; deferred to inc2c-2.
      - `allocatorErrors` -- a process-global mimalloc error counter, not
        per-task.
+   inc2c-2 DELETED `jobOwner` (the process-global single-job arbiter + panic):
+   per-worker disjoint stripes make it moot. Admission is per-worker lazy (the
+   first force on a worker binds its stripe + timeline; `beginUnforceScope`).
+   `EvalMemory::stats` and the per-worker `stats` merge remain for inc2c-3.
    See notes/research/PARALLEL-EVAL-INC2C-DESIGN.md Sec 1/6.
 */
 struct TaskUnforceState
@@ -924,6 +948,15 @@ struct TaskUnforceState
        single per-task counter, exactly as the global it replaces. */
     size_t generation = 0;
 
+    /* inc2c-2: Inc3 escape scaffolding. A cell this task published while another
+       task was awaiting it (a cross-thread consumer) escapes this task's private
+       foam and must be PINNED at the join, not reverted. The signal is
+       `old & awaitedBit` at the publish (Value::publishCompletionSlow); Inc3
+       will append the escaping cell here. INERT in 2c-2: never appended to, never
+       read -- revert is OFF, so nothing is reverted and every surviving cell is
+       pinned trivially (retain-only). */
+    std::vector<Value *> escaped;
+
     /* Task-join / reclamation seam. Runs once today, at the root task's end
        (`endUnforceScope`), where the single task reclaims its nursery
        segment: a kept-whole job RETAINS it (its objects become ordinary old
@@ -936,8 +969,21 @@ struct TaskUnforceState
     void joinAndReclaim(bool keepWhole);
 };
 
-/* The single root task: one instance today, so this is a pure rename. */
+/* The single root task: one instance today, so this is a pure rename.
+   NOTE for 2c-3/Inc3: `rootTask` is still process-global, so its nursery
+   bookkeeping (`keptStart`/`keptFloor`/`keptEnd`, env-size table) is shared
+   across workers. It must become per-worker/per-task before a worker's
+   retain-only join (below) can actually run concurrently; moot in 2c-2 (only
+   the main thread forces), flagged for 2c-3. */
 static TaskUnforceState rootTask;
+
+/* inc2c-2: the task whose unforce scope is open on THIS worker (Inc3 escape
+   scaffolding). Set to the worker's task at scope open, cleared at close.
+   `publishCompletionSlow`'s awaited branch (the cross-thread-escape seam) will,
+   in Inc3, append the escaping cell to `curTask->escaped`. INERT in 2c-2:
+   tracked (set/cleared) but never read to act on -- a new per-worker TLS set on
+   a cold path, so it changes no value and no counter. */
+[[gnu::tls_model("initial-exec")]] static thread_local TaskUnforceState * curTask = nullptr;
 
 static size_t envSizeTableBytes()
 {
@@ -2650,29 +2696,30 @@ void EvalState::endLoggedForceSlow(Value & v)
         setOwnerLast(uint32_t(saved >> 1));
 }
 
-/* The EvalState whose job is open. The per-job state above is per thread,
-   but the region (`evalRegion`) is
-   process-wide, so at most one job may be open in the process, and every
-   scope opened while it is must belong to its EvalState: another
-   EvalState's job would take over the region, and the first job's
-   decision would then see none of what it allocated. Nothing opens jobs
-   that way today (only the CLI's traversals
-   open jobs, on one thread with one EvalState); this checks it. */
-static std::atomic<const EvalState *> jobOwner = nullptr;
+/* inc2c-2: the process-global single-job arbiter `jobOwner` -- which CAS'd
+   nullptr->this and panicked if a second EvalState's job opened while one was
+   open -- is DELETED. It existed because the region/owner-timeline state was
+   process-wide, so at most one job could own it. inc2c-1 made all that state
+   per-worker (thread_local), and 2c-2 binds each worker to its own disjoint
+   stripe; concurrent jobs are therefore physically independent and need no
+   global arbiter. Admission is now per-worker and lazy: the first force on a
+   worker (isolationDepth 0->1) binds its stripe and opens its own timeline. */
 
 size_t EvalState::beginUnforceScope(const void * stackMark)
 {
-    if (!isolationDepth) {
-        const EvalState * none = nullptr;
-        if (!jobOwner.compare_exchange_strong(none, this))
-            panic("unforce: a job was opened while another EvalState's job is open");
-    } else
-        assert(jobOwner.load() == this);
     /* The canonical frame address is the caller's stack pointer at the call:
        frames the caller enters from now on lie below it, its own locals at
        or above. */
     scopeStackMarks.push_back((const char *) (stackMark ? stackMark : __builtin_dwarf_cfa()));
     if (!isolationDepth++) {
+        /* First force on this worker: bind its stripe (one per worker, indexed
+           by the eval-thread id -- 0 for the main thread -> stripe 0 -> the
+           whole arena at eval-cores == 1), bind the stripe count to eval-cores,
+           and point `curTask` at this worker's task (Inc3 escape scaffolding).
+           Nested forces on the same worker just bump the depth. */
+        bindStripeCount(executor->evalCores);
+        myStripe = myEvalThreadId;
+        curTask = &rootTask;
         openRegion();
         openOwners(*this);
     }
@@ -2685,7 +2732,9 @@ void EvalState::endUnforceScope(size_t mark)
     /* Only the outermost scope is a job. */
     if (--isolationDepth)
         return;
-    jobOwner = nullptr;
+    /* inc2c-2: no `jobOwner` to release -- admission is per-worker now.
+       `curTask` is cleared at the very end, after the join (where Inc3 consumes
+       `curTask->escaped`); inert in 2c-2. */
 
     auto & cfg = unforceSettings();
     stats.jobs++;
@@ -2768,8 +2817,43 @@ void EvalState::endUnforceScope(size_t mark)
     /* Task-join: the root task reclaims its nursery segment. */
     rootTask.joinAndReclaim(keepWhole);
 
+    /* inc2c-2: the join is done; clear the Inc3 escape context (inert in 2c-2
+       -- `escaped` is never appended to, so nothing to pin). */
+    curTask->escaped.clear();
+    curTask = nullptr;
+
     if (cfg.stats)
         printStatsAtExit();
+}
+
+/* inc2c-2: the per-worker scope close (Inc3 scaffolding; see Executor::worker).
+   Unlike `endUnforceScope` -- the main thread's full promote/revert decision --
+   a worker RETAINS its whole stripe at join: revert stays OFF until Inc3, so
+   reclamation is retain-only (`joinAndReclaim(keepWhole = true)` ->
+   `retainRegion`, never `releaseRegion`/revert). Every surviving cell keeps its
+   address, so pointer-equality is trivially preserved. INERT until 2c-3: never
+   reached while the eval-cores > 1 + unforce ctor guard stands.
+
+   NOTE for 2c-3: this retains into the still-shared `rootTask` (see its note);
+   it must reclaim a PER-WORKER task segment before it can run concurrently, and
+   this worker's `stats` must be summed into a process total here. */
+void EvalState::endUnforceScopeRetaining()
+{
+    scopeStackMarks.pop_back();
+    if (--isolationDepth)
+        return;
+    stats.jobs++;
+    rootTask.generation++;
+    /* A cleanly-finished worker has no running forces open and never consumes
+       its undo log (retain-only), so just close the owner timeline, retain the
+       whole stripe, and drop the log. 2c-3 adds per-worker task segmentation
+       and the cross-worker stats merge here. */
+    closeOwners();
+    undoLog.clear();
+    undoLog.shrink_to_fit();
+    rootTask.joinAndReclaim(/*keepWhole=*/true);
+    curTask->escaped.clear();
+    curTask = nullptr;
 }
 
 } // namespace nix

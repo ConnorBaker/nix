@@ -440,6 +440,9 @@ EvalState::EvalState(
             "whose bump allocator is not thread-safe; unset NIX_NOGC_BUMP");
 
     executor = std::make_unique<Executor>(settings);
+    /* inc2c-2: give the executor a back-pointer so a worker can open its own
+       per-worker unforce scope (Inc3 scaffolding; inert until 2c-3). */
+    executor->evalState = this;
 }
 
 EvalState::~EvalState() {}

@@ -680,8 +680,8 @@ class alignas(16)
          pending, no waiter :  pdPending | (tid << discriminatorBits)
          pending, awaited   :  pdPending | (tid << discriminatorBits) | awaitedBit
 
-       tid is small (<= eval-cores + 1, i.e. a few bits), so it never reaches
-       awaitedBit. */
+       tid is small (inc2c-2: a 0-based id in [0, eval-cores], i.e. a few bits),
+       so it never reaches awaitedBit. */
     static constexpr PackedPointer awaitedBit = PackedPointer(1) << 63;
 
     /**
@@ -796,8 +796,19 @@ class alignas(16)
            flagged. */
         payloadWords[1] = payload[1];
         PackedPointer old = AtomicWord0(payloadWords[0]).exchange(payload[0], std::memory_order_release);
-        if (old & awaitedBit)
+        if (old & awaitedBit) {
+            /* inc2c-2 Inc3 seam: `old & awaitedBit` at publish <=> a cross-thread
+               consumer awaited this cell, i.e. it ESCAPED the forcing task's
+               private foam and must be PINNED (not reverted) at that task's join.
+               This is the single documented Inc3 insertion point: Inc3 appends
+               `this` to the forcing worker's `curTask->escaped` here (reached via
+               a tiny unforce helper, since this `Value noexcept` method has no
+               EvalState/task context). In 2c-2 the branch is ONLY the wake below
+               -- no append -- and runs only on the (rare) awaited publish, which
+               cannot happen while the eval-cores > 1 + unforce ctor guard stands,
+               so it is exercised only once that guard is lifted (2c-3). */
             detail::notifyValueWaiters(this);
+        }
     }
 
 protected:

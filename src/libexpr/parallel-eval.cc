@@ -19,7 +19,16 @@ namespace detail {
 std::atomic<bool> parallelForcingArmed{false};
 }
 
-static std::atomic<uint32_t> nextEvalThreadId{1};
+/* inc2c-2: the eval-thread-id handout is 0-based so that a worker's id indexes
+   its stripe directly (`myStripe = myEvalThreadId`, unforce.cc). The main
+   evaluator thread is the first to touch this TLS (it forces before it
+   dispatches any work to a worker, and at eval-cores == 1 the one idle worker
+   never forces), so it is id 0 -> stripe 0 -> the whole arena, exactly as the
+   former `activeStripe == 0`. Worker ids are a contiguous [1, evalCores]
+   handout. (The absolute id is never observable: it is written transiently into
+   the pending word (fvMarkPending) and compared for self-cycles, never
+   persisted or printed, so this base change is byte-identical.) */
+static std::atomic<uint32_t> nextEvalThreadId{0};
 [[gnu::tls_model("initial-exec")]] thread_local uint32_t myEvalThreadId(nextEvalThreadId++);
 
 /* ------------------------------------------------------------------ *
@@ -150,6 +159,25 @@ void Executor::worker()
     ReceiveInterrupts receiveInterrupts;
 
     amWorkerThread = true;
+
+    /* inc2c-2: per-worker unforce scope (Inc3 scaffolding). A worker that
+       forces under unforcing binds its own stripe + owner timeline here
+       (beginUnforceScope -> myStripe = myEvalThreadId) and RETAINS the whole
+       stripe at exit (retain-only; revert stays OFF until Inc3). One scope per
+       worker lifetime suffices while everything is retained -- per-item
+       segmentation is only needed once revert turns on.
+
+       INERT until 2c-3: `enabled` implies eval-cores > 1, which the EvalState
+       ctor guard forbids together with unforce, so `enabled && unforce` is
+       never true here yet; and at eval-cores == 1 `enabled` is false and this
+       (single, idle) worker never pulls work, so it never forces. */
+    const bool workerScope = enabled && evalState && evalState->settings.unforce;
+    if (workerScope)
+        evalState->beginUnforceScope();
+    Finally closeWorkerScope([&]() {
+        if (workerScope)
+            evalState->endUnforceScopeRetaining();
+    });
 
     while (true) {
         Item item;

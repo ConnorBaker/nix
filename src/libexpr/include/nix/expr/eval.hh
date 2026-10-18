@@ -1329,6 +1329,14 @@ public:
     void endUnforceScope(size_t mark);
 
     /**
+     * inc2c-2: close a per-worker unforce scope, retaining the whole stripe
+     * (retain-only; revert stays OFF until Inc3). Opened from `Executor::worker`
+     * for a worker that forces under unforcing. INERT until 2c-3 (the
+     * eval-cores > 1 + unforce ctor guard forbids the only path that reaches it).
+     */
+    void endUnforceScopeRetaining();
+
+    /**
      * Check that the call depth is within limits, and increment it, until the returned object is destroyed.
      */
     /* inc2b-1: out of line so the thread_local `callDepth` TLS access (read +
