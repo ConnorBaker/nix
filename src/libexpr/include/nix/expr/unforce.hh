@@ -105,6 +105,13 @@ bool unforceIsScopeStackSlot(const void * p);
  */
 void unforceNoteClientCode();
 
+/** Inc3 S4-b-a1 (F4a): at the quiescent drv-set wave barrier, copy each
+    participating worker's thread_local stripe into a registry indexed by global
+    stripe id (validating the indexing). Reclamation stays OFF in a1 (this frees
+    nothing; the deep copy + TLS write-back/reset are S4-b-b). Called from the
+    drv-set driver after the wave barrier. */
+void unforceRehomeWorkerStripes();
+
 /** Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();
 

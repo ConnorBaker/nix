@@ -29,6 +29,9 @@
 #include <atomic>
 #include <set>
 #include <unordered_map>
+#include <map>
+#include <mutex>
+#include <deque>
 #include <unordered_set>
 
 #include "expr-config-private.hh"
@@ -2756,7 +2759,87 @@ void pruneCounts(
     std::abort();
 }
 
+/* ---------------------------------------------------------------------------
+   Inc3 S4-b-a1 (F4a): the cross-worker stripe RE-HOME. Each worker registers a
+   handle (pointers to its thread_local stripe -- stable addresses) at its first
+   scope open; at the quiescent drv-set wave barrier the MAIN thread copies each
+   PARTICIPATING worker's stripe into a registry INDEXED BY GLOBAL STRIPE ID
+   (reusing the F4b sparse indexing). a1 copies the region DESCRIPTOR + stats +
+   asserts the global-id indexing; the DEEP copy (undoLog/segs/task) and the TLS
+   write-back/reset are // S4-b-b (needed only once reclamation runs). Safe: the
+   barrier (wave pending==0 + executor idle) guarantees no worker is mutating.
+   --------------------------------------------------------------------------- */
+struct WorkerStripeHandle
+{
+    uint32_t stripeId = 0;
+    EvalRegion * region = nullptr;
+    EvalUndoLog * undoLog = nullptr;
+    SegStack * segs = nullptr;
+    TaskUnforceState * task = nullptr;
+};
+static std::mutex g_workerRegMutex;
+static std::map<uint32_t, WorkerStripeHandle> g_workerReg; /* global stripe id -> handle */
+static WaveController g_rehomeRegistry;                    /* populated at the barrier */
+
+struct RehomeStats
+{
+    size_t stripes = 0, undoEntries = 0, youngBytes = 0;
+};
+static RehomeStats g_lastRehome;
+
+/* Called ON a worker at its first scope open (`beginUnforceScope`) to register a
+   handle to its thread_local stripe. Idempotent per worker (stable addresses). */
+static void registerWorkerStripeHandle()
+{
+    WorkerStripeHandle h;
+    h.stripeId = myStripe;
+    h.region = &evalRegion;
+    h.undoLog = &undoLog;
+    h.segs = &ownerSegs;
+    h.task = &rootTask;
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    g_workerReg[myStripe] = h;
+}
+
+/* The re-home proper (runs on the main thread at the quiescent barrier). */
+static void rehomeWorkerStripesImpl()
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    RehomeStats stats;
+    for (auto & [id, h] : g_workerReg) {
+        if (!h.region->base)
+            continue; /* a worker that never forced -- not participating */
+        /* F4a + F4b validation: worker `id`'s region must sit at the global
+           stripe base for `id` (the global-stripe-id indexing is correct). */
+        assert((char *) h.region->base == stripeBase(id));
+        if (g_rehomeRegistry.stripes.size() <= id)
+            g_rehomeRegistry.stripes.resize(id + 1);
+        auto & dst = g_rehomeRegistry.stripes[id];
+        dst.region = *h.region; /* region DESCRIPTOR (base/cur/sizes) -- cheap */
+        dst.myStripe = id;
+        /* // S4-b-b: deep-copy for the reclamation release helpers:
+           //   dst.undoLog = *h.undoLog; dst.segs = *h.segs; dst.task = *h.task;
+           // (and after munmap, write the reset back into the worker's TLS:
+           //   *h.region = {}; h.undoLog->clear(); ...). Omitted in a1 (frees
+           // nothing; a deep copy of every worker's undo log would be prohibitive
+           // and unused). */
+        stats.stripes++;
+        stats.undoEntries += h.undoLog->size();
+        stats.youngBytes += size_t(h.region->cur - h.region->base);
+    }
+    g_lastRehome = stats;
+    if (getenv("NIX_UNFORCE_REHOME_DEBUG"))
+        fprintf(
+            stderr, "unforce rehome: stripes=%zu undoEntries=%zu youngBytes=%zu\n", stats.stripes, stats.undoEntries,
+            stats.youngBytes);
+}
+
 } // namespace
+
+void unforceRehomeWorkerStripes()
+{
+    rehomeWorkerStripesImpl();
+}
 
 /* ---------------------------------------------------------------------------
    Inc3 S4-b-a0 (F4b) test hook. Exercises the stripe-classification MATH
@@ -2809,6 +2892,61 @@ size_t waveStripeSpanForTest()
 size_t stripeShiftForTest()
 {
     return stripeShift;
+}
+
+/* ---- Inc3 S4-b-a1 (F4a) re-home test hook. Injects SYNTHETIC participating
+   workers (each region at the synthetic stripe base for its global id) and runs
+   the real `rehomeWorkerStripesImpl`, so the SPARSE global-stripe-id indexing +
+   the region-descriptor copy are validated deterministically without a real eval.
+   Use inside a `beginSyntheticWave`/`endSyntheticWave` pair (sets `stripesBase`).
+   ---- */
+static std::deque<EvalRegion> g_synthRegions;
+static std::deque<EvalUndoLog> g_synthLogs;
+
+void clearSyntheticWorkers()
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    g_workerReg.clear();
+    g_rehomeRegistry.stripes.clear();
+    g_synthRegions.clear();
+    g_synthLogs.clear();
+    g_lastRehome = {};
+}
+
+void injectSyntheticWorker(uint32_t id, size_t bytes)
+{
+    g_synthRegions.emplace_back();
+    g_synthLogs.emplace_back();
+    auto & r = g_synthRegions.back();
+    r.base = (char *) const_cast<char *>(stripeBase(id)); /* = synthetic base for `id` */
+    r.cur = r.base + bytes;
+    r.end = r.base + (size_t(1) << stripeShift);
+    WorkerStripeHandle h;
+    h.stripeId = id;
+    h.region = &r;
+    h.undoLog = &g_synthLogs.back();
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    g_workerReg[id] = h;
+}
+
+void runRehomeForTest()
+{
+    rehomeWorkerStripesImpl();
+}
+
+size_t lastRehomeStripes()
+{
+    return g_lastRehome.stripes;
+}
+
+bool rehomeRegistryHasStripe(uint32_t id)
+{
+    return id < g_rehomeRegistry.stripes.size() && g_rehomeRegistry.stripes[id].region.base != nullptr;
+}
+
+const void * rehomeRegistryStripeBase(uint32_t id)
+{
+    return id < g_rehomeRegistry.stripes.size() ? (const void *) g_rehomeRegistry.stripes[id].region.base : nullptr;
 }
 
 } // namespace unforce_test
@@ -3545,6 +3683,12 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
         curTask = &rootTask;
         openRegion();
         openOwners(*this);
+        /* Inc3 S4-b-a1 (F4a): a worker registers a handle to its thread_local
+           stripe here (stable addresses), so the main thread can re-home it at
+           the quiescent drv-set wave barrier. Worker-only: the main thread's
+           stripe 0 is the driver's own and is not re-homed. */
+        if (Executor::amWorkerThread)
+            registerWorkerStripeHandle();
     }
     return undoLog.size();
 }

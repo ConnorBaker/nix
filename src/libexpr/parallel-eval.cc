@@ -325,7 +325,17 @@ void Executor::worker()
         try {
             item.work();
         } catch (const Interrupted &) {
-            quit = true;
+            /* Inc3 S4-b-a1 (§2.5 refinement): distinguish a per-WAVE cancel from a
+               real teardown/signal. A wave cancel (`currentWave->cancel` set, but
+               NOT `quit` or a global SIGINT) must unwind only THIS item's wave --
+               it must NOT set `quit` and tear down the whole pool, or a later
+               drv-set wave on the main thread would spawn into a dead pool and
+               hang. A real teardown (`quit`) or a global interrupt still tears the
+               pool down as before. */
+            bool realQuit = quit.load(std::memory_order_acquire) || getInterrupted();
+            bool waveCancel = currentWave && currentWave->cancel.load(std::memory_order_acquire);
+            if (realQuit || !waveCancel)
+                quit = true;
             ex = std::current_exception();
         } catch (...) {
             ex = std::current_exception();

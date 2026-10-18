@@ -35,6 +35,13 @@ size_t waveStripeOfForTest(const void * p);
 bool youngWForTest(const void * p);
 size_t waveStripeSpanForTest();
 size_t stripeShiftForTest();
+/* F4a re-home (Inc3 S4-b-a1) test hook. */
+void clearSyntheticWorkers();
+void injectSyntheticWorker(uint32_t id, size_t bytes);
+void runRehomeForTest();
+size_t lastRehomeStripes();
+bool rehomeRegistryHasStripe(uint32_t id);
+const void * rehomeRegistryStripeBase(uint32_t id);
 } // namespace unforce_test
 
 class WaveS4baTest : public LibExprTest
@@ -178,6 +185,41 @@ TEST_F(WaveS4baTest, sparseStripeIdClassification)
     /* A high participating id (7) is classified young -- the bug the span fix
        closes (a stripes.size()-based span would call it OLD). */
     EXPECT_TRUE(youngWForTest(base + (size_t(7) << shift) + 123));
+}
+
+/* F4a (Inc3 S4-b-a1): the cross-worker re-home indexes the registry by GLOBAL
+   stripe id (sparse). Inject synthetic participating workers at sparse ids
+   {1,4,7}, run the re-home, and check each landed at its global index with the
+   right stripe base, and non-participating ids are empty slots. (Validates the
+   same `rehomeWorkerStripesImpl` the real barrier runs; the real-eval run also
+   asserts `region.base == stripeBase(id)` for the actual M workers.) */
+TEST_F(WaveS4baTest, f4aRehomeSparseWorkers)
+{
+    using namespace unforce_test;
+    const size_t shift = stripeShiftForTest();
+    auto base = (const char *) (uintptr_t(1) << (shift + 4));
+    const size_t n = 8; /* ids 0..7 */
+
+    beginSyntheticWave(base, n);
+    Finally end([]() {
+        endSyntheticWave();
+        clearSyntheticWorkers();
+    });
+    clearSyntheticWorkers();
+
+    injectSyntheticWorker(1, size_t(1) << 20);
+    injectSyntheticWorker(4, size_t(2) << 20);
+    injectSyntheticWorker(7, size_t(3) << 20);
+
+    runRehomeForTest();
+
+    EXPECT_EQ(lastRehomeStripes(), 3u);
+    for (uint32_t id : {uint32_t(1), uint32_t(4), uint32_t(7)}) {
+        EXPECT_TRUE(rehomeRegistryHasStripe(id)) << "id=" << id;
+        EXPECT_EQ(rehomeRegistryStripeBase(id), (const void *) (base + (size_t(id) << shift))) << "id=" << id;
+    }
+    for (uint32_t id : {uint32_t(0), uint32_t(2), uint32_t(3), uint32_t(5), uint32_t(6)})
+        EXPECT_FALSE(rehomeRegistryHasStripe(id)) << "non-participating id=" << id;
 }
 
 } // namespace nix

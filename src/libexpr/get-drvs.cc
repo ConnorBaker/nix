@@ -1,11 +1,14 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/unforce.hh"
+#include "nix/expr/parallel-eval.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/path-with-outputs.hh"
+#include "nix/util/finally.hh"
 
 #include <cstring>
+#include <optional>
 
 namespace nix {
 
@@ -408,6 +411,34 @@ static void getDerivations(
     const Bindings & autoArgs,
     const DrvSink & drvs,
     Done & done,
+    bool ignoreAssertionFailures);
+
+/* Inc3 S4-b-a1: process ONE drv-set attribute (the attrs-branch loop body),
+   factored out so the authoritative serial pass AND the warm pre-force tasks run
+   the SAME code -> the warm tasks force exactly what the serial pass forces. */
+static void processDrvSetElement(
+    EvalState & state,
+    const Attr & i,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    const DrvSink & drvs,
+    Done & done,
+    bool combineChannels,
+    bool ignoreAssertionFailures);
+
+/* Inc3 S4-b-a1: true on the MAIN thread while a drv-set fan-out is active, so a
+   recursive `getDerivations` (for a `recurseForDerivations` set) does NOT fan out
+   again (no nested dispatch). thread_local: workers never set it (they are gated
+   out by `!amWorkerThread`). */
+static thread_local bool drvSetFanOutActive = false;
+
+static void getDerivations(
+    EvalState & state,
+    Value & vIn,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    const DrvSink & drvs,
+    Done & done,
     bool ignoreAssertionFailures)
 {
     auto _level = state.addCallDepth(vIn.determinePos(noPos));
@@ -430,42 +461,106 @@ static void getDerivations(
            there are names clashes between derivations, the derivation
            bound to the attribute with the "lower" name should take
            precedence). */
-        /* With `unforce`, what each attribute's evaluation forced is
-           unforced once its batch is done (see `UnforceBatch`). */
-        UnforceBatch batch(state, drvs.unforce);
-        for (auto & i : v.attrs()->lexicographicOrder(state.symbols)) {
-            std::string_view symbol{state.symbols[i->name]};
-            UnforceBatch::Element element(batch);
-            /* Inc3-S2: the wave barrier classifies this element's result
-               closure by cross-element reachability (see
-               `EvalState::waveElementRoots`). */
-            if (drvs.unforce)
-                state.noteWaveElementRoot(i->value);
-            try {
-                debug("evaluating attribute '%1%'", symbol);
+        auto order = v.attrs()->lexicographicOrder(state.symbols);
+
+        /* Inc3 S4-b-a1: the drv-set fan-out. When unforcing runs under worker
+           threads, PRE-FORCE each element's derivation on a worker (a WARM task,
+           running the SAME `processDrvSetElement` into a DISCARD sink), then run
+           the authoritative serial pass below -- which is the SOLE producer of
+           `drvs` and hits the warm-forced values via the election protocol
+           (single producer per shared cell => byte-identical; drvPaths are
+           content hashes, not identities). Gated on the MAIN thread only
+           (`!amWorkerThread`) and not already inside a fan-out
+           (`!drvSetFanOutActive`), so a recursive `getDerivations` runs serially
+           (no nested dispatch). Reclamation stays OFF (a1): the barrier only
+           awaits quiescence and re-homes (frees nothing). */
+        bool fanOut = state.executor && state.executor->enabled && drvs.unforce && !Executor::amWorkerThread
+            && !drvSetFanOutActive;
+
+        std::optional<WaveScope> wave;
+        bool serialOk = false;
+        if (fanOut) {
+            drvSetFanOutActive = true;
+            wave.emplace(*state.executor);
+            for (auto * i : order) {
+                std::string_view symbol{state.symbols[i->name]};
                 if (!isAttrPathComponent(symbol))
                     continue;
-                std::string pathPrefix2 = addToPath(pathPrefix, symbol);
-                if (combineChannels)
-                    getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
-                else if (getDerivation(state, *i->value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
-                    /* If the value of this attribute is itself a set,
-                    should we recurse into it?  => Only if it has a
-                    `recurseForDerivations = true' attribute. */
-                    if (i->value->type() == nAttrs) {
-                        auto j = i->value->attrs()->get(state.s.recurseForDerivations);
-                        if (j
-                            && state.forceBool(
-                                *j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))
-                            getDerivations(
-                                state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
-                    }
-                }
-            } catch (Error & e) {
-                e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
-                throw;
+                Executor::WorkItems work;
+                work.emplace_back(
+                    [&state, i, &pathPrefix, &autoArgs, combineChannels, ignoreAssertionFailures, uf(drvs.unforce)]() {
+                        Done localDone;
+                        DrvSink discard{[](PackageInfo &) {}, uf};
+                        try {
+                            processDrvSetElement(
+                                state, *i, pathPrefix, autoArgs, discard, localDone, combineChannels,
+                                ignoreAssertionFailures);
+                        } catch (const Interrupted &) {
+                            throw; /* propagate a wave-cancel / teardown */
+                        } catch (...) {
+                            /* A warm hint's error is dropped -- the serial pass
+                               below surfaces the real (first, in-order) error. */
+                        }
+                    },
+                    uint8_t(0));
+                wave->spawn(std::move(work));
             }
         }
+
+        /* The barrier runs on EVERY exit from this scope (normal or unwinding),
+           so the warm tasks -- which reference `state`/`pathPrefix`/`autoArgs` --
+           are always awaited before this call returns. On an abnormal exit
+           (`!serialOk`) the wave is CANCELLED first so a sibling the serial pass
+           never reached unwinds promptly instead of hanging. */
+        Finally drainWave([&]() noexcept {
+            if (!wave)
+                return;
+            drvSetFanOutActive = false;
+            if (!serialOk)
+                wave->requestCancel();
+            try {
+                wave->barrier();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+            try {
+                state.executor->awaitExecutorIdle();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+            /* F4a: re-home each participating worker's stripe into the registry
+               (quiescent; frees nothing in a1). */
+            try {
+                unforceRehomeWorkerStripes();
+            } catch (...) {
+                ignoreExceptionInDestructor();
+            }
+        });
+
+        /* The authoritative serial pass -- byte-identical to base (the sole
+           producer of `drvs`). */
+        {
+            /* With `unforce`, what each attribute's evaluation forced is
+               unforced once its batch is done (see `UnforceBatch`). */
+            UnforceBatch batch(state, drvs.unforce);
+            for (auto * i : order) {
+                std::string_view symbol{state.symbols[i->name]};
+                UnforceBatch::Element element(batch);
+                /* Inc3-S2: the wave barrier classifies this element's result
+                   closure by cross-element reachability. */
+                if (drvs.unforce)
+                    state.noteWaveElementRoot(i->value);
+                try {
+                    debug("evaluating attribute '%1%'", symbol);
+                    processDrvSetElement(
+                        state, *i, pathPrefix, autoArgs, drvs, done, combineChannels, ignoreAssertionFailures);
+                } catch (Error & e) {
+                    e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
+                    throw;
+                }
+            }
+        }
+        serialOk = true;
     }
 
     else if (v.type() == nList) {
@@ -485,6 +580,37 @@ static void getDerivations(
 
     else
         state.error<TypeError>("expression does not evaluate to a derivation (or a set or list of those)").debugThrow();
+}
+
+/* Inc3 S4-b-a1: one drv-set attribute, exactly as the attrs-branch loop body did
+   it -- used by BOTH the authoritative serial pass and the warm pre-force tasks.
+   (Mirrors the original inline body; `done` is inert under `unforce`, so a warm
+   task's local `done` behaves identically to the serial pass's shared one.) */
+static void processDrvSetElement(
+    EvalState & state,
+    const Attr & i,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    const DrvSink & drvs,
+    Done & done,
+    bool combineChannels,
+    bool ignoreAssertionFailures)
+{
+    std::string_view symbol{state.symbols[i.name]};
+    if (!isAttrPathComponent(symbol))
+        return;
+    std::string pathPrefix2 = addToPath(pathPrefix, symbol);
+    if (combineChannels)
+        getDerivations(state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+    else if (getDerivation(state, *i.value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
+        /* If the value of this attribute is itself a set, should we recurse into
+           it? => Only if it has a `recurseForDerivations = true' attribute. */
+        if (i.value->type() == nAttrs) {
+            auto j = i.value->attrs()->get(state.s.recurseForDerivations);
+            if (j && state.forceBool(*j->value, j->pos, "while evaluating the attribute `recurseForDerivations`"))
+                getDerivations(state, *i.value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+        }
+    }
 }
 
 void getDerivations(
