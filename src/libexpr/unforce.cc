@@ -256,10 +256,18 @@ static std::atomic<size_t> nStripes{stripeOverride};
    `evalCores + 1` stripes at eval-cores > 1. At eval-cores == 1 only the main
    thread ever forces, so one stripe (the whole arena) suffices and the
    reservation stays byte-identical to inc2c-2. */
+static size_t waveM();
+
 static void bindStripeCount(size_t evalCores)
 {
-    if (!stripeOverride)
-        nStripes.store(evalCores > 1 ? evalCores + 1 : 1, std::memory_order_relaxed);
+    if (!stripeOverride) {
+        size_t n = evalCores > 1 ? evalCores + 1 : 1;
+        /* Inc3-S3: at eval-cores == 1 the drv-set wave may simulate M > 1
+           serialized pseudo-stripes, each needing its own disjoint stripe
+           arena; reserve M of them. */
+        n = std::max(n, waveM());
+        nStripes.store(n, std::memory_order_relaxed);
+    }
 }
 
 /* The single reserved striped mapping; stripe `id` is at base + id*stripeBytes. */
@@ -1043,6 +1051,215 @@ static void useEnvSizeTable(const char * mapping)
     evalRegion.envSizesBase = rootTask.envSizeMapping;
 }
 
+/* ==========================================================================
+   Inc3-S3: the M-stripe wave barrier (SERIALIZED, eval-cores == 1, M > 1).
+
+   S2 generalized the promotion trigger of ONE stripe's barrier. S3 generalizes
+   the barrier itself to M > 1 stripes reclaimed together at a single quiescent
+   wave barrier, still single-threaded: the batch's output elements are
+   partitioned into M consecutive pseudo-stripes, each forced into its OWN
+   stripe arena with its OWN owner timeline / undo log / nursery
+   (`TaskUnforceState`), held in a REGISTRY (`WaveController::stripes`); nothing
+   is reverted or freed until all M are forced. This validates the two A7
+   mechanisms before concurrency (S4): (a) the cross-`thread_local`
+   owner-timeline re-home -- the barrier reclaims across the M registered
+   states, not just the current thread's -- and (b) ONE shared Evacuator
+   forwarding map spanning all M stripes, so a young cell reachable from more
+   than one stripe's promoted closure is copied ONCE to a single OLD address
+   (identity across stripes; the `&a == &b` gate).
+
+   Because the owner-segment offset is a `uint32` within ONE 64 GiB stripe, the
+   M timelines CANNOT be rebased onto a single base (the global offset would
+   overflow). So the barrier keeps the M per-stripe timelines and routes
+   `ownerOf` / `ownerCell` / `envSizeOf` / young by ADDRESS (the stripe is
+   `(p - stripesBase) >> stripeShift`), via `g_wave`, in the COLD reclamation
+   helpers only (the Evacuator, the owner closure); the inlined force-path
+   `ownerOf` / `envSizeOf` are untouched, and `g_wave` is null except inside the
+   barrier, so the hot path and M == 1 are byte-identical.
+
+   Identity does NOT rest on the nomination: the shipped guarantee is that the
+   undo log + the owner-closure-closed Evacuator copy preserve `&a == &b` for
+   ANY nomination (policy comment above `JobTargets`; S2 review verdict #1). So
+   the M > 1 barrier nominates by the force count alone (`countTargets`, which
+   is owner-free and already cross-stripe, keyed by cell) and lets the unified
+   owner closure keep identity -- the drv-set values are byte-identical to the
+   base (only the promoted/reverted split, RSS and counters differ from the M==1
+   reachability path). The reachability refinement and the consumer-pair /
+   markFirst heuristics are skipped at M > 1 (RSS knobs, not identity); they stay
+   exactly as shipped at M == 1 (`g_wave` null). See
+   notes/reviews/unforce-parallel-inc3-s3.md.
+   ========================================================================== */
+
+/* The per-stripe context captured for the wave barrier: a snapshot of the
+   whole unforce `thread_local` block after that stripe's elements were forced.
+   `swapWaveContext` exchanges it with the live globals; during forcing the live
+   stripe is in the globals and the earlier stripes are parked here, and at the
+   barrier every stripe is parked here and the globals are a clean default. */
+struct WaveStripe
+{
+    EvalRegion region;
+    EvalUndoLog undoLog;
+    SegStack segs;
+    char * ownerSeg = nullptr;
+    uint32_t curOwner = noOwner;
+    bool ownersOn = false, ownersOverflowed = false, ownerConsumersOn = false;
+    size_t ownerHint = 0, ownerBudget = 0;
+    PairSet ownerConsumers;
+    uint64_t lastConsumerPair = PairSet::empty;
+    TaskUnforceState task;
+    uint32_t myStripe = 0;
+    /* Index-order flush bookkeeping: the element-index range this stripe
+       produced (contiguous, since stripes fill in order on one thread). */
+    size_t firstElement = 0, lastElement = 0;
+};
+
+/* The wave in progress on this (main) thread. `g_wave` is set ONLY while the
+   barrier runs, so the inlined force path never sees it. Single-threaded
+   (eval-cores == 1), so a file-static is sound -- the parallel S4 generalization
+   gives each worker its own. */
+struct WaveController;
+static WaveController * g_wave = nullptr;
+
+/* The Evacuator's `young` test spans all M wave stripes (so a cross-stripe
+   cell is copied, not shared then dangled); outside the barrier it is one
+   region. */
+static size_t waveStripeSpan(); /* bytes covered by the wave's stripes */
+
+[[gnu::always_inline]] static inline bool youngW(const void * p)
+{
+    if (g_wave) [[unlikely]] {
+        auto a = (const char *) p;
+        return a >= stripesBase && a < stripesBase + waveStripeSpan();
+    }
+    return evalRegion.contains(p);
+}
+
+/* The stripe (index into the wave registry) an address lives in. */
+[[gnu::always_inline]] static inline size_t waveStripeOf(const void * p)
+{
+    return size_t((const char *) p - stripesBase) >> stripeShift;
+}
+
+/* `ownerOf` for a parked stripe: the shipped lookup, reading the snapshot's
+   timeline (no `ownerHint` cache -- the barrier is cold). */
+static uint32_t ownerOfInStripe(const WaveStripe & st, const void * p)
+{
+    auto a = (const char *) p;
+    if (a >= st.ownerSeg)
+        return st.curOwner;
+    auto off = uint32_t((a - st.region.base) >> 4);
+    size_t n = st.segs.t - st.segs.b;
+    auto s = st.segs.b;
+    auto i = std::upper_bound(s + 1, s + n, off, [](uint32_t off, const OwnerSeg & s) { return off < s.off; });
+    return i[-1].owner;
+}
+
+static size_t envSizeOfInStripe(const WaveStripe & st, const Env * e)
+{
+    auto s = st.task.envSizeTable[((const char *) e - st.task.envSizeMapping) >> 4];
+    return s < 255 ? s : st.task.bigEnvSizes.at(e);
+}
+
+/* The barrier's routed owner id: `noOwner`, or `(stripe << waveOwnerShift) |
+   local-log-index`. The low bits match the single-stripe id at stripe 0, so the
+   non-wave path (`g_wave` null) is identical. */
+static constexpr uint32_t waveOwnerShift = 40;
+static constexpr uint64_t waveOwnerMask = (uint64_t(1) << waveOwnerShift) - 1;
+
+/* How many pseudo-stripes to simulate per wave at eval-cores == 1 (the drv-set
+   driver only; a no-op for any other driver). Default 1 = exact S2 behaviour.
+   Read once. */
+static size_t waveM()
+{
+    static size_t m = [] {
+        auto s = getenv("NIX_UNFORCE_WAVE_M");
+        size_t n = s ? strtoul(s, nullptr, 10) : 0;
+        return n ? std::max<size_t>(1, n) : size_t(1);
+    }();
+    return m;
+}
+
+/* The in-progress wave: the registry of parked per-stripe contexts, the active
+   (not-yet-parked) stripe index, and whether the wave has engaged for this
+   batch (set at the first element boundary once the drv-set driver has recorded
+   roots). */
+struct WaveController
+{
+    std::vector<WaveStripe> stripes; /* parked stripes [0, active) */
+    size_t active = 0;               /* the live stripe (in the globals) */
+    bool engaged = false;
+    size_t elementIndex = 0;         /* elements seen this wave (index-order) */
+
+    void reset()
+    {
+        stripes.clear();
+        active = 0;
+        engaged = false;
+        elementIndex = 0;
+    }
+
+    /* Park the live stripe and open the next one fresh (force phase). */
+    void advanceStripe(EvalState & state);
+    /* Reclaim all parked + the live stripe together (barrier). Returns the
+       bytes freed (for stats parity with the single-stripe path). */
+    void barrier(EvalState & state);
+};
+
+/* Exchange the live unforce `thread_local` block with a parked snapshot. Used
+   to park the live stripe (globals -> snapshot, leaving a clean default live)
+   and, at the barrier, to bring a parked stripe back into the globals for the
+   shipped per-region release helpers. `opens`/`openLogIndices` are empty at a
+   stripe boundary (no force is in flight), so they need no swap; `ownerLog`
+   stays `&undoLog` (a constant TLS address). */
+static void swapWaveContext(WaveStripe & w)
+{
+    std::swap(w.region, evalRegion);
+    std::swap(w.undoLog, undoLog);
+    std::swap(w.segs, ownerSegs);
+    std::swap(w.ownerSeg, ownerSeg);
+    std::swap(w.curOwner, curOwner);
+    std::swap(w.ownersOn, ownersOn);
+    std::swap(w.ownersOverflowed, ownersOverflowed);
+    std::swap(w.ownerConsumersOn, ownerConsumersOn);
+    std::swap(w.ownerHint, ownerHint);
+    std::swap(w.ownerBudget, ownerBudget);
+    std::swap(w.ownerConsumers, ownerConsumers);
+    std::swap(w.lastConsumerPair, lastConsumerPair);
+    std::swap(w.task, rootTask);
+    std::swap(w.myStripe, myStripe);
+}
+
+static size_t waveStripeSpan()
+{
+    /* All stripes the wave has opened are contiguous from `stripesBase`. */
+    return (g_wave ? (g_wave->stripes.size()) : 1) << stripeShift;
+}
+
+/* Routed owner id: `noOwner`, else `(stripe << waveOwnerShift) | local`. */
+static uint64_t ownerOfW(const void * p)
+{
+    if (!g_wave) [[likely]]
+        return ownerOf(p);
+    size_t s = waveStripeOf(p);
+    auto o = ownerOfInStripe(g_wave->stripes[s], p);
+    return o == noOwner ? uint64_t(noOwner) : (uint64_t(s) << waveOwnerShift) | o;
+}
+
+static const Value * ownerCellW(uint64_t o)
+{
+    if (!g_wave) [[likely]]
+        return ownerCell(uint32_t(o));
+    size_t s = o >> waveOwnerShift;
+    return g_wave->stripes[s].undoLog[o & waveOwnerMask].target;
+}
+
+static size_t envSizeOfW(const Env * e)
+{
+    if (!g_wave) [[likely]]
+        return envSizeOf(e);
+    return envSizeOfInStripe(g_wave->stripes[waveStripeOf(e)], e);
+}
+
 /* At a job's end its Envs are copied or kept as old objects, or freed:
    none of their sizes is read again. */
 static void dropEnvSizes(const char * base, const char * cur)
@@ -1288,7 +1505,10 @@ struct Evacuator
 
     bool young(const void * p) const
     {
-        return evalRegion.contains(p);
+        /* Inc3-S3: at the wave barrier `young` spans all M stripes, so a
+           cross-stripe cell is copied (into one shared OLD address) rather than
+           left pointing into a stripe about to be freed. */
+        return youngW(p);
     }
 
     template<typename T>
@@ -1328,7 +1548,9 @@ struct Evacuator
             return e;
         if (auto f = forwarded(e))
             return f;
-        auto size = envSizeOf(e);
+        /* Inc3-S3: route to the owning stripe's size table at the wave barrier
+           (a cross-stripe env is sized from ITS stripe, not the active one). */
+        auto size = envSizeOfW(e);
         auto & n = state.mem.allocEnv(size);
         stats.copiedBytes += sizeof(Env) + size * sizeof(Value *);
         n.up = e->up;
@@ -2226,7 +2448,10 @@ struct OwnerClosure
     std::vector<std::pair<const Value *, uint32_t>> byCell;
     std::vector<size_t> work;
     size_t added = 0;
-    uint32_t last = noOwner;
+    /* uint64: at the wave barrier an owner id is `(stripe << 40) | local`
+       (`ownerOfW`); `noOwner` widens unchanged, and at M == 1 the id is the
+       stripe-0 local index, so this is byte-identical to the shipped path. */
+    uint64_t last = noOwner;
 
     OwnerClosure(const JobTargets & targets, std::vector<bool> & promote)
         : targets(targets)
@@ -2253,12 +2478,12 @@ struct OwnerClosure
     {
         auto & x = *(OwnerClosure *) ctx;
         stats.ownerJobLookups++;
-        auto o = ownerOf(p);
+        auto o = ownerOfW(p);
         /* Consecutive objects mostly share an owner. */
         if (o == noOwner || o == x.last)
             return;
         x.last = o;
-        auto t = x.indexOf(ownerCell(o));
+        auto t = x.indexOf(ownerCellW(o));
         /* Every owner is a cell logged in this job. */
         assert(t);
         if (t && !x.promote[*t]) {
@@ -2656,6 +2881,175 @@ void UnforceBatch::open()
     openAt(__builtin_dwarf_cfa());
 }
 
+/* The wave in progress on the main thread (eval-cores == 1). */
+static WaveController theWave;
+
+/* Park the live stripe and open the next one (force phase). */
+void WaveController::advanceStripe(EvalState & state)
+{
+    /* Park the live stripe: its region, timeline, undo log and nursery move
+       into the registry, leaving a clean default in the globals. */
+    stripes.emplace_back();
+    stripes.back().firstElement = active == 0 ? 0 : stripes[active - 1].lastElement;
+    stripes.back().lastElement = elementIndex;
+    swapWaveContext(stripes.back());
+    /* Open the next stripe fresh (its own disjoint arena + timeline). */
+    active++;
+    myStripe = uint32_t(active);
+    openRegion();
+    openOwners(state);
+}
+
+/* The quiescent M-stripe barrier: reclaim every parked + the live stripe
+   together, with ONE shared Evacuator forwarding map (identity across stripes)
+   and per-stripe address-routed owner / env lookups. Single-threaded, so no
+   concurrent reader -- exactly the single-stripe barrier's precondition,
+   generalized over M stripes. */
+void WaveController::barrier(EvalState & state)
+{
+    /* Park the live (last) stripe; now every stripe is in the registry and the
+       globals are a clean default. */
+    stripes.emplace_back();
+    stripes.back().firstElement = active == 0 ? 0 : stripes[active - 1].lastElement;
+    stripes.back().lastElement = elementIndex;
+    swapWaveContext(stripes.back());
+
+    /* The merged undo log: every stripe's targets, in stripe order. The owner
+       ids the barrier routes (`ownerOfW`) name cells in a specific stripe's
+       log; `ownerCellW` resolves them, and every such cell is also a target
+       here, so the owner closure's `indexOf` finds it. */
+    EvalUndoLog merged;
+    size_t total = 0;
+    for (auto & st : stripes)
+        total += st.undoLog.size();
+    merged.reserve(total);
+    for (auto & st : stripes)
+        for (auto & e : st.undoLog)
+            merged.push_back(e);
+
+    size_t youngBytes = 0, youngTotal = 0;
+    for (auto & st : stripes) {
+        size_t span = size_t(st.region.cur - st.region.base);
+        youngTotal += span;
+        youngBytes += span - std::min(st.region.stringBytes, span);
+    }
+    (void) youngBytes;
+
+    stats.jobs++;
+    rootTask.generation++;
+    stats.logged += total;
+
+    g_wave = this;
+    JobTargets jt(merged, 0);
+    /* Nominate by the force count only (owner-free, already cross-stripe). The
+       owner closure below keeps identity for this or any nomination; the
+       reachability / consumer-pair refinements are RSS knobs, skipped at M > 1
+       (see the S3 header). */
+    std::vector<bool> promote = countTargets(state.forceCounts, jt, state.settings.unforceBatchSize, nullptr);
+    std::vector<Value> copies;
+    std::vector<bool> copied(jt.size());
+    try {
+        PauseRegion pause; /* copies land in OLD (stable addresses) */
+        Evacuator evac{state};
+        auto doCopy = [&](size_t i) {
+            if (copies.empty())
+                copies.resize(jt.size());
+            if (!copied[i]) {
+                copies[i] = evac.copy(*jt.cells[i]);
+                copied[i] = true;
+            }
+        };
+        /* The owner closure: ONE shared forwarding map spans all M stripes, so a
+           young cell reachable from several stripes' promoted closures is copied
+           once -> one OLD address -> `&a == &b` preserved (the S3 identity
+           gate). `OwnerClosure::note` routes `ownerOf`/`ownerCell` by address. */
+        OwnerClosure oc(jt, promote);
+        evac.onIdentity = &OwnerClosure::note;
+        evac.onIdentityCtx = &oc;
+        oc.run([&](size_t i) { doCopy(i); });
+        evac.onIdentity = nullptr;
+        for (size_t i = 0; i < jt.size(); ++i)
+            if (promote[i] && !copied[i])
+                doCopy(i);
+    } catch (std::bad_alloc &) {
+        g_wave = nullptr;
+        unforceFatal("deciding which values to keep at the end of an unforce wave, and copying them");
+    }
+    g_wave = nullptr;
+
+    pruneCounts(state.forceCounts, jt, promote);
+
+    /* The release: assign promoted copies / revert the rest over the merged
+       targets, then free every stripe. Nothing is allocated here. */
+    for (size_t i = 0; i < jt.size(); ++i)
+        if (promote[i]) {
+            *jt.cells[i] = copies[i];
+            stats.promoted++;
+        }
+    for (size_t i = 0; i < jt.size(); ++i) {
+        if (promote[i])
+            continue;
+        *jt.cells[i] = jt.preImage(i);
+        stats.reverted++;
+    }
+
+    /* Free every stripe's arena + owner-segment / env-size mappings, by
+       bringing each back into the globals for the shipped release helpers. */
+    for (auto & st : stripes) {
+        swapWaveContext(st);
+        closeOwners();
+        if (ownerSegs.map) {
+            munmap(ownerSegs.map, ownerSegs.mapped);
+            ownerSegs.map = nullptr;
+            ownerSegs.mapped = 0;
+            ownerSegs.bottom();
+        }
+        if (evalRegion.base)
+            stats.freedBytes += evalRegion.cur - evalRegion.base;
+        releaseRegion();
+        swapWaveContext(st);
+    }
+    clientCodeInJob = false;
+}
+
+/* Whether the drv-set wave should run M > 1 serialized pseudo-stripes for this
+   batch: eval-cores == 1 (no real workers, the S3 regime), M > 1, and the
+   driver is the order-independent drv-set one (it is the only one that records
+   element roots, which the wave barrier also needs). Any other driver keeps the
+   S2 single-stripe path (no reorder), byte-identical. */
+static bool waveEligible(EvalState & state)
+{
+    return waveM() > 1 && state.executor && !state.executor->enabled && !state.waveElementRoots.empty();
+}
+
+/* Memory the active stripe holds (young + owner timeline + undo log), as
+   `full()` accounts a batch, for the per-stripe 1/M fill threshold. */
+static size_t waveActiveStripeBytes()
+{
+    return unforceCurrentScopeBytes() + unforceOwnerBytes()
+        + undoLog.size() * (sizeof(EvalState::UndoEntry) + 2 * sizeof(void *));
+}
+
+/* An element finished. In wave mode: switch to the next pseudo-stripe when the
+   active one has filled its 1/M share, or end the batch (-> the M-stripe
+   barrier) when the last stripe fills. Returns true if it handled the boundary.
+   The wave total stays within one batch (M shares of batchSize/M). */
+static bool waveElementBoundary(UnforceBatch & batch, EvalState & state)
+{
+    if (!waveEligible(state))
+        return false;
+    theWave.engaged = true;
+    theWave.elementIndex++;
+    size_t share = state.settings.unforceBatchSize / waveM();
+    if (waveActiveStripeBytes() >= share) {
+        if (theWave.active + 1 < waveM())
+            theWave.advanceStripe(state);
+        else
+            batch.end();
+    }
+    return true;
+}
+
 bool UnforceBatch::full() const
 {
     if (!mark)
@@ -2682,6 +3076,10 @@ UnforceBatch::Element::Element(UnforceBatch & batch)
 
 UnforceBatch::Element::~Element()
 {
+    /* Inc3-S3: in wave mode the boundary switches pseudo-stripes / triggers the
+       M-stripe barrier; otherwise the shipped per-batch end. */
+    if (batch.mark && batch.state && waveElementBoundary(batch, *batch.state))
+        return;
     if (batch.full())
         batch.end();
 }
@@ -3125,6 +3523,26 @@ void EvalState::endUnforceScope(size_t mark)
             printStatsAtExit();
         return;
     }
+
+    /* Inc3-S3: a drv-set wave that split into >= 2 pseudo-stripes is reclaimed
+       by the M-stripe barrier (the live stripe is still in the globals; the
+       barrier parks it and reclaims all M together with one shared forwarding
+       map). A wave that never split (fewer elements than one 1/M share) falls
+       through to the shipped single-stripe path, byte-identical to S2. Only
+       reached at eval-cores == 1 (above). */
+    if (theWave.engaged && theWave.active >= 1) {
+        dropOpenForces(mark);
+        forgetSeenReports();
+        theWave.barrier(*this);
+        curTask->escaped.clear();
+        curTask = nullptr;
+        waveElementRoots.clear();
+        theWave.reset();
+        if (cfg.stats)
+            printStatsAtExit();
+        return;
+    }
+    theWave.reset();
 
     stats.jobs++;
     rootTask.generation++;
