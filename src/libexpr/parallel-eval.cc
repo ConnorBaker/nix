@@ -77,6 +77,11 @@ void notifyValueWaiters(void * valueAddr) noexcept
    plain initial-exec TLS load, no `_ZTH`/TLS-wrapper call on the serial path. */
 [[gnu::tls_model("initial-exec")]] constinit thread_local bool Executor::amWorkerThread = false;
 
+/* Inc3 S4-a: the ambient wave scope for this thread (see parallel-eval.hh).
+   `constinit` initial-exec, like `amWorkerThread`, so the serial path never
+   emits a TLS-init guard; read only in the cold `prim_parallel`. */
+[[gnu::tls_model("initial-exec")]] constinit thread_local WaveScope * Executor::currentWave = nullptr;
+
 unsigned int Executor::getEvalCores(const EvalSettings & evalSettings)
 {
     /* Note: the default number of cores is currently limited to 32 due to
@@ -265,6 +270,17 @@ void Executor::worker()
             state.wait(wakeup);
         }
 
+        /* Inc3 S4-a (F2): make the wave this item belongs to ambient for the
+           item's duration, so a nested spawn (`prim_parallel`) on this worker
+           inherits it via `currentWave`. The wave rides `Completion::wave`
+           (threaded into every Item at spawn), NOT a separate `Item::wave` each
+           producer must remember to stamp. Restore the PREVIOUS value (not
+           unconditionally null) so items that run while this worker was already
+           inside a wave nest correctly. */
+        WaveScope * prevWave = currentWave;
+        currentWave = item.completion ? item.completion->wave : nullptr;
+        Finally restoreWave([&]() noexcept { currentWave = prevWave; });
+
         std::exception_ptr ex;
         try {
             item.work();
@@ -351,6 +367,41 @@ void FutureVector::finishAll()
 }
 
 /* ------------------------------------------------------------------ *
+ * WaveScope (Inc3 S4-a)
+ * ------------------------------------------------------------------ */
+
+void WaveScope::barrier()
+{
+    /* Await transitive quiescence. Mirrors `FutureVector::finishAll`'s ordering
+       exactly (acquire load of `pending` under the state lock, wait on the cv),
+       which is what makes `pending == 0` a genuine quiescence point: a new wave
+       item can only be created by an already-counted running wave item, which
+       increments before it queues (`spawn`) and whose own `finish()` runs only
+       after its `work()` returns -- so while any transitive descendant exists
+       `pending >= 1`. */
+    std::vector<std::exception_ptr> exceptions;
+    {
+        auto state(completion->state_.lock());
+        while (completion->pending.load(std::memory_order_acquire) != 0)
+            state.wait(completion->cv);
+        std::swap(exceptions, state->exceptions);
+    }
+
+    /* S4-a: the only work bound to a wave is warm `__parallel` pre-force -- a
+       pure hint whose errors the fire-and-forget producers always dropped.
+       Swallow recorded warm-work exceptions (preserving that semantics), except
+       re-raise an interrupt so SIGTERM / teardown still unwinds the driver.
+       S4-b adds the real element-task error/cancel propagation. */
+    for (auto & ex : exceptions) {
+        try {
+            std::rethrow_exception(ex);
+        } catch (...) {
+            ignoreExceptionExceptInterrupt();
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ *
  * Blackhole wait / notify
  * ------------------------------------------------------------------ */
 
@@ -410,6 +461,22 @@ static void prim_parallel(EvalState & state, CallSite callSite, Value * const * 
     state.forceList(*args[0], pos, "while evaluating the first argument passed to builtins.__parallel");
 
     if (state.executor->enabled) {
+        /* S4-a: `prim_parallel` is observably IDENTICAL to base -- warm
+           deep-forces are spawned fire-and-forget and NOT awaited here, so a
+           throwing or diverging un-demanded hint element does not change the
+           result ("it does not change the result", below): the warm work's
+           errors are dropped (its spawn carries no completion) and its
+           divergence is cut at `~Executor` teardown (the Item-1 cancel poll).
+           This holds for ALL inputs, not just the drv-set gate.
+           // S4-b: when revert turns ON (a wave barrier munmaps stripes), a
+           // fire-and-forget warm item with `currentWave == nullptr` is the F1
+           // UAF. The correct fix is NOT inline forcing here (it changes
+           // throw-vs-value / terminate-vs-hang -- an L2 break) but a GLOBAL
+           // executor-idle barrier precondition (Gate-1 review option 2): the
+           // barrier blocks on a global outstanding-work count so ANY spawn --
+           // including this one, and any future producer -- is awaited before a
+           // stripe is freed. The wave-ambient routing (spawn into
+           // `currentWave->completion`) is then the per-wave accounting on top. */
         Executor::WorkItems work;
         for (auto value : args[0]->listView())
             if (!value->isFinished())

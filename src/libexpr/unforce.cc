@@ -3504,6 +3504,19 @@ void EvalState::endUnforceScope(size_t mark)
        and the full single-threaded promote/revert decision runs exactly as in
        inc2c-2 -- the byte-identical gate. */
     if (executor->enabled) {
+        /* // S4-b: this is the drv-set wave barrier / reclamation site. When
+           // revert turns on, open a `WaveScope` for the wave (the driver
+           // dispatches its output elements into `waveScope.completion`), AWAIT
+           // transitive quiescence (`barrier()` -> pending == 0) behind a GLOBAL
+           // executor-idle precondition (Gate-1 review option 2, so any stray
+           // producer is caught too), THEN run the single-writer reclamation
+           // Finally-ordered AFTER the barrier (G1-F3: still runs if it rethrows),
+           // with the cross-worker TLS registry re-home indexed by GLOBAL stripe
+           // id (G1-F4a/b/c) and the wake-all-domains + `currentWave->cancel`
+           // wiring (§2.5). S4-a builds only the dormant join PRIMITIVE
+           // (`WaveScope`/`barrier`/`Completion::wave` + the worker-pickup F2
+           // propagation in parallel-eval.cc); reclamation stays OFF and this
+           // branch is byte-identical to the pre-S4-a retain-only path. */
         stats.jobs++;
         rootTask.generation++;
         stats.logged += undoLog.size() - mark;
