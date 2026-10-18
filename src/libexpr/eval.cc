@@ -418,16 +418,13 @@ EvalState::EvalState(
         break;
     }
 
-    /* inc2b-1: mutual exclusion between multi-worker parallel eval and
-       unforcing. Wiring unforcing's hot state through worker threads is inc2c;
-       until then, running with eval-cores > 1 while eval-unforce is on is
-       rejected rather than silently racing the (still process-global)
-       unforcing state. At eval-cores == 1 (the default, and the inc2b-1 gate)
-       unforcing behaves exactly as inc2a. */
-    if (Executor::getEvalCores(settings) > 1 && settings.unforce)
-        throw Error(
-            "eval-cores > 1 (parallel evaluation) is not yet compatible with eval-unforce; "
-            "wiring unforcing through worker threads is deferred to increment 2c");
+    /* inc2c-3: the eval-cores > 1 <-> eval-unforce mutual-exclusion guard that
+       inc2b-1 raised here is LIFTED. Unforcing now runs under worker threads:
+       its hot owner-timeline/arena state is per-worker (thread_local,
+       initial-exec) and each worker/main gets its own disjoint 64 GiB stripe
+       (see unforce.cc). Reclamation stays OFF under threads (retain-only on
+       every thread; nothing is reverted/copied/freed), so no address a worker
+       may hold can be invalidated -- revert-on under threads is Inc3. */
 
     /* inc2b-2: the NIX_NOGC_BUMP bump allocator (BumpArena::alloc) advances its
        cursor without a lock, so concurrent allocValue() calls from worker
@@ -439,10 +436,12 @@ EvalState::EvalState(
             "eval-cores > 1 (parallel evaluation) is not compatible with NIX_NOGC_BUMP, "
             "whose bump allocator is not thread-safe; unset NIX_NOGC_BUMP");
 
-    executor = std::make_unique<Executor>(settings);
-    /* inc2c-2: give the executor a back-pointer so a worker can open its own
-       per-worker unforce scope (Inc3 scaffolding; inert until 2c-3). */
-    executor->evalState = this;
+    /* inc2c-3: the Executor takes the EvalState so it can set its `evalState`
+       back-pointer BEFORE spawning workers (a worker reads it at entry to
+       decide whether to open a per-worker unforce scope) and reserve the
+       striped unforce arena up front on this (main) thread. Previously the
+       back-pointer was assigned after construction, racing fast workers. */
+    executor = std::make_unique<Executor>(*this);
 }
 
 EvalState::~EvalState() {}

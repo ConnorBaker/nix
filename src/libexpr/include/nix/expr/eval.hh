@@ -1337,6 +1337,19 @@ public:
     void endUnforceScopeRetaining();
 
     /**
+     * inc2c-3: reserve the striped unforce arena up front, on the main thread,
+     * before the Executor spawns its worker threads. A worker opens its unforce
+     * scope at entry (`Executor::worker`), so without this the first few workers
+     * would race the lazy `stripesBase` reservation (and `nStripes` binding).
+     * `evalCores` is passed in because the Executor's own back-pointer
+     * (`EvalState::executor`) is not yet assigned while this runs (it is called
+     * from inside the Executor constructor). No-op unless unforcing is enabled;
+     * the caller only invokes it when eval-cores > 1, so the single-stripe
+     * eval-cores == 1 path keeps reserving lazily (byte-identical).
+     */
+    void reserveUnforceStripes(size_t evalCores);
+
+    /**
      * Check that the call depth is within limits, and increment it, until the returned object is destroyed.
      */
     /* inc2b-1: out of line so the thread_local `callDepth` TLS access (read +

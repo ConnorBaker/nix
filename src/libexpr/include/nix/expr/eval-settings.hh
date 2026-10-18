@@ -493,9 +493,9 @@ public:
        is 1 (serial), which keeps the executor present but idle -- effectively
        serial evaluation, byte-identical to the non-parallel path. A value of 0
        means "auto" (min(32, nproc)); any value > 1 enables multi-threaded
-       evaluation. Multiple workers are not yet compatible with eval-unforce
-       (increment 2c); constructing an EvalState with eval-cores > 1 while
-       eval-unforce is on is rejected. */
+       evaluation. inc2c-3: eval-cores > 1 is now compatible with eval-unforce
+       -- unforcing runs under worker threads with per-worker striped arenas,
+       reclamation retain-only (revert OFF until Inc3). */
     Setting<unsigned int> evalCores{
         this,
         1,
@@ -505,7 +505,7 @@ public:
           The default of `1` evaluates serially. A value of `0` means one thread
           per CPU core (capped at 32). Values greater than `1` require the
           [`parallel-eval`](@docroot@/development/experimental-features.md#xp-feature-parallel-eval)
-          experimental feature and are not yet compatible with `eval-unforce`.
+          experimental feature.
         )"};
 
     /* Never with Boehm GC: a collection may free an old cell

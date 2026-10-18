@@ -115,11 +115,10 @@ struct Executor
 
     const bool enabled;
 
-    /* inc2c-2: the EvalState that owns this executor (1:1), set right after
-       construction. Used only by `worker()` to open a per-worker unforce scope
-       when unforcing runs under threads (Inc3 scaffolding). INERT until 2c-3:
-       `enabled` implies eval-cores > 1, which the EvalState ctor guard forbids
-       together with unforce, so the worker-scope branch is never taken yet. */
+    /* inc2c-2/2c-3: the EvalState that owns this executor (1:1). Set in the
+       constructor BEFORE workers are spawned (2c-3), so a worker reading it at
+       entry to open its per-worker unforce scope never sees a null. Used by
+       `worker()` to open that scope when unforcing runs under threads. */
     EvalState * evalState = nullptr;
 
     const std::unique_ptr<InterruptCallback> interruptCallback;
@@ -130,7 +129,7 @@ struct Executor
 
     static unsigned int getEvalCores(const EvalSettings & evalSettings);
 
-    Executor(const EvalSettings & evalSettings);
+    Executor(EvalState & evalState);
 
     ~Executor();
 

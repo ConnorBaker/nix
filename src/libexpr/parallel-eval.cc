@@ -19,15 +19,20 @@ namespace detail {
 std::atomic<bool> parallelForcingArmed{false};
 }
 
-/* inc2c-2: the eval-thread-id handout is 0-based so that a worker's id indexes
-   its stripe directly (`myStripe = myEvalThreadId`, unforce.cc). The main
-   evaluator thread is the first to touch this TLS (it forces before it
-   dispatches any work to a worker, and at eval-cores == 1 the one idle worker
-   never forces), so it is id 0 -> stripe 0 -> the whole arena, exactly as the
-   former `activeStripe == 0`. Worker ids are a contiguous [1, evalCores]
-   handout. (The absolute id is never observable: it is written transiently into
-   the pending word (fvMarkPending) and compared for self-cycles, never
-   persisted or printed, so this base change is byte-identical.) */
+/* The per-eval-thread id, handed out in TLS-access order. It is used ONLY for
+   self-cycle detection: it is written transiently into a cell's pending word
+   (`fvMarkPending`) and compared against the forcing thread's own id, never
+   persisted or printed, so each thread only needs a distinct id and the handout
+   order is unobservable (byte-identical).
+
+   inc2c-3: this id NO LONGER picks the unforce stripe. Because workers are
+   spawned in the Executor constructor and open their unforce scopes at entry --
+   before the main thread's first force -- the id handout order does not match
+   thread role (the main thread can get a higher id than the workers). The
+   stripe is therefore assigned by thread role in `beginUnforceScope`
+   (`Executor::amWorkerThread`): the main thread always gets stripe 0 (the whole
+   arena at eval-cores == 1, byte-identical), and each worker a distinct stripe
+   in [1, evalCores]. */
 static std::atomic<uint32_t> nextEvalThreadId{0};
 [[gnu::tls_model("initial-exec")]] thread_local uint32_t myEvalThreadId(nextEvalThreadId++);
 
@@ -79,9 +84,10 @@ unsigned int Executor::getEvalCores(const EvalSettings & evalSettings)
                                                                        : evalSettings.evalCores;
 }
 
-Executor::Executor(const EvalSettings & evalSettings)
-    : evalCores(getEvalCores(evalSettings))
+Executor::Executor(EvalState & evalState)
+    : evalCores(getEvalCores(evalState.settings))
     , enabled(evalCores > 1)
+    , evalState(&evalState)
     , interruptCallback(createInterruptCallback([&]() {
         for (auto & domain : waiterDomainsStorage())
             domain.lock()->cv.notify_all();
@@ -94,6 +100,17 @@ Executor::Executor(const EvalSettings & evalSettings)
        value write stays a plain store, byte-identical to inc2a). */
     if (enabled)
         detail::parallelForcingArmed.store(true, std::memory_order_relaxed);
+
+    /* inc2c-3: reserve the striped unforce arena on this (main) thread, before
+       any worker is spawned. A worker opens its unforce scope at entry
+       (`worker()`), so without an up-front reservation the first workers would
+       race the lazy `stripesBase` reservation / `nStripes` binding. Done only
+       when unforcing actually runs under threads (eval-cores > 1 + unforce); at
+       eval-cores == 1 the single stripe is still reserved lazily by the main
+       thread's first scope, byte-identical to inc2c-2. The main thread's write
+       here happens-before each worker's reads via pthread_create. */
+    if (enabled && evalState.settings.unforce)
+        evalState.reserveUnforceStripes(evalCores);
 
     auto state(state_.lock());
     // FIXME: create worker threads on demand?

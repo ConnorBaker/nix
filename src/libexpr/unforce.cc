@@ -241,30 +241,45 @@ static const size_t stripeOverride = [] {
     size_t n = s ? strtoul(s, nullptr, 10) : 0;
     return n ? std::max<size_t>(1, n) : size_t(0);
 }();
-static size_t nStripes = stripeOverride;
+/* atomic (relaxed): at eval-cores > 1 the main thread binds this up front
+   (`reserveUnforceStripes`, before workers spawn) and each worker re-binds it
+   to the SAME value in `beginUnforceScope`; the atomic makes those concurrent
+   same-value writes well-defined. Reads are cold (region open only). */
+static std::atomic<size_t> nStripes{stripeOverride};
 
-/* Bind `nStripes` to this eval's `eval-cores` at the first scope open, unless
-   the dev override already fixed it. Idempotent (the bound value is the same
-   for every worker of one eval, and the reservation is made once, after this).
-   NOTE for 2c-3: with `evalCores` workers plus the main thread there are up to
-   `evalCores + 1` forcing threads (ids [0, evalCores]); giving the main thread
-   its own stripe therefore needs `nStripes >= evalCores + 1` (or sharing stripe
-   0). Moot in 2c-2 (eval-cores == 1 while unforce is on), flagged for 2c-3. */
+/* Bind `nStripes` to this eval's thread count at the first scope open (and up
+   front on the main thread at eval-cores > 1), unless the dev override already
+   fixed it. Idempotent: the bound value is the same for every thread of one
+   eval. inc2c-3: with `evalCores` workers PLUS the main thread there are up to
+   `evalCores + 1` forcing threads, each needing its own disjoint stripe (main
+   -> stripe 0, worker k -> stripe k in [1, evalCores]); so reserve
+   `evalCores + 1` stripes at eval-cores > 1. At eval-cores == 1 only the main
+   thread ever forces, so one stripe (the whole arena) suffices and the
+   reservation stays byte-identical to inc2c-2. */
 static void bindStripeCount(size_t evalCores)
 {
     if (!stripeOverride)
-        nStripes = std::max<size_t>(1, evalCores);
+        nStripes.store(evalCores > 1 ? evalCores + 1 : 1, std::memory_order_relaxed);
 }
 
 /* The single reserved striped mapping; stripe `id` is at base + id*stripeBytes. */
 static char * stripesBase = nullptr;
 
-/* inc2c-1/2c-2: this worker's stripe. Per-worker (initial-exec,
-   constant-initialized); bound to `myEvalThreadId` at the first scope open
-   (`beginUnforceScope`). At eval-cores == 1 the one (main) worker has
-   `myEvalThreadId == 0`, so this is 0 -- the whole arena, exactly as the former
-   `static const activeStripe`. */
+/* This worker's stripe. Per-worker (initial-exec, constant-initialized); bound
+   at the first scope open (`beginUnforceScope`). inc2c-3: assigned by thread
+   ROLE, not by `myEvalThreadId` access order -- the main thread is always
+   stripe 0 (the whole arena at eval-cores == 1, exactly as the former
+   `static const activeStripe`), and each worker takes a distinct stripe in
+   [1, evalCores] from `nextWorkerStripe`. Assigning by role is necessary
+   because workers open their scopes (at worker entry) before the main thread's
+   first force, so an access-order id would hand the main thread a non-zero
+   stripe. */
 [[gnu::tls_model("initial-exec")]] static thread_local uint32_t myStripe = 0;
+
+/* inc2c-3: the next stripe index to hand a worker. Workers get [1, evalCores];
+   stripe 0 is reserved for the main thread. Incremented once per worker at its
+   first (and only) scope open. */
+static std::atomic<uint32_t> nextWorkerStripe{1};
 
 /* Whether allocation comes from the striped reservation (always, except under
    the tripwire dial). */
@@ -281,9 +296,12 @@ static char * stripeBase(size_t id)
     if (!stripesBase) {
         assert(stripeBytes == regionSize());
         /* `bindStripeCount` runs before the first scope's `openRegion` reaches
-           here, so the count is bound (>= 1). */
-        assert(nStripes >= 1 && id < nStripes);
-        stripesBase = (char *) mapArena(nStripes << stripeShift);
+           here, so the count is bound (>= 1). At eval-cores > 1 this first
+           reservation is made on the main thread by `reserveUnforceStripes`
+           (before workers spawn), so workers only ever read `stripesBase`. */
+        auto n = nStripes.load(std::memory_order_relaxed);
+        assert(n >= 1 && id < n);
+        stripesBase = (char *) mapArena(n << stripeShift);
     }
     return stripesBase + (id << stripeShift);
 }
@@ -969,13 +987,15 @@ struct TaskUnforceState
     void joinAndReclaim(bool keepWhole);
 };
 
-/* The single root task: one instance today, so this is a pure rename.
-   NOTE for 2c-3/Inc3: `rootTask` is still process-global, so its nursery
-   bookkeeping (`keptStart`/`keptFloor`/`keptEnd`, env-size table) is shared
-   across workers. It must become per-worker/per-task before a worker's
-   retain-only join (below) can actually run concurrently; moot in 2c-2 (only
-   the main thread forces), flagged for 2c-3. */
-static TaskUnforceState rootTask;
+/* The root task of THIS worker. inc2c-3: per-worker (thread_local,
+   initial-exec). Its nursery bookkeeping (`keptStart`/`keptFloor`/`keptEnd`,
+   env-size table, `generation`) was process-global through inc2c-2, which was
+   sound only because the eval-cores > 1 + unforce ctor guard kept exactly one
+   (main) thread forcing. 2c-3 lifts that guard, so each worker now anchors and
+   recycles its OWN disjoint stripe through its own `rootTask`; a shared one
+   would have every worker overwrite `keptStart` with its own stripe base.
+   Reached only on the owning thread (set/read inside its own scope). */
+[[gnu::tls_model("initial-exec")]] static thread_local TaskUnforceState rootTask;
 
 /* inc2c-2: the task whose unforce scope is open on THIS worker (Inc3 escape
    scaffolding). Set to the worker's task at scope open, cleared at close.
@@ -2712,18 +2732,54 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
        or above. */
     scopeStackMarks.push_back((const char *) (stackMark ? stackMark : __builtin_dwarf_cfa()));
     if (!isolationDepth++) {
-        /* First force on this worker: bind its stripe (one per worker, indexed
-           by the eval-thread id -- 0 for the main thread -> stripe 0 -> the
-           whole arena at eval-cores == 1), bind the stripe count to eval-cores,
-           and point `curTask` at this worker's task (Inc3 escape scaffolding).
-           Nested forces on the same worker just bump the depth. */
-        bindStripeCount(executor->evalCores);
-        myStripe = myEvalThreadId;
+        /* First force on this thread: bind its stripe, bind the stripe count to
+           the thread count, and point `curTask` at this thread's task (Inc3
+           escape scaffolding). Nested forces just bump the depth.
+
+           inc2c-3: the stripe is chosen by thread ROLE, not by `myEvalThreadId`
+           access order. The main thread always takes stripe 0 (the whole arena
+           at eval-cores == 1 -> byte-identical to inc2c-2); each worker takes a
+           distinct stripe in [1, evalCores] from `nextWorkerStripe`. This must
+           be role-based because workers open their scopes at worker entry --
+           before the main thread's first force -- so an access-order id would
+           hand the main thread a non-zero stripe. `rootTask` is thread_local,
+           so `&rootTask` is this thread's own task.
+
+           Only the MAIN thread binds the stripe count here: at eval-cores == 1
+           `reserveUnforceStripes` is not called, so the main thread's first
+           scope must bind it (to 1). A WORKER must NOT touch `executor`: a
+           worker opens its scope at entry from inside the Executor constructor's
+           spawn loop, while `EvalState::executor` (a `unique_ptr`) is still
+           being assigned by `make_unique` -- reading it there is a null deref /
+           data race. For workers, `nStripes` is already bound (and `stripesBase`
+           reserved) by `reserveUnforceStripes`, which ran on the main thread
+           before this worker was spawned (happens-before via pthread_create);
+           a worker opens a scope only when `enabled && unforce`, which is
+           exactly when `reserveUnforceStripes` ran. */
+        if (!Executor::amWorkerThread)
+            bindStripeCount(executor->evalCores);
+        myStripe = Executor::amWorkerThread ? nextWorkerStripe.fetch_add(1, std::memory_order_relaxed) : 0;
+        assert(myStripe < nStripes.load(std::memory_order_relaxed));
         curTask = &rootTask;
         openRegion();
         openOwners(*this);
     }
     return undoLog.size();
+}
+
+/* inc2c-3: reserve the striped arena up front, on the main thread, before the
+   Executor spawns workers (each worker opens its scope at entry and would
+   otherwise race the lazy `stripesBase`/`nStripes` init). Only reached at
+   eval-cores > 1 with unforce on (the caller guards), and only when stripes are
+   actually used (not under the tripwire debug dial, which keeps per-job
+   standalone mappings). The main thread's writes here happen-before every
+   worker's reads via pthread_create. */
+void EvalState::reserveUnforceStripes(size_t evalCores)
+{
+    if (!unforceEnabled(*this) || !useStripes())
+        return;
+    bindStripeCount(evalCores);
+    (void) stripeBase(0);
 }
 
 void EvalState::endUnforceScope(size_t mark)
@@ -2737,6 +2793,44 @@ void EvalState::endUnforceScope(size_t mark)
        `curTask->escaped`); inert in 2c-2. */
 
     auto & cfg = unforceSettings();
+
+    /* inc2c-3: once unforcing runs under worker threads (eval-cores > 1),
+       reclamation stays OFF on EVERY thread -- including the main thread's
+       top-level batches. The main thread RETAINS its whole nursery (exactly
+       like a worker's `endUnforceScopeRetaining`): NOTHING is reverted,
+       promoted-by-copy or freed, so no address another worker may hold can be
+       invalidated. The owner timeline and `logPreImage` still run during
+       forcing (logging ON) -- only the promote/revert DECISION (the Evacuator /
+       `decideJob` / release block below) is skipped, so the reclamation
+       counters stay clean (reverted/promoted/copiedBytes/freedBytes = 0;
+       keptJobs/keptJobBytes/logged reflect the retained work). The printer's
+       «repeated» seen-set stays exact without `translateSeen`: nothing moves,
+       so every job-region `seen` entry still points at a live, retained object
+       across batches (`jobKeys`); only `forgetSeenReports` is needed, to clear
+       the per-batch reported cells. Revert-on under threads (pin-on-escape) is
+       Inc3. At eval-cores == 1 (`enabled == false`) this branch is never taken
+       and the full single-threaded promote/revert decision runs exactly as in
+       inc2c-2 -- the byte-identical gate. */
+    if (executor->enabled) {
+        stats.jobs++;
+        rootTask.generation++;
+        stats.logged += undoLog.size() - mark;
+        /* Balance the owner timeline / `opens` stack like the full path (a
+           clean batch boundary has no running forces to drop). */
+        dropOpenForces(mark);
+        forgetSeenReports();
+        closeOwners();
+        stats.keptJobs++;
+        undoLog.resize(mark);
+        undoLog.shrink_to_fit();
+        rootTask.joinAndReclaim(/*keepWhole=*/true);
+        curTask->escaped.clear();
+        curTask = nullptr;
+        if (cfg.stats)
+            printStatsAtExit();
+        return;
+    }
+
     stats.jobs++;
     rootTask.generation++;
     stats.logged += undoLog.size() - mark;
