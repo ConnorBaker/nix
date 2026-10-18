@@ -80,7 +80,7 @@ unsigned int Executor::getEvalCores(const EvalSettings & evalSettings)
        scalability bottlenecks. The eval-cores setting defaults to 1 in inc2b-1
        (serial); 0 means "auto". */
     return evalSettings.evalProfilerMode != EvalProfilerMode::disabled ? 1
-           : evalSettings.evalCores == 0UL                             ? std::min(32U, Settings::getDefaultCores())
+           : evalSettings.evalCores == 0UL                             ? std::min(32U, nix::Settings::getDefaultCores())
                                                                        : evalSettings.evalCores;
 }
 
