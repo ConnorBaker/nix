@@ -1257,6 +1257,12 @@ static uint64_t ownerOfW(const void * p)
     if (!g_wave) [[likely]]
         return ownerOf(p);
     size_t s = waveStripeOf(p);
+    /* // S4-b-b2b: `youngW` admits the WHOLE reservation (all `nStripes`), but a
+       // wave may use a SPARSE subset -- `g_wave->stripes[s]` can be an empty slot
+       // (region.base == nullptr) or past `.size()`. The pseudo-stripe (WAVE_M) and
+       // white-box paths are dense, so this is safe today; the real eval-cores>1
+       // barrier must bounds-check `s` / `region.base` here, in `ownerCellW` and
+       // `envSizeOfW` before routing (return `noOwner` / skip for an empty slot). */
     auto o = ownerOfInStripe(g_wave->stripes[s], p);
     return o == noOwner ? uint64_t(noOwner) : (uint64_t(s) << waveOwnerShift) | o;
 }
@@ -2180,13 +2186,40 @@ static bool reachDeg2Only()
     return v;
 }
 
+/* Inc3 S4-b-b2a: the reach walk is parametrized over (base, tag table, touched
+   list) and uses the `*W` address-routed primitives (`youngW` / `ownerOfW` /
+   `ownerCellW` / `envSizeOfW`). With `g_wave == nullptr` (the single-thread
+   reclamation path) every `*W` falls back to the live single-region primitive and
+   `base`/`tag`/`touched` are the shipped region/`elemTag`/`elemTouched`, so that
+   path is BYTE-IDENTICAL. With `g_wave` set to the assembled wave registry, the
+   SAME walk spans all M stripes: a pointer from one stripe into another is
+   followed (`youngW` is the global-span test), its owner is routed to the owning
+   stripe's timeline (`ownerOfInStripe`), and a cell shared across elements that
+   live on different workers is nominated -- the cross-worker sharing (T3) that a
+   per-stripe walk cannot see. The `bound` flag (test-only) restricts the young
+   test to one stripe, reproducing the pre-generalization (stripe-bounded) walk to
+   demonstrate it MISSES cross-worker shares (the teeth). */
 struct ReachNominator
 {
     const char * base;
+    uint32_t * tag;                 /* dense element-tag table (keyed off `base`) */
+    std::vector<size_t> * touched;  /* slots set this walk, cleared at the end */
     std::vector<bool> & promote;
     const std::vector<std::pair<const Value *, uint32_t>> & byCell;
     std::vector<ReachTask> stack;
     uint32_t curElem = 0;
+    bool bound = false;             /* test teeth: stop at stripe boundaries */
+    uint32_t boundStripe = 0;       /* the single stripe `bound` confines to */
+
+    /* The young test: cross-stripe (`youngW`) unless `bound`, which confines the
+       walk to `boundStripe` (the stripe-bounded behaviour the generalization
+       replaces). */
+    [[gnu::always_inline]] bool inYoung(const void * p) const
+    {
+        if (bound) [[unlikely]]
+            return youngW(p) && waveStripeOf(p) == boundStripe;
+        return youngW(p);
+    }
 
     std::optional<size_t> indexOf(const Value * c) const
     {
@@ -2199,15 +2232,18 @@ struct ReachNominator
         return i->second;
     }
 
-    /* A shared identity-bearing object's producer must be promoted. */
+    /* A shared identity-bearing object's producer must be promoted. Routed by
+       ADDRESS: `ownerOfW` finds the owning stripe's timeline, `ownerCellW` the
+       cell that owner names (both the live path when `g_wave` is null). */
     void nominate(const void * p)
     {
-        auto o = ownerOf(p);
-        if (o == noOwner)
+        auto o = ownerOfW(p);
+        if (o == uint64_t(noOwner))
             return;
-        /* `ownerOf` names a cell logged this job; it may not be a target if it
-           was driver-allocated -- then there is nothing to nominate. */
-        if (auto t = indexOf(ownerCell(o)))
+        /* The owner names a cell logged in some stripe's job; it may not be a
+           target (driver-allocated, or a prior-wave cell outside this wave's
+           slices) -- then there is nothing to nominate. */
+        if (auto t = indexOf(ownerCellW(o)))
             promote[*t] = true;
     }
 
@@ -2217,18 +2253,18 @@ struct ReachNominator
        object's subtree, so a shared object is not re-walked here. */
     bool enter(const void * p, bool identityBearing)
     {
-        if (!p || !evalRegion.contains(p))
+        if (!p || !inYoung(p))
             return false;
         size_t idx = size_t((const char *) p - base) >> 4;
-        uint32_t & slot = elemTag[idx];
+        uint32_t & slot = tag[idx];
         if (slot == curElem || slot == kElemShared)
             return false;
         if (slot == 0) {
             slot = curElem;
-            elemTouched.push_back(idx);
+            touched->push_back(idx);
             return true;
         }
-        /* Owned by another element -> shared (already in `elemTouched`). */
+        /* Owned by another element -> shared (already in `touched`). */
         slot = kElemShared;
         if (identityBearing)
             nominate(p);
@@ -2310,7 +2346,7 @@ struct ReachNominator
         }
         case rkEnv: {
             auto e = (const Env *) t.p;
-            auto n = envSizeOf(e);
+            auto n = envSizeOfW(e);
             visitEnv(e->up);
             for (size_t i = 0; i < n; ++i)
                 visitValue(e->values[i]);
@@ -2335,11 +2371,20 @@ struct ReachNominator
     void walk(const Value * root, uint32_t elem)
     {
         curElem = elem;
-        if (evalRegion.contains(root))
+        /* Inc3 S4-b-b2a: route the ROOT through `inYoung` like every other entry
+           decision in the walk (NOT `evalRegion.contains`). A root that is young in
+           a WORKER stripe must be TAGGED (`visitValue` -> `enter`), exactly as the
+           same cell is tagged when the whole foam is one region; otherwise a cell
+           that is one element's young root AND another element's child would flip
+           deg-2 (shared) to deg-1 (private) with the stripe split -- a
+           placement-dependent nomination. `inYoung` falls back to
+           `evalRegion.contains` when `g_wave` is null, so the single-thread path is
+           byte-identical. */
+        if (inYoung(root))
             visitValue(root);
         else
-            /* The root cell is OLD (a persistent attr); walk its young forced
-               contents directly. */
+            /* The root cell is OLD (a persistent attr) or not in this wave's young
+               span; walk its young forced contents directly. */
             scan(ReachTask{root, rkValue, 0});
         while (!stack.empty()) {
             auto t = stack.back();
@@ -2377,7 +2422,9 @@ static std::optional<std::vector<bool>> reachabilityNominate(EvalState & state, 
         byCell.emplace_back(targets.cells[i], i);
     std::sort(byCell.begin(), byCell.end());
 
-    ReachNominator nom{evalRegion.base, promote, byCell};
+    /* Single-thread path: `g_wave` is null, so the `*W` primitives fall back to
+       the live single region and this is byte-identical to the shipped walk. */
+    ReachNominator nom{evalRegion.base, elemTag, &elemTouched, promote, byCell};
     auto & roots = state.waveElementRoots;
     for (size_t i = 0; i < roots.size(); ++i)
         if (roots[i])
@@ -2386,6 +2433,90 @@ static std::optional<std::vector<bool>> reachabilityNominate(EvalState & state, 
     for (auto idx : elemTouched)
         elemTag[idx] = 0;
     elemTouched.clear();
+    return promote;
+}
+
+/* -------------------------------------------------------------------------
+   Inc3 S4-b-b2a: the CROSS-STRIPE reachability nomination. Runs at the
+   quiescent drv-set wave barrier over the assembled registry (`g_wave` set): the
+   SAME `ReachNominator`, now spanning all M stripes. From each drv-set element's
+   forced result it DFS-walks the young closure across stripe boundaries; a young
+   object reached by >= 2 elements is SHARED and its producer -- `ownerOfW(p)`,
+   routed to the owning stripe's timeline -- is nominated. This recovers the
+   single-wave reach set that a per-stripe walk cannot, because the cross-worker
+   shares (a cell one worker forced, another worker's element references) live in
+   a different stripe. COMPUTE ONLY -- reclamation stays OFF; nothing is
+   promoted-by-copy, reverted or freed. `roots` are the elements' forced result
+   Values. `wave` is the assembled registry; `targets` the merged this-wave slices.
+   The `bound`/`boundStripe` args drive the teeth test. Returns nullopt if the
+   cross-stripe tag table cannot be mapped.
+
+   // S4-b-b2b: at the REAL eval-cores>1 drain barrier the roots cannot come from
+   // `state.waveElementRoots` -- it is CLEARED at every `endUnforceScope`
+   // (unforce.cc ~4229 / ~4247 / ~4341 / ~4375), and the main's serial pass flushes
+   // ~26 batches, so it is EMPTY by the drain. b2b must re-seed the roots at the
+   // barrier (collect each element's forced result Value at dispatch in get-drvs.cc
+   // and hand them here) AND keep the main's (stripe 0) owner/env-size metadata
+   // alive across the wave so the walk can traverse the drv structure (T4). */
+static uint32_t * g_elemTagW = nullptr;
+static size_t g_elemTagWSlots = 0;
+static std::vector<size_t> g_elemTouchedW;
+
+static std::optional<std::vector<bool>> reachabilityNominateWaveImpl(
+    WaveController & wave,
+    const JobTargets & targets,
+    const std::vector<const Value *> & roots,
+    bool bound,
+    uint32_t boundStripe)
+{
+    /* The cross-stripe span: the whole reserved arena (`nStripes` stripes), the
+       same bound `youngW`/`waveStripeSpan` use while `g_wave` is set. */
+    size_t span = nStripes.load(std::memory_order_relaxed) << stripeShift;
+    size_t wantSlots = span >> 4;
+    if (!g_elemTagW || g_elemTagWSlots < wantSlots) {
+        if (g_elemTagW) {
+            munmap(g_elemTagW, g_elemTagWSlots * sizeof(uint32_t));
+            g_elemTagW = nullptr;
+            g_elemTagWSlots = 0;
+        }
+        auto p = mmap(
+            nullptr, wantSlots * sizeof(uint32_t), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+            -1, 0);
+        if (p == MAP_FAILED)
+            return std::nullopt;
+        g_elemTagW = (uint32_t *) p;
+        g_elemTagWSlots = wantSlots;
+    }
+
+    std::vector<bool> promote(targets.size());
+    std::vector<std::pair<const Value *, uint32_t>> byCell;
+    byCell.reserve(targets.size());
+    for (uint32_t i = 0; i < targets.cells.size(); ++i)
+        byCell.emplace_back(targets.cells[i], i);
+    std::sort(byCell.begin(), byCell.end());
+
+    WaveController * prev = g_wave;
+    g_wave = &wave; /* so youngW/ownerOfW/ownerCellW/envSizeOfW route cross-stripe */
+    ReachNominator nom{stripesBase, g_elemTagW, &g_elemTouchedW, promote, byCell};
+    nom.bound = bound;
+    nom.boundStripe = boundStripe;
+    for (size_t i = 0; i < roots.size(); ++i) {
+        if (!roots[i])
+            continue;
+        /* The pre-generalization per-stripe walk sees only the elements whose
+           result lives in `boundStripe` (each stripe ran its own reachability
+           over its own region + roots), so it cannot even start from a root in a
+           different stripe -- which, with the bounded child test, is exactly how
+           a cross-stripe share goes unseen. */
+        if (bound && (!youngW(roots[i]) || waveStripeOf(roots[i]) != boundStripe))
+            continue;
+        nom.walk(roots[i], uint32_t(i + 2));
+    }
+    g_wave = prev;
+
+    for (auto idx : g_elemTouchedW)
+        g_elemTagW[idx] = 0;
+    g_elemTouchedW.clear();
     return promote;
 }
 
@@ -3173,6 +3304,188 @@ const void * rehomeRegistryStripeBase(uint32_t id)
     return id < g_rehomeRegistry.stripes.size() ? (const void *) g_rehomeRegistry.stripes[id].region.base : nullptr;
 }
 
+/* Inc3 S4-b-b2a white-box SET-EQUALITY proof. The graph bites the 2368 asymmetry:
+   X is element 0's RESULT ROOT and also element 1's CHILD (A1 = tApp(X, Q)). X is
+   therefore reached by BOTH elements (deg-2 => SHARED => its producer nominated);
+   Q is reached by element 1 only (deg-1 => private => NOT nominated). The correct
+   nominated SET is {X}, independent of placement.
+
+   `layout == 0`: single live region, `g_wave == null` -- the SHIPPED
+   `reachabilityNominate` runs (roots in `evalRegion`, so `walk` takes the young
+   branch). `layout == 2 | 3`: X (and Q) split into worker stripes, A1 in another
+   stripe, `g_wave` set -- the generalized cross-stripe walk runs. Returns, by
+   ROLE (`indexOf` of X / Q in the merged targets -- address-independent, not
+   sizes), whether X and Q are nominated. After the 2368 fix all three layouts
+   return {x=true, q=false}; BEFORE the fix, the split layouts return {x=false}
+   because X (a worker-stripe root) is scanned-not-tagged, so it never flips to
+   shared -- the placement-dependent bug. */
+struct ReachSet
+{
+    bool x = false, q = false;
+};
+
+/* Fill a registry stripe `id` at `base` whose owner timeline maps each target's
+   address to its own log index, with an undo log of those targets (in offset
+   order). */
+static void b2aSetupStripe(WaveController & wc, uint32_t id, char * base, const std::vector<Value *> & targets)
+{
+    if (wc.stripes.size() <= id)
+        wc.stripes.resize(id + 1);
+    auto & ss = wc.stripes[id];
+    ss.region.base = base;
+    ss.region.cur = base + (size_t(1) << 20);
+    ss.myStripe = id;
+    ss.ownerSeg = ss.region.cur; /* every cell < cur uses the segment timeline */
+    ss.curOwner = noOwner;
+    ss.segs.open(size_t(1) << 20);
+    ss.segs.b[0] = segSentinel;
+    for (size_t k = 0; k < targets.size(); ++k) {
+        uint32_t off = uint32_t(((const char *) targets[k] - base) >> 4);
+        ss.segs.b[1 + k] = OwnerSeg{off, uint32_t(k)}; /* target k -> owner (log index) k */
+    }
+    ss.segs.t = ss.segs.high = ss.segs.b + 1 + targets.size();
+    for (auto * t : targets) {
+        EvalState::UndoEntry e{};
+        e.target = t;
+        ss.undoLog.push_back(e);
+    }
+}
+
+static size_t b2aIndexOf(const JobTargets & jt, const Value * c)
+{
+    for (size_t i = 0; i < jt.cells.size(); ++i)
+        if (jt.cells[i] == c)
+            return i;
+    return size_t(-1);
+}
+
+ReachSet reachRootAsChildForTest(EvalState & state, int layout)
+{
+    ReachSet out;
+    char * savedBase = stripesBase;
+    size_t savedN = nStripes.load(std::memory_order_relaxed);
+    WaveController * savedWave = g_wave;
+    auto cellAt = [](char * base, size_t slot) { return (Value *) (base + slot * 16); };
+
+    if (layout == 0) {
+        /* Single live region -> the SHIPPED `reachabilityNominate` (g_wave null). */
+        EvalRegion savedRegion = evalRegion;
+        bool savedOn = ownersOn;
+        char * savedOwnerSeg = ownerSeg;
+        uint32_t savedCurOwner = curOwner;
+        SegStack savedSegs = ownerSegs;
+        const EvalUndoLog * savedOwnerLog = ownerLog;
+        size_t savedHint = ownerHint;
+        auto savedRoots = state.waveElementRoots;
+
+        char * rm = (char *) mmap(
+            nullptr, size_t(1) << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        assert(rm != MAP_FAILED);
+        Value * X = cellAt(rm, 0);
+        Value * Q = cellAt(rm, 1);
+        Value * A1 = cellAt(rm, 2);
+        X->mkInt(NixInt(1));
+        Q->mkInt(NixInt(2));
+        A1->mkApp(X, Q);
+
+        evalRegion = EvalRegion{};
+        evalRegion.base = rm;
+        evalRegion.cur = rm + 64;
+        evalRegion.end = rm + (size_t(1) << 20);
+        ownersOn = true;
+        ownerSeg = evalRegion.cur;
+        curOwner = noOwner;
+        ownerHint = 0;
+        ownerSegs.open(size_t(1) << 20);
+        ownerSegs.b[0] = segSentinel;
+        ownerSegs.b[1] = OwnerSeg{0, 0}; /* X at off 0 -> owner 0 */
+        ownerSegs.b[2] = OwnerSeg{1, 1}; /* Q at off 1 -> owner 1 */
+        ownerSegs.t = ownerSegs.high = ownerSegs.b + 3;
+        EvalUndoLog log;
+        {
+            EvalState::UndoEntry ex{};
+            ex.target = X;
+            log.push_back(ex);
+            EvalState::UndoEntry eq{};
+            eq.target = Q;
+            log.push_back(eq);
+        }
+        ownerLog = &log;
+        JobTargets jt(log, 0);
+        state.waveElementRoots.clear();
+        state.waveElementRoots.push_back(X);  /* element 0: X is the ROOT */
+        state.waveElementRoots.push_back(A1); /* element 1: A1 = tApp(X, Q) */
+
+        auto promote = reachabilityNominate(state, jt);
+        if (promote) {
+            auto xi = b2aIndexOf(jt, X), qi = b2aIndexOf(jt, Q);
+            out.x = xi != size_t(-1) && (*promote)[xi];
+            out.q = qi != size_t(-1) && (*promote)[qi];
+        }
+
+        if (ownerSegs.map)
+            munmap(ownerSegs.map, ownerSegs.mapped);
+        state.waveElementRoots = savedRoots;
+        ownerHint = savedHint;
+        ownerLog = savedOwnerLog;
+        ownerSegs = savedSegs;
+        curOwner = savedCurOwner;
+        ownerSeg = savedOwnerSeg;
+        ownersOn = savedOn;
+        evalRegion = savedRegion;
+        munmap(rm, size_t(1) << 20);
+        return out;
+    }
+
+    /* Split: g_wave set, the generalized cross-stripe walk. layout == 2: X,Q in
+       stripe 2, A1 in stripe 1. layout == 3: X in stripe 2, Q in stripe 3, A1 in
+       stripe 1 (so X -> (nothing) and A1 -> X, Q cross three stripes). */
+    const size_t nst = size_t(layout) + 1;
+    char * resv = (char *) mmap(
+        nullptr, nst << stripeShift, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(resv != MAP_FAILED);
+    stripesBase = resv;
+    nStripes.store(nst, std::memory_order_relaxed);
+    auto stripeAt = [&](uint32_t id) { return resv + (size_t(id) << stripeShift); };
+
+    Value * A1 = cellAt(stripeAt(1), 0); /* stripe 1 */
+    Value * X = cellAt(stripeAt(2), 0);  /* stripe 2 */
+    Value * Q = (layout == 3) ? cellAt(stripeAt(3), 0) : cellAt(stripeAt(2), 1);
+    X->mkInt(NixInt(1));
+    Q->mkInt(NixInt(2));
+    A1->mkApp(X, Q);
+
+    WaveController wc;
+    if (layout == 3) {
+        b2aSetupStripe(wc, 2, stripeAt(2), {X});
+        b2aSetupStripe(wc, 3, stripeAt(3), {Q});
+    } else
+        b2aSetupStripe(wc, 2, stripeAt(2), {X, Q});
+
+    EvalUndoLog merged;
+    for (auto & st : wc.stripes)
+        for (auto & e : st.undoLog)
+            merged.push_back(e);
+    JobTargets jt(merged, 0);
+    std::vector<const Value *> roots{X, A1}; /* element 0: X (ROOT); element 1: A1 */
+
+    auto promote = reachabilityNominateWaveImpl(wc, jt, roots, false, 0);
+    if (promote) {
+        auto xi = b2aIndexOf(jt, X), qi = b2aIndexOf(jt, Q);
+        out.x = xi != size_t(-1) && (*promote)[xi];
+        out.q = qi != size_t(-1) && (*promote)[qi];
+    }
+
+    for (auto & st : wc.stripes)
+        if (st.segs.map)
+            munmap(st.segs.map, st.segs.mapped);
+    g_wave = savedWave;
+    nStripes.store(savedN, std::memory_order_relaxed);
+    stripesBase = savedBase;
+    munmap(resv, nst << stripeShift);
+    return out;
+}
+
 } // namespace unforce_test
 
 #if !NIX_USE_BOEHMGC
@@ -3390,6 +3703,39 @@ void WaveController::barrier(EvalState & state)
 
     g_wave = this;
     JobTargets jt(merged, 0);
+
+    /* Inc3 S4-b-b2a: COMPUTE the cross-stripe reachability nomination alongside
+       the actual (countTargets) reclaim -- compute-only, never applied here, so
+       WAVE_M stays byte-identical. The proof harness (`NIX_UNFORCE_REACH_CHECK`)
+       reports: `reach` = the generalized cross-stripe walk (follows pointers
+       across stripe boundaries); `bound` = the PRE-GENERALIZATION walk confined to
+       each stripe, unioned. The cross-stripe count is PLACEMENT-INVARIANT (same
+       for any WAVE_M split of the same foam = the single-wave reach set); the
+       bounded count is strictly smaller and VARIES with the split, because it
+       misses cells shared across elements that landed in different stripes. */
+    if (getenv("NIX_UNFORCE_REACH_CHECK")) {
+        auto reach = reachabilityNominateWaveImpl(*this, jt, state.waveElementRoots, false, 0);
+        std::vector<bool> boundUnion(jt.size());
+        for (size_t s = 0; s < stripes.size(); ++s) {
+            if (!stripes[s].region.base)
+                continue;
+            if (auto b = reachabilityNominateWaveImpl(*this, jt, state.waveElementRoots, true, uint32_t(s)))
+                for (size_t i = 0; i < b->size(); ++i)
+                    boundUnion[i] = boundUnion[i] || (*b)[i];
+        }
+        size_t rc = 0, bc = 0, parts = 0;
+        if (reach)
+            for (bool b : *reach)
+                rc += b;
+        for (bool b : boundUnion)
+            bc += b;
+        for (auto & st : stripes)
+            parts += st.region.base != nullptr;
+        fprintf(
+            stderr, "unforce reach-check: stripes=%zu targets=%zu roots=%zu reach=%zu bound=%zu\n", parts, jt.size(),
+            state.waveElementRoots.size(), rc, bc);
+    }
+
     /* Nominate by the force count only (owner-free, already cross-stripe). The
        owner closure below keeps identity for this or any nomination; the
        reachability / consumer-pair refinements are RSS knobs, skipped at M > 1

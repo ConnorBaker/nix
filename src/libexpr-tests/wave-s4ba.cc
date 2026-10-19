@@ -57,6 +57,12 @@ void promoteSplitForTest(
     const std::vector<size_t> & targetOffs, const std::vector<uint32_t> & counts, uint32_t stripeId,
     size_t & promotedCount, size_t & revertibleCount);
 uint32_t promoteAfterForTest();
+/* Inc3 S4-b-b2a cross-stripe reachability set-equality hook. */
+struct ReachSet
+{
+    bool x = false, q = false;
+};
+ReachSet reachRootAsChildForTest(EvalState & state, int layout);
 } // namespace unforce_test
 
 class WaveS4baTest : public LibExprTest
@@ -379,6 +385,36 @@ TEST_F(F4cFixture, promotedCellsExcludedFromRevertible)
     promoteSplitForTest(offs, allShared, 1, promoted, revertible);
     EXPECT_EQ(promoted, 5u);
     EXPECT_EQ(revertible, 0u);
+}
+
+/* ===== Inc3 S4-b-b2a: cross-stripe reach SET-EQUALITY (bites the 2368 bug) =====
+   X is element 0's RESULT ROOT and element 1's CHILD -> reached by both -> the
+   correct nominated SET is {X}, independent of placement. We compare the SET (by
+   role, address-independent) across the SHIPPED single-wave reach (`g_wave` null,
+   real region) and the generalized cross-stripe walk at 2 and 3 stripe splits. */
+TEST_F(WaveS4baTest, b2aReachSetInvariantAcrossSplitsWithTeeth)
+{
+    using namespace unforce_test;
+
+    /* Single-wave: the shipped `reachabilityNominate` runs (roots in `evalRegion`,
+       so the root takes the young/tag branch). Correct set = {X}. */
+    ReachSet single = reachRootAsChildForTest(state, 0);
+    EXPECT_TRUE(single.x) << "shipped single-wave reach must nominate X (shared root+child)";
+    EXPECT_FALSE(single.q) << "Q is reached by one element only -> not nominated";
+
+    /* 2- and 3-stripe splits: the generalized cross-stripe walk. The nominated SET
+       must be IDENTICAL to the single-wave set. TEETH on the 2368 bug: before the
+       fix (root entry via `evalRegion.contains`), X -- a WORKER-stripe root -- is
+       scanned-not-tagged, so element 1 reaching it does not make it shared, and
+       `split.x` is FALSE: this assertion then fails. */
+    ReachSet split2 = reachRootAsChildForTest(state, 2);
+    ReachSet split3 = reachRootAsChildForTest(state, 3);
+    EXPECT_EQ(split2.x, single.x) << "cross-stripe (2 splits) nominated set must equal single-wave (X)";
+    EXPECT_EQ(split2.q, single.q) << "cross-stripe (2 splits): Q still excluded";
+    EXPECT_EQ(split3.x, single.x) << "cross-stripe (3 splits) nominated set must equal single-wave (X)";
+    EXPECT_EQ(split3.q, single.q) << "cross-stripe (3 splits): Q still excluded";
+    /* Safety: the shared cell reachable from BOTH retained roots IS in the set. */
+    EXPECT_TRUE(split2.x && split3.x) << "a cell reachable from a retained root must be nominated";
 }
 
 } // namespace nix
