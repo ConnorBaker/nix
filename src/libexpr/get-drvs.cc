@@ -482,6 +482,14 @@ static void getDerivations(
         if (fanOut) {
             drvSetFanOutActive = true;
             wave.emplace(*state.executor);
+            /* Inc3 S4-b-b1 (F4c): capture each worker's per-wave START mark BEFORE
+               any warm task is dispatched. Guarded on the pool being quiescent so
+               the read of worker thread-locals is race-free (the drv-set driver
+               has dispatched no wave work yet; any prior executor work has
+               drained). If not idle, the marks stay empty and the barrier treats
+               the whole worker region as this wave's foam (safe, b1 reverts
+               nothing). */
+            unforceCaptureWaveStart(state.executor->outstandingWork() == 0);
             for (auto * i : order) {
                 std::string_view symbol{state.symbols[i->name]};
                 if (!isAttrPathComponent(symbol))
@@ -528,10 +536,11 @@ static void getDerivations(
             } catch (...) {
                 ignoreExceptionInDestructor();
             }
-            /* F4a: re-home each participating worker's stripe into the registry
-               (quiescent; frees nothing in a1). */
+            /* F4a + F4c: assemble each participating worker's this-wave stripe
+               slice into the registry + validate the delimitation (quiescent;
+               frees nothing, reverts nothing, resets no TLS in b1). */
             try {
-                unforceRehomeWorkerStripes();
+                unforceRehomeWorkerStripes(state);
             } catch (...) {
                 ignoreExceptionInDestructor();
             }

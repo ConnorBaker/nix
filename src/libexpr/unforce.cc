@@ -2781,9 +2781,41 @@ static std::mutex g_workerRegMutex;
 static std::map<uint32_t, WorkerStripeHandle> g_workerReg; /* global stripe id -> handle */
 static WaveController g_rehomeRegistry;                    /* populated at the barrier */
 
+/* Inc3 S4-b-b1 (F4c): the per-wave delimiter. A worker opens its unforce scope
+   ONCE, at its first force (`isolationDepth 0->1`); every later force is a nested
+   scope that only bumps the depth, so the worker's `undoLog`/`region`/`ownerSegs`/
+   `generation` ACCUMULATE across every wave in one lifetime context. There is no
+   per-wave `mark` inside the worker (unlike the S3 pseudo-stripe, a fresh snapshot
+   per stripe). So the main thread captures, at wave-open (quiescent), the analogue
+   of `beginUnforceScope`'s `mark = undoLog.size()` for each worker, and slices
+   `[mark, current)` at the barrier. `[base, start)` is prior-wave retained state,
+   excluded by construction. */
+struct WaveStartMarker
+{
+    const char * regionCur = nullptr; /* region.cur at wave-open (segment start) */
+    size_t undoMark = 0;              /* undoLog.size() at wave-open */
+    size_t ownerUsed = 0;             /* ownerSegs (t - b) at wave-open */
+    size_t generation = 0;            /* rootTask.generation at wave-open */
+    bool captured = false;
+};
+static std::map<uint32_t, WaveStartMarker> g_waveStart; /* global id -> wave-open mark */
+
+/* The delimited this-wave segment bounds per worker, assembled at the barrier
+   (kept parallel to `g_rehomeRegistry` so `WaveStripe` stays untouched for the S3
+   path). b2 frees `[startCur, endCur)` ONLY and resets cur to startCur. */
+struct WaveSegmentBounds
+{
+    const char * startCur = nullptr, * endCur = nullptr;
+    size_t undoMark = 0, undoEnd = 0, generation = 0;
+};
+static std::map<uint32_t, WaveSegmentBounds> g_waveSegBounds;
+
 struct RehomeStats
 {
     size_t stripes = 0, undoEntries = 0, youngBytes = 0;
+    /* b1: the delimited this-wave slice + the dry-run promote/revert split. */
+    size_t sliceEntries = 0, revertible = 0, promoted = 0;
+    bool delimitationValid = true; /* every structural invariant held */
 };
 static RehomeStats g_lastRehome;
 
@@ -2801,44 +2833,130 @@ static void registerWorkerStripeHandle()
     g_workerReg[myStripe] = h;
 }
 
-/* The re-home proper (runs on the main thread at the quiescent barrier). */
-static void rehomeWorkerStripesImpl()
+/* Inc3 S4-b-b1 (F4c): capture each worker's wave-open mark (the per-wave `mark`).
+   `executorIdle` must hold for the read to be race-free (every worker quiescent);
+   otherwise the marks are left empty and the barrier defaults each worker to
+   {base, 0} -- the whole region as this wave's foam (safe over-approximation). */
+static void captureWaveStartImpl(bool executorIdle)
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    g_waveStart.clear();
+    if (!executorIdle)
+        return;
+    for (auto & [id, h] : g_workerReg) {
+        if (!h.region->base)
+            continue; /* not yet participating; its first force IS this wave */
+        WaveStartMarker m;
+        m.regionCur = h.region->cur;
+        m.undoMark = h.undoLog->size();
+        m.ownerUsed = size_t(h.segs->t - h.segs->b);
+        m.generation = h.task->generation;
+        m.captured = true;
+        g_waveStart[id] = m;
+    }
+}
+
+/* The assembly + delimitation + validation (runs on the main thread at the
+   quiescent barrier). Frees nothing, reverts nothing, resets no worker TLS.
+   `state` (null in the white-box test) enables the env-gated dry-run promote. */
+static void rehomeWorkerStripesImpl(EvalState * state)
 {
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     RehomeStats stats;
+    g_rehomeRegistry.stripes.clear(); /* fresh registry per wave */
+    g_waveSegBounds.clear();
+    EvalUndoLog mergedSlice; /* this-wave targets across all workers (dry-run) */
     for (auto & [id, h] : g_workerReg) {
         if (!h.region->base)
             continue; /* a worker that never forced -- not participating */
-        /* F4a + F4b validation: worker `id`'s region must sit at the global
-           stripe base for `id` (the global-stripe-id indexing is correct). */
+        /* F4a + F4b: worker `id`'s region must sit at the global stripe base for
+           `id` (the global-stripe-id indexing is correct). */
         assert((char *) h.region->base == stripeBase(id));
+        /* F4c delimiter: this-wave start marks (empty -> whole region). */
+        auto it = g_waveStart.find(id);
+        bool haveMark = it != g_waveStart.end() && it->second.captured;
+        const char * startCur = haveMark ? it->second.regionCur : h.region->base;
+        size_t undoMark = haveMark ? it->second.undoMark : 0;
+        size_t undoEnd = h.undoLog->size();
+        /* --- structural delimitation validation (inert, cheap) --- */
+        if (!(startCur >= h.region->base && startCur <= h.region->cur))
+            stats.delimitationValid = false; /* segment start out of region */
+        if (undoMark > undoEnd)
+            stats.delimitationValid = false; /* stale/non-monotonic capture */
+        if (waveStripeOf(startCur) != id)
+            stats.delimitationValid = false; /* not this worker's stripe (excl. main 0) */
+        if (undoMark > undoEnd)
+            undoMark = undoEnd; /* clamp so the slice below is well-formed */
+
         if (g_rehomeRegistry.stripes.size() <= id)
             g_rehomeRegistry.stripes.resize(id + 1);
         auto & dst = g_rehomeRegistry.stripes[id];
-        dst.region = *h.region; /* region DESCRIPTOR (base/cur/sizes) -- cheap */
+        dst.region = *h.region; /* region DESCRIPTOR (base/cur/sizes) */
         dst.myStripe = id;
-        /* // S4-b-b: deep-copy for the reclamation release helpers:
-           //   dst.undoLog = *h.undoLog; dst.segs = *h.segs; dst.task = *h.task;
-           // (and after munmap, write the reset back into the worker's TLS:
-           //   *h.region = {}; h.undoLog->clear(); ...). Omitted in a1 (frees
-           // nothing; a deep copy of every worker's undo log would be prohibitive
-           // and unused). */
+        /* This-wave undo SLICE (deep, OWNED): the target list b2 reverts. Bounded
+           by the entries LOGGED this wave (not the young region), so cheap. */
+        dst.undoLog.assign(h.undoLog->begin() + undoMark, h.undoLog->end());
+        /* Owner timeline (SHALLOW -> live worker memory, read in place at the
+           quiescent barrier by `ownerOfInStripe`; never freed from the registry,
+           so no double-free; b1 frees nothing). // S4-b-b2: own vs read-in-place. */
+        dst.segs = *h.segs;
+        /* Task fields: bigEnvSizes (deep, owned map); envSizeTable/Mapping/
+           keptStart/Floor/End (shallow -> live); generation. Feeds
+           `envSizeOfInStripe`. */
+        dst.task = *h.task;
+        /* Prior-wave young TEETH: every young slice target must lie in
+           [startCur, cur). A young target below startCur is a prior-wave cell that
+           sneaked into this wave's slice -- the delimitation is wrong. */
+        for (auto & e : dst.undoLog) {
+            auto a = (const char *) e.target;
+            if (a >= h.region->base && a < h.region->cur && a < startCur)
+                stats.delimitationValid = false;
+        }
+        g_waveSegBounds[id] =
+            WaveSegmentBounds{startCur, h.region->cur, undoMark, undoEnd, haveMark ? it->second.generation : 0};
+        for (auto & e : dst.undoLog)
+            mergedSlice.push_back(e);
         stats.stripes++;
-        stats.undoEntries += h.undoLog->size();
-        stats.youngBytes += size_t(h.region->cur - h.region->base);
+        stats.undoEntries += undoEnd;
+        stats.sliceEntries += dst.undoLog.size();
+        stats.youngBytes += size_t(h.region->cur - startCur); /* this-wave span */
     }
+
+    /* --- dry-run promote/revert split (env-gated; OFF in the gate => inert). A
+       COPY of forceCounts is used so the real promote decision is unperturbed;
+       nothing is reverted, copied to OLD, or freed. --- */
+    if (state && getenv("NIX_UNFORCE_VALIDATE_PROMOTE") && !mergedSlice.empty()) {
+        JobTargets jt(mergedSlice, 0);
+        auto countsCopy = state->forceCounts;
+        auto promote = countTargets(countsCopy, jt, state->settings.unforceBatchSize, nullptr);
+        for (size_t i = 0; i < jt.size(); ++i)
+            (promote[i] ? stats.promoted : stats.revertible)++;
+    }
+
     g_lastRehome = stats;
     if (getenv("NIX_UNFORCE_REHOME_DEBUG"))
         fprintf(
-            stderr, "unforce rehome: stripes=%zu undoEntries=%zu youngBytes=%zu\n", stats.stripes, stats.undoEntries,
-            stats.youngBytes);
+            stderr,
+            "unforce rehome: stripes=%zu undoEntries=%zu sliceEntries=%zu youngBytes=%zu "
+            "revertible=%zu promoted=%zu valid=%d\n",
+            stats.stripes, stats.undoEntries, stats.sliceEntries, stats.youngBytes, stats.revertible, stats.promoted,
+            int(stats.delimitationValid));
 }
 
 } // namespace
 
-void unforceRehomeWorkerStripes()
+void unforceCaptureWaveStart(bool executorIdle)
 {
-    rehomeWorkerStripesImpl();
+    captureWaveStartImpl(executorIdle);
+}
+
+void unforceRehomeWorkerStripes(EvalState & state)
+{
+    rehomeWorkerStripesImpl(&state);
+    /* The delimitation must be structurally sound on every real wave. */
+    assert(g_lastRehome.delimitationValid);
+    if (!g_lastRehome.delimitationValid)
+        unforceFatal("validating the per-wave reclamation delimitation");
 }
 
 /* ---------------------------------------------------------------------------
@@ -2902,14 +3020,20 @@ size_t stripeShiftForTest()
    ---- */
 static std::deque<EvalRegion> g_synthRegions;
 static std::deque<EvalUndoLog> g_synthLogs;
+static std::deque<SegStack> g_synthSegs;
+static std::deque<TaskUnforceState> g_synthTasks;
 
 void clearSyntheticWorkers()
 {
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     g_workerReg.clear();
     g_rehomeRegistry.stripes.clear();
+    g_waveStart.clear();
+    g_waveSegBounds.clear();
     g_synthRegions.clear();
     g_synthLogs.clear();
+    g_synthSegs.clear();
+    g_synthTasks.clear();
     g_lastRehome = {};
 }
 
@@ -2917,6 +3041,8 @@ void injectSyntheticWorker(uint32_t id, size_t bytes)
 {
     g_synthRegions.emplace_back();
     g_synthLogs.emplace_back();
+    g_synthSegs.emplace_back();
+    g_synthTasks.emplace_back();
     auto & r = g_synthRegions.back();
     r.base = (char *) const_cast<char *>(stripeBase(id)); /* = synthetic base for `id` */
     r.cur = r.base + bytes;
@@ -2925,18 +3051,116 @@ void injectSyntheticWorker(uint32_t id, size_t bytes)
     h.stripeId = id;
     h.region = &r;
     h.undoLog = &g_synthLogs.back();
+    h.segs = &g_synthSegs.back(); /* b1: captureWaveStartImpl / assembly deref these */
+    h.task = &g_synthTasks.back();
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     g_workerReg[id] = h;
 }
 
+/* b1: append a synthetic undo entry (target only; the pre-image and payload are
+   never dereferenced by JobTargets/countTargets/the delimitation -- the target
+   is an opaque key/address). `off` is a byte offset from the worker's stripe base. */
+void appendSyntheticUndoEntry(uint32_t id, size_t off)
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    auto it = g_workerReg.find(id);
+    if (it == g_workerReg.end())
+        return;
+    EvalState::UndoEntry e{};
+    e.target = (Value *) (stripeBase(id) + off);
+    it->second.undoLog->push_back(e);
+}
+
+/* b1: set the region cursor (this-wave allocation high-water) for a worker. */
+void setSyntheticRegionCur(uint32_t id, size_t bytes)
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    auto it = g_workerReg.find(id);
+    if (it != g_workerReg.end())
+        it->second.region->cur = it->second.region->base + bytes;
+}
+
+/* b1: inject a wave-start mark directly (for the INCONSISTENT-mark teeth test:
+   a wrong undoMark with a correct startCur must trip the young-address invariant). */
+void setWaveStartMarkerForTest(uint32_t id, size_t startCurOff, size_t undoMark)
+{
+    std::lock_guard<std::mutex> lk(g_workerRegMutex);
+    WaveStartMarker m;
+    m.regionCur = stripeBase(id) + startCurOff;
+    m.undoMark = undoMark;
+    m.captured = true;
+    g_waveStart[id] = m;
+}
+
+void captureWaveStartForTest(bool executorIdle)
+{
+    captureWaveStartImpl(executorIdle);
+}
+
 void runRehomeForTest()
 {
-    rehomeWorkerStripesImpl();
+    rehomeWorkerStripesImpl(nullptr);
 }
 
 size_t lastRehomeStripes()
 {
     return g_lastRehome.stripes;
+}
+
+size_t lastRehomeSliceEntries()
+{
+    return g_lastRehome.sliceEntries;
+}
+
+bool lastRehomeDelimitationValid()
+{
+    return g_lastRehome.delimitationValid;
+}
+
+/* b1: the assembled this-wave slice size for a stripe. */
+size_t rehomeSliceSize(uint32_t id)
+{
+    return id < g_rehomeRegistry.stripes.size() ? g_rehomeRegistry.stripes[id].undoLog.size() : 0;
+}
+
+/* b1: the delimited this-wave segment start offset (from the stripe base). */
+size_t waveSegStartOff(uint32_t id)
+{
+    auto it = g_waveSegBounds.find(id);
+    return it != g_waveSegBounds.end() ? size_t(it->second.startCur - stripeBase(id)) : 0;
+}
+
+/* b1 promote-exclusion math (reuses the production `countTargets`): given target
+   addresses with each one's force count, run the real nomination and report the
+   promoted vs revertible split. The test seeds each count so a cell forced in >=
+   `promoteAfter` jobs (shared) is nominated (promoted, hence EXCLUDED from the
+   revertible foam) and a once-forced cell is revertible. The caller asserts the
+   split matches the known seeding -- a mis-nomination (a shared cell left
+   revertible, or a private cell swept into promoted) would mismatch (teeth). */
+void promoteSplitForTest(
+    const std::vector<size_t> & targetOffs, const std::vector<uint32_t> & counts, uint32_t stripeId,
+    size_t & promotedCount, size_t & revertibleCount)
+{
+    EvalUndoLog log;
+    std::unordered_map<const Value *, uint32_t> fc;
+    for (size_t i = 0; i < targetOffs.size(); ++i) {
+        EvalState::UndoEntry e{};
+        e.target = (Value *) (stripeBase(stripeId) + targetOffs[i]);
+        log.push_back(e);
+        /* pre-seed (count - 1) so countTargets' single increment reaches `count`. */
+        if (counts[i] > 1)
+            fc[e.target] = counts[i] - 1;
+    }
+    JobTargets jt(log, 0);
+    auto promote = countTargets(fc, jt, 1u << 20, nullptr);
+    promotedCount = revertibleCount = 0;
+    for (size_t i = 0; i < jt.size(); ++i)
+        (promote[i] ? promotedCount : revertibleCount)++;
+}
+
+uint32_t promoteAfterForTest()
+{
+    return unforceSettings().promoteAfter;
 }
 
 bool rehomeRegistryHasStripe(uint32_t id)

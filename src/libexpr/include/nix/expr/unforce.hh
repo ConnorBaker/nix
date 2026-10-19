@@ -105,12 +105,27 @@ bool unforceIsScopeStackSlot(const void * p);
  */
 void unforceNoteClientCode();
 
-/** Inc3 S4-b-a1 (F4a): at the quiescent drv-set wave barrier, copy each
-    participating worker's thread_local stripe into a registry indexed by global
-    stripe id (validating the indexing). Reclamation stays OFF in a1 (this frees
-    nothing; the deep copy + TLS write-back/reset are S4-b-b). Called from the
-    drv-set driver after the wave barrier. */
-void unforceRehomeWorkerStripes();
+/** Inc3 S4-b-b1 (F4c): capture, for each registered worker, the per-wave START
+    mark (region.cur, undoLog.size, ownerSegs used, generation) at wave-open --
+    the per-wave analogue of `beginUnforceScope`'s `mark = undoLog.size()`. A
+    worker's scope is lifetime (opened once), so these marks delimit this wave's
+    slice `[mark, current)` at the barrier; `[base, mark)` is prior-wave retained
+    state. `executorIdle` guards the read: if the pool is not quiescent the marks
+    are left empty and the barrier conservatively treats the whole worker region
+    as this wave's (safe over-approximation; b1 reverts nothing). Inert: reads
+    only quiescent worker thread-locals, writes a side table. Called from the
+    drv-set driver right after the WaveScope opens, before any warm task. */
+void unforceCaptureWaveStart(bool executorIdle);
+
+/** Inc3 S4-b-a1 (F4a) + S4-b-b1 (F4c): at the quiescent drv-set wave barrier,
+    assemble each participating worker's thread_local stripe into a registry
+    indexed by global stripe id -- the region descriptor (a1), plus the this-wave
+    undoLog SLICE (deep, owned), owner timeline + task fields (b1), delimited by
+    the wave-start marks -- and VALIDATE the delimitation (this-wave foam excludes
+    prior-wave / promoted / main-thread cells). Reclamation stays OFF (this frees
+    nothing, reverts nothing, resets no TLS; the revert + per-wave region free +
+    TLS write-back are S4-b-b2). Called from the drv-set driver after the barrier. */
+void unforceRehomeWorkerStripes(EvalState & state);
 
 /** Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();
