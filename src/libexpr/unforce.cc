@@ -3122,6 +3122,34 @@ struct WaveSegmentBounds
 };
 static std::map<uint32_t, WaveSegmentBounds> g_waveSegBounds;
 
+/* Inc3 S4-b-b2b2: the revert knob (DORMANT by default). When off (or eval-cores==1),
+   the barrier is the exact b2b1c retain-only compute path -> byte-for-byte base. */
+static bool unforceRevertOn()
+{
+    static bool v = [] {
+        auto s = getenv("NIX_UNFORCE_REVERT");
+        return s && s[0] && s[0] != '0';
+    }();
+    return v;
+}
+/* Set by `captureWaveStartImpl`: were the wave-open marks captured under a quiescent
+   pool? If not, the marks are empty and the revert must RETAIN-ALL (T1) -- freeing the
+   whole region as "this-wave foam" could drop prior-wave retained state. */
+static bool g_waveStartReliable = false;
+/* Set by the barrier when it actually reverted this wave, so the main's
+   `endUnforceScope` frees main-young (releaseRegion) instead of retaining it. */
+static bool g_waveReverted = false;
+/* Read the thread-global `stats.copiedBytes` from inside a scope where `stats` is
+   shadowed by a local `RehomeStats` (the barrier) -- for the Gate-2 skew number. */
+static size_t globalCopiedBytes()
+{
+    return stats.copiedBytes;
+}
+static char * pageDown(char * p)
+{
+    return (char *) ((uintptr_t) p & ~(uintptr_t) (pageSize() - 1));
+}
+
 struct RehomeStats
 {
     size_t stripes = 0, undoEntries = 0, youngBytes = 0;
@@ -3138,6 +3166,12 @@ struct RehomeStats
     size_t afterPersistent = 0;     /* keep-set after the persistent-root seed (pre-close) */
     bool seedFailedKeepAll = false; /* reach tag table OOM -> retained ALL targets */
     size_t traversalGaps = 0;       /* cells reached in unassembled stripes (must be 0) */
+    /* b2b2: the revert. */
+    bool reverted = false;          /* the wave actually reverted (vs retain-all) */
+    size_t copiedTargets = 0;       /* keep-set targets copied to OLD */
+    size_t revertedTargets = 0;     /* targets restored to pre-image */
+    size_t freedWorkerBytes = 0;    /* young worker bytes freed this wave */
+    size_t copiedBytesAtBarrier = 0; /* Gate-2 skew: bytes copied-to-OLD at the barrier */
 };
 static RehomeStats g_lastRehome;
 
@@ -3165,6 +3199,7 @@ static void captureWaveStartImpl(bool executorIdle)
 {
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     g_waveStart.clear();
+    g_waveStartReliable = executorIdle; /* b2b2 T1: unreliable marks -> retain-all */
     if (!executorIdle)
         return;
     for (auto & [id, h] : g_workerReg) {
@@ -3188,6 +3223,7 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
     (void) roots; /* // S4-b-b2b1: consumed by the reach seed + OwnerClosure below */
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     RehomeStats stats;
+    g_waveReverted = false; /* b2b2: set below only if this wave actually reverts */
     g_rehomeRegistry.stripes.clear(); /* fresh registry per wave */
     g_waveSegBounds.clear();
     EvalUndoLog mergedSlice; /* this-wave targets across all workers (dry-run) */
@@ -3331,14 +3367,122 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
            missing a required owner fails). */
         stats.closureValid = checkClosureInvariant(g_rehomeRegistry, jt, promote);
         stats.traversalGaps = g_waveTraversalGaps;
-        /* // S4-b-b2b2 (the revert, turned OFF here): `promote` IS the keep-set.
-           // b2b2 would, with `g_wave` = registry: PauseRegion; Evacuator copy
-           // each promoted target to OLD; assign the copies (*cell = copy);
-           // revert the rest (*cell = preImage(i)) over each stripe's revert slice
-           // [sliceStart:end] (R1); then free each stripe's [startCur, cur)
-           // (MADV_DONTNEED) and reset its TLS (region.cur := startCur, undoLog
-           // truncate to sliceStart, ownerSegs/generation rollback). b2b1b does
-           // NONE of this. */
+
+        /* ===================================================================
+           Inc3 S4-b-b2b2: THE REVERT (reclamation ON, behind the dormant knob).
+           EVACUATE-ALL: one shared Evacuator copies the keep-set across ALL stripes
+           (main 0 + workers) to OLD through one forwarding map (cross-stripe identity),
+           assign/revert the merged slice, then free the WORKER stripes (the main is
+           freed by `endUnforceScope` via `releaseRegion`). This is
+           `WaveController::barrier` generalized to real worker stripes.
+           =================================================================== */
+        bool canRevert = unforceRevertOn() && state->executor && state->executor->enabled && g_waveStartReliable
+            && !stats.seedFailedKeepAll && stats.closureValid && stats.traversalGaps == 0;
+        /* T1: every participating WORKER stripe must be single-wave (startCur==base,
+           undoMark==0). Under revert-on each wave resets its workers, so this holds in
+           the steady state; a worker carrying prior-wave foam -> RETAIN-ALL (safe). */
+        if (canRevert)
+            for (auto & [id, sb] : g_waveSegBounds)
+                if (id != 0 && (sb.startCur != (const char *) stripeBase(id) || sb.undoMark != 0))
+                    canRevert = false;
+
+        /* GATE BITE (test-only): a deliberately-WRONG revert to prove each gate bites.
+           `keepfree` frees the keep-set too (promote all false -> kept, still-referenced
+           cells are reverted + freed): must trip Gate B (shared cell duplicated -> DUP),
+           Gate C (freed referenced cell accessed -> tripwire SIGSEGV), Gate A (crash /
+           sha diverges). Never set in production. */
+        if (canRevert && getenv("NIX_UNFORCE_REVERT_BITE") && !mergedSlice.empty()) {
+            std::string b = getenv("NIX_UNFORCE_REVERT_BITE");
+            if (b == "keepfree" || b == "dangle")
+                std::fill(promote.begin(), promote.end(), false);
+        }
+
+        if (canRevert && !mergedSlice.empty()) {
+            std::vector<Value> copies(jt.size());
+            std::vector<bool> copied(jt.size());
+            size_t copiedBefore = globalCopiedBytes();
+            g_wave = &g_rehomeRegistry; /* youngW/ownerOfW/envSizeOfW route cross-stripe */
+            try {
+                PauseRegion pause; /* copies land in the main's OLD (stable addresses) */
+                Evacuator evac{*state};
+                /* ONE shared forwarding map over ALL stripes: a cell reachable from
+                   several stripes' promoted closures is copied ONCE -> one OLD address
+                   -> `&a==&b` preserved (Gate B). */
+                OwnerClosure oc(jt, promote);
+                evac.onIdentity = &OwnerClosure::note;
+                evac.onIdentityCtx = &oc;
+                auto doCopy = [&](size_t i) {
+                    if (!copied[i]) {
+                        copies[i] = evac.copy(*jt.cells[i]);
+                        copied[i] = true;
+                    }
+                };
+                oc.run([&](size_t i) { doCopy(i); });
+                evac.onIdentity = nullptr;
+                for (size_t i = 0; i < jt.size(); ++i)
+                    if (promote[i] && !copied[i])
+                        doCopy(i);
+            } catch (std::bad_alloc &) {
+                g_wave = nullptr;
+                unforceFatal("copying the wave keep-set to OLD at the barrier");
+            }
+            g_wave = nullptr;
+            stats.copiedBytesAtBarrier = globalCopiedBytes() - copiedBefore;
+
+            pruneCounts(state->forceCounts, jt, promote); /* follow-up: drop freed keys */
+
+            /* Assign the OLD copies (promoted) / restore pre-images (reverted) over the
+               merged slice -- main's result targets included (so PackageInfo's `attrs`,
+               held through the stable target cells, now point to OLD: Half-2 automatic). */
+            for (size_t i = 0; i < jt.size(); ++i)
+                if (promote[i]) {
+                    *jt.cells[i] = copies[i];
+                    stats.copiedTargets++;
+                }
+            bool biteDangle = getenv("NIX_UNFORCE_REVERT_BITE")
+                && std::string(getenv("NIX_UNFORCE_REVERT_BITE")) == "dangle";
+            for (size_t i = 0; i < jt.size(); ++i)
+                if (!promote[i]) {
+                    if (!biteDangle) /* BITE `dangle`: leave the target pointing into freed young */
+                        *jt.cells[i] = jt.preImage(i);
+                    stats.revertedTargets++;
+                }
+
+            /* Free each WORKER stripe's this-wave young [startCur,cur) and write back its
+               TLS so the next wave starts fresh. The pool is quiescent (single-writer).
+               NEVER touch [base,startCur) (prior-wave retained -- here startCur==base, so
+               the whole stripe is this-wave). The main (id 0) is freed at endUnforceScope. */
+            for (auto & [id, h] : g_workerReg) {
+                if (id == 0 || !h.region->base)
+                    continue;
+                auto sbit = g_waveSegBounds.find(id);
+                if (sbit == g_waveSegBounds.end())
+                    continue;
+                char * start = (char *) sbit->second.startCur;
+                char * end = h.region->cur;
+                if (end > start) {
+                    stats.freedWorkerBytes += size_t(end - start);
+                    /* Page-granular: free whole pages at/after `start` (page-aligned
+                       stripe base). Under the tripwire dial, also mprotect PROT_NONE so
+                       any access to a freed cell SIGSEGVs (Gate C). */
+                    char * lo = pageUp(start);
+                    char * hi = pageDown(end);
+                    if (unforceDebug().tripwire && pageUp(end) > start)
+                        mprotect(start, size_t(pageUp(end) - start), PROT_NONE);
+                    if (hi > lo)
+                        madvise(lo, size_t(hi - lo), MADV_DONTNEED);
+                }
+                /* TLS write-back (single-wave reset: startCur==base). */
+                h.region->cur = start;
+                h.undoLog->resize(sbit->second.undoMark);
+                h.segs->bottom();
+                *h.ownerSegPtr = h.region->base;
+                *h.curOwnerPtr = noOwner;
+                h.task->generation++;
+            }
+            stats.reverted = true;
+            g_waveReverted = true;
+        }
     }
 
     g_lastRehome = stats;
@@ -3347,11 +3491,13 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
             stderr,
             "unforce rehome: stripes=%zu undoEntries=%zu sliceEntries=%zu youngBytes=%zu "
             "youngTargets=%zu reachSeed=%zu persistentRoots=%zu afterPersistent=%zu promotedClosed=%zu "
-            "closureValid=%d keepAll=%d valid=%d envGaps=%zu traversalGaps=%zu\n",
+            "closureValid=%d keepAll=%d valid=%d envGaps=%zu traversalGaps=%zu "
+            "reverted=%d copiedTargets=%zu revertedTargets=%zu freedWorkerBytes=%zu copiedAtBarrier=%zu\n",
             stats.stripes, stats.undoEntries, stats.sliceEntries, stats.youngBytes, stats.youngTargets,
             stats.reachSeed, stats.persistentRoots, stats.afterPersistent, stats.promotedClosed,
             int(stats.closureValid), int(stats.seedFailedKeepAll), int(stats.delimitationValid), g_envSizeWGaps,
-            stats.traversalGaps);
+            stats.traversalGaps, int(stats.reverted), stats.copiedTargets, stats.revertedTargets,
+            stats.freedWorkerBytes, stats.copiedBytesAtBarrier);
 }
 
 } // namespace
@@ -5181,10 +5327,26 @@ void EvalState::endUnforceScope(size_t mark)
         dropOpenForces(mark);
         forgetSeenReports();
         closeOwners();
-        stats.keptJobs++;
-        undoLog.resize(mark);
-        undoLog.shrink_to_fit();
-        rootTask.joinAndReclaim(/*keepWhole=*/true);
+        /* Inc3 S4-b-b2b2: if the wave barrier REVERTED this wave (knob on), it already
+           made the cross-stripe decision, evacuated the keep-set (incl. main stripe 0's
+           result structure) to OLD via the ONE shared Evacuator, and assigned/reverted
+           EVERY target (main's included). So the main just FREES its young nursery
+           (`releaseRegion`, which preserves the retained package-set foam below the kept
+           floor) instead of RETAINING it -- NO `decideJob` here (the barrier decided, and
+           a second Evacuator would duplicate cross-stripe cells, breaking identity). When
+           the knob is off / the wave retained, this is the exact b2b1c retain path. */
+        bool reclaim = g_waveReverted;
+        g_waveReverted = false;
+        if (reclaim) {
+            undoLog.resize(mark);
+            undoLog.shrink_to_fit();
+            rootTask.joinAndReclaim(/*keepWhole=*/false); /* free main-young */
+        } else {
+            stats.keptJobs++;
+            undoLog.resize(mark);
+            undoLog.shrink_to_fit();
+            rootTask.joinAndReclaim(/*keepWhole=*/true);
+        }
         curTask->escaped.clear();
         curTask = nullptr;
         waveElementRoots.clear();
