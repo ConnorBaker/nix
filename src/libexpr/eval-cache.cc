@@ -459,7 +459,22 @@ Value & AttrCursor::getValue()
     Value * vp;
     if (parent) {
         auto & vParent = parent->first->getValue();
-        root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
+        {
+            /* inc3-A FIO: `vParent` is the parent cursor's persistent
+               `allocRootValue` RootValue (its `_value`), enumerated by
+               `forEachPersistentRootValue` and read lock-free across waves.
+               Forcing it here publishes its attrset WHNF into that persistent
+               root, so under the threaded regime force it into OLD -- the cell
+               must not live in a reclaimable worker stripe. Mirrors the
+               `fileEvalCache` FIO in `evalFile` (eval.cc). Gated on
+               parallelEnabled(): at eval-cores==1 the PauseRegion is not entered,
+               so this is byte-identical to base; inert under revert-off (threads):
+               it only changes which arena the cells live in. */
+            std::optional<PauseRegion> fioPause;
+            if (root->state.parallelEnabled())
+                fioPause.emplace();
+            root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
+        }
         auto attr = vParent.attrs()->get(parent->second);
         if (!attr)
             throw Error("attribute '%s' is unexpectedly missing", getAttrPathStr());
@@ -517,6 +532,18 @@ Value & AttrCursor::forceValue()
     auto & v = getValue();
 
     try {
+        /* inc3-A FIO: this WHNF is published into the cursor's persistent
+           `allocRootValue` RootValue (`_value`, set by `getValue`), which
+           `forEachPersistentRootValue` enumerates and which another worker reads
+           lock-free across waves. Force it into OLD under the threaded regime so
+           the cell never lives in a reclaimable worker stripe -- mirrors the
+           `fileEvalCache` FIO in `evalFile` (eval.cc). Gated on parallelEnabled():
+           at eval-cores==1 the PauseRegion is not entered and behaviour is
+           byte-identical to base; inert under revert-off (threads): it only
+           changes which arena the cells live in. */
+        std::optional<PauseRegion> fioPause;
+        if (root->state.parallelEnabled())
+            fioPause.emplace();
         root->state.forceValue(v, noPos);
     } catch (EvalError &) {
         debug("setting '%s' to failed", getAttrPathStr());

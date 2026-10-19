@@ -4966,10 +4966,41 @@ bool unforceIsScopeStackSlot(const void * p)
     youngOwnerChange(v, o);
 }
 
+/* inc3-A OLD-BORN canary (see V2-OLDBORN-REDTEAM.md "other-stripe force"
+   assert). Reaching an old-cell force means `&v` is outside this worker's
+   `[base, cur)` scope (`logPreImageRest`): it must live in the never-reclaimed
+   OLD arena or in THIS worker's own stripe -- NEVER in another worker's stripe.
+   A force driving a cell in another worker's stripe would birth its result WHNF
+   in the forcer's own stripe while reading a cross-worker young cell: a direct
+   OLD-BORN violation, meaning an upstream FIO (a persistent-root boundary) was
+   missed. This is a standing invariant canary for the parallel line. It compiles
+   to nothing under NDEBUG, and on the single-thread gate path it is trivially
+   satisfied (one active stripe, `evalRegion.arenaId == waveStripeOf(&v)`); it
+   must never fire on a correct run. */
+[[gnu::cold]] static inline void oldBornCanary(const void * p)
+{
+#ifndef NDEBUG
+    char * sb = stripesBase;
+    /* No striped reservation yet (tripwire fallback / pre-reservation): the cell
+       cannot be in any worker's stripe. */
+    if (!sb)
+        return;
+    auto a = (const char *) p;
+    size_t span = nStripes.load(std::memory_order_relaxed) << stripeShift;
+    if (a >= sb && a < sb + span) {
+        size_t id = size_t(a - sb) >> stripeShift;
+        assert(id == evalRegion.arenaId && "inc3-A OLD-BORN canary: forcing a cell in another worker's stripe");
+    }
+#else
+    (void) p;
+#endif
+}
+
 /* The start of a logged force: an old cell. Every container is reserved
    before anything is pushed, so a failed allocation changes nothing. */
 [[gnu::noinline]] static void logOldForce(EvalState & state, Value & v, const Value & preImage)
 {
+    oldBornCanary(&v);
     if (unforceIsScopeStackSlot(&v))
         return;
     if (undoLog.size() == undoLog.capacity())
