@@ -470,7 +470,7 @@ Value & AttrCursor::getValue()
                parallelEnabled(): at eval-cores==1 the PauseRegion is not entered,
                so this is byte-identical to base; inert under revert-off (threads):
                it only changes which arena the cells live in. */
-            std::optional<PauseRegion> fioPause;
+            std::optional<FioPauseRegion> fioPause;
             if (root->state.parallelEnabled())
                 fioPause.emplace();
             root->state.forceAttrs(vParent, noPos, "while searching for an attribute");
@@ -541,7 +541,7 @@ Value & AttrCursor::forceValue()
            at eval-cores==1 the PauseRegion is not entered and behaviour is
            byte-identical to base; inert under revert-off (threads): it only
            changes which arena the cells live in. */
-        std::optional<PauseRegion> fioPause;
+        std::optional<FioPauseRegion> fioPause;
         if (root->state.parallelEnabled())
             fioPause.emplace();
         root->state.forceValue(v, noPos);

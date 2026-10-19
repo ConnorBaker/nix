@@ -1363,7 +1363,7 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
            base (including revert-on bs=0 identity). Inert under revert-off
            (threads, retain-only): only changes which arena the cells live in. */
         {
-            std::optional<PauseRegion> fioPause;
+            std::optional<FioPauseRegion> fioPause;
             if (parallelEnabled())
                 fioPause.emplace();
             forceValue(**v2, noPos);
@@ -1400,7 +1400,7 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
        attribute thunks land OLD, not the transitive package graph. Byte-identical
        to base at eval-cores==1 (PauseRegion not entered); inert under revert-off. */
     {
-        std::optional<PauseRegion> fioPause;
+        std::optional<FioPauseRegion> fioPause;
         if (parallelEnabled())
             fioPause.emplace();
         forceValue(*vExpr, noPos);

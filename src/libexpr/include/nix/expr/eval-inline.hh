@@ -6,6 +6,7 @@
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval-settings.hh"
 #include <exception>
+#include <optional>
 
 namespace nix {
 
@@ -20,6 +21,16 @@ inline void * EvalMemory::allocBytes(size_t n)
        build, so the region check is compiled out entirely there. */
     if (evalRegion.active()) [[unlikely]]
         return evalRegion.alloc(n);
+    /* inc3-A2: these `n` bytes are about to be born in the OLD arena. If a
+       born-OLD force pause is active, attribute them (old-driven force vs gated
+       FIO). Both depths are 0 at eval-cores == 1 (no pause entered), so this
+       never fires there and nothing observable changes. allocValue/allocEnv route
+       their OLD-arena allocations through here (nogc), so this single site
+       captures every byte born under a pause. */
+    if (evalOldDrivenPauseDepth) [[unlikely]]
+        evalOldForcedBytes.fetch_add(n, std::memory_order_relaxed);
+    else if (evalFioPauseDepth) [[unlikely]]
+        evalFioWhnfBytes.fetch_add(n, std::memory_order_relaxed);
 #endif
     void * p;
 #if NIX_USE_BOEHMGC
@@ -175,6 +186,19 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         if (!t.env) [[unlikely]]
             return;
         try {
+            /* inc3-A2 (V2 old-allocate-on-shared-force): if this force drives a
+               cell in the genuine OLD arena, born its whole result closure in OLD
+               (never a reclaimable worker stripe) by holding a PauseRegion across
+               the body -- the generalization of the `fileEvalCache` FIO to every
+               old-driven force. Gated on `parallelEnabled()`: at eval-cores == 1
+               it is not entered, so the single-thread owner-timeline path is
+               byte-identical (values and stats). The optional's scope ends with
+               the body (and during exception unwind, before the catch), so
+               `endLoggedForce`/exception handling runs un-paused, exactly like the
+               `fileEvalCache` pattern wraps only the force. */
+            std::optional<OldForcePause> oldPause;
+            if (parallelEnabled() && unforceOldDrivenForce(&v)) [[unlikely]]
+                oldPause.emplace();
             t.expr->eval(*this, *t.env, v);
         } catch (...) {
             endLoggedForce(v);
@@ -192,6 +216,11 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         if (!a.left) [[unlikely]]
             return;
         try {
+            /* inc3-A2: old-driven apps are born OLD too (R1: the pause must wrap
+               app cells, not just thunks). Same gating/scope as the thunk arm. */
+            std::optional<OldForcePause> oldPause;
+            if (parallelEnabled() && unforceOldDrivenForce(&v)) [[unlikely]]
+                oldPause.emplace();
             callFunction(*a.left, *a.right, v, pos);
         } catch (...) {
             endLoggedForce(v);

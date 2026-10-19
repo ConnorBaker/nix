@@ -30,6 +30,9 @@
 #include <optional>
 #include <functional>
 #include <span>
+#include <atomic>
+#include <cstdint>
+#include <utility>
 
 namespace nix {
 
@@ -447,6 +450,72 @@ struct EvalRegion
    guard on the hot access). At eval-cores == 1 there is one worker, so this is
    a pure relocation of where the region lives. */
 [[gnu::tls_model("initial-exec")]] extern thread_local EvalRegion evalRegion;
+
+/* inc3-A2 (V2 old-allocate-on-shared-force). Nesting depth of the two kinds of
+   born-OLD force pause, per worker. While a depth is > 0, `evalRegion.paused` is
+   set (allocations are born in the OLD arena), and `allocBytes` attributes the
+   bytes it allocates to the matching counter:
+     - `evalOldDrivenPauseDepth`: a force whose driven cell is in the genuine OLD
+       arena (`unforceOldDrivenForce`), wrapped by `OldForcePause` in `forceValue`.
+       Its born-OLD bytes are `evalOldForcedBytes` (the V2 over-retention proxy).
+     - `evalFioPauseDepth`: a persistent-root force-into-OLD at a populate site
+       (the `fileEvalCache`/eval-cache FIO, gated on `parallelEnabled()`), wrapped
+       by `FioPauseRegion`. Its born-OLD bytes are `evalFioWhnfBytes`.
+   Both are 0 at eval-cores == 1 (no pause is entered, every gate is off), so the
+   counters stay 0 and nothing on any existing path changes -- byte-identical.
+   initial-exec + constant-initialized: no TLS-init guard on the hot alloc read. */
+[[gnu::tls_model("initial-exec")]] extern thread_local uint32_t evalOldDrivenPauseDepth;
+[[gnu::tls_model("initial-exec")]] extern thread_local uint32_t evalFioPauseDepth;
+/* Summed across workers (relaxed): read by the main thread for the `.unforce`
+   stats JSON. Only touched on the OLD-arena alloc path while a pause is active,
+   never on the young/in-scope hot path. */
+extern std::atomic<size_t> evalOldForcedBytes;
+extern std::atomic<size_t> evalFioWhnfBytes;
+
+/** inc3-A2 (V2): whether forcing the cell at `p` is an OLD-DRIVEN force -- `p`
+    is in the genuine OLD arena: outside this worker's active scope
+    (`!evalRegion.contains(p)`) AND outside the whole striped worker reservation
+    `[stripesBase, stripesBase + (nStripes << stripeShift))`. A cell in ANOTHER
+    worker's stripe also satisfies `!contains` but is NOT old-driven (it is the
+    OLD-BORN canary violation, caught by the `logOldForce` assert). Defined in
+    unforce.cc, where the stripe geometry lives. */
+bool unforceOldDrivenForce(const void * p);
+
+/** inc3-A2 (V2): RAII born-OLD pause for an old-driven force. Mirrors
+    `PauseRegion` (sets `evalRegion.paused` so the whole forced closure is born in
+    the OLD arena -- never a reclaimable stripe) and additionally tracks the
+    old-driven nesting depth so the bytes it allocates are attributed to
+    `evalOldForcedBytes`. Restores on normal and exception exit. */
+struct OldForcePause
+{
+    bool saved = std::exchange(evalRegion.paused, true);
+    OldForcePause() noexcept
+    {
+        ++evalOldDrivenPauseDepth;
+    }
+    ~OldForcePause()
+    {
+        --evalOldDrivenPauseDepth;
+        evalRegion.paused = saved;
+    }
+};
+
+/** inc3-A2 (V2): RAII born-OLD pause for a persistent-root force-into-OLD (the
+    gated FIO populate sites). Mirrors `PauseRegion` plus the FIO depth so its
+    born-OLD bytes are attributed to `evalFioWhnfBytes`. */
+struct FioPauseRegion
+{
+    bool saved = std::exchange(evalRegion.paused, true);
+    FioPauseRegion() noexcept
+    {
+        ++evalFioPauseDepth;
+    }
+    ~FioPauseRegion()
+    {
+        --evalFioPauseDepth;
+        evalRegion.paused = saved;
+    }
+};
 
 #if !NIX_USE_BOEHMGC
 /** Zeroed evaluator memory outside unforce scopes, without Boehm

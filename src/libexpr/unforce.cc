@@ -358,6 +358,47 @@ struct Stats
    across workers at teardown is inc2c-3's step. */
 [[gnu::tls_model("initial-exec")]] thread_local Stats stats;
 
+/* inc3-A2 (V2 old-allocate-on-shared-force). These are declared in eval.hh as
+   `nix::` symbols (the extern decls + the `allocBytes`/`forceValue` readers), so
+   they must be defined at `nix::` namespace scope, NOT in this file's anonymous
+   namespace -- close it for the definitions, then reopen (the anonymous-namespace
+   statics `stripesBase`/`nStripes`/`stripeShift` above remain visible from `nix::`
+   in this TU, so the predicate still reads the stripe geometry). The per-worker
+   pause depths gate `allocBytes`'s OLD-arena byte attribution; the byte counters
+   are process-global (relaxed) so the main thread reads the whole eval's totals
+   for the `.unforce` JSON regardless of which worker paused. All stay 0 at
+   eval-cores == 1 (no pause entered), so the stats are unchanged. */
+} // namespace (anonymous)
+
+[[gnu::tls_model("initial-exec")]] thread_local uint32_t evalOldDrivenPauseDepth = 0;
+[[gnu::tls_model("initial-exec")]] thread_local uint32_t evalFioPauseDepth = 0;
+std::atomic<size_t> evalOldForcedBytes{0};
+std::atomic<size_t> evalFioWhnfBytes{0};
+
+/* inc3-A2 (V2): the generation-keyed old-driven-force predicate. A force of the
+   cell at `p` is OLD-DRIVEN iff `p` is in the genuine OLD arena: outside this
+   worker's active `[base, cur)` scope AND outside the WHOLE striped worker
+   reservation `[stripesBase, stripesBase + (nStripes << stripeShift))`. A cell in
+   ANOTHER worker's stripe also satisfies `!contains` but is NOT old-driven -- it
+   is the OLD-BORN canary violation (an upstream FIO was missed), left for the
+   `logOldForce` assert to catch, NOT paused here. Same stripe arithmetic the
+   canary/`waveStripeOf` use. */
+bool unforceOldDrivenForce(const void * p)
+{
+    if (evalRegion.contains(p))
+        return false;
+    char * sb = stripesBase;
+    if (sb) {
+        auto a = (const char *) p;
+        size_t span = nStripes.load(std::memory_order_relaxed) << stripeShift;
+        if (a >= sb && a < sb + span)
+            return false;
+    }
+    return true;
+}
+
+namespace {
+
 /* This thread's stack, [low, high). */
 static thread_local const std::pair<const char *, const char *> threadStack = [] {
     pthread_attr_t attr;
@@ -4363,7 +4404,8 @@ std::string unforceStatsJSON()
         R"("revertedInClientJobs":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
         R"("keptJobBytes":%d,"identity":"%s","ownerLookups":%d,"ownerChanges":%d,"ownerSegsPeak":%d,)"
         R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,)"
-        R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d,"ownerCopyLimitJobs":%d})",
+        R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d,"ownerCopyLimitJobs":%d,)"
+        R"("oldForcedBytes":%d,"fioWhnfBytes":%d})",
         stats.jobs,
         stats.logged,
         stats.reverted,
@@ -4394,7 +4436,9 @@ std::string unforceStatsJSON()
         stats.ownerConsumerNominated,
         stats.ownerOverflowJobs,
         stats.ownerConsumerPairsPeak,
-        stats.ownerCopyLimitJobs);
+        stats.ownerCopyLimitJobs,
+        evalOldForcedBytes.load(std::memory_order_relaxed),
+        evalFioWhnfBytes.load(std::memory_order_relaxed));
 }
 
 static size_t allocatorErrors = 0;
