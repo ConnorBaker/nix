@@ -1257,12 +1257,13 @@ static uint64_t ownerOfW(const void * p)
     if (!g_wave) [[likely]]
         return ownerOf(p);
     size_t s = waveStripeOf(p);
-    /* // S4-b-b2b: `youngW` admits the WHOLE reservation (all `nStripes`), but a
-       // wave may use a SPARSE subset -- `g_wave->stripes[s]` can be an empty slot
-       // (region.base == nullptr) or past `.size()`. The pseudo-stripe (WAVE_M) and
-       // white-box paths are dense, so this is safe today; the real eval-cores>1
-       // barrier must bounds-check `s` / `region.base` here, in `ownerCellW` and
-       // `envSizeOfW` before routing (return `noOwner` / skip for an empty slot). */
+    /* Inc3 S4-b-b2b1: `youngW` admits the WHOLE reservation (all `nStripes`), but a
+       wave may use a SPARSE subset -- `g_wave->stripes[s]` can be an empty slot
+       (region.base == nullptr) or past `.size()`. A cell in such a gap has no
+       owner here (cold barrier path only; the `g_wave == null` hot path is
+       unchanged). */
+    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base)
+        return uint64_t(noOwner);
     auto o = ownerOfInStripe(g_wave->stripes[s], p);
     return o == noOwner ? uint64_t(noOwner) : (uint64_t(s) << waveOwnerShift) | o;
 }
@@ -1272,14 +1273,28 @@ static const Value * ownerCellW(uint64_t o)
     if (!g_wave) [[likely]]
         return ownerCell(uint32_t(o));
     size_t s = o >> waveOwnerShift;
-    return g_wave->stripes[s].undoLog[o & waveOwnerMask].target;
+    /* b2b1: guard the sparse/empty stripe + the log index (cold barrier path). */
+    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base)
+        return nullptr;
+    auto idx = o & waveOwnerMask;
+    if (idx >= g_wave->stripes[s].undoLog.size())
+        return nullptr;
+    return g_wave->stripes[s].undoLog[idx].target;
 }
 
+static size_t g_envSizeWGaps = 0; /* b2b1 debug: Envs the barrier walk couldn't size */
 static size_t envSizeOfW(const Env * e)
 {
     if (!g_wave) [[likely]]
         return envSizeOf(e);
-    return envSizeOfInStripe(g_wave->stripes[waveStripeOf(e)], e);
+    size_t s = waveStripeOf(e);
+    /* b2b1: an Env in a gap / unassembled stripe has no size table to read; 0 means
+       "no values to scan" (cold barrier path; the hot path is the fast branch). */
+    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base || !g_wave->stripes[s].task.envSizeTable) {
+        g_envSizeWGaps++;
+        return 0;
+    }
+    return envSizeOfInStripe(g_wave->stripes[s], e);
 }
 
 /* At a job's end its Envs are copied or kept as old objects, or freed:
@@ -2176,6 +2191,10 @@ static uint32_t * elemTag = nullptr;
 static size_t elemTagSlots = 0;
 static std::vector<size_t> elemTouched;
 static constexpr uint32_t kElemShared = 1;
+/* Inc3 S4-b-b2b1: the tag value for "visited by the owner-closure walk" (distinct
+   from element tags; the closure walk reuses the same table after the reach walk
+   has cleared it). */
+static constexpr uint32_t kClosureVisited = UINT32_MAX;
 
 /* When set, drop the design's second nomination disjunct (persistent-root /
    force-count reuse), nominating by within-wave reachability (deg >= 2) alone.
@@ -2210,6 +2229,12 @@ struct ReachNominator
     uint32_t curElem = 0;
     bool bound = false;             /* test teeth: stop at stripe boundaries */
     uint32_t boundStripe = 0;       /* the single stripe `bound` confines to */
+    /* Inc3 S4-b-b2b1: CLOSURE MODE. When set, the walk marks each young object
+       `kClosureVisited` (once) and calls `closureNote(closureCtx, obj)` for each
+       identity-bearing one -- the owner-closure of the seed, without copying. A
+       function pointer so this struct need not see `OwnerClosure` (defined later). */
+    void (*closureNote)(void *, const void *) = nullptr;
+    void * closureCtx = nullptr;
 
     /* The young test: cross-stripe (`youngW`) unless `bound`, which confines the
        walk to `boundStripe` (the stripe-bounded behaviour the generalization
@@ -2257,6 +2282,16 @@ struct ReachNominator
             return false;
         size_t idx = size_t((const char *) p - base) >> 4;
         uint32_t & slot = tag[idx];
+        if (closureNote) [[unlikely]] {
+            /* Closure mode: visit each young object once; nominate its owner. */
+            if (slot == kClosureVisited)
+                return false;
+            slot = kClosureVisited;
+            touched->push_back(idx);
+            if (identityBearing)
+                closureNote(closureCtx, p);
+            return true;
+        }
         if (slot == curElem || slot == kElemShared)
             return false;
         if (slot == 0) {
@@ -2658,6 +2693,43 @@ struct OwnerClosure
     }
 };
 
+/* Inc3 S4-b-b2b1: grow `promote` to its cross-stripe owner-closure over the
+   assembled registry `reg`, COMPUTE ONLY. The `OwnerClosure` fixpoint (`run`) drives
+   a cross-stripe walk of each promoted target's young closure (`ReachNominator` in
+   closure mode) that calls `OwnerClosure::note` per identity-bearing young object,
+   so the owner of everything in Evac(S) joins S. Nothing is copied or freed.
+   Returns the number of targets the closure ADDED (0 == already closed). Requires
+   `g_elemTagW` mapped (the reach walk allocated + cleared it). */
+static size_t closeOwnerSetWalk(WaveController & reg, const JobTargets & jt, std::vector<bool> & promote)
+{
+    if (!g_elemTagW)
+        return 0;
+    WaveController * prev = g_wave;
+    g_wave = &reg;
+    std::vector<std::pair<const Value *, uint32_t>> emptyByCell;
+    OwnerClosure oc(jt, promote);
+    ReachNominator cw{stripesBase, g_elemTagW, &g_elemTouchedW, promote, emptyByCell};
+    cw.closureNote = &OwnerClosure::note;
+    cw.closureCtx = &oc;
+    oc.run([&](size_t i) { cw.walk(jt.cells[i], 0); });
+    g_wave = prev;
+    for (auto idx : g_elemTouchedW)
+        g_elemTagW[idx] = 0;
+    g_elemTouchedW.clear();
+    return oc.added;
+}
+
+/* The closure invariant (the safety property b2b2 needs): a keep-set S is closed
+   iff closing it again ADDS nothing -- i.e. every identity-bearing young object in
+   Evac(S) already has its owner in S, so reverting everything outside S cannot
+   dangle an S pointer. Teeth: a set MISSING a required owner is not closed -> the
+   re-closure adds it back -> returns false. */
+static bool checkClosureInvariant(WaveController & reg, const JobTargets & jt, const std::vector<bool> & promote)
+{
+    std::vector<bool> copy = promote;
+    return closeOwnerSetWalk(reg, jt, copy) == 0;
+}
+
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
    `counts` nominate, as do the targets `printed` marks (`UnforceSeen`; null
@@ -2907,6 +2979,10 @@ struct WorkerStripeHandle
     EvalUndoLog * undoLog = nullptr;
     SegStack * segs = nullptr;
     TaskUnforceState * task = nullptr;
+    /* Inc3 S4-b-b2b1: the open-segment pointer + current owner, needed by
+       `ownerOfInStripe` for the barrier's cross-stripe owner routing. */
+    char ** ownerSegPtr = nullptr;
+    uint32_t * curOwnerPtr = nullptr;
 };
 static std::mutex g_workerRegMutex;
 static std::map<uint32_t, WorkerStripeHandle> g_workerReg; /* global stripe id -> handle */
@@ -2947,6 +3023,11 @@ struct RehomeStats
     /* b1: the delimited this-wave slice + the dry-run promote/revert split. */
     size_t sliceEntries = 0, revertible = 0, promoted = 0;
     bool delimitationValid = true; /* every structural invariant held */
+    /* b2b1: the reach seed + OwnerClosure promote set computed at the real barrier. */
+    size_t youngTargets = 0;    /* merged this-wave targets (the revert candidates) */
+    size_t reachSeed = 0;       /* cross-stripe reach nominations (pre-closure) */
+    size_t promotedClosed = 0;  /* after the OwnerClosure (the keep-set) */
+    bool closureValid = true;   /* the keep-set satisfies the closure invariant */
 };
 static RehomeStats g_lastRehome;
 
@@ -2960,6 +3041,8 @@ static void registerWorkerStripeHandle()
     h.undoLog = &undoLog;
     h.segs = &ownerSegs;
     h.task = &rootTask;
+    h.ownerSegPtr = &ownerSeg;
+    h.curOwnerPtr = &curOwner;
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     g_workerReg[myStripe] = h;
 }
@@ -2990,8 +3073,9 @@ static void captureWaveStartImpl(bool executorIdle)
 /* The assembly + delimitation + validation (runs on the main thread at the
    quiescent barrier). Frees nothing, reverts nothing, resets no worker TLS.
    `state` (null in the white-box test) enables the env-gated dry-run promote. */
-static void rehomeWorkerStripesImpl(EvalState * state)
+static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const Value *> & roots)
 {
+    (void) roots; /* // S4-b-b2b1: consumed by the reach seed + OwnerClosure below */
     std::lock_guard<std::mutex> lk(g_workerRegMutex);
     RehomeStats stats;
     g_rehomeRegistry.stripes.clear(); /* fresh registry per wave */
@@ -3035,6 +3119,14 @@ static void rehomeWorkerStripesImpl(EvalState * state)
            keptStart/Floor/End (shallow -> live); generation. Feeds
            `envSizeOfInStripe`. */
         dst.task = *h.task;
+        /* b2b1: the open-segment + current owner, so `ownerOfInStripe` routes the
+           cross-stripe reach/closure owner lookups (b1 left these default, which
+           made `ownerOfInStripe` always return `noOwner`). For a single wave
+           undoMark==0, so `dst.undoLog` (the [undoMark:] slice) IS the full log and
+           `ownerCellW`'s log-index routing is correct. // S4-b-b2b2: a multi-wave
+           barrier (undoMark>0) must assemble the FULL log for owner routing. */
+        dst.ownerSeg = h.ownerSegPtr ? *h.ownerSegPtr : nullptr;
+        dst.curOwner = h.curOwnerPtr ? *h.curOwnerPtr : noOwner;
         /* Prior-wave young TEETH: every young slice target must lie in
            [startCur, cur). A young target below startCur is a prior-wave cell that
            sneaked into this wave's slice -- the delimitation is wrong. */
@@ -3064,14 +3156,47 @@ static void rehomeWorkerStripesImpl(EvalState * state)
             (promote[i] ? stats.promoted : stats.revertible)++;
     }
 
+    /* --- b2b1: the cross-stripe reach SEED + OwnerClosure at the LIVE barrier.
+       Roots (the elements' forced result Values) + the main's stripe-0 metadata are
+       available now; `g_wave` is set to the assembled registry inside the walk.
+       COMPUTE ONLY -- no copy to OLD, no revert, no free, no TLS reset. --- */
+    if (state && !roots.empty() && !mergedSlice.empty()) {
+        JobTargets jt(mergedSlice, 0);
+        stats.youngTargets = jt.size();
+        if (auto seed = reachabilityNominateWaveImpl(g_rehomeRegistry, jt, roots, false, 0)) {
+            std::vector<bool> promote = std::move(*seed);
+            for (bool b : promote)
+                stats.reachSeed += b;
+            /* OwnerClosure: close the reach seed to the ownership invariant (every
+               identity-bearing young object in Evac(S) has its owner in S), the real
+               keep-set. The closure is grown by a cross-stripe walk of Evac(S) that
+               calls `OwnerClosure::note` per object (reusing `ReachNominator`'s
+               traversal in closure mode); nothing is copied or freed. */
+            closeOwnerSetWalk(g_rehomeRegistry, jt, promote);
+            for (bool b : promote)
+                stats.promotedClosed += b;
+            /* Validate: the keep-set satisfies the closure invariant (teeth: a set
+               missing a required owner fails). */
+            stats.closureValid = checkClosureInvariant(g_rehomeRegistry, jt, promote);
+            /* // S4-b-b2b2 (the revert, turned OFF here): `promote` IS the keep-set.
+               // b2b2 would, with `g_wave` = registry: PauseRegion; Evacuator copy
+               // each promoted target to OLD; assign the copies (*cell = copy);
+               // revert the rest (*cell = preImage(i)) over the merged this-wave
+               // slices; then free each stripe's [startCur, cur) (MADV_DONTNEED) and
+               // reset its TLS (region.cur := startCur, undoLog truncate to undoMark,
+               // ownerSegs/generation rollback). b2b1 does NONE of this. */
+        }
+    }
+
     g_lastRehome = stats;
     if (getenv("NIX_UNFORCE_REHOME_DEBUG"))
         fprintf(
             stderr,
             "unforce rehome: stripes=%zu undoEntries=%zu sliceEntries=%zu youngBytes=%zu "
-            "revertible=%zu promoted=%zu valid=%d\n",
-            stats.stripes, stats.undoEntries, stats.sliceEntries, stats.youngBytes, stats.revertible, stats.promoted,
-            int(stats.delimitationValid));
+            "youngTargets=%zu reachSeed=%zu promotedClosed=%zu closureValid=%d valid=%d envGaps=%zu\n",
+            stats.stripes, stats.undoEntries, stats.sliceEntries, stats.youngBytes, stats.youngTargets,
+            stats.reachSeed, stats.promotedClosed, int(stats.closureValid), int(stats.delimitationValid),
+            g_envSizeWGaps);
 }
 
 } // namespace
@@ -3081,9 +3206,9 @@ void unforceCaptureWaveStart(bool executorIdle)
     captureWaveStartImpl(executorIdle);
 }
 
-void unforceRehomeWorkerStripes(EvalState & state)
+void unforceRehomeWorkerStripes(EvalState & state, const std::vector<const Value *> & roots)
 {
-    rehomeWorkerStripesImpl(&state);
+    rehomeWorkerStripesImpl(&state, roots);
     /* The delimitation must be structurally sound on every real wave. */
     assert(g_lastRehome.delimitationValid);
     if (!g_lastRehome.delimitationValid)
@@ -3230,7 +3355,7 @@ void captureWaveStartForTest(bool executorIdle)
 
 void runRehomeForTest()
 {
-    rehomeWorkerStripesImpl(nullptr);
+    rehomeWorkerStripesImpl(nullptr, {});
 }
 
 size_t lastRehomeStripes()
@@ -3484,6 +3609,94 @@ ReachSet reachRootAsChildForTest(EvalState & state, int layout)
     stripesBase = savedBase;
     munmap(resv, nst << stripeShift);
     return out;
+}
+
+/* Inc3 S4-b-b2b1 white-box: the OwnerClosure + its safety invariant. Graph in one
+   stripe: X = tApp(Y, leaf) is a target; Y is an identity-bearing young object
+   OWNED by a DIFFERENT target Z (the owner timeline maps Y's address to Z's log
+   index). With the SEED = {X}, the closure must pull in Z (X's Evac contains Y,
+   owned by Z). Reports: `closedHasZ` (the closure added Z), `invClosed` (the closed
+   set {X,Z} satisfies the invariant), `invSeedOnly` (the seed {X} alone does NOT --
+   the teeth: a set missing a required owner is not closed). */
+void ownerClosureForTest(bool & closedHasZ, bool & invClosed, bool & invSeedOnly)
+{
+    char * savedBase = stripesBase;
+    size_t savedN = nStripes.load(std::memory_order_relaxed);
+    WaveController * savedWave = g_wave;
+
+    const size_t nst = 2;
+    char * resv = (char *) mmap(
+        nullptr, nst << stripeShift, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(resv != MAP_FAILED);
+    stripesBase = resv;
+    nStripes.store(nst, std::memory_order_relaxed);
+    char * b1 = resv + (size_t(1) << stripeShift);
+    auto cellAt = [&](size_t slot) { return (Value *) (b1 + slot * 16); };
+
+    Value * X = cellAt(0);    /* target 0 */
+    Value * Z = cellAt(1);    /* target 1 (owner of Y) */
+    Value * Y = cellAt(2);    /* identity-bearing young object owned by Z */
+    Value * leaf = cellAt(3); /* also owned by Z */
+    Z->mkInt(NixInt(1));
+    Y->mkInt(NixInt(2));
+    leaf->mkInt(NixInt(3));
+    X->mkApp(Y, leaf); /* X's closure reaches Y */
+
+    WaveController wc;
+    wc.stripes.resize(2);
+    auto & ss = wc.stripes[1];
+    ss.region.base = b1;
+    ss.region.cur = b1 + (size_t(1) << 20);
+    ss.myStripe = 1;
+    ss.ownerSeg = ss.region.cur;
+    ss.curOwner = noOwner;
+    ss.segs.open(size_t(1) << 20);
+    ss.segs.b[0] = segSentinel;
+    ss.segs.b[1] = OwnerSeg{0, 0}; /* off 0 (X) -> owner 0 (X) */
+    ss.segs.b[2] = OwnerSeg{1, 1}; /* off >= 1 (Z, Y, leaf) -> owner 1 (Z) */
+    ss.segs.t = ss.segs.high = ss.segs.b + 3;
+    {
+        EvalState::UndoEntry ex{};
+        ex.target = X;
+        ss.undoLog.push_back(ex);
+        EvalState::UndoEntry ez{};
+        ez.target = Z;
+        ss.undoLog.push_back(ez);
+    }
+
+    EvalUndoLog merged;
+    for (auto & e : ss.undoLog)
+        merged.push_back(e);
+    JobTargets jt(merged, 0);
+    auto xi = b2aIndexOf(jt, X), zi = b2aIndexOf(jt, Z);
+
+    /* The reach walk allocates + clears `g_elemTagW`; run it once (empty roots) to
+       ensure the table is mapped, then drive the closure. */
+    { std::vector<const Value *> none; (void) reachabilityNominateWaveImpl(wc, jt, none, false, 0); }
+
+    std::vector<bool> seed(jt.size());
+    seed[xi] = true; /* SEED = {X} */
+    std::vector<bool> closed = seed;
+    closeOwnerSetWalk(wc, jt, closed);
+    closedHasZ = zi != size_t(-1) && closed[zi];
+    invClosed = checkClosureInvariant(wc, jt, closed);
+    invSeedOnly = checkClosureInvariant(wc, jt, seed);
+
+    if (ss.segs.map)
+        munmap(ss.segs.map, ss.segs.mapped);
+    g_wave = savedWave;
+    nStripes.store(savedN, std::memory_order_relaxed);
+    stripesBase = savedBase;
+    munmap(resv, nst << stripeShift);
+}
+
+size_t lastRehomePromotedClosed()
+{
+    return g_lastRehome.promotedClosed;
+}
+bool lastRehomeClosureValid()
+{
+    return g_lastRehome.closureValid;
 }
 
 } // namespace unforce_test
@@ -4255,9 +4468,13 @@ size_t EvalState::beginUnforceScope(const void * stackMark)
         openOwners(*this);
         /* Inc3 S4-b-a1 (F4a): a worker registers a handle to its thread_local
            stripe here (stable addresses), so the main thread can re-home it at
-           the quiescent drv-set wave barrier. Worker-only: the main thread's
-           stripe 0 is the driver's own and is not re-homed. */
-        if (Executor::amWorkerThread)
+           the quiescent drv-set wave barrier. Inc3 S4-b-b2b1: the MAIN thread (when
+           the pool is enabled) ALSO registers its stripe 0, so the barrier's
+           cross-stripe reach walk can traverse the main's drv structure to reach the
+           worker cells it references. A worker must NOT read `executor` (it may be
+           mid-construction); the main safely can. At eval-cores=1 the pool is
+           disabled, so the main does not register -- byte-for-byte base. */
+        if (Executor::amWorkerThread || (executor && executor->enabled))
             registerWorkerStripeHandle();
     }
     return undoLog.size();

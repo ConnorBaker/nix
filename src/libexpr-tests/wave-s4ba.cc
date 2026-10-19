@@ -63,6 +63,8 @@ struct ReachSet
     bool x = false, q = false;
 };
 ReachSet reachRootAsChildForTest(EvalState & state, int layout);
+/* Inc3 S4-b-b2b1 OwnerClosure hooks. */
+void ownerClosureForTest(bool & closedHasZ, bool & invClosed, bool & invSeedOnly);
 } // namespace unforce_test
 
 class WaveS4baTest : public LibExprTest
@@ -415,6 +417,23 @@ TEST_F(WaveS4baTest, b2aReachSetInvariantAcrossSplitsWithTeeth)
     EXPECT_EQ(split3.q, single.q) << "cross-stripe (3 splits): Q still excluded";
     /* Safety: the shared cell reachable from BOTH retained roots IS in the set. */
     EXPECT_TRUE(split2.x && split3.x) << "a cell reachable from a retained root must be nominated";
+}
+
+/* ===== Inc3 S4-b-b2b1: the OwnerClosure + its safety invariant =============
+   The reach nomination is the SEED; the keep-set is its cross-stripe OwnerClosure.
+   With seed {X} where X's Evac contains Y owned by a different target Z, the
+   closure must add Z, and the result must satisfy the closure invariant (so b2b2
+   can revert everything outside it without dangling). */
+TEST_F(WaveS4baTest, b2b1OwnerClosureInvariantWithTeeth)
+{
+    using namespace unforce_test;
+    bool closedHasZ = false, invClosed = false, invSeedOnly = true;
+    ownerClosureForTest(closedHasZ, invClosed, invSeedOnly);
+    EXPECT_TRUE(closedHasZ) << "the closure must pull in Z (owner of X's Evac-reachable object Y)";
+    EXPECT_TRUE(invClosed) << "the closed keep-set {X,Z} satisfies the closure invariant (safe to revert outside)";
+    /* TEETH: a keep-set MISSING a required owner (the seed {X} without Z) is NOT
+       closed -- reverting outside it would dangle X's reference to Y (owned by Z). */
+    EXPECT_FALSE(invSeedOnly) << "a promote set missing a retained-reachable owner must FAIL the invariant";
 }
 
 } // namespace nix

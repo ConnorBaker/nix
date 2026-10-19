@@ -125,7 +125,7 @@ void unforceCaptureWaveStart(bool executorIdle);
     prior-wave / promoted / main-thread cells). Reclamation stays OFF (this frees
     nothing, reverts nothing, resets no TLS; the revert + per-wave region free +
     TLS write-back are S4-b-b2). Called from the drv-set driver after the barrier. */
-void unforceRehomeWorkerStripes(EvalState & state);
+void unforceRehomeWorkerStripes(EvalState & state, const std::vector<const Value *> & roots);
 
 /** Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();

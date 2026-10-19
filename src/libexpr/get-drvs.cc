@@ -515,61 +515,94 @@ static void getDerivations(
             }
         }
 
-        /* The barrier runs on EVERY exit from this scope (normal or unwinding),
-           so the warm tasks -- which reference `state`/`pathPrefix`/`autoArgs` --
-           are always awaited before this call returns. On an abnormal exit
-           (`!serialOk`) the wave is CANCELLED first so a sibling the serial pass
-           never reached unwinds promptly instead of hanging. */
-        Finally drainWave([&]() noexcept {
-            if (!wave)
-                return;
-            drvSetFanOutActive = false;
-            if (!serialOk)
-                wave->requestCancel();
-            try {
-                wave->barrier();
-            } catch (...) {
-                ignoreExceptionInDestructor();
-            }
-            try {
-                state.executor->awaitExecutorIdle();
-            } catch (...) {
-                ignoreExceptionInDestructor();
-            }
-            /* F4a + F4c: assemble each participating worker's this-wave stripe
-               slice into the registry + validate the delimitation (quiescent;
-               frees nothing, reverts nothing, resets no TLS in b1). */
-            try {
-                unforceRehomeWorkerStripes(state);
-            } catch (...) {
-                ignoreExceptionInDestructor();
-            }
-        });
+        /* Inc3 S4-b-b2b1: the element RESULT ROOTS for the barrier's cross-stripe
+           reach walk. `waveElementRoots` is cleared at every `endUnforceScope`, so
+           it is empty at the drain -- collect the roots here, where they survive. */
+        std::vector<const Value *> waveRoots;
 
         /* The authoritative serial pass -- byte-identical to base (the sole
-           producer of `drvs`). */
+           producer of `drvs`). For the FAN-OUT it runs under ONE unforce scope
+           (no per-element flush), so the main's owner / env-size metadata stays
+           LIVE for the barrier's reach walk; `drainWave` is declared AFTER the
+           batch, so it runs (the barrier) BEFORE the scope closes. The main is
+           retain-only at eval-cores>1, so one kept-whole scope vs many is
+           byte-identical in VALUES -- it reverts / promotes / frees nothing, only
+           DEFERS the metadata release (RSS-only). Off the fan-out path the batching
+           is EXACTLY the shipped per-element one (byte- and stack-parity-identical). */
         {
             /* With `unforce`, what each attribute's evaluation forced is
                unforced once its batch is done (see `UnforceBatch`). */
             UnforceBatch batch(state, drvs.unforce);
+            if (fanOut)
+                batch.open(); /* one scope spanning the whole drv-set */
+
+            /* The barrier runs on EVERY exit from this block (normal or unwinding),
+               so the warm tasks -- which reference `state`/`pathPrefix`/`autoArgs`
+               -- are always awaited before this call returns, and BEFORE the batch
+               (main metadata) is released. On an abnormal exit (`!serialOk`) the
+               wave is CANCELLED first so a sibling the serial pass never reached
+               unwinds promptly instead of hanging. */
+            Finally drainWave([&]() noexcept {
+                if (!wave)
+                    return;
+                drvSetFanOutActive = false;
+                if (!serialOk)
+                    wave->requestCancel();
+                try {
+                    wave->barrier();
+                } catch (...) {
+                    ignoreExceptionInDestructor();
+                }
+                try {
+                    state.executor->awaitExecutorIdle();
+                } catch (...) {
+                    ignoreExceptionInDestructor();
+                }
+                /* F4a + F4c + b2b1: quiescent, and the main's stripe-0 metadata is
+                   still LIVE (the batch is not destructed yet). Assemble the stripes
+                   (incl. main stripe 0), run the cross-stripe reach seed +
+                   OwnerClosure, validate. Frees / reverts nothing; resets no TLS. */
+                try {
+                    unforceRehomeWorkerStripes(state, waveRoots);
+                } catch (...) {
+                    ignoreExceptionInDestructor();
+                }
+            });
+
             for (auto * i : order) {
                 std::string_view symbol{state.symbols[i->name]};
-                UnforceBatch::Element element(batch);
-                /* Inc3-S2: the wave barrier classifies this element's result
-                   closure by cross-element reachability. */
-                if (drvs.unforce)
-                    state.noteWaveElementRoot(i->value);
-                try {
-                    debug("evaluating attribute '%1%'", symbol);
-                    processDrvSetElement(
-                        state, *i, pathPrefix, autoArgs, drvs, done, combineChannels, ignoreAssertionFailures);
-                } catch (Error & e) {
-                    e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
-                    throw;
+                if (fanOut) {
+                    /* One scope: no per-element `Element` (no flush), so the main's
+                       metadata survives to the barrier. */
+                    if (drvs.unforce) {
+                        state.noteWaveElementRoot(i->value);
+                        waveRoots.push_back(i->value);
+                    }
+                    try {
+                        debug("evaluating attribute '%1%'", symbol);
+                        processDrvSetElement(
+                            state, *i, pathPrefix, autoArgs, drvs, done, combineChannels, ignoreAssertionFailures);
+                    } catch (Error & e) {
+                        e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
+                        throw;
+                    }
+                } else {
+                    /* Shipped per-element batching (unchanged). */
+                    UnforceBatch::Element element(batch);
+                    if (drvs.unforce)
+                        state.noteWaveElementRoot(i->value);
+                    try {
+                        debug("evaluating attribute '%1%'", symbol);
+                        processDrvSetElement(
+                            state, *i, pathPrefix, autoArgs, drvs, done, combineChannels, ignoreAssertionFailures);
+                    } catch (Error & e) {
+                        e.addTrace(state.positions[i->pos], "while evaluating the attribute '%s'", symbol);
+                        throw;
+                    }
                 }
             }
+            serialOk = true;
         }
-        serialOk = true;
     }
 
     else if (v.type() == nList) {
