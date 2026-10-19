@@ -410,6 +410,13 @@ Value * EvalCache::getRootValue()
     return *v->value;
 }
 
+Value * EvalCache::peekRootValue()
+{
+    /* Inc3 S4-b-b2b1b: peek only -- do NOT run the loader. */
+    auto v(rootValue.lock());
+    return v->value ? *v->value : nullptr;
+}
+
 ref<AttrCursor> EvalCache::getRoot()
 {
     return make_ref<AttrCursor>(ref(shared_from_this()), std::nullopt);

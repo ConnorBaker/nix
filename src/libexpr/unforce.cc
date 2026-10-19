@@ -1111,6 +1111,12 @@ struct WaveStripe
     uint64_t lastConsumerPair = PairSet::empty;
     TaskUnforceState task;
     uint32_t myStripe = 0;
+    /* Inc3 S4-b-b2b1b (R1): `undoLog` holds the FULL owner log (all waves) so the
+       owner ids on `segs` -- which are FULL-log indices -- resolve in `ownerCellW`.
+       The THIS-WAVE revert slice (what b2b2 reverts, what the reach targets are) is
+       `[sliceStart:end]`; for a single wave / the pseudo-stripe path sliceStart==0,
+       so full == slice (byte-identical). */
+    size_t sliceStart = 0;
     /* Index-order flush bookkeeping: the element-index range this stripe
        produced (contiguous, since stripes fill in order on one thread). */
     size_t firstElement = 0, lastElement = 0;
@@ -1251,6 +1257,12 @@ static size_t waveStripeSpan()
     return (g_wave ? nStripes.load(std::memory_order_relaxed) : 1) << stripeShift;
 }
 
+/* Inc3 S4-b-b2b1b (fix 3): cells the barrier walk reached in a sparse/unassembled
+   stripe -- their owner/size could not be resolved, so an incomplete (under-promoting)
+   traversal would otherwise pass silently. Reset before the barrier walk; >0 after is
+   a HARD fatal. `g_envSizeWGaps` is the env-size subset (kept for the debug line). */
+static size_t g_waveTraversalGaps = 0;
+
 /* Routed owner id: `noOwner`, else `(stripe << waveOwnerShift) | local`. */
 static uint64_t ownerOfW(const void * p)
 {
@@ -1262,8 +1274,10 @@ static uint64_t ownerOfW(const void * p)
        (region.base == nullptr) or past `.size()`. A cell in such a gap has no
        owner here (cold barrier path only; the `g_wave == null` hot path is
        unchanged). */
-    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base)
+    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base) {
+        g_waveTraversalGaps++;
         return uint64_t(noOwner);
+    }
     auto o = ownerOfInStripe(g_wave->stripes[s], p);
     return o == noOwner ? uint64_t(noOwner) : (uint64_t(s) << waveOwnerShift) | o;
 }
@@ -1274,11 +1288,15 @@ static const Value * ownerCellW(uint64_t o)
         return ownerCell(uint32_t(o));
     size_t s = o >> waveOwnerShift;
     /* b2b1: guard the sparse/empty stripe + the log index (cold barrier path). */
-    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base)
+    if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base) {
+        g_waveTraversalGaps++;
         return nullptr;
+    }
     auto idx = o & waveOwnerMask;
-    if (idx >= g_wave->stripes[s].undoLog.size())
+    if (idx >= g_wave->stripes[s].undoLog.size()) {
+        g_waveTraversalGaps++;
         return nullptr;
+    }
     return g_wave->stripes[s].undoLog[idx].target;
 }
 
@@ -1292,6 +1310,7 @@ static size_t envSizeOfW(const Env * e)
        "no values to scan" (cold barrier path; the hot path is the fast branch). */
     if (s >= g_wave->stripes.size() || !g_wave->stripes[s].region.base || !g_wave->stripes[s].task.envSizeTable) {
         g_envSizeWGaps++;
+        g_waveTraversalGaps++;
         return 0;
     }
     return envSizeOfInStripe(g_wave->stripes[s], e);
@@ -2730,6 +2749,75 @@ static bool checkClosureInvariant(WaveController & reg, const JobTargets & jt, c
     return closeOwnerSetWalk(reg, jt, copy) == 0;
 }
 
+/* Inc3 S4-b-b2b1b (R2): a tolerant owner-nomination note for the PERSISTENT-root
+   walk. Unlike `OwnerClosure::note` (which asserts every owner is a this-wave
+   target, true for the element-result closure), a persistent root may reach a
+   PRIOR-wave young cell whose owner is not in this wave's slice -- that owner is
+   simply skipped (its retention was decided at its own wave's barrier). */
+struct PersistentNote
+{
+    std::vector<bool> & promote;
+    std::vector<std::pair<const Value *, uint32_t>> byCell;
+    uint64_t last = noOwner;
+
+    PersistentNote(const JobTargets & jt, std::vector<bool> & promote)
+        : promote(promote)
+    {
+        byCell.reserve(jt.size());
+        for (size_t i = 0; i < jt.size(); ++i)
+            byCell.emplace_back(jt.cells[i], i);
+        std::sort(byCell.begin(), byCell.end());
+    }
+
+    std::optional<size_t> indexOf(const Value * c) const
+    {
+        auto i = std::lower_bound(byCell.begin(), byCell.end(), c, [](const auto & e, const Value * c) {
+            return std::less<const Value *>{}(e.first, c);
+        });
+        if (i == byCell.end() || i->first != c)
+            return std::nullopt;
+        return i->second;
+    }
+
+    static void note(void * ctx, const void * p)
+    {
+        auto & x = *(PersistentNote *) ctx;
+        auto o = ownerOfW(p);
+        if (o == uint64_t(noOwner) || o == x.last)
+            return;
+        x.last = o;
+        if (auto t = x.indexOf(ownerCellW(o)))
+            x.promote[*t] = true;
+    }
+};
+
+/* Inc3 S4-b-b2b1b (R2): nominate the OWNER of every identity-bearing young cell
+   reachable from the PERSISTENT roots into `promote` (deg-1 included -- a persistent
+   root alone re-navigates the cell after the wave; the subsequent `closeOwnerSetWalk`
+   grows it to the full owner-closure). Closure-mode walk, COMPUTE-ONLY -- nothing is
+   copied, reverted, or freed. Requires `g_elemTagW` mapped. */
+static void seedPersistentRootsWalk(
+    WaveController & reg, const JobTargets & jt, std::vector<bool> & promote,
+    const std::vector<const Value *> & proots)
+{
+    if (!g_elemTagW || proots.empty())
+        return;
+    WaveController * prev = g_wave;
+    g_wave = &reg;
+    std::vector<std::pair<const Value *, uint32_t>> emptyByCell;
+    PersistentNote pn(jt, promote);
+    ReachNominator pw{stripesBase, g_elemTagW, &g_elemTouchedW, promote, emptyByCell};
+    pw.closureNote = &PersistentNote::note;
+    pw.closureCtx = &pn;
+    for (auto * r : proots)
+        if (r)
+            pw.walk(r, 0);
+    g_wave = prev;
+    for (auto idx : g_elemTouchedW)
+        g_elemTagW[idx] = 0;
+    g_elemTouchedW.clear();
+}
+
 /* Decide which of a job's targets to promote, and copy them with
    `evacuator` into `copies` (indexed like the targets): the counts in
    `counts` nominate, as do the targets `printed` marks (`UnforceSeen`; null
@@ -3028,6 +3116,11 @@ struct RehomeStats
     size_t reachSeed = 0;       /* cross-stripe reach nominations (pre-closure) */
     size_t promotedClosed = 0;  /* after the OwnerClosure (the keep-set) */
     bool closureValid = true;   /* the keep-set satisfies the closure invariant */
+    /* b2b1b: persistent-root seed (R2) + OOM keep-all (fix 4) + traversal gaps (fix 3). */
+    size_t persistentRoots = 0;     /* persistent-root values seeded from */
+    size_t afterPersistent = 0;     /* keep-set after the persistent-root seed (pre-close) */
+    bool seedFailedKeepAll = false; /* reach tag table OOM -> retained ALL targets */
+    size_t traversalGaps = 0;       /* cells reached in unassembled stripes (must be 0) */
 };
 static RehomeStats g_lastRehome;
 
@@ -3108,9 +3201,15 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
         auto & dst = g_rehomeRegistry.stripes[id];
         dst.region = *h.region; /* region DESCRIPTOR (base/cur/sizes) */
         dst.myStripe = id;
-        /* This-wave undo SLICE (deep, OWNED): the target list b2 reverts. Bounded
-           by the entries LOGGED this wave (not the young region), so cheap. */
-        dst.undoLog.assign(h.undoLog->begin() + undoMark, h.undoLog->end());
+        /* Inc3 S4-b-b2b1b (R1): assemble the FULL owner log (deep, OWNED), and record
+           the this-wave revert SLICE boundary `sliceStart = undoMark`. The owner ids
+           on `segs` are FULL-log indices, so `ownerCellW` MUST index the full log
+           (indexing the [undoMark:] slice mis-resolved a this-wave target's owner id
+           to an OOB index -> the bounds guard dropped it -> a shared producer went
+           unpromoted when undoMark>0). The revert targets are still only
+           `[sliceStart:end]` (iterated below). */
+        dst.undoLog.assign(h.undoLog->begin(), h.undoLog->end());
+        dst.sliceStart = undoMark;
         /* Owner timeline (SHALLOW -> live worker memory, read in place at the
            quiescent barrier by `ownerOfInStripe`; never freed from the registry,
            so no double-free; b1 frees nothing). // S4-b-b2: own vs read-in-place. */
@@ -3121,27 +3220,27 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
         dst.task = *h.task;
         /* b2b1: the open-segment + current owner, so `ownerOfInStripe` routes the
            cross-stripe reach/closure owner lookups (b1 left these default, which
-           made `ownerOfInStripe` always return `noOwner`). For a single wave
-           undoMark==0, so `dst.undoLog` (the [undoMark:] slice) IS the full log and
-           `ownerCellW`'s log-index routing is correct. // S4-b-b2b2: a multi-wave
-           barrier (undoMark>0) must assemble the FULL log for owner routing. */
+           made `ownerOfInStripe` always return `noOwner`). b2b1b: the full log +
+           `sliceStart` make this correct for undoMark>0 too (R1). */
         dst.ownerSeg = h.ownerSegPtr ? *h.ownerSegPtr : nullptr;
         dst.curOwner = h.curOwnerPtr ? *h.curOwnerPtr : noOwner;
-        /* Prior-wave young TEETH: every young slice target must lie in
+        /* Prior-wave young TEETH: every young THIS-WAVE slice target must lie in
            [startCur, cur). A young target below startCur is a prior-wave cell that
-           sneaked into this wave's slice -- the delimitation is wrong. */
-        for (auto & e : dst.undoLog) {
-            auto a = (const char *) e.target;
+           sneaked into this wave's slice -- the delimitation is wrong. (Iterate the
+           slice [sliceStart:end], not the full log -- prior-wave entries legitimately
+           sit below startCur.) */
+        for (size_t k = dst.sliceStart; k < dst.undoLog.size(); ++k) {
+            auto a = (const char *) dst.undoLog[k].target;
             if (a >= h.region->base && a < h.region->cur && a < startCur)
                 stats.delimitationValid = false;
         }
         g_waveSegBounds[id] =
             WaveSegmentBounds{startCur, h.region->cur, undoMark, undoEnd, haveMark ? it->second.generation : 0};
-        for (auto & e : dst.undoLog)
-            mergedSlice.push_back(e);
+        for (size_t k = dst.sliceStart; k < dst.undoLog.size(); ++k)
+            mergedSlice.push_back(dst.undoLog[k]);
         stats.stripes++;
         stats.undoEntries += undoEnd;
-        stats.sliceEntries += dst.undoLog.size();
+        stats.sliceEntries += dst.undoLog.size() - dst.sliceStart;
         stats.youngBytes += size_t(h.region->cur - startCur); /* this-wave span */
     }
 
@@ -3156,36 +3255,69 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
             (promote[i] ? stats.promoted : stats.revertible)++;
     }
 
-    /* --- b2b1: the cross-stripe reach SEED + OwnerClosure at the LIVE barrier.
-       Roots (the elements' forced result Values) + the main's stripe-0 metadata are
-       available now; `g_wave` is set to the assembled registry inside the walk.
-       COMPUTE ONLY -- no copy to OLD, no revert, no free, no TLS reset. --- */
+    /* --- b2b1/b2b1b: the cross-stripe reach SEED + persistent-root seed +
+       OwnerClosure at the LIVE barrier. Roots (the elements' forced result Values)
+       + the main's stripe-0 metadata are available now; `g_wave` is set to the
+       assembled registry inside each walk. COMPUTE ONLY -- no copy to OLD, no
+       revert, no free, no TLS reset. --- */
     if (state && !roots.empty() && !mergedSlice.empty()) {
         JobTargets jt(mergedSlice, 0);
         stats.youngTargets = jt.size();
-        if (auto seed = reachabilityNominateWaveImpl(g_rehomeRegistry, jt, roots, false, 0)) {
-            std::vector<bool> promote = std::move(*seed);
+        /* b2b1b fix 3: reset the gap counters; any cell reached in an unassembled
+           stripe below makes the traversal incomplete -> a HARD fatal (no silent
+           under-promotion). */
+        g_envSizeWGaps = 0;
+        g_waveTraversalGaps = 0;
+
+        auto seed = reachabilityNominateWaveImpl(g_rehomeRegistry, jt, roots, false, 0);
+        std::vector<bool> promote;
+        if (seed) {
+            promote = std::move(*seed);
             for (bool b : promote)
                 stats.reachSeed += b;
-            /* OwnerClosure: close the reach seed to the ownership invariant (every
-               identity-bearing young object in Evac(S) has its owner in S), the real
-               keep-set. The closure is grown by a cross-stripe walk of Evac(S) that
-               calls `OwnerClosure::note` per object (reusing `ReachNominator`'s
-               traversal in closure mode); nothing is copied or freed. */
-            closeOwnerSetWalk(g_rehomeRegistry, jt, promote);
-            for (bool b : promote)
-                stats.promotedClosed += b;
-            /* Validate: the keep-set satisfies the closure invariant (teeth: a set
-               missing a required owner fails). */
-            stats.closureValid = checkClosureInvariant(g_rehomeRegistry, jt, promote);
-            /* // S4-b-b2b2 (the revert, turned OFF here): `promote` IS the keep-set.
-               // b2b2 would, with `g_wave` = registry: PauseRegion; Evacuator copy
-               // each promoted target to OLD; assign the copies (*cell = copy);
-               // revert the rest (*cell = preImage(i)) over the merged this-wave
-               // slices; then free each stripe's [startCur, cur) (MADV_DONTNEED) and
-               // reset its TLS (region.cur := startCur, undoLog truncate to undoMark,
-               // ownerSegs/generation rollback). b2b1 does NONE of this. */
+        } else {
+            /* b2b1b fix 4: the cross-stripe tag table could not be mapped (OOM).
+               The safe fallback is RETAIN-ALL (never free-all): keep every target. */
+            promote.assign(jt.size(), true);
+            stats.seedFailedKeepAll = true;
+            stats.reachSeed = jt.size();
         }
+
+        /* b2b1b fix 2 (R2): seed the keep-set from the PERSISTENT roots too, so a
+           young cell reachable only from a persistent cache (fileEvalCache / flake
+           evalCaches) -- not from any element result -- is kept. Skipped on the
+           keep-all fallback (already keeping everything) and when the tag table is
+           absent. */
+        if (!stats.seedFailedKeepAll) {
+            std::vector<const Value *> proots;
+            state->forEachPersistentRootValue([&](const Value * v) { proots.push_back(v); });
+            stats.persistentRoots = proots.size();
+            seedPersistentRootsWalk(g_rehomeRegistry, jt, promote, proots);
+            for (bool b : promote)
+                stats.afterPersistent += b;
+        } else
+            stats.afterPersistent = jt.size();
+
+        /* OwnerClosure: close the union seed to the ownership invariant (every
+           identity-bearing young object in Evac(S) has its owner in S), the real
+           keep-set. The closure is grown by a cross-stripe walk of Evac(S) that
+           calls `OwnerClosure::note` per object (reusing `ReachNominator`'s
+           traversal in closure mode); nothing is copied or freed. */
+        closeOwnerSetWalk(g_rehomeRegistry, jt, promote);
+        for (bool b : promote)
+            stats.promotedClosed += b;
+        /* Validate: the keep-set satisfies the closure invariant (teeth: a set
+           missing a required owner fails). */
+        stats.closureValid = checkClosureInvariant(g_rehomeRegistry, jt, promote);
+        stats.traversalGaps = g_waveTraversalGaps;
+        /* // S4-b-b2b2 (the revert, turned OFF here): `promote` IS the keep-set.
+           // b2b2 would, with `g_wave` = registry: PauseRegion; Evacuator copy
+           // each promoted target to OLD; assign the copies (*cell = copy);
+           // revert the rest (*cell = preImage(i)) over each stripe's revert slice
+           // [sliceStart:end] (R1); then free each stripe's [startCur, cur)
+           // (MADV_DONTNEED) and reset its TLS (region.cur := startCur, undoLog
+           // truncate to sliceStart, ownerSegs/generation rollback). b2b1b does
+           // NONE of this. */
     }
 
     g_lastRehome = stats;
@@ -3193,10 +3325,12 @@ static void rehomeWorkerStripesImpl(EvalState * state, const std::vector<const V
         fprintf(
             stderr,
             "unforce rehome: stripes=%zu undoEntries=%zu sliceEntries=%zu youngBytes=%zu "
-            "youngTargets=%zu reachSeed=%zu promotedClosed=%zu closureValid=%d valid=%d envGaps=%zu\n",
+            "youngTargets=%zu reachSeed=%zu persistentRoots=%zu afterPersistent=%zu promotedClosed=%zu "
+            "closureValid=%d keepAll=%d valid=%d envGaps=%zu traversalGaps=%zu\n",
             stats.stripes, stats.undoEntries, stats.sliceEntries, stats.youngBytes, stats.youngTargets,
-            stats.reachSeed, stats.promotedClosed, int(stats.closureValid), int(stats.delimitationValid),
-            g_envSizeWGaps);
+            stats.reachSeed, stats.persistentRoots, stats.afterPersistent, stats.promotedClosed,
+            int(stats.closureValid), int(stats.seedFailedKeepAll), int(stats.delimitationValid), g_envSizeWGaps,
+            stats.traversalGaps);
 }
 
 } // namespace
@@ -3213,6 +3347,15 @@ void unforceRehomeWorkerStripes(EvalState & state, const std::vector<const Value
     assert(g_lastRehome.delimitationValid);
     if (!g_lastRehome.delimitationValid)
         unforceFatal("validating the per-wave reclamation delimitation");
+    /* b2b1b fix 3: an incomplete traversal (a cell reached in an unassembled stripe)
+       would silently UNDER-promote -> a dangling pointer once b2b2 frees. Loud fatal. */
+    assert(g_lastRehome.traversalGaps == 0);
+    if (g_lastRehome.traversalGaps != 0)
+        unforceFatal("the wave keep-set traversal reached cells in unassembled stripes");
+    /* The computed keep-set must satisfy the owner-closure invariant on every wave. */
+    assert(g_lastRehome.closureValid);
+    if (!g_lastRehome.closureValid)
+        unforceFatal("validating the wave keep-set owner-closure invariant");
 }
 
 /* ---------------------------------------------------------------------------
@@ -3373,10 +3516,14 @@ bool lastRehomeDelimitationValid()
     return g_lastRehome.delimitationValid;
 }
 
-/* b1: the assembled this-wave slice size for a stripe. */
+/* b1: the assembled this-wave slice size for a stripe. b2b1b (R1): `undoLog` is now
+   the FULL log; the this-wave slice is `[sliceStart:end]`. */
 size_t rehomeSliceSize(uint32_t id)
 {
-    return id < g_rehomeRegistry.stripes.size() ? g_rehomeRegistry.stripes[id].undoLog.size() : 0;
+    if (id >= g_rehomeRegistry.stripes.size())
+        return 0;
+    auto & st = g_rehomeRegistry.stripes[id];
+    return st.undoLog.size() - st.sliceStart;
 }
 
 /* b1: the delimited this-wave segment start offset (from the stripe base). */
@@ -3697,6 +3844,296 @@ size_t lastRehomePromotedClosed()
 bool lastRehomeClosureValid()
 {
     return g_lastRehome.closureValid;
+}
+size_t lastRehomePersistentRoots()
+{
+    return g_lastRehome.persistentRoots;
+}
+size_t lastRehomeAfterPersistent()
+{
+    return g_lastRehome.afterPersistent;
+}
+bool lastRehomeSeedFailedKeepAll()
+{
+    return g_lastRehome.seedFailedKeepAll;
+}
+size_t lastRehomeTraversalGaps()
+{
+    return g_lastRehome.traversalGaps;
+}
+
+/* Inc3 S4-b-b2b1b (R1) MULTI-WAVE owner-routing teeth. Build a stripe whose owner
+   log has `prior` PRIOR-wave entries followed by this-wave targets X, Z, with
+   `sliceStart = prior` (undoMark>0). A young cell Y is owned by Z, whose FULL-log
+   index is `prior+1` (>> the slice length 2). `ownerCellW` must resolve Y's owner id
+   to Z via the FULL log (the b2b1b fix); `fullIdxBeyondSlice` confirms the owner id
+   is past the slice, so the pre-fix slice-indexed lookup WOULD go OOB -> `nullptr` ->
+   the shared producer dropped. After the fix `resolvedShared == true`. */
+void multiWaveOwnerRoutingForTest(bool & resolvedShared, bool & fullIdxBeyondSlice)
+{
+    resolvedShared = false;
+    fullIdxBeyondSlice = false;
+    char * savedBase = stripesBase;
+    size_t savedN = nStripes.load(std::memory_order_relaxed);
+    WaveController * savedWave = g_wave;
+
+    const size_t nst = 2;
+    const size_t prior = 1000; /* prior-wave log entries -> undoMark = 1000 */
+    char * resv = (char *) mmap(
+        nullptr, nst << stripeShift, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(resv != MAP_FAILED);
+    stripesBase = resv;
+    nStripes.store(nst, std::memory_order_relaxed);
+    char * b1 = resv + (size_t(1) << stripeShift);
+    auto cellAt = [&](size_t slot) { return (Value *) (b1 + slot * 16); };
+
+    Value * X = cellAt(0); /* this-wave target, full-log index `prior` */
+    Value * Z = cellAt(1); /* this-wave target, full-log index `prior+1`, owns Y */
+    Value * Y = cellAt(2); /* young cell owned by Z */
+    X->mkInt(NixInt(1));
+    Z->mkInt(NixInt(2));
+    Y->mkInt(NixInt(3));
+
+    WaveController wc;
+    wc.stripes.resize(2);
+    auto & ss = wc.stripes[1];
+    ss.region.base = b1;
+    ss.region.cur = b1 + (size_t(1) << 20);
+    ss.myStripe = 1;
+    ss.ownerSeg = ss.region.cur;
+    ss.curOwner = noOwner;
+    /* Owner timeline: off 0 (X) -> owner `prior`; off >= 1 (Z, Y) -> owner `prior+1`. */
+    ss.segs.open(size_t(1) << 20);
+    ss.segs.b[0] = segSentinel;
+    ss.segs.b[1] = OwnerSeg{0, uint32_t(prior)};
+    ss.segs.b[2] = OwnerSeg{1, uint32_t(prior + 1)};
+    ss.segs.t = ss.segs.high = ss.segs.b + 3;
+    /* FULL log: `prior` dummy prior-wave entries, then X, Z. sliceStart = prior. */
+    for (size_t i = 0; i < prior; ++i) {
+        EvalState::UndoEntry e{};
+        e.target = (Value *) (b1 + (4 + i) * 16); /* distinct dummy addresses */
+        ss.undoLog.push_back(e);
+    }
+    {
+        EvalState::UndoEntry ex{};
+        ex.target = X;
+        ss.undoLog.push_back(ex); /* full index prior */
+        EvalState::UndoEntry ez{};
+        ez.target = Z;
+        ss.undoLog.push_back(ez); /* full index prior+1 */
+    }
+    ss.sliceStart = prior;
+
+    g_wave = &wc;
+    uint64_t o = ownerOfW(Y);                              /* -> (1 << shift) | (prior+1) */
+    uint64_t localIdx = o & waveOwnerMask;
+    fullIdxBeyondSlice = localIdx >= (ss.undoLog.size() - ss.sliceStart); /* 1001 >= 2 */
+    resolvedShared = (o != uint64_t(noOwner)) && (ownerCellW(o) == Z);
+    g_wave = savedWave;
+
+    if (ss.segs.map)
+        munmap(ss.segs.map, ss.segs.mapped);
+    nStripes.store(savedN, std::memory_order_relaxed);
+    stripesBase = savedBase;
+    munmap(resv, nst << stripeShift);
+}
+
+/* Inc3 S4-b-b2b1b (R2) PERSISTENT-root seed teeth. A young cell W (owned by target
+   T) is reachable ONLY from a persistent root P = tApp(W, leaf) -- NOT from the
+   element roots (empty). Without the persistent seed, T is absent from the keep-set;
+   WITH `seedPersistentRootsWalk([P])`, W is reached and its owner T is promoted. */
+void persistentRootSeedForTest(bool & keptWithPersistent, bool & absentWithout)
+{
+    keptWithPersistent = false;
+    absentWithout = false;
+    char * savedBase = stripesBase;
+    size_t savedN = nStripes.load(std::memory_order_relaxed);
+    WaveController * savedWave = g_wave;
+
+    const size_t nst = 2;
+    char * resv = (char *) mmap(
+        nullptr, nst << stripeShift, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(resv != MAP_FAILED);
+    stripesBase = resv;
+    nStripes.store(nst, std::memory_order_relaxed);
+    char * b1 = resv + (size_t(1) << stripeShift);
+    auto cellAt = [&](size_t slot) { return (Value *) (b1 + slot * 16); };
+
+    Value * T = cellAt(0);    /* target 0: owner of W */
+    Value * X = cellAt(1);    /* target 1: an unrelated this-wave target */
+    Value * W = cellAt(2);    /* young cell owned by T, reachable only from P */
+    Value * leaf = cellAt(3); /* owned by T */
+    T->mkInt(NixInt(1));
+    X->mkInt(NixInt(2));
+    W->mkInt(NixInt(3));
+    leaf->mkInt(NixInt(4));
+    /* P is an OLD root (outside the young stripes) whose closure reaches W. */
+    Value P;
+    P.mkApp(W, leaf);
+
+    WaveController wc;
+    wc.stripes.resize(2);
+    auto & ss = wc.stripes[1];
+    ss.region.base = b1;
+    ss.region.cur = b1 + (size_t(1) << 20);
+    ss.myStripe = 1;
+    ss.ownerSeg = ss.region.cur;
+    ss.curOwner = noOwner;
+    ss.segs.open(size_t(1) << 20);
+    ss.segs.b[0] = segSentinel;
+    ss.segs.b[1] = OwnerSeg{0, 0}; /* off 0 (T) -> owner 0 (T) */
+    ss.segs.b[2] = OwnerSeg{1, 1}; /* off 1 (X) -> owner 1 (X) */
+    ss.segs.b[3] = OwnerSeg{2, 0}; /* off >= 2 (W, leaf) -> owner 0 (T) */
+    ss.segs.t = ss.segs.high = ss.segs.b + 4;
+    {
+        EvalState::UndoEntry e0{};
+        e0.target = T;
+        ss.undoLog.push_back(e0);
+        EvalState::UndoEntry e1{};
+        e1.target = X;
+        ss.undoLog.push_back(e1);
+    }
+
+    EvalUndoLog merged;
+    for (auto & e : ss.undoLog)
+        merged.push_back(e);
+    JobTargets jt(merged, 0);
+    auto ti = b2aIndexOf(jt, T);
+
+    /* Map the tag table (empty element roots). */
+    { std::vector<const Value *> none; (void) reachabilityNominateWaveImpl(wc, jt, none, false, 0); }
+
+    /* Element-only seed: no element reaches W -> T absent. */
+    std::vector<bool> promoteNoP(jt.size());
+    absentWithout = ti != size_t(-1) && !promoteNoP[ti];
+
+    /* Add the persistent root P: W is reached -> owner T promoted. */
+    std::vector<bool> promoteP(jt.size());
+    std::vector<const Value *> proots{&P};
+    seedPersistentRootsWalk(wc, jt, promoteP, proots);
+    keptWithPersistent = ti != size_t(-1) && promoteP[ti];
+
+    if (ss.segs.map)
+        munmap(ss.segs.map, ss.segs.mapped);
+    g_wave = savedWave;
+    nStripes.store(savedN, std::memory_order_relaxed);
+    stripesBase = savedBase;
+    munmap(resv, nst << stripeShift);
+}
+
+/* Inc3 S4-b-b2b1b EDGE-COMPLETENESS teeth. Independent oracle: `Closure::children`
+   (the authoritative Evacuator edge set) vs `ReachNominator::scan`. For a Value of
+   each internalType, compare the DIRECT child-pointer set the two enumerate (depth-1,
+   no deref of the children, so no Env/Bindings metadata is needed). A missing or
+   extra edge in `scan` mismatches the oracle (teeth). Returns "" if every type
+   matches, else the name of the first mismatching type. */
+std::string edgeCompletenessForTest(EvalState & state)
+{
+    EvalRegion savedRegion = evalRegion;
+    WaveController * savedWave = g_wave;
+    g_wave = nullptr; /* live single-region path: inYoung == YoungSpace == contains */
+
+    char * rm = (char *) mmap(
+        nullptr, size_t(1) << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(rm != MAP_FAILED);
+    evalRegion = EvalRegion{};
+    evalRegion.base = rm;
+    evalRegion.cur = rm + (size_t(1) << 19);
+    evalRegion.end = rm + (size_t(1) << 20);
+
+    /* child sentinels, all in the young region. */
+    auto cellAt = [&](size_t slot) { return (Value *) (rm + slot * 16); };
+    Value * c0 = cellAt(0);
+    Value * c1 = cellAt(1);
+    Env * e0 = (Env *) cellAt(2);
+    Bindings * bnd = (Bindings *) cellAt(3);
+
+    std::vector<uint32_t> tagbuf((size_t(1) << 20) >> 4, 0);
+    std::vector<size_t> touched;
+    std::vector<bool> promoteDummy;
+    std::vector<std::pair<const Value *, uint32_t>> byCellDummy;
+    YoungSpace ys;
+
+    auto oracleChildren = [&](const Value & v) {
+        std::set<const void *> s;
+        Closure<RegionMarks> clo{ys, RegionMarks(evalRegion.base, evalRegion.cur)};
+        clo.children(
+            v, [&](const void * p, Closure<RegionMarks>::Kind) { s.insert(p); },
+            [&](Value * const * elems, size_t) { s.insert(elems); });
+        return s;
+    };
+    auto scanChildren = [&](const Value & v) {
+        std::set<const void *> s;
+        std::fill(tagbuf.begin(), tagbuf.end(), 0u);
+        touched.clear();
+        ReachNominator nom{rm, tagbuf.data(), &touched, promoteDummy, byCellDummy};
+        nom.curElem = 1;
+        nom.scan(ReachTask{&v, rkValue, 0});
+        for (auto & t : nom.stack)
+            s.insert(t.p);
+        return s;
+    };
+
+    std::string mismatch;
+    auto check = [&](const char * name, const Value & v) {
+        if (!mismatch.empty())
+            return;
+        if (oracleChildren(v) != scanChildren(v))
+            mismatch = name;
+    };
+
+    Value v;
+    v.mkApp(c0, c1);
+    check("tApp", v);
+    v.mkPrimOpApp(c0, c1);
+    check("tPrimOpApp", v);
+    v.mkThunk(e0, nullptr);
+    check("tThunk", v);
+    v.mkLambda(e0, nullptr);
+    check("tLambda", v);
+    v.mkAttrs(bnd);
+    check("tAttrs", v);
+    {
+        /* tListSmall stores the two element pointers inline (c0, c1 in the region). */
+        auto lb = state.mem.buildList(2);
+        lb[0] = c0;
+        lb[1] = c1;
+        v.mkList(lb);
+        check("tListSmall", v);
+    }
+    {
+        /* tListN references a separate elems array; place it in the young region so
+           the `young(l.elems)` edge fires in BOTH the oracle and scan. */
+        Value ** arr = (Value **) (rm + 128); /* 8-byte aligned, clear of c0..c5 */
+        arr[0] = c0;
+        arr[1] = c1;
+        arr[2] = cellAt(5);
+        assert(evalRegion.contains(arr));
+        auto lb = state.mem.buildList(3);
+        lb.elems = arr; /* public field; mkList(size>2) stores List{.elems = arr} */
+        v.mkList(lb);
+        check("tListN", v);
+    }
+    {
+        /* tFailed forwards to recoveryValue (a sentinel in the region); scan never
+           reads the exception, but ExceptionRef requires a non-null one. */
+        Value * recY = c0;
+        v.setRawFailed(new Value::Failed(std::make_exception_ptr(std::exception{}), recY));
+        check("tFailed", v);
+    }
+    /* Leaf / no-object-edge types: both must yield the EMPTY set (confirms there is
+       no string-context or external object edge). */
+    v.mkInt(NixInt(1));
+    check("tInt", v);
+    v.mkBool(true);
+    check("tBool", v);
+    v.mkNull();
+    check("tNull", v);
+
+    g_wave = savedWave;
+    evalRegion = savedRegion;
+    munmap(rm, size_t(1) << 20);
+    return mismatch;
 }
 
 } // namespace unforce_test

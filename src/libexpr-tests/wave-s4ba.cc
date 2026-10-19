@@ -65,6 +65,10 @@ struct ReachSet
 ReachSet reachRootAsChildForTest(EvalState & state, int layout);
 /* Inc3 S4-b-b2b1 OwnerClosure hooks. */
 void ownerClosureForTest(bool & closedHasZ, bool & invClosed, bool & invSeedOnly);
+/* Inc3 S4-b-b2b1b hooks. */
+void multiWaveOwnerRoutingForTest(bool & resolvedShared, bool & fullIdxBeyondSlice);
+void persistentRootSeedForTest(bool & keptWithPersistent, bool & absentWithout);
+std::string edgeCompletenessForTest(EvalState & state);
 } // namespace unforce_test
 
 class WaveS4baTest : public LibExprTest
@@ -434,6 +438,43 @@ TEST_F(WaveS4baTest, b2b1OwnerClosureInvariantWithTeeth)
     /* TEETH: a keep-set MISSING a required owner (the seed {X} without Z) is NOT
        closed -- reverting outside it would dangle X's reference to Y (owned by Z). */
     EXPECT_FALSE(invSeedOnly) << "a promote set missing a retained-reachable owner must FAIL the invariant";
+}
+
+/* Inc3 S4-b-b2b1b (R1) MULTI-WAVE owner routing. With undoMark>0, a this-wave
+   target's owner id is a FULL-log index past the revert slice; the keep-set
+   assembly must retain the FULL log so `ownerCellW` resolves it. TEETH: the owner
+   id is beyond the slice, so the pre-fix slice-indexed lookup would have gone OOB
+   (-> nullptr -> the shared producer silently dropped -> UAF when b2b2 frees). */
+TEST_F(WaveS4baTest, b2b1bMultiWaveOwnerRoutingResolvesPastSlice)
+{
+    using namespace unforce_test;
+    bool resolvedShared = false, fullIdxBeyondSlice = false;
+    multiWaveOwnerRoutingForTest(resolvedShared, fullIdxBeyondSlice);
+    EXPECT_TRUE(fullIdxBeyondSlice) << "the owner id must lie past the this-wave slice (so the fix is load-bearing)";
+    EXPECT_TRUE(resolvedShared) << "the full log must resolve the shared producer's owner id (R1 fix)";
+}
+
+/* Inc3 S4-b-b2b1b (R2) PERSISTENT-root seed. A young cell reachable only from a
+   persistent cache root (not from any element result) must be kept. TEETH: without
+   the persistent seed its owner is absent from the keep-set. */
+TEST_F(WaveS4baTest, b2b1bPersistentRootSeedKeepsCacheOnlyCell)
+{
+    using namespace unforce_test;
+    bool keptWithPersistent = false, absentWithout = false;
+    persistentRootSeedForTest(keptWithPersistent, absentWithout);
+    EXPECT_TRUE(absentWithout) << "without the persistent seed, a cache-only young cell's owner is NOT kept";
+    EXPECT_TRUE(keptWithPersistent) << "the persistent-root seed must keep a cell reachable only from a cache root";
+}
+
+/* Inc3 S4-b-b2b1b EDGE-COMPLETENESS. `ReachNominator::scan` must enumerate exactly
+   the edge set of the authoritative `Closure::children` (the Evacuator traversal),
+   per internalType. An independent oracle: a missing/extra edge in `scan` mismatches
+   `Closure::children` for the crafted Value of that type (teeth). */
+TEST_F(WaveS4baTest, b2b1bScanEdgeSetMatchesClosureChildren)
+{
+    using namespace unforce_test;
+    std::string mismatch = edgeCompletenessForTest(state);
+    EXPECT_EQ(mismatch, "") << "ReachNominator::scan diverges from Closure::children for type: " << mismatch;
 }
 
 } // namespace nix

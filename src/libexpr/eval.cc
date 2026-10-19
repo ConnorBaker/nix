@@ -14,6 +14,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/eval-cache.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/parallel-eval.hh"
 #include "nix/store/filetransfer.hh"
@@ -1354,6 +1355,21 @@ void EvalState::resetFileCache()
     inputCache->clear();
     lookupPathResolved->clear();
     rootFS->invalidateCache();
+}
+
+void EvalState::forEachPersistentRootValue(std::function<void(const Value *)> f) const
+{
+    /* Inc3 S4-b-b2b1b (R2): the GC-root-like persistent roots that can retain a
+       young cell across a wave. Call only at the quiescent barrier (the pool is
+       idle, so iterating the concurrent maps is race-free). */
+    fileEvalCache->cvisit_all([&](const auto & i) {
+        if (i.second)
+            f(i.second);
+    });
+    /* Flake / eval-cache cursor roots: PEEK only (no load -> no evaluation). */
+    for (auto & [hash, cache] : evalCaches)
+        if (Value * r = cache->peekRootValue())
+            f(r);
 }
 
 void EvalState::eval(Expr * e, Value & v)

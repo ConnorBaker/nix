@@ -1303,6 +1303,16 @@ public:
             waveElementRoots.push_back(root);
     }
 
+    /** Inc3 S4-b-b2b1b (R2): call `f` for each GC-root-like PERSISTENT root value
+        that can retain a young cell across a wave -- the `fileEvalCache` entries
+        (imported-file results, `gc_root_allocator`) and the materialised
+        `evalCaches` roots (flake / eval-cache cursors). `baseEnv` is excluded (built
+        once at `createBaseEnv`, never acquires young cells). The wave barrier walks
+        these so a young cell reachable ONLY from a persistent cache (not from any
+        element result) is promoted, restoring the coverage the parallel barrier lost
+        when it dropped the force-count disjunct. Call only at the quiescent barrier. */
+    void forEachPersistentRootValue(std::function<void(const Value *)> f) const;
+
     /**
      * Open an unforce scope: thunks updated until the matching
      * `endUnforceScope` are recorded. Returns the log mark to pass back.
