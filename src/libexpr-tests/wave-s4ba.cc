@@ -69,6 +69,9 @@ void ownerClosureForTest(bool & closedHasZ, bool & invClosed, bool & invSeedOnly
 void multiWaveOwnerRoutingForTest(bool & resolvedShared, bool & fullIdxBeyondSlice);
 void persistentRootSeedForTest(bool & keptWithPersistent, bool & absentWithout);
 std::string edgeCompletenessForTest(EvalState & state);
+/* Inc3 S4-b-b2b1c hooks. */
+void rootValueRegistrySeedForTest(EvalState & state, bool & keptWithRoot, bool & absentWithout);
+void multiWaveNoteToleranceForTest(bool & noAbort, bool & priorNotMarked, bool & keptX);
 } // namespace unforce_test
 
 class WaveS4baTest : public LibExprTest
@@ -475,6 +478,33 @@ TEST_F(WaveS4baTest, b2b1bScanEdgeSetMatchesClosureChildren)
     using namespace unforce_test;
     std::string mismatch = edgeCompletenessForTest(state);
     EXPECT_EQ(mismatch, "") << "ReachNominator::scan diverges from Closure::children for type: " << mismatch;
+}
+
+/* Inc3 S4-b-b2b1c (piece 1) RootValue registry. A young cell held ONLY by a live
+   RootValue (via the real allocRootValue) must be in the keep-set -- the registry makes
+   persistent-root enumeration complete by construction. TEETH: before the root is
+   registered, the cell's owner is absent. */
+TEST_F(WaveS4baTest, b2b1cRootValueRegistrySeedKeepsRootOnlyCell)
+{
+    using namespace unforce_test;
+    bool keptWithRoot = false, absentWithout = false;
+    rootValueRegistrySeedForTest(state, keptWithRoot, absentWithout);
+    EXPECT_TRUE(absentWithout) << "before the RootValue is registered, a root-only cell's owner is NOT kept";
+    EXPECT_TRUE(keptWithRoot) << "a live RootValue (allocRootValue) must surface via the registry and keep its cell";
+}
+
+/* Inc3 S4-b-b2b1c (piece 2) multi-wave note tolerance. A this-wave kept target's closure
+   reaching a PRIOR-wave young cell must be handled gracefully: note resolves the
+   prior-wave owner, skips it (not in this-wave jt), never aborts, and never marks the
+   prior-wave target in this wave's keep-set. */
+TEST_F(WaveS4baTest, b2b1cMultiWaveNoteToleranceNoAbort)
+{
+    using namespace unforce_test;
+    bool noAbort = false, priorNotMarked = false, keptX = false;
+    multiWaveNoteToleranceForTest(noAbort, priorNotMarked, keptX);
+    EXPECT_TRUE(noAbort) << "the tolerant note must not assert-abort on a resolved prior-wave owner";
+    EXPECT_TRUE(keptX) << "the this-wave seed target stays kept";
+    EXPECT_TRUE(priorNotMarked) << "the prior-wave owner is not a this-wave target -> never marked here";
 }
 
 } // namespace nix

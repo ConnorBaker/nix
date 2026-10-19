@@ -83,15 +83,6 @@ class EvalCache : public std::enable_shared_from_this<EvalCache>
 
 public:
 
-    /**
-     * Inc3 S4-b-b2b1b: peek the already-materialised root value WITHOUT
-     * loading it (unlike `getRootValue`, this never runs the root loader /
-     * allocates). Returns nullptr if the root has not been materialised yet.
-     * Used at the quiescent wave barrier to seed the keep-set from the
-     * persistent eval-cache roots without triggering any evaluation.
-     */
-    Value * peekRootValue();
-
     EvalCache(std::optional<std::reference_wrapper<const Hash>> useCache, EvalState & state, RootLoader rootLoader);
 
     ref<AttrCursor> getRoot();

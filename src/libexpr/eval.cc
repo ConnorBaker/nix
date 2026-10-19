@@ -14,7 +14,6 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
-#include "nix/expr/eval-cache.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/parallel-eval.hh"
 #include "nix/store/filetransfer.hh"
@@ -113,9 +112,71 @@ const StringData & StringData::make(EvalMemory & mem, std::string_view s)
     return res;
 }
 
+/* Inc3 S4-b-b2b1c: the RootValue registry. `allocRootValue` is the SOLE constructor
+   of a `RootValue` (an untracked GC root holding a `Value*`), so registering the
+   stored `Value**` here and unregistering it in the cell's destructor gives a
+   COMPLETE, enumerable set of every live root -- independent of calling context
+   (AttrCursor::_value, InstallableAttrPath::v, json/xml/parallel-force roots, ...).
+   The wave barrier seeds its keep-set from this set so any young cell reachable from
+   ANY live root is promoted (safe by construction, not by flow assumption).
+
+   Thread-safe: RootValues are created/destroyed on worker threads (parallel-eval,
+   value-to-json/xml). A mutex-guarded set is sound and NEGLIGIBLE: `allocRootValue`
+   is O(roots) -- orders of magnitude rarer than `allocValue`/`forceValue` (O(cells))
+   -- and is NOT on forceValue/allocValue/ownerOf/youngW/ownerOfW. */
+static std::mutex g_rootValueMutex;
+static std::unordered_set<Value **> g_rootValues;
+
+static void registerRootValue(Value ** slot)
+{
+    std::lock_guard<std::mutex> lk(g_rootValueMutex);
+    g_rootValues.insert(slot);
+}
+
+static void unregisterRootValue(Value ** slot) noexcept
+{
+    std::lock_guard<std::mutex> lk(g_rootValueMutex);
+    g_rootValues.erase(slot);
+}
+
+static void forEachLiveRootValue(std::function<void(Value *)> f)
+{
+    /* Called at the quiescent wave barrier (pool idle). A snapshot under the lock,
+       then `f` runs outside it (the walk may allocate / take other locks). */
+    std::vector<Value **> slots;
+    {
+        std::lock_guard<std::mutex> lk(g_rootValueMutex);
+        slots.reserve(g_rootValues.size());
+        for (auto * s : g_rootValues)
+            slots.push_back(s);
+    }
+    for (auto * s : slots)
+        if (*s)
+            f(*s);
+}
+
+namespace {
+/* The managed object behind a `RootValue`: holds the `Value*` in GC-scanned memory
+   (identical reachability to the old `allocate_shared<Value*>`) and unregisters its
+   slot when the last owner drops. */
+struct RootValueCell
+{
+    Value * v;
+    explicit RootValueCell(Value * v)
+        : v(v)
+    {
+    }
+    ~RootValueCell() { unregisterRootValue(&v); }
+};
+} // namespace
+
 RootValue allocRootValue(Value * v)
 {
-    return std::allocate_shared<Value *>(traceable_allocator<Value *>(), v);
+    auto cell = std::allocate_shared<RootValueCell>(traceable_allocator<RootValueCell>(), v);
+    registerRootValue(&cell->v);
+    /* Aliasing shared_ptr: shares the cell's control block, points at `&cell->v`
+       (a `Value**`), so `*rv` yields the `Value*` exactly as before. */
+    return RootValue(cell, &cell->v);
 }
 
 // Pretty print types for assertion errors
@@ -1359,17 +1420,22 @@ void EvalState::resetFileCache()
 
 void EvalState::forEachPersistentRootValue(std::function<void(const Value *)> f) const
 {
-    /* Inc3 S4-b-b2b1b (R2): the GC-root-like persistent roots that can retain a
-       young cell across a wave. Call only at the quiescent barrier (the pool is
-       idle, so iterating the concurrent maps is race-free). */
+    /* Inc3 S4-b-b2b1c: the persistent roots that can retain a young cell across a
+       wave. Call only at the quiescent barrier (the pool is idle, so iterating these
+       is race-free). Two classes:
+       (1) fileEvalCache -- `Value*` in a `gc_root_allocator` map (NOT RootValues).
+       (2) every LIVE RootValue -- the COMPLETE set from the `allocRootValue` registry
+           (AttrCursor::_value, InstallableAttrPath::v, flake/eval-cache cursor roots,
+           transient json/xml/parallel-force roots). This supersedes the b2b1b
+           evalCaches `peekRootValue` seeding (the registry covers those and more). */
     fileEvalCache->cvisit_all([&](const auto & i) {
         if (i.second)
             f(i.second);
     });
-    /* Flake / eval-cache cursor roots: PEEK only (no load -> no evaluation). */
-    for (auto & [hash, cache] : evalCaches)
-        if (Value * r = cache->peekRootValue())
+    forEachLiveRootValue([&](Value * r) {
+        if (r)
             f(r);
+    });
 }
 
 void EvalState::eval(Expr * e, Value & v)
