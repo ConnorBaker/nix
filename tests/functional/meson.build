@@ -107,6 +107,7 @@ suites = [
       'eval.sh',
       'eval-unforce.sh',
       'eval-unforce-identity.sh',
+      'eval-unforce-pure-identity.sh',
       'eval-unforce-repeated.sh',
       'experimental-features.sh',
       'export-graph.sh',
