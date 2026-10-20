@@ -119,6 +119,16 @@ std::string unforceStatsJSON();
 bool unforceEnabled(const EvalState & state);
 
 /**
+ * Test-only injection hook. When set to `true`, the batch-decide step
+ * (`decideJob` in unforce.cc) throws `std::bad_alloc` at the point where the
+ * keep-set has been decided, simulating an allocation failure during the end
+ * of an unforce batch. This reaches the fatal catch that calls
+ * `unforceFatal`, exercising the otherwise untestable OOM-abort path. It is
+ * never set by normal evaluation; only the unforce OOM death test sets it.
+ */
+extern bool unforceTestFailDecide;
+
+/**
  * Unforcing for a traversal that visits each element once
  * (printing or serialising a value, searching, checking): what visiting its
  * elements forced is unforced, and what it allocated freed, when their batch

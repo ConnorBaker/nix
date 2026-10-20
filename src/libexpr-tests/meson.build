@@ -63,6 +63,7 @@ sources = files(
   'trivial.cc',
   'unforce-cursor-boundary.cc',
   'unforce-identity.cc',
+  'unforce-oom.cc',
   'value/context.cc',
   'value/print.cc',
   'value/value.cc',

@@ -1577,6 +1577,14 @@ std::vector<bool> decideJob(
         return promote;
     }
 
+    /* Test-only: simulate an allocation failure at the end of the batch,
+       after the keep-set has been decided and before the evacuator copies.
+       The throw unwinds to the `catch (std::bad_alloc &)` around the
+       `decideJob` call, which calls `unforceFatal` and aborts. Never set by
+       normal evaluation (see unforce.hh). */
+    if (unforceTestFailDecide)
+        throw std::bad_alloc();
+
     /* The owner timeline ran out of budget: keep the job whole, which is
        exact (nothing is reverted). */
     if (ownersOverflowed && keepWhole) {
@@ -1751,6 +1759,10 @@ bool unforceEnabled(const EvalState & state)
     /* Not with Boehm GC, whatever the setting (see `eval-unforce`). */
     return !NIX_USE_BOEHMGC && state.settings.unforce && !state.debugRepl;
 }
+
+/* Test-only injection hook (see unforce.hh). Default false; set only by the
+   unforce OOM death test. */
+bool unforceTestFailDecide = false;
 
 UnforceBatch::UnforceBatch(EvalState & state, bool enabled)
     : state(enabled && unforceEnabled(state) ? &state : nullptr)
