@@ -61,6 +61,7 @@ sources = files(
   'primops.cc',
   'search-path.cc',
   'trivial.cc',
+  'unforce-cursor-boundary.cc',
   'unforce-identity.cc',
   'value/context.cc',
   'value/print.cc',
