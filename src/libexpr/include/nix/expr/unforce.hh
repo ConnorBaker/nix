@@ -169,4 +169,26 @@ private:
     void openAt(const void * stackMark);
 };
 
+/**
+ * A one-shot `UnforceBatch` for a single element: opens a batch at
+ * construction and ends it at destruction. Equivalent to a local
+ * `UnforceBatch` plus one `UnforceBatch::Element`, in one object. The
+ * constructor is inlined so the element still finds the user frame's stack
+ * pointer (as the two locals it replaces did).
+ */
+class UnforceOnce
+{
+    UnforceBatch batch;
+    UnforceBatch::Element element;
+
+public:
+    [[gnu::always_inline]] explicit UnforceOnce(EvalState & state)
+        : batch(state)
+        , element(batch)
+    {
+    }
+
+    UnforceOnce(const UnforceOnce &) = delete;
+};
+
 } // namespace nix
