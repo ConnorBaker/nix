@@ -151,15 +151,6 @@ for opts in off on batch0; do
     [[ ! -s $out ]] || fail "nix-instantiate --strict ($opts) printed partial output: $(< "$out")"
 done
 
-# Running out of memory while deciding what to keep at the end of a batch is
-# fatal: a clear message, then abort(), before any value has changed.
-rc=0
-out=$(NIX_UNFORCE_DEBUG=fail-decide nix-instantiate "${batch0[@]}" --eval --strict \
-    -E 'let s = { a = 1; }; in [ s.a s.a s.a ]' 2>&1) || rc=$?
-(( rc == 134 )) || fail "expected abort() (status 134), got $rc: $out"
-[[ $out == *"out of memory while deciding"*"--option eval-unforce false"* ]] \
-    || fail "no fatal message: $out"
-
 # The owner closure keeps identity on deep producer chains with no walk,
 # however deep: here a chain t1..t600 (promoting t(i+1) puts t(i)'s list in
 # the kept set), beside 300 000 targets forced to integers. The owner

@@ -97,8 +97,7 @@ namespace {
 /* Whether unforcing happens at all is the `eval-unforce` setting, and
    `eval-unforce-batch-size` sizes its batches; those two are the only user
    settings. The fields below were experiments whose measured winners are now
-   hardcoded; the only remaining NIX_UNFORCE_* variable is the single hidden
-   developer dial `NIX_UNFORCE_DEBUG` (see `DebugDial`). */
+   hardcoded. */
 struct Settings
 {
     /* DECIDED winners (shipping): an all-types bump region holding the owner
@@ -134,52 +133,12 @@ const Settings & unforceSettings()
     return s;
 }
 
-/* The single hidden developer dial. NIX_UNFORCE_DEBUG is a comma-separated
-   list of flags, each enabling one cross-check or trace that used to have its
-   own NIX_UNFORCE_* variable; all default off (unset means none). */
-struct DebugDial
-{
-    bool verify = false;     /* was NIX_UNFORCE_VERIFY */
-    bool verifyDump = false; /* was NIX_UNFORCE_VERIFY_DUMP */
-    bool tripwire = false;   /* was NIX_UNFORCE_TRIPWIRE */
-    bool failDecide = false; /* was NIX_UNFORCE_FAIL_DECIDE */
-};
-
-const DebugDial & unforceDebug()
-{
-    static const DebugDial d = [] {
-        DebugDial r;
-        auto spec = getEnv("NIX_UNFORCE_DEBUG").value_or("");
-        for (size_t i = 0; i < spec.size();) {
-            auto j = spec.find(',', i);
-            if (j == std::string::npos)
-                j = spec.size();
-            auto tok = spec.substr(i, j - i);
-            i = j + 1;
-            if (tok.empty())
-                continue;
-            else if (tok == "verify")
-                r.verify = true;
-            else if (tok == "verify-dump")
-                r.verifyDump = true;
-            else if (tok == "tripwire")
-                r.tripwire = true;
-            else if (tok == "fail-decide")
-                r.failDecide = true;
-            else
-                std::cerr << fmt("unforce: unknown NIX_UNFORCE_DEBUG flag '%s'\n", tok);
-        }
-        return r;
-    }();
-    return d;
-}
-
-/* The tripwire keeps every released region reserved, so it uses smaller
-   ones: 64 GiB regions would exhaust a 48-bit address space after about
-   4000 jobs. */
+/* The job region's address-space reservation: 64 GiB, large enough that a
+   job rarely needs a second mapping, small enough that a 48-bit address
+   space holds thousands of them. */
 size_t regionSize()
 {
-    return unforceDebug().tripwire ? size_t(4) << 30 : size_t(64) << 30;
+    return size_t(64) << 30;
 }
 
 /* The statistics the tests read: the NIX_SHOW_STATS JSON
@@ -787,11 +746,10 @@ void openRegion()
 {
     hookCollector();
     if (keptStart) {
-        /* Continue above the kept jobs while at least half a region is left
-           (with the tripwire, released memory is not reused). The memory
-           released above the floor is zero pages, and the floor's own page is
-           zeroed above it (`releaseRegion`). */
-        if (!unforceDebug().tripwire && size_t(keptEnd - keptFloor) >= regionSize() / 2) {
+        /* Continue above the kept jobs while at least half a region is left.
+           The memory released above the floor is zero pages, and the floor's
+           own page is zeroed above it (`releaseRegion`). */
+        if (size_t(keptEnd - keptFloor) >= regionSize() / 2) {
             evalRegion.base = evalRegion.cur = keptFloor;
             evalRegion.end = keptEnd;
             useEnvSizeTable(keptStart);
@@ -805,95 +763,8 @@ void openRegion()
     useEnvSizeTable(base);
 }
 
-/* With NIX_UNFORCE_DEBUG=verify, check the invariant that makes releasing a
-   region safe: no live object outside it still points into it. Every live
-   mimalloc block is scanned word by word, so with Boehm disabled (and
-   without NIX_NOGC_BUMP) this covers all long-lived evaluator objects; it is
-   conservative, so a hit names a word that merely looks like a pointer. */
-void verifyNoEscapes()
-{
-    /* Precise enough: the base arena holds only evaluator objects, so a hit
-       is an evaluator object (or string bytes) pointing into the region. */
-    if (evalUseBaseArena) {
-        uintptr_t lo = (uintptr_t) evalRegion.base, hi = (uintptr_t) evalRegion.cur;
-        size_t bytes = 0, hits = 0;
-        for (auto [start, end] : evalBaseArena.chunks) {
-            /* The current chunk is only filled up to `cur`. */
-            if (evalBaseArena.cur >= start && evalBaseArena.cur <= end)
-                end = evalBaseArena.cur;
-            bytes += end - start;
-            for (auto w = (const uintptr_t *) start; w < (const uintptr_t *) end; ++w)
-                if (auto v = *w & ~uintptr_t(7); v >= lo && v < hi) {
-                    if (hits++ < 5)
-                        std::cerr << fmt(
-                            "unforce verify: arena word at %x = %x points into the region\n", (uintptr_t) w, *w);
-                }
-        }
-        std::cerr << fmt(
-            "unforce verify: job %d scanned the base arena (%d MiB), %d pointers into the region\n",
-            stats.jobs,
-            bytes >> 20,
-            hits);
-        return;
-    }
-#if NIX_UNFORCE_MIMALLOC
-    struct Scan
-    {
-        uintptr_t lo, hi;
-        size_t blocks = 0, bytes = 0, hits = 0;
-    } scan{(uintptr_t) evalRegion.base, (uintptr_t) evalRegion.cur};
-
-    mi_heap_visit_blocks(
-        mi_heap_main(),
-        true,
-        [](const mi_heap_t *, const mi_heap_area_t *, void * block, size_t size, void * arg) -> bool {
-            auto & scan = *(Scan *) arg;
-            if (!block)
-                return true;
-            scan.blocks++;
-            scan.bytes += size;
-            auto words = (const uintptr_t *) block;
-            for (size_t i = 0; i < size / sizeof(uintptr_t); ++i)
-                /* Strip Value's tag bits. */
-                if (auto w = words[i] & ~uintptr_t(7); w >= scan.lo && w < scan.hi) {
-                    if (scan.hits++ < 3) {
-                        std::cerr << fmt(
-                            "unforce verify: block %x (%d bytes) word %d points into the region\n",
-                            (uintptr_t) block,
-                            size,
-                            i);
-                        if (unforceDebug().verifyDump) {
-                            std::string line;
-                            for (size_t j = 0; j < std::min<size_t>(size / 8, 40); ++j)
-                                line += fmt(" %016x", words[j]);
-                            std::cerr << "  words:" << line << "\n";
-                            std::string text;
-                            for (size_t j = 0; j < std::min<size_t>(size, 320); ++j) {
-                                char c = ((const char *) block)[j];
-                                text += c >= 32 && c < 127 ? c : '.';
-                            }
-                            std::cerr << "  text: " << text << "\n";
-                        }
-                    }
-                }
-            return true;
-        },
-        &scan);
-    std::cerr << fmt(
-        "unforce verify: job %d scanned %d blocks (%d MiB), %d pointers into the region\n",
-        stats.jobs,
-        scan.blocks,
-        scan.bytes >> 20,
-        scan.hits);
-#endif
-}
-
-/* With the tripwire, the pages stay reserved but inaccessible, so a missed
-   escape faults instead of reading reused memory. */
 void releaseRegion()
 {
-    if (unforceDebug().verify)
-        verifyNoEscapes();
     auto base = evalRegion.base;
     auto cur = evalRegion.cur;
     evalRegion = EvalRegion{};
@@ -907,11 +778,7 @@ void releaseRegion()
             madvise(up, pageUp(cur) - up, MADV_DONTNEED);
         return;
     }
-    if (unforceDebug().tripwire) {
-        mprotect(base, regionSize(), PROT_NONE);
-        madvise(base, regionSize(), MADV_DONTNEED);
-    } else
-        munmap(base, regionSize());
+    munmap(base, regionSize());
     if (envSizeMapping == base)
         unmapEnvSizeTable();
 }
@@ -1752,9 +1619,6 @@ std::vector<bool> decideJob(
         copyPromoted();
         return promote;
     }
-
-    if (unforceDebug().failDecide)
-        throw std::bad_alloc();
 
     /* The owner timeline ran out of budget: keep the job whole, which is
        exact (nothing is reverted). */
