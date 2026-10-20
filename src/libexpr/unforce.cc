@@ -38,7 +38,6 @@
 
 #if NIX_UNFORCE_MIMALLOC
 #  include <mimalloc.h>
-#  include <mimalloc-stats.h>
 #endif
 
 namespace nix {
@@ -175,11 +174,6 @@ const DebugDial & unforceDebug()
     return d;
 }
 
-/* Whether the per-force statistics counters are ever observed: only the
-   NIX_SHOW_STATS summary and JSON dump read them, so when stats are off the
-   hot in-job force path skips them entirely. */
-static const bool statsObserved = unforceSettings().stats;
-
 /* The tripwire keeps every released region reserved, so it uses smaller
    ones: 64 GiB regions would exhaust a 48-bit address space after about
    4000 jobs. */
@@ -188,57 +182,25 @@ size_t regionSize()
     return unforceDebug().tripwire ? size_t(4) << 30 : size_t(64) << 30;
 }
 
+/* The statistics the tests read: the NIX_SHOW_STATS JSON
+   (`unforceStatsJSON`) and the end-of-run summary (`printStatsAtExit`).
+   Counters that fed neither were removed with the rest of the telemetry. */
 struct Stats
 {
-    size_t jobs = 0, logged = 0, reverted = 0, stubbed = 0, promoted = 0, copiedBytes = 0, regionPeak = 0;
-    /* Targets logged in a job that an earlier job had forced and reverted. */
-    size_t reforced = 0;
-    /* Job memory released, summed over jobs. */
-    size_t freedBytes = 0;
-    /* The owner closure: promotions it added, and jobs whose closure
-       changed anything. */
-    size_t markerPromoted = 0, markerJobs = 0;
-    /* The force counts: the most entries they held, and how often they
-       were rebuilt from one job's targets for outgrowing their cap. */
-    size_t countsPeak = 0, countsResets = 0;
-    /* Counted targets on the thread's stack (stack slots the job restores),
-       whose addresses a later job may reuse for another cell (P5). */
-    size_t stackTargets = 0;
-    /* Jobs that promoted nothing because client code ran in them, and the
-       cells reverted at their ends. */
-    size_t clientJobs = 0, revertedInClientJobs = 0;
+    size_t jobs = 0, reverted = 0;
+    /* Jobs that promoted nothing because client code ran in them. */
+    size_t clientJobs = 0;
     /* `UnforceSeen`: targets nominated because a printer printed the
-       container they hold, and printers' `seen` entries rewritten to a
-       copy's address at job ends. No entry is ever dropped: a job that
-       would drop one keeps all its memory instead (`keptJobs`, and the
-       bytes those jobs used, `keptJobBytes`, which is what they retain:
+       container they hold, printers' `seen` entries rewritten to a copy's
+       address at job ends, and jobs kept whole (with the bytes they retain:
        kept jobs share one mapping). */
     size_t seenNominated = 0, seenKept = 0, keptJobs = 0, keptJobBytes = 0;
-    /* Owner timeline: forces of young cells outside the current segment
-       (each looks up its owner), those that changed the owner, the most
-       segments one job had, owner lookups at job ends (one per copied or
-       marked identity-bearing object), jobs whose closure added promotions,
-       and consumers nominated. */
-    size_t ownerLookups = 0, ownerChanges = 0, ownerSegsPeak = 0, ownerJobLookups = 0, ownerJobs = 0,
-           ownerConsumerNominated = 0, ownerOverflowJobs = 0, ownerConsumerPairsPeak = 0, ownerCopyLimitJobs = 0;
+    /* Owner timeline: owner changes, the most segments one job had, the most
+       consumer pairs, jobs whose timeline overflowed the budget, and jobs
+       whose young closure exceeded the copy limit. */
+    size_t ownerChanges = 0, ownerSegsPeak = 0, ownerConsumerPairsPeak = 0, ownerOverflowJobs = 0,
+           ownerCopyLimitJobs = 0;
 } stats;
-
-/* This thread's stack, [low, high). */
-static thread_local const std::pair<const char *, const char *> threadStack = [] {
-    pthread_attr_t attr;
-    void * addr = nullptr;
-    size_t size = 0;
-    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
-        pthread_attr_getstack(&attr, &addr, &size);
-        pthread_attr_destroy(&attr);
-    }
-    return std::pair{(const char *) addr, (const char *) addr + size};
-}();
-
-static bool onThreadStack(const void * p)
-{
-    return threadStack.first && (const char *) p >= threadStack.first && (const char *) p < threadStack.second;
-}
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). Per
    thread, like the scope marks that `unforceNoteClientCode` tests: a C-API
@@ -253,27 +215,7 @@ static void printStatsAtExit()
     [[maybe_unused]] static bool registered =
         (std::atexit([] {
              std::cerr << fmt(
-                 "unforce: %s %d, logged %d, reverted %d, stubbed %d, promoted %d, copied %d MiB, "
-                 "largest scope %d MiB; reforced %d, freed %d MiB; owner closure: promoted %d, jobs %d; "
-                 "counts peak %d, counts resets %d, stack targets %d; client-code jobs %d, reverted in client-code jobs %d; "
-                 "seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
-                 "jobs",
-                 stats.jobs,
-                 stats.logged,
-                 stats.reverted,
-                 stats.stubbed,
-                 stats.promoted,
-                 stats.copiedBytes >> 20,
-                 stats.regionPeak >> 20,
-                 stats.reforced,
-                 stats.freedBytes >> 20,
-                 stats.markerPromoted,
-                 stats.markerJobs,
-                 stats.countsPeak,
-                 stats.countsResets,
-                 stats.stackTargets,
-                 stats.clientJobs,
-                 stats.revertedInClientJobs,
+                 "unforce: seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
                  stats.seenNominated,
                  stats.seenKept,
                  stats.keptJobs,
@@ -954,7 +896,6 @@ void releaseRegion()
         verifyNoEscapes();
     auto base = evalRegion.base;
     auto cur = evalRegion.cur;
-    stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     evalRegion = EvalRegion{};
     dropEnvSizes(base, cur);
     if (keptStart && base == keptFloor) {
@@ -982,7 +923,6 @@ static void retainRegion()
 {
     auto base = evalRegion.base;
     auto cur = evalRegion.cur;
-    stats.regionPeak = std::max(stats.regionPeak, size_t(cur - base));
     stats.keptJobBytes += cur - base;
     dropEnvSizes(base, cur);
     if (keptStart && base == keptFloor)
@@ -1030,7 +970,6 @@ struct Evacuator
 
     void * copyBytes(const void * p, size_t n)
     {
-        stats.copiedBytes += n;
         auto q = state.mem.allocBytes(n);
         memcpy(q, p, n);
         return q;
@@ -1043,7 +982,6 @@ struct Evacuator
         if (auto f = forwarded(v))
             return f;
         auto n = state.allocValue();
-        stats.copiedBytes += sizeof(Value);
         *n = *v;
         note(v, n);
         if (onIdentity)
@@ -1060,7 +998,6 @@ struct Evacuator
             return f;
         auto size = envSizeOf(e);
         auto & n = state.mem.allocEnv(size);
-        stats.copiedBytes += sizeof(Env) + size * sizeof(Value *);
         n.up = e->up;
         std::copy_n(e->values, size, n.values);
         note(e, &n);
@@ -1089,7 +1026,6 @@ struct Evacuator
         if (auto f = forwarded(elems))
             return f;
         auto n = (Value **) state.mem.allocBytes(size * sizeof(Value *));
-        stats.copiedBytes += size * sizeof(Value *);
         note(elems, n);
         if (onIdentity)
             onIdentity(onIdentityCtx, elems);
@@ -1122,7 +1058,6 @@ struct Evacuator
         if (auto f = forwarded(b))
             return f;
         auto bytes = sizeof(Bindings) + b->layerSize() * sizeof(Attr);
-        stats.copiedBytes += bytes;
         auto n = b->copyLayer(
             state.mem.allocBytes(bytes),
             [&](Value * v) { return value(v); },
@@ -1653,7 +1588,6 @@ static std::vector<bool> countTargets(
         for (size_t i = 0; i < targets.size(); ++i)
             if (prior[i])
                 counts.emplace(targets.cells[i], prior[i]);
-        stats.countsResets++;
     }
     std::vector<bool> reached(targets.size());
     for (size_t i = 0; i < targets.size(); ++i) {
@@ -1661,11 +1595,7 @@ static std::vector<bool> countTargets(
            would only grow the map. */
         if (skip && (*skip)[i])
             continue;
-        if (onThreadStack(targets.cells[i]))
-            stats.stackTargets++;
         auto before = counts[targets.cells[i]]++;
-        if (before)
-            stats.reforced++;
         reached[i] = before + 1 >= cfg.promoteAfter;
     }
     return reached;
@@ -1713,7 +1643,6 @@ struct OwnerClosure
     static void note(void * ctx, const void * p)
     {
         auto & x = *(OwnerClosure *) ctx;
-        stats.ownerJobLookups++;
         auto o = ownerOf(p);
         /* Consecutive objects mostly share an owner. */
         if (o == noOwner || o == x.last)
@@ -1884,7 +1813,6 @@ std::vector<bool> decideJob(
                 std::optional<size_t> ci = c, pi = p;
                 if (ci && pi && promote[*pi] && !promote[*ci]) {
                     promote[*ci] = true;
-                    stats.ownerConsumerNominated++;
                     oc.added++;
                     more = true;
                 }
@@ -1900,9 +1828,6 @@ std::vector<bool> decideJob(
             return promote;
         }
         evacuator.onIdentity = nullptr;
-        stats.markerPromoted += oc.added;
-        if (oc.added)
-            stats.markerJobs++, stats.ownerJobs++;
         /* Markers' rule for printing jobs (it keeps the printer's «repeated»
            cheaply); a job that marked first only for the copy limit
            copies. */
@@ -1929,7 +1854,6 @@ std::vector<bool> decideJob(
 void pruneCounts(
     std::unordered_map<const Value *, uint32_t> & counts, const JobTargets & targets, const std::vector<bool> & promoted)
 {
-    stats.countsPeak = std::max(stats.countsPeak, counts.size());
     for (size_t i = 0; i < targets.size(); ++i)
         if (promoted[i])
             counts.erase(targets.cells[i]);
@@ -1977,81 +1901,17 @@ std::string unforceStatsJSON()
     if (!stats.jobs)
         return "";
     return fmt(
-        R"({"scopes":%d,"logged":%d,"reverted":%d,"stubbed":%d,"promoted":%d,"copiedBytes":%d,"largestScopeBytes":%d,)"
-        R"("reforced":%d,"promotedBytes":%d,"freedBytes":%d,"markerPromoted":%d,"markerJobs":%d,)"
-        R"("countsPeak":%d,"countsResets":%d,"stackTargets":%d,"clientJobs":%d,)"
-        R"("revertedInClientJobs":%d,"seenNominated":%d,"seenKept":%d,"keptJobs":%d,)"
-        R"("keptJobBytes":%d,"identity":"%s","ownerLookups":%d,"ownerChanges":%d,"ownerSegsPeak":%d,)"
-        R"("ownerJobLookups":%d,"ownerJobs":%d,"ownerConsumerNominated":%d,)"
-        R"("ownerOverflowJobs":%d,"ownerConsumerPairsPeak":%d,"ownerCopyLimitJobs":%d})",
+        R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"ownerChanges":%d,)"
+        R"("ownerSegsPeak":%d,"ownerConsumerPairsPeak":%d,"ownerOverflowJobs":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
-        stats.logged,
         stats.reverted,
-        stats.stubbed,
-        stats.promoted,
-        stats.copiedBytes,
-        stats.regionPeak,
-        stats.reforced,
-        stats.copiedBytes,
-        stats.freedBytes,
-        stats.markerPromoted,
-        stats.markerJobs,
-        stats.countsPeak,
-        stats.countsResets,
-        stats.stackTargets,
         stats.clientJobs,
-        stats.revertedInClientJobs,
-        stats.seenNominated,
-        stats.seenKept,
         stats.keptJobs,
-        stats.keptJobBytes,
-        "owners",
-        stats.ownerLookups + stats.ownerChanges,
         stats.ownerChanges,
         stats.ownerSegsPeak,
-        stats.ownerJobLookups,
-        stats.ownerJobs,
-        stats.ownerConsumerNominated,
-        stats.ownerOverflowJobs,
         stats.ownerConsumerPairsPeak,
+        stats.ownerOverflowJobs,
         stats.ownerCopyLimitJobs);
-}
-
-static size_t allocatorErrors = 0;
-
-std::string allocatorStatsJSON()
-{
-#if NIX_UNFORCE_MIMALLOC
-    /* mi_process_info covers the whole process, whichever collector owns
-       the evaluator's heap; mi_stats_get_json adds mimalloc's own counters
-       (arena reservation and commit, mmap and purge calls). */
-    size_t elapsed, user, sys, rss, peakRss, commit, peakCommit, faults;
-    mi_process_info(&elapsed, &user, &sys, &rss, &peakRss, &commit, &peakCommit, &faults);
-    auto mi = mi_stats_get_json(0, nullptr);
-    auto res = fmt(
-        R"({"mimallocVersion":%d,"currentRss":%d,"peakRss":%d,"currentCommit":%d,"peakCommit":%d,"pageFaults":%d,"errors":%d,"mimalloc":%s})",
-        mi_version(),
-        rss,
-        peakRss,
-        commit,
-        peakCommit,
-        faults,
-        allocatorErrors,
-        mi ? mi : "null");
-    mi_free(mi);
-    return res;
-#else
-    return "";
-#endif
-}
-
-void initAllocator()
-{
-#if NIX_UNFORCE_MIMALLOC
-    /* Count mimalloc's errors (it reports them itself as well); throwing
-       from here would unwind through C. */
-    mi_register_error([](int, void *) { allocatorErrors++; }, nullptr);
-#endif
 }
 
 static size_t generation = 0;
@@ -2336,8 +2196,7 @@ bool unforceIsScopeStackSlot(const void * p)
    so the hook needs no stack frame. */
 [[gnu::always_inline]] inline static void youngOwnerChange(const Value & v, uint32_t o)
 {
-    if (statsObserved) [[unlikely]]
-        stats.ownerChanges++;
+    stats.ownerChanges++;
     if (curOwner != noOwner && ownerConsumersOn) [[unlikely]]
         return youngConsumerChange(v, o);
     if (opens.t == opens.e) [[unlikely]]
@@ -2350,13 +2209,8 @@ bool unforceIsScopeStackSlot(const void * p)
 [[gnu::always_inline]] inline static void youngForce(const Value & v)
 {
     auto o = ownerOf(&v);
-    /* `ownerLookups` counts these forces; the common one changes the
-       owner, so it is `ownerChanges` that the hot path counts. */
-    if (o == curOwner) [[unlikely]] {
-        if (statsObserved) [[unlikely]]
-            stats.ownerLookups++;
+    if (o == curOwner) [[unlikely]]
         return;
-    }
     youngOwnerChange(v, o);
 }
 
@@ -2543,7 +2397,6 @@ void EvalState::endUnforceScope(size_t mark)
     auto & cfg = unforceSettings();
     stats.jobs++;
     generation++;
-    stats.logged += undoLog.size() - mark;
     dropOpenForces(mark);
     /* Effects design R: no force is active at a job end, so any replay the
        hooks were counting has ended; clear it in case `dropOpenForces` cut an
@@ -2600,18 +2453,14 @@ void EvalState::endUnforceScope(size_t mark)
         if (!keepWhole) {
             auto & targets = jt->cells;
             for (size_t i = 0; i < targets.size(); ++i)
-                if (promoted[i]) {
+                if (promoted[i])
                     *targets[i] = copies[i];
-                    stats.promoted++;
-                }
 
             for (size_t i = 0; i < targets.size(); ++i) {
                 if (promoted[i])
                     continue;
                 *targets[i] = jt->preImage(i);
                 stats.reverted++;
-                if (clientCodeInJob)
-                    stats.revertedInClientJobs++;
                 /* Effects design R: a reverted cell re-forced in a later batch
                    replays its diagnostics; arm their suppression (a no-op until
                    the first diagnostic fires). */
@@ -2622,8 +2471,6 @@ void EvalState::endUnforceScope(size_t mark)
 
     if (keepWhole)
         stats.keptJobs++;
-    else if (evalRegion.base)
-        stats.freedBytes += evalRegion.cur - evalRegion.base;
     clientCodeInJob = false;
     undoLog.resize(mark);
     undoLog.shrink_to_fit();

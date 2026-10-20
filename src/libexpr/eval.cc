@@ -3183,11 +3183,9 @@ void EvalState::printStatistics()
         {"cycles", gcCycles},
     };
 #endif
-    /* Allocator and unforcing statistics. */
+    /* Unforcing statistics. */
     if (auto s = unforceStatsJSON(); !s.empty())
         topObj["unforce"] = json::parse(s);
-    if (auto s = allocatorStatsJSON(); !s.empty())
-        topObj["allocator"] = json::parse(s);
 
     if (countCalls) {
         {

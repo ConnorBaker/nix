@@ -136,7 +136,6 @@ void initGC()
 
     gcCyclesAfterInit = GC_get_gc_no();
 #endif
-    initAllocator();
 
     // NIX_PATH must override the regular setting
     // See the comment in applyConfig

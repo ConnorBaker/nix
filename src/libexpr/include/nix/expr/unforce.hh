@@ -108,9 +108,8 @@ void unforceNoteClientCode();
 /** Bytes allocated so far in the innermost unforce scope. */
 size_t unforceCurrentScopeBytes();
 
-/** NIX_SHOW_STATS sections as JSON text, or empty. */
+/** NIX_SHOW_STATS section as JSON text, or empty. */
 std::string unforceStatsJSON();
-std::string allocatorStatsJSON();
 
 /**
  * Whether traversals unforce what they visit: the `eval-unforce`
