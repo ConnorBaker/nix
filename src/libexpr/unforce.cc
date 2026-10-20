@@ -43,7 +43,6 @@
 namespace nix {
 
 EvalRegion evalRegion;
-BumpArena evalBaseArena;
 
 /* Effects design R (declared in eval.hh). `unforceReplayDepth` is non-zero
    exactly while re-forcing a reverted cell, so a `builtins.trace`/`warn` in it
@@ -56,40 +55,12 @@ BumpArena evalBaseArena;
 thread_local unsigned unforceReplayDepth = 0;
 thread_local bool unforceSawDiagnostic = false;
 
-const bool evalUseBaseArena = [] {
-    auto s = getenv("NIX_NOGC_BUMP");
-    return s && std::string_view(s) != "0";
-}();
-
-static const bool useHugePages = [] {
-    auto s = getenv("NIX_NOGC_THP");
-    return s && std::string_view(s) != "0";
-}();
-
 static void * mapArena(size_t n)
 {
     auto p = mmap(nullptr, n, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (p == MAP_FAILED)
         throw std::bad_alloc();
-    if (useHugePages)
-        madvise(p, n, MADV_HUGEPAGE);
     return p;
-}
-
-void * BumpArena::refill(size_t n)
-{
-    static constexpr size_t chunk = size_t(64) << 20;
-    /* A large object gets its own mapping, so the current chunk stays. */
-    if (n > chunk / 4) {
-        auto p = (char *) mapArena(n);
-        chunks.emplace_back(p, p + n);
-        return p;
-    }
-    auto p = mapArena(chunk);
-    cur = (char *) p;
-    chunks.emplace_back(cur, cur + chunk);
-    end = cur + chunk;
-    return alloc(n);
 }
 
 namespace {

@@ -25,7 +25,7 @@ inline void * EvalMemory::allocBytes(size_t n)
 #if NIX_USE_BOEHMGC
     p = GC_MALLOC(n);
 #else
-    p = evalUseBaseArena ? evalBaseArena.alloc(n) : evalBaseAlloc(n);
+    p = evalBaseAlloc(n);
 #endif
     if (!p)
         throw std::bad_alloc();

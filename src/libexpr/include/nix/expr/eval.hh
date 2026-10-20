@@ -425,37 +425,6 @@ extern EvalRegion evalRegion;
 void * evalBaseAlloc(size_t n);
 #endif
 
-/**
- * A never-freed bump arena for evaluator objects outside job
- * regions, used instead of `calloc` when Boehm GC is disabled and
- * `NIX_NOGC_BUMP` is set. Memory is zero because it comes fresh from mmap.
- */
-struct BumpArena
-{
-    char * cur = nullptr;
-    char * end = nullptr;
-
-    [[gnu::always_inline]] void * alloc(size_t n)
-    {
-        n = (n + 15) & ~size_t(15);
-        if (size_t(end - cur) >= n) [[likely]] {
-            auto p = cur;
-            cur += n;
-            return p;
-        }
-        return refill(n);
-    }
-
-    void * refill(size_t n);
-
-    /** Every mapping handed out, for heap verification: [start, end). */
-    std::vector<std::pair<char *, char *>> chunks;
-};
-
-extern BumpArena evalBaseArena;
-
-extern const bool evalUseBaseArena;
-
 class EvalMemory
 {
 public:

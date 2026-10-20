@@ -5,8 +5,8 @@
    surface: the job-region pause guard, the «seen»-set and traversal-batch
    helpers, and the free functions that only cold call sites (unforce.cc and
    its consumers) use. The hot inlined pieces that `eval-inline.hh` needs --
-   `EvalRegion`, `evalRegion`, `evalBaseAlloc`, `BumpArena`/`evalBaseArena`,
-   and the `logPreImage`/`endLoggedForce` hooks -- stay in `eval.hh`. */
+   `EvalRegion`, `evalRegion`, `evalBaseAlloc`, and the
+   `logPreImage`/`endLoggedForce` hooks -- stay in `eval.hh`. */
 
 #include "nix/expr/eval.hh"
 
