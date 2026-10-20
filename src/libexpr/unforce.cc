@@ -67,40 +67,30 @@ namespace {
 
 /* Whether unforcing happens at all is the `eval-unforce` setting, and
    `eval-unforce-batch-size` sizes its batches; those two are the only user
-   settings. The fields below were experiments whose measured winners are now
-   hardcoded. */
-struct Settings
-{
-    /* DECIDED winners (shipping): an all-types bump region holding the owner
-       timeline (both now hardcoded, not fields), promoting a cell forced in
-       two jobs, nominating consumers, and keeping printers' `seen` sets exact.
-       The owner timeline closes each job's promotion set under "producer-of"
-       (`decideJob`), which makes promotion pointer-equality-safe: a promoted
-       cell keeps the address its holders already compared, so eqValues'
-       `&v1 == &v2` short-cut still holds. At the 64 MiB default batch this is
-       byte-identical to base, ~1.12x its instructions, with 0 pointer-equality
-       flips on 3491 real Nixpkgs comparisons.
-       Previously NIX_UNFORCE_PROMOTE, _OWNER_CONSUMERS, _SEEN. */
-    uint32_t promoteAfter = 2;
-    bool ownerConsumers = true;
-    bool keepSeen = true;
-    /* 0 derives these from the batch size (`eval-unforce-batch-size`):
-       countsCap = max(256 Ki, batch / 256); ownerBudget and copyLimit =
-       max(batch / 4, 4 MiB). Previously NIX_UNFORCE_COUNTS_CAP,
-       _OWNER_BUDGET, _COPY_LIMIT. */
-    uint64_t countsCap = 0;
-    size_t ownerBudget = 0;
-    size_t copyLimit = 0;
+   settings. The policy knobs below were experiments whose measured winners
+   are now hardcoded constants (formerly the NIX_UNFORCE_PROMOTE,
+   _OWNER_CONSUMERS and _SEEN variables): promote a cell forced in two jobs,
+   nominate consumers, and keep printers' `seen` sets exact. The owner
+   timeline closes each job's promotion set under "producer-of" (`decideJob`),
+   which makes promotion pointer-equality-safe: a promoted cell keeps the
+   address its holders already compared, so eqValues' `&v1 == &v2` short-cut
+   still holds. At the 64 MiB default batch this is byte-identical to base,
+   ~1.12x its instructions, with 0 pointer-equality flips on 3491 real Nixpkgs
+   comparisons.
 
-    /* The statistics summary is requested with NIX_SHOW_STATS, the same dial
-       as the evaluator's own statistics (whose JSON already carries the
-       unforce numbers); there is no separate NIX_UNFORCE_STATS. */
-    bool stats = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
-};
+   The force-counts cap, owner-timeline budget and copy limit (formerly
+   NIX_UNFORCE_COUNTS_CAP, _OWNER_BUDGET, _COPY_LIMIT, all "0 means derive")
+   are derived from the batch size at each use. */
+constexpr uint32_t promoteAfter = 2;
+constexpr bool ownerConsumersWinner = true;
+constexpr bool keepSeenWinner = true;
 
-const Settings & unforceSettings()
+/* The statistics summary is requested with NIX_SHOW_STATS, the same dial as
+   the evaluator's own statistics (whose JSON already carries the unforce
+   numbers); there is no separate NIX_UNFORCE_STATS. */
+static bool unforceStatsRequested()
 {
-    static const Settings s;
+    static const bool s = getEnv("NIX_SHOW_STATS").value_or("0") != "0";
     return s;
 }
 
@@ -553,10 +543,9 @@ static const Value * ownerCell(uint32_t o)
 /* A job opens: everything is the driver's until a force says otherwise. */
 static void openOwners(EvalState & state)
 {
-    auto & cfg = unforceSettings();
     ownersOn = evalRegion.cur != nullptr;
     ownersOverflowed = false;
-    ownerConsumersOn = cfg.ownerConsumers;
+    ownerConsumersOn = ownerConsumersWinner;
     ownerConsumers.clear();
     lastConsumerPair = PairSet::empty;
     curOwner = noOwner;
@@ -566,7 +555,7 @@ static void openOwners(EvalState & state)
     ownerSegs.bottom();
     if (!ownersOn)
         return;
-    ownerBudget = cfg.ownerBudget ? cfg.ownerBudget : std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
+    ownerBudget = std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
     ownerBudget = std::max<size_t>((ownerBudget + 4095) & ~size_t(4095), 4096);
     if (!ownerSegs.open(ownerBudget)) {
         /* No timeline: keep the job whole. */
@@ -1410,8 +1399,7 @@ static std::vector<bool> countTargets(
     uint64_t batchSize,
     const Reported * skip)
 {
-    auto & cfg = unforceSettings();
-    auto cap = cfg.countsCap ? cfg.countsCap : std::max<uint64_t>(256 << 10, batchSize / 256);
+    auto cap = std::max<uint64_t>(256 << 10, batchSize / 256);
     auto counted = targets.size();
     if (skip)
         for (size_t i = 0; i < targets.size(); ++i)
@@ -1434,7 +1422,7 @@ static std::vector<bool> countTargets(
         if (skip && (*skip)[i])
             continue;
         auto before = counts[targets.cells[i]]++;
-        reached[i] = before + 1 >= cfg.promoteAfter;
+        reached[i] = before + 1 >= promoteAfter;
     }
     return reached;
 }
@@ -1544,7 +1532,6 @@ std::vector<bool> decideJob(
     const Reported * printed = nullptr,
     bool * keepWhole = nullptr)
 {
-    auto & cfg = unforceSettings();
     std::vector<bool> promote(targets.size());
     std::vector<bool> copied(targets.size());
     auto copy = [&](size_t i) {
@@ -1563,8 +1550,7 @@ std::vector<bool> decideJob(
                 copy(i);
     };
 
-    if (cfg.promoteAfter)
-        promote = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
+    promote = countTargets(counts, targets, state.settings.unforceBatchSize, printed);
 
     /* Cells reported to an `UnforceSeen` (holding a container a printer
        printed, or walked by `forceValueDeep` for a printer that prints
@@ -1611,8 +1597,7 @@ std::vector<bool> decideJob(
            larger than the limit cannot copy more, so it copies at once
            (e.g. print-meta-200 copied
            1 101 MiB in one job). */
-        auto copyLimit =
-            cfg.copyLimit ? cfg.copyLimit : std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
+        auto copyLimit = std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
         bool markFirst = keepWhole && (printed || youngBytes > copyLimit);
         std::optional<Closure<RegionMarks>> marker;
         if (markFirst) {
@@ -1863,7 +1848,7 @@ UnforceSeen::~UnforceSeen()
 
 bool unforceSeenExact()
 {
-    return unforceSettings().keepSeen;
+    return keepSeenWinner;
 }
 
 void unforceNoteSeen(std::set<const void *> & seen, const Value & cell, const void * key)
@@ -2229,7 +2214,6 @@ void EvalState::endUnforceScope(size_t mark)
         return;
     jobOwner = nullptr;
 
-    auto & cfg = unforceSettings();
     stats.jobs++;
     generation++;
     dropOpenForces(mark);
@@ -2316,7 +2300,7 @@ void EvalState::endUnforceScope(size_t mark)
             releaseRegion();
     }
 
-    if (cfg.stats)
+    if (unforceStatsRequested())
         printStatsAtExit();
 }
 
