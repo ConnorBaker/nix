@@ -56,6 +56,6 @@ done
 
 # What was kept is counted.
 stats=$(NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH=/dev/null nix-instantiate "${on[@]}" --eval --strict rep.nix 2>&1 >/dev/null)
-[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+)\ \(([0-9]+)\ KiB\)$ ]] \
+[[ $stats =~ seen\ nominated\ ([0-9]+),\ kept\ ([0-9]+)\;\ jobs\ kept\ whole\ ([0-9]+)\ \(([0-9]+)\ KiB\)\;\ heavy\ reclaimed\ ([0-9]+),\ over\ ceiling\ ([0-9]+)$ ]] \
     || fail "no unforce stats: $stats"
 (( BASH_REMATCH[1] >= 1 )) || fail "rep.nix: nothing nominated: $stats"
