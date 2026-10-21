@@ -541,6 +541,16 @@ public:
           evaluation, and trades CPU (one more re-force of the reverted values) to
           cap peak memory only once memory is actually tight.
 
+          Reclaiming narrows, but does not close, the range of memory limits in
+          which evaluation runs out of memory. A batch kept whole is never freed:
+          its memory stays in use until the process exits. By the time reclaiming
+          starts, the batches kept whole already hold about `fraction × headroom`,
+          and any batch kept whole later adds to that; everything else the
+          evaluation needs must fit in the memory that is left. Below some limit
+          it does not fit, and evaluation still runs out of memory. Lowering the
+          fraction makes reclaiming start earlier, so less memory is held this
+          way and evaluation fits under a lower limit, at the cost of more CPU.
+
           `0` reclaims every heavy batch (most aggressive; the behaviour measured
           as −34 % peak / +27 % CPU on whole-Nixpkgs). Values in `(0, 1)` gate on
           pressure as above. A value `≥ 1` is a **debug/bisection sentinel** that
