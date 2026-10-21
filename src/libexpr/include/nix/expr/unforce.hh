@@ -132,7 +132,7 @@ extern bool unforceTestFailDecide;
  * Test-only override. When set to `true`, every *heavy* unforce batch (one
  * whose young closure exceeds the per-batch copy limit) is reclaimed —
  * evacuated and its region reverted and freed — regardless of the
- * `eval-unforce-reclaim-fraction` pressure gate and regardless of the
+ * `eval-unforce-reclaim-margin` pressure gate and regardless of the
  * transient-cap Evac(S) ceiling. It forces the pressure-gated reclaim path to
  * run deterministically on any machine, whatever its memory headroom, so a
  * test can assert the reclaim path is exercised and its output is
@@ -152,12 +152,29 @@ size_t unforceHeavyEvacuatedCount();
 /**
  * Test-only override. When non-zero, it replaces the measured memory headroom
  * (physical RAM / cgroup limit / `RLIMIT_AS`) that the
- * `eval-unforce-reclaim-fraction` gate and the reclaim transient cap (an
+ * `eval-unforce-reclaim-margin` gate and the reclaim transient cap (an
  * Evac(S) ceiling of headroom/16) are computed from, so a test can place a
  * batch above or below that ceiling deterministically on any machine. Zero
  * (the default) uses the measured headroom. Never set by normal evaluation.
  */
 extern size_t unforceTestHeadroom;
+
+/**
+ * Test-only override. When set, it is called in place of reading the
+ * process's current memory (resident set size) at each heavy batch's
+ * `eval-unforce-reclaim-margin` gate decision, so a test can drive the gate
+ * deterministically, batch by batch. A return of 0 means "no reading" and
+ * falls back to the bytes retained by batches kept whole, as when the
+ * platform offers no reading. Null (the default) reads the process's memory.
+ * Never set by normal evaluation.
+ */
+extern size_t (*unforceTestMemoryReading)();
+
+/**
+ * The number of times the reclaim gate read the process's memory (one per
+ * heavy batch decision with a margin in (0, headroom)), process-wide.
+ */
+size_t unforceMemoryReadsCount();
 
 /**
  * The number of heavy unforce batches the memory-pressure gate would have

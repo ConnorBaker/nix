@@ -521,42 +521,60 @@ public:
           undoes after every element.
         )"};
 
-    Setting<float> unforceReclaimFraction{
+    Setting<uint64_t> unforceReclaimMargin{
         this,
-        0.5f,
-        "eval-unforce-reclaim-fraction",
+        uint64_t(6) << 30,
+        "eval-unforce-reclaim-margin",
         R"(
-          With `eval-unforce`, the memory-pressure threshold above which a *heavy*
-          unforce batch (one whose young closure is larger than the per-batch copy
-          limit) is reclaimed — its kept values are evacuated and the rest of its
-          region is reverted and freed — instead of being kept whole.
+          With `eval-unforce`, how much memory, in bytes, must remain free for a
+          *heavy* unforce batch (one whose young closure is larger than the
+          per-batch copy limit) to be kept whole. With less free than this, the
+          batch is reclaimed instead: its kept values are evacuated and the rest
+          of its region is reverted and freed. Like other size settings it takes
+          a `K`, `M`, `G` or `T` suffix (for example `3G`).
 
-          The threshold is this fraction of the process's memory *headroom*: the
-          smallest of physical RAM, the cgroup memory limit (v2 `memory.max` or v1
-          `memory.limit_in_bytes`), and a finite `RLIMIT_AS` (`ulimit -v`). A heavy
-          batch is reclaimed once the running total of bytes retained by batches
-          kept whole so far exceeds `fraction × headroom`; until then heavy batches
-          are kept whole, which costs no extra CPU. This makes reclaiming
-          self-tuning: it stays dormant on a machine with ample memory for the
-          evaluation, and trades CPU (one more re-force of the reverted values) to
-          cap peak memory only once memory is actually tight.
+          Free memory is the process's memory *headroom* — the smallest of
+          physical RAM, the cgroup memory limit (v2 `memory.max` or v1
+          `memory.limit_in_bytes`), and a finite `RLIMIT_AS` (`ulimit -v`) —
+          minus its current memory use (its resident set size:
+          `/proc/self/statm` on Linux, `task_info` on macOS), read when a heavy
+          batch ends. While at least the margin is free, heavy batches are kept
+          whole, which costs no extra CPU; below it they are reclaimed, trading
+          CPU (one more re-force of the reverted values) for memory. The reading
+          is taken afresh at every heavy batch and reclaiming frees memory, so
+          this is a feedback loop that holds free memory near the margin once
+          memory is tight. Reclaiming stays dormant whenever headroom exceeds
+          what the evaluation uses kept whole plus the margin, however large the
+          machine. Only this process is read: other processes sharing the same
+          cgroup limit are not counted. Where no reading is available, the bytes
+          retained by batches kept whole so far stand in for it (a lower bound,
+          so reclaiming starts later).
 
           Reclaiming narrows, but does not close, the range of memory limits in
           which evaluation runs out of memory. A batch kept whole is never freed:
-          its memory stays in use until the process exits. By the time reclaiming
-          starts, the batches kept whole already hold about `fraction × headroom`,
-          and any batch kept whole later adds to that; everything else the
-          evaluation needs must fit in the memory that is left. Below some limit
-          it does not fit, and evaluation still runs out of memory. Lowering the
-          fraction makes reclaiming start earlier, so less memory is held this
-          way and evaluation fits under a lower limit, at the cost of more CPU.
+          its memory stays in use until the process exits, so up to
+          `headroom − margin` can be retained before reclaiming starts. After
+          that, reclaiming cannot lower the memory already retained, nor the
+          memory outside unforce batches; an evaluation that still needs more
+          than the margin from that point runs out of memory, where triggering
+          earlier would have kept fewer batches whole and might have fit. A
+          larger margin starts reclaiming earlier and protects more, at the cost
+          of CPU whenever less than the margin plus the evaluation's needs is
+          available.
 
-          `0` reclaims every heavy batch (most aggressive; the behaviour measured
-          as −34 % peak / +27 % CPU on whole-Nixpkgs). Values in `(0, 1)` gate on
-          pressure as above. A value `≥ 1` is a **debug/bisection sentinel** that
+          The default, `6G`, was chosen by measurement: with it, both a
+          whole-Nixpkgs evaluation and one that builds a second package set
+          late fit under as low a memory limit as reclaiming every heavy batch
+          does, while reclaiming stays dormant once headroom exceeds what the
+          evaluation uses kept whole by the margin. An evaluation that grows by
+          more than the margin after reclaiming starts is less protected than
+          with an earlier trigger.
+
+          A margin at least as large as headroom reclaims every heavy batch (the
+          most aggressive setting). `0` is a **debug/bisection sentinel** that
           disables reclaiming entirely (heavy batches always kept whole, the
-          pre-reclaim behaviour); it is not a supported way to turn the feature off
-          for normal use and may be removed.
+          pre-reclaim behaviour); it is not a supported way to turn the feature
+          off for normal use and may be removed.
 
           Reclaiming a batch adds only a bounded, one-shot transient: its region
           is mapped either way when the batch ends, and reclaiming adds the

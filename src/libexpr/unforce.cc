@@ -17,8 +17,12 @@
 
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <unistd.h>
+#ifdef __APPLE__
+#  include <mach/mach.h>
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +32,7 @@
 #include <optional>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -108,12 +113,13 @@ size_t regionSize()
 /* ---------------------------------------------------------------------------
    Memory headroom: the smallest of physical RAM, the cgroup memory limit, and
    a finite address-space limit (`RLIMIT_AS`). Computed once and cached; no
-   syscall is on any per-job or per-force path (the pressure gate reads only
-   `headroom()` and the internal `stats.keptJobBytes` counter). It feeds the
-   self-tuning reclaim trigger (`eval-unforce-reclaim-fraction`): the running
-   total of bytes retained by batches kept whole is compared against a fraction
-   of this. Returns 0 if nothing could be determined, which disables the gate
-   (heavy batches stay kept whole, the pre-reclaim behaviour).
+   syscall is on any per-job or per-force path. It feeds the self-tuning
+   reclaim trigger (`eval-unforce-reclaim-margin`): the memory still free under
+   it (headroom minus the process's current memory, `processMemory`, read only
+   at a heavy batch's decision) is compared against the margin. Returns 0 if
+   nothing could be determined, which
+   disables the gate (heavy batches stay kept whole, the pre-reclaim
+   behaviour).
    --------------------------------------------------------------------------- */
 
 /* A value this large or larger in a cgroup limit file is the "unlimited"
@@ -227,8 +233,9 @@ size_t headroom()
    forwarding table (≤ ~3·Evac(S) for a node-based map keyed by the copied
    objects) — at most ~4·Evac(S) — and then frees R. Capping Evac(S) at
    headroom/16 bounds that increment at ~1/4 of headroom however large R is
-   (whether that much is still free is not known here: the gate reads no
-   live RSS, so this bounds a reclaim's transient, it cannot promise it fits).
+   (this bounds a reclaim's transient, it does not promise that much is still
+   free: the gate opens when less than the margin is free, and the ceiling is
+   not checked against what is left).
    Capping R instead (the earlier
    rule) kept whole exactly the batches whose region is largest — the ones
    reclaiming frees most — even when their Evac(S) was small, and since the
@@ -262,12 +269,80 @@ struct Stats
     size_t ownerChanges = 0, ownerSegsPeak = 0, ownerConsumerPairsPeak = 0, ownerOverflowJobs = 0,
            ownerCopyLimitJobs = 0;
     /* Heavy batches reclaimed (evacuated-then-freed) by the memory-pressure
-       gate instead of kept whole (`decideJob`, `eval-unforce-reclaim-fraction`). */
+       gate instead of kept whole (`decideJob`, `eval-unforce-reclaim-margin`). */
     size_t heavyEvacuated = 0;
     /* Heavy batches the pressure gate would have reclaimed but kept whole
        because their Evac(S) exceeded the transient cap (`reclaimEvacCeiling`). */
     size_t heavyOverCeiling = 0;
+    /* Reads of the process's memory by the pressure gate (`processMemory`,
+       one per heavy-batch decision with a margin in (0, headroom)), the time they
+       took, and how many of them found no reading and fell back to
+       `keptJobBytes`. JSON only: the end-of-run summary line is parsed by
+       tests and keeps its format. */
+    size_t memoryReads = 0, memoryReadNanos = 0, memoryReadFallbacks = 0;
 } stats;
+
+/* The resident memory of this process, in bytes, or 0 if it cannot be read
+   here. Linux: the resident field of `/proc/self/statm` (pages). macOS:
+   `task_info` (`MACH_TASK_BASIC_INFO`) `resident_size`. Elsewhere: 0.
+
+   Why resident memory, and not the cgroup's `memory.current` even when the
+   headroom is a cgroup limit: `memory.current` also counts the cgroup's page
+   cache, which the kernel reclaims before it OOM-kills, so in a cgroup that
+   has done file I/O (a CI container after a clone) it can sit near
+   `memory.max` with no real pressure and hold the gate open for good; and
+   the binding limit may be on an ancestor cgroup, whose usage is shared with
+   other processes this one cannot free memory for. Resident memory is what
+   reclaiming a batch lowers. On whole-Nixpkgs the two differ by under
+   ~20 MiB throughout (the evaluator's memory is anonymous). Its blind spot:
+   other processes in the same limited cgroup are not seen. */
+static size_t readProcessMemory()
+{
+#if defined(__linux__)
+    int fd = ::open("/proc/self/statm", O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    char buf[128];
+    ssize_t n = ::read(fd, buf, sizeof buf - 1);
+    ::close(fd);
+    if (n <= 0)
+        return 0;
+    buf[n] = 0;
+    unsigned long long size = 0, resident = 0;
+    if (sscanf(buf, "%llu %llu", &size, &resident) != 2)
+        return 0;
+    long pageSize = sysconf(_SC_PAGESIZE);
+    return pageSize > 0 ? size_t(resident) * size_t(pageSize) : 0;
+#elif defined(__APPLE__)
+    mach_task_basic_info_data_t info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, reinterpret_cast<task_info_t>(&info), &count) != KERN_SUCCESS)
+        return 0;
+    return size_t(info.resident_size);
+#else
+    return 0;
+#endif
+}
+
+/* The memory-pressure signal the reclaim gate subtracts from headroom:
+   the process's current memory (`readProcessMemory`,
+   or the test-only `unforceTestMemoryReading`). Where it cannot be read, the
+   bytes retained by batches kept whole (`keptJobBytes`), a lower bound of
+   it. Called only from a heavy batch's decision in `decideJob`, never on a
+   per-job or per-force path; each call is counted and timed in `stats`. */
+static size_t processMemory()
+{
+    auto t0 = std::chrono::steady_clock::now();
+    size_t m = unforceTestMemoryReading ? unforceTestMemoryReading() : readProcessMemory();
+    stats.memoryReadNanos +=
+        size_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    stats.memoryReads++;
+    if (m == 0) {
+        stats.memoryReadFallbacks++;
+        return stats.keptJobBytes;
+    }
+    return m;
+}
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). Per
    thread, like the scope marks that `unforceNoteClientCode` tests: a C-API
@@ -1756,11 +1831,12 @@ std::vector<bool> decideJob(
            1 101 MiB in one job). */
         auto copyLimit = std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
 
-        /* Memory-pressure-gated reclaim (`eval-unforce-reclaim-fraction`,
+        /* Memory-pressure-gated reclaim (`eval-unforce-reclaim-margin`,
            blocker (a)). A heavy batch (young closure over the copy limit) is
            normally kept whole, retaining its region, to cap the end-of-batch
-           copy transient. When memory is tight — the bytes retained so far by
-           batches kept whole exceed a fraction of headroom — reclaim it
+           copy transient. When memory is tight — less than the margin of
+           headroom is still free (headroom minus the process's current
+           memory) — reclaim it
            instead: raise the copy limit so Evac(S) is evacuated and the caller
            reverts and frees the region (the ordinary revert path), trading one
            re-force of the reverted values for the region's bytes. The raised
@@ -1768,12 +1844,17 @@ std::vector<bool> decideJob(
            (`reclaimEvacCeiling`), whatever the region's size: a batch whose
            region exceeds it marks Evac(S) first, bounded by it (below), and is
            kept whole only if Evac(S) itself does not fit.
-           Cold `decideJob` path: it reads only the cached headroom and the
-           internal `keptJobBytes` counter, never a syscall, and nothing here
-           touches the hot force/deref path. */
+           The gate is re-evaluated at every heavy decision, so it is a
+           feedback loop: reclaiming frees regions and lowers the reading, and
+           while at least the margin is free heavy batches are kept
+           whole again (no extra CPU). Cold `decideJob` path: the memory read
+           (`processMemory`, one small file read on Linux) happens only here,
+           once per heavy decision, and nothing here touches the hot
+           force/deref path. */
         bool pressureReclaim = false;
         if (keepWhole && youngBytes > copyLimit) {
-            float fraction = state.settings.unforceReclaimFraction;
+            uint64_t margin = state.settings.unforceReclaimMargin;
+            size_t room = headroom();
             size_t ceiling = reclaimEvacCeiling();
             bool wantReclaim;
             if (unforceTestForceReclaim) {
@@ -1781,13 +1862,19 @@ std::vector<bool> decideJob(
                    transient cap (test only). */
                 wantReclaim = true;
                 ceiling = ~size_t(0);
-            } else if (fraction >= 1.0f || headroom() == 0) {
-                /* Debug/bisection sentinel (fraction ≥ 1), or headroom unknown:
-                   keep whole, the pre-reclaim behaviour. */
+            } else if (margin == 0 || room == 0) {
+                /* Debug/bisection sentinel (margin 0: less than nothing is
+                   never free), or headroom unknown: keep whole, the
+                   pre-reclaim behaviour. No read. */
                 wantReclaim = false;
+            } else if (margin >= room) {
+                /* Less than all of headroom is always free: always reclaim.
+                   No read. */
+                wantReclaim = true;
             } else {
-                size_t threshold = size_t(double(fraction) * double(headroom()));
-                wantReclaim = stats.keptJobBytes >= threshold;
+                /* Free = room − memory < margin, written so that it cannot
+                   underflow when memory exceeds headroom. */
+                wantReclaim = processMemory() > room - margin;
             }
             /* A ceiling at or below the ordinary copy limit (a tiny headroom)
                would only lower it: nothing more to reclaim. */
@@ -1929,7 +2016,7 @@ std::string unforceStatsJSON()
         return "";
     return fmt(
         R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"keptJobBytes":%d,"heavyEvacuated":%d,)"
-        R"("heavyOverCeiling":%d,"ownerChanges":%d,)"
+        R"("heavyOverCeiling":%d,"memoryReads":%d,"memoryReadNanos":%d,"memoryReadFallbacks":%d,"ownerChanges":%d,)"
         R"("ownerSegsPeak":%d,"ownerConsumerPairsPeak":%d,"ownerOverflowJobs":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
         stats.reverted,
@@ -1938,6 +2025,9 @@ std::string unforceStatsJSON()
         stats.keptJobBytes,
         stats.heavyEvacuated,
         stats.heavyOverCeiling,
+        stats.memoryReads,
+        stats.memoryReadNanos,
+        stats.memoryReadFallbacks,
         stats.ownerChanges,
         stats.ownerSegsPeak,
         stats.ownerConsumerPairsPeak,
@@ -1975,6 +2065,15 @@ bool unforceTestForceReclaim = false;
 /* Test-only override (see unforce.hh). Default 0: use the measured
    headroom. */
 size_t unforceTestHeadroom = 0;
+
+/* Test-only override (see unforce.hh). Default null: read the process's
+   memory. */
+size_t (*unforceTestMemoryReading)() = nullptr;
+
+size_t unforceMemoryReadsCount()
+{
+    return stats.memoryReads;
+}
 
 size_t unforceHeavyEvacuatedCount()
 {
