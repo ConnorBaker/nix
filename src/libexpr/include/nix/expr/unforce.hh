@@ -133,7 +133,7 @@ extern bool unforceTestFailDecide;
  * whose young closure exceeds the per-batch copy limit) is reclaimed —
  * evacuated and its region reverted and freed — regardless of the
  * `eval-unforce-reclaim-fraction` pressure gate and regardless of the
- * transient-cap region ceiling. It forces the pressure-gated reclaim path to
+ * transient-cap Evac(S) ceiling. It forces the pressure-gated reclaim path to
  * run deterministically on any machine, whatever its memory headroom, so a
  * test can assert the reclaim path is exercised and its output is
  * byte-identical to keeping batches whole. Never set by normal evaluation;
@@ -148,6 +148,29 @@ extern bool unforceTestForceReclaim;
  * anti-rot test asserts this is non-zero to prove the path ran.
  */
 size_t unforceHeavyEvacuatedCount();
+
+/**
+ * Test-only override. When non-zero, it replaces the measured memory headroom
+ * (physical RAM / cgroup limit / `RLIMIT_AS`) that the
+ * `eval-unforce-reclaim-fraction` gate and the reclaim transient cap (an
+ * Evac(S) ceiling of headroom/16) are computed from, so a test can place a
+ * batch above or below that ceiling deterministically on any machine. Zero
+ * (the default) uses the measured headroom. Never set by normal evaluation.
+ */
+extern size_t unforceTestHeadroom;
+
+/**
+ * The number of heavy unforce batches the memory-pressure gate would have
+ * reclaimed but kept whole instead, because the bytes they would copy out
+ * (Evac(S)) exceeded the transient cap, process-wide.
+ */
+size_t unforceHeavyOverCeilingCount();
+
+/**
+ * The number of unforce batches kept whole (their region retained for the
+ * rest of the process), process-wide.
+ */
+size_t unforceKeptJobsCount();
 
 /**
  * The number of targets a printer nominated (because it printed the container

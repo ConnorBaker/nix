@@ -89,10 +89,120 @@ std::string runWorkload(ref<Store> store, fetchers::Settings & fetchSettings, bo
     return out.str();
 }
 
+/* A workload where the transient-cap ceiling decides (`reclaimEvacCeiling`,
+   Evac(S) ≤ headroom/16). Every element is its own batch, and every batch is
+   heavy: it forces `heavy`, a 300 000-element list folded to one integer
+   (young garbage well over the ceiling the test sets, nothing kept).
+   Elements 0 and 1 also deep-force the shared `mid`, elements 2 and 3 the
+   shared `big`: the first force of each is reverted, the second (the cell's
+   second force, `promoteAfter`) promotes it, so
+
+     batch 0: Evac(S) small,                region > ceiling
+     batch 1: Evac(S) = mid (~6 MiB),       region > ceiling
+     batch 2: Evac(S) small,                region > ceiling
+     batch 3: Evac(S) = big (~19 MiB),      region > ceiling
+     batch 4: Evac(S) small,                region > ceiling
+
+   With a 192 MiB headroom the ceiling is 12 MiB, above the 4 MiB copy limit
+   and `mid`, below `big`: under pressure only batch 3 may be kept whole.
+   Without pressure (keep-whole) batches 1 and 3 are, as their Evac(S)
+   exceeds the copy limit. */
+static const char * ceilingWorkload =
+    "let\n"
+    "  heavy = i: builtins.foldl' (a: b: a + b) 0 (builtins.genList (k: k + i) 300000);\n"
+    "  mid = builtins.genList (k: { x = k; }) 80000;\n"
+    "  big = builtins.genList (k: { x = k; }) 250000;\n"
+    "  touch = i: if i < 2 then builtins.deepSeq mid 0 else if i < 4 then builtins.deepSeq big 0 else 0;\n"
+    "in builtins.genList (i: { n = heavy i + touch i; }) 5\n";
+
+struct CeilingRun
+{
+    std::string out;
+    size_t evacuated, overCeiling, keptJobs;
+};
+
+/* Run `ceilingWorkload` with headroom overridden to `headroomBytes` (the
+   test-only `unforceTestHeadroom`) and the given reclaim fraction; return the
+   printed form and the deltas of the reclaim counters. */
+CeilingRun
+runCeilingWorkload(ref<Store> store, fetchers::Settings & fetchSettings, size_t headroomBytes, float fraction)
+{
+    bool readOnlyMode = true;
+    EvalSettings settings{readOnlyMode};
+    settings.nixPath = {};
+    settings.unforce = true;
+    settings.unforceBatchSize = 0;
+    settings.unforceReclaimFraction = fraction;
+    EvalState state{{}, store, fetchSettings, settings, nullptr};
+
+    Value v;
+    Expr * e = state.parseExprFromString(ceilingWorkload, state.rootPath(CanonPath::root));
+    state.eval(e, v);
+
+    PrintOptions options;
+    options.force = true;
+    options.unforce = true;
+
+    size_t evac0 = unforceHeavyEvacuatedCount(), over0 = unforceHeavyOverCeilingCount(), kept0 = unforceKeptJobsCount();
+    std::ostringstream out;
+    unforceTestHeadroom = headroomBytes;
+    try {
+        printValue(state, out, v, options);
+    } catch (...) {
+        unforceTestHeadroom = 0;
+        throw;
+    }
+    unforceTestHeadroom = 0;
+    return {
+        out.str(),
+        unforceHeavyEvacuatedCount() - evac0,
+        unforceHeavyOverCeilingCount() - over0,
+        unforceKeptJobsCount() - kept0};
+}
+
 } // namespace
 
 class UnforceReclaimTest : public LibExprTest
 {};
+
+/* The transient cap bounds Evac(S) — what a reclaim copies — not the region:
+   a heavy batch whose region is above the ceiling but whose Evac(S) is below
+   it is reclaimed, and only a batch whose Evac(S) itself exceeds the ceiling
+   is kept whole. Mutation sensitivity:
+     - capping the region instead (`youngBytes <= ceiling`, the earlier rule)
+       keeps batch 1 whole as well and reclaims none: `keptJobs` is 2 and
+       `evacuated` 0, failing both;
+     - dropping the cap (no ceiling) reclaims batch 3 too: `keptJobs` 0 and
+       `overCeiling` 0, failing both;
+     - the gate never reclaiming: `evacuated` 0. */
+TEST_F(UnforceReclaimTest, ceilingBoundsEvacNotRegion)
+{
+    if (NIX_USE_BOEHMGC)
+        GTEST_SKIP() << "unforcing is disabled under Boehm GC";
+
+    constexpr size_t headroomBytes = size_t(192) << 20; /* ceiling 12 MiB */
+
+    /* Baseline: reclaim disabled. Batches 1 and 3 (Evac(S) over the 4 MiB
+       copy limit) are kept whole. */
+    auto keepWhole = runCeilingWorkload(store, fetchSettings, headroomBytes, 1.0f);
+    EXPECT_EQ(keepWhole.keptJobs, 2u);
+    EXPECT_EQ(keepWhole.evacuated, 0u);
+    EXPECT_EQ(keepWhole.overCeiling, 0u);
+
+    /* Under pressure (fraction 0: the gate is open from the first batch). */
+    auto pressured = runCeilingWorkload(store, fetchSettings, headroomBytes, 0.0f);
+    EXPECT_EQ(pressured.out, keepWhole.out) << "reclaiming must be byte-identical to keeping whole";
+    EXPECT_EQ(pressured.keptJobs, 1u) << "only the batch whose Evac(S) exceeds the ceiling (3) is kept whole";
+    EXPECT_EQ(pressured.overCeiling, 1u) << "batch 3's Evac(S) exceeds the ceiling";
+    EXPECT_EQ(pressured.evacuated, 4u) << "batches 0, 1, 2 and 4 (regions over the ceiling) are reclaimed";
+
+    /* Dormant: with ample headroom the default gate never opens. */
+    auto dormant = runCeilingWorkload(store, fetchSettings, size_t(1) << 40, 0.5f);
+    EXPECT_EQ(dormant.out, keepWhole.out);
+    EXPECT_EQ(dormant.keptJobs, 2u);
+    EXPECT_EQ(dormant.evacuated, 0u);
+    EXPECT_EQ(dormant.overCeiling, 0u);
+}
 
 TEST_F(UnforceReclaimTest, forcedReclaimIsByteIdenticalToKeepWhole)
 {

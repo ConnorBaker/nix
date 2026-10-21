@@ -548,11 +548,14 @@ public:
           pre-reclaim behaviour); it is not a supported way to turn the feature off
           for normal use and may be removed.
 
-          Reclaiming never raises peak memory above keeping batches whole: a batch
-          is reclaimed only when its region is small enough that the one-shot
-          evacuation transient cannot exceed the kept-whole baseline it replaces
-          (see `src/libexpr/unforce.cc`); a batch with a region larger than that
-          ceiling is always kept whole.
+          Reclaiming a batch adds only a bounded, one-shot transient: its region
+          is mapped either way when the batch ends, and reclaiming adds the
+          copies of the values it keeps plus a forwarding table before freeing
+          the region. A batch is reclaimed only when what it would copy fits
+          under a ceiling of 1/16 of headroom (checked before anything is
+          copied), so that transient stays within about a quarter of headroom
+          however large the batch's region is (see `src/libexpr/unforce.cc`); a
+          batch that would copy more than the ceiling is kept whole.
         )"};
 };
 

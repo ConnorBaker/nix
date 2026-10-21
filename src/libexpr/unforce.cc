@@ -212,23 +212,33 @@ static size_t computeHeadroom()
 
 size_t headroom()
 {
+    if (unforceTestHeadroom)
+        return unforceTestHeadroom;
     static const size_t h = computeHeadroom();
     return h;
 }
 
-/* The largest young-region size a heavy batch may have and still be reclaimed
-   (the transient cap, blocker (a)). Reclaiming a batch of region R costs a
-   one-shot transient of R (the region, still mapped) + Evac(S) (the evacuated
-   copies in a fresh region, Evac(S) ≤ R) + the evacuator's forwarding table
-   (≤ ~3·Evac(S) ≤ 3·R for a node-based map keyed by the copied objects), i.e.
-   at most ~5·R. Keeping the batch whole instead retains R forever. Capping R
-   at headroom/16 bounds that transient at ~5/16 < 1/2 of headroom, so a single
-   reclaim can never exceed the kept-whole baseline it replaces (at the default
-   gate, which only reclaims once ≥ fraction ≥ 1/2 of headroom is already
-   retained) and can never OOM on its own. A batch with a region larger than
-   this — a monster job, region ≫ batch — is always kept whole (exact: nothing
-   is reverted), so its region is never transiently multiplied. */
-static size_t reclaimRegionCeiling()
+/* The largest Evac(S) — the bytes a heavy batch's decision would copy out of
+   its region — for which the batch may still be reclaimed (the transient cap,
+   blocker (a)). The cap is on what reclaiming *adds*, not on the region:
+   when a batch ends its region R is mapped whichever way it goes, so keeping
+   it whole adds nothing now and retains R for the rest of the process, while
+   reclaiming adds Evac(S) (the copies, in old memory) plus the evacuator's
+   forwarding table (≤ ~3·Evac(S) for a node-based map keyed by the copied
+   objects) — at most ~4·Evac(S) — and then frees R. Capping Evac(S) at
+   headroom/16 bounds that increment at ~1/4 of headroom however large R is
+   (whether that much is still free is not known here: the gate reads no
+   live RSS, so this bounds a reclaim's transient, it cannot promise it fits).
+   Capping R instead (the earlier
+   rule) kept whole exactly the batches whose region is largest — the ones
+   reclaiming frees most — even when their Evac(S) was small, and since the
+   cap scales with headroom it kept more of them the tighter memory was.
+   Evac(S) is measured, not assumed: a batch whose region exceeds the cap is
+   marked first (`Closure::mark`, bounded by this cap), and only copied if its
+   Evac(S) fits; one whose region is within it cannot copy more than that.
+   A batch whose Evac(S) exceeds the cap is kept whole (exact: nothing is
+   reverted). */
+static size_t reclaimEvacCeiling()
 {
     return headroom() >> 4;
 }
@@ -254,6 +264,9 @@ struct Stats
     /* Heavy batches reclaimed (evacuated-then-freed) by the memory-pressure
        gate instead of kept whole (`decideJob`, `eval-unforce-reclaim-fraction`). */
     size_t heavyEvacuated = 0;
+    /* Heavy batches the pressure gate would have reclaimed but kept whole
+       because their Evac(S) exceeded the transient cap (`reclaimEvacCeiling`). */
+    size_t heavyOverCeiling = 0;
 } stats;
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). Per
@@ -269,12 +282,13 @@ static void printStatsAtExit()
     [[maybe_unused]] static bool registered =
         (std::atexit([] {
              std::cerr << fmt(
-                 "unforce: seen nominated %d, kept %d; jobs kept whole %d (%d KiB); heavy reclaimed %d\n",
+                 "unforce: seen nominated %d, kept %d; jobs kept whole %d (%d KiB); heavy reclaimed %d, over ceiling %d\n",
                  stats.seenNominated,
                  stats.seenKept,
                  stats.keptJobs,
                  stats.keptJobBytes >> 10,
-                 stats.heavyEvacuated);
+                 stats.heavyEvacuated,
+                 stats.heavyOverCeiling);
          }),
          true);
 }
@@ -1749,17 +1763,18 @@ std::vector<bool> decideJob(
            batches kept whole exceed a fraction of headroom — reclaim it
            instead: raise the copy limit so Evac(S) is evacuated and the caller
            reverts and frees the region (the ordinary revert path), trading one
-           re-force of the reverted values for the region's bytes. Only a batch
-           whose region fits under the transient-cap ceiling is reclaimed (the
-           raised limit *is* that ceiling, so Evac(S) ≤ region ≤ ceiling never
-           overshoots); a larger region — a monster job — stays kept whole.
+           re-force of the reverted values for the region's bytes. The raised
+           copy limit is the transient-cap ceiling on Evac(S)
+           (`reclaimEvacCeiling`), whatever the region's size: a batch whose
+           region exceeds it marks Evac(S) first, bounded by it (below), and is
+           kept whole only if Evac(S) itself does not fit.
            Cold `decideJob` path: it reads only the cached headroom and the
            internal `keptJobBytes` counter, never a syscall, and nothing here
            touches the hot force/deref path. */
         bool pressureReclaim = false;
         if (keepWhole && youngBytes > copyLimit) {
             float fraction = state.settings.unforceReclaimFraction;
-            size_t ceiling = reclaimRegionCeiling();
+            size_t ceiling = reclaimEvacCeiling();
             bool wantReclaim;
             if (unforceTestForceReclaim) {
                 /* Force the path on any machine, regardless of the gate and the
@@ -1774,7 +1789,9 @@ std::vector<bool> decideJob(
                 size_t threshold = size_t(double(fraction) * double(headroom()));
                 wantReclaim = stats.keptJobBytes >= threshold;
             }
-            if (wantReclaim && youngBytes <= ceiling) {
+            /* A ceiling at or below the ordinary copy limit (a tiny headroom)
+               would only lower it: nothing more to reclaim. */
+            if (wantReclaim && ceiling > copyLimit) {
                 copyLimit = ceiling;
                 pressureReclaim = true;
             }
@@ -1826,6 +1843,8 @@ std::vector<bool> decideJob(
             /* Evac(S) is larger than the copy limit. */
             evacuator.onIdentity = nullptr;
             stats.ownerCopyLimitJobs++;
+            if (pressureReclaim)
+                stats.heavyOverCeiling++;
             *keepWhole = true;
             return promote;
         }
@@ -1909,13 +1928,16 @@ std::string unforceStatsJSON()
     if (!stats.jobs)
         return "";
     return fmt(
-        R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"heavyEvacuated":%d,"ownerChanges":%d,)"
+        R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"keptJobBytes":%d,"heavyEvacuated":%d,)"
+        R"("heavyOverCeiling":%d,"ownerChanges":%d,)"
         R"("ownerSegsPeak":%d,"ownerConsumerPairsPeak":%d,"ownerOverflowJobs":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
         stats.reverted,
         stats.clientJobs,
         stats.keptJobs,
+        stats.keptJobBytes,
         stats.heavyEvacuated,
+        stats.heavyOverCeiling,
         stats.ownerChanges,
         stats.ownerSegsPeak,
         stats.ownerConsumerPairsPeak,
@@ -1950,9 +1972,23 @@ bool unforceTestFailDecide = false;
    machine. */
 bool unforceTestForceReclaim = false;
 
+/* Test-only override (see unforce.hh). Default 0: use the measured
+   headroom. */
+size_t unforceTestHeadroom = 0;
+
 size_t unforceHeavyEvacuatedCount()
 {
     return stats.heavyEvacuated;
+}
+
+size_t unforceHeavyOverCeilingCount()
+{
+    return stats.heavyOverCeiling;
+}
+
+size_t unforceKeptJobsCount()
+{
+    return stats.keptJobs;
 }
 
 size_t unforceSeenNominatedCount()
