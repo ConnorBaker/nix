@@ -520,6 +520,40 @@ public:
           batches use less memory but recompute shared work more often; `0`
           undoes after every element.
         )"};
+
+    Setting<float> unforceReclaimFraction{
+        this,
+        0.5f,
+        "eval-unforce-reclaim-fraction",
+        R"(
+          With `eval-unforce`, the memory-pressure threshold above which a *heavy*
+          unforce batch (one whose young closure is larger than the per-batch copy
+          limit) is reclaimed — its kept values are evacuated and the rest of its
+          region is reverted and freed — instead of being kept whole.
+
+          The threshold is this fraction of the process's memory *headroom*: the
+          smallest of physical RAM, the cgroup memory limit (v2 `memory.max` or v1
+          `memory.limit_in_bytes`), and a finite `RLIMIT_AS` (`ulimit -v`). A heavy
+          batch is reclaimed once the running total of bytes retained by batches
+          kept whole so far exceeds `fraction × headroom`; until then heavy batches
+          are kept whole, which costs no extra CPU. This makes reclaiming
+          self-tuning: it stays dormant on a machine with ample memory for the
+          evaluation, and trades CPU (one more re-force of the reverted values) to
+          cap peak memory only once memory is actually tight.
+
+          `0` reclaims every heavy batch (most aggressive; the behaviour measured
+          as −34 % peak / +27 % CPU on whole-Nixpkgs). Values in `(0, 1)` gate on
+          pressure as above. A value `≥ 1` is a **debug/bisection sentinel** that
+          disables reclaiming entirely (heavy batches always kept whole, the
+          pre-reclaim behaviour); it is not a supported way to turn the feature off
+          for normal use and may be removed.
+
+          Reclaiming never raises peak memory above keeping batches whole: a batch
+          is reclaimed only when its region is small enough that the one-shot
+          evacuation transient cannot exceed the kept-whole baseline it replaces
+          (see `src/libexpr/unforce.cc`); a batch with a region larger than that
+          ceiling is always kept whole.
+        )"};
 };
 
 /**

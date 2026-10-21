@@ -22,11 +22,14 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <algorithm>
 #include <atomic>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -102,6 +105,134 @@ size_t regionSize()
     return size_t(64) << 30;
 }
 
+/* ---------------------------------------------------------------------------
+   Memory headroom: the smallest of physical RAM, the cgroup memory limit, and
+   a finite address-space limit (`RLIMIT_AS`). Computed once and cached; no
+   syscall is on any per-job or per-force path (the pressure gate reads only
+   `headroom()` and the internal `stats.keptJobBytes` counter). It feeds the
+   self-tuning reclaim trigger (`eval-unforce-reclaim-fraction`): the running
+   total of bytes retained by batches kept whole is compared against a fraction
+   of this. Returns 0 if nothing could be determined, which disables the gate
+   (heavy batches stay kept whole, the pre-reclaim behaviour).
+   --------------------------------------------------------------------------- */
+
+/* A value this large or larger in a cgroup limit file is the "unlimited"
+   sentinel (`max`, or v1's page-rounded LLONG_MAX), not a real limit. */
+static constexpr size_t cgroupUnlimited = size_t(1) << 62;
+
+/* Read a single unsigned integer from `path` (a cgroup limit file). Returns 0
+   on absence, error, a `max`/`unlimited` token, or a value at or above the
+   unlimited sentinel. */
+static size_t readLimitFile(const std::string & path)
+{
+    std::ifstream f(path);
+    if (!f.is_open())
+        return 0;
+    std::string tok;
+    if (!(f >> tok))
+        return 0;
+    if (tok == "max" || tok == "unlimited")
+        return 0;
+    errno = 0;
+    char * end = nullptr;
+    unsigned long long v = std::strtoull(tok.c_str(), &end, 10);
+    if (errno != 0 || end == tok.c_str())
+        return 0;
+    return size_t(v) >= cgroupUnlimited ? 0 : size_t(v);
+}
+
+/* The memory limit of this process's cgroup, taking the smallest finite limit
+   over the cgroup and its ancestors (a limit may be set on an ancestor, not
+   the leaf). Handles cgroup v2 (`memory.max`) and v1 (`memory.limit_in_bytes`).
+   Returns 0 if there is no finite limit. */
+static size_t readCgroupLimit()
+{
+    std::ifstream cg("/proc/self/cgroup");
+    if (!cg.is_open())
+        return 0;
+    std::string v2path, v1mempath;
+    std::string line;
+    while (std::getline(cg, line)) {
+        /* `hierarchy-id:controller-list:cgroup-path` */
+        auto c1 = line.find(':');
+        if (c1 == std::string::npos)
+            continue;
+        auto c2 = line.find(':', c1 + 1);
+        if (c2 == std::string::npos)
+            continue;
+        std::string controllers = line.substr(c1 + 1, c2 - c1 - 1);
+        std::string path = line.substr(c2 + 1);
+        if (controllers.empty())
+            v2path = path; /* unified v2 hierarchy */
+        else if (controllers.find("memory") != std::string::npos)
+            v1mempath = path;
+    }
+
+    size_t limit = 0;
+    auto consider = [&](size_t v) {
+        if (v)
+            limit = limit ? std::min(limit, v) : v;
+    };
+    /* Walk a path and its ancestors under `base`, reading `leaf` at each. */
+    auto walk = [&](const std::string & base, const std::string & file, std::string cur) {
+        for (;;) {
+            consider(readLimitFile(base + cur + "/" + file));
+            if (cur.empty() || cur == "/")
+                break;
+            auto slash = cur.find_last_of('/');
+            if (slash == std::string::npos)
+                break;
+            cur = slash == 0 ? "/" : cur.substr(0, slash);
+        }
+    };
+    if (!v2path.empty())
+        walk("/sys/fs/cgroup", "memory.max", v2path);
+    if (!v1mempath.empty())
+        walk("/sys/fs/cgroup/memory", "memory.limit_in_bytes", v1mempath);
+    return limit;
+}
+
+static size_t computeHeadroom()
+{
+    size_t h = 0;
+    auto consider = [&](size_t v) {
+        if (v)
+            h = h ? std::min(h, v) : v;
+    };
+    long pages = sysconf(_SC_PHYS_PAGES);
+    long pageSize = sysconf(_SC_PAGESIZE);
+    if (pages > 0 && pageSize > 0)
+        consider(size_t(pages) * size_t(pageSize));
+    consider(readCgroupLimit());
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur != RLIM_INFINITY)
+        consider(size_t(rl.rlim_cur));
+    return h;
+}
+
+size_t headroom()
+{
+    static const size_t h = computeHeadroom();
+    return h;
+}
+
+/* The largest young-region size a heavy batch may have and still be reclaimed
+   (the transient cap, blocker (a)). Reclaiming a batch of region R costs a
+   one-shot transient of R (the region, still mapped) + Evac(S) (the evacuated
+   copies in a fresh region, Evac(S) ≤ R) + the evacuator's forwarding table
+   (≤ ~3·Evac(S) ≤ 3·R for a node-based map keyed by the copied objects), i.e.
+   at most ~5·R. Keeping the batch whole instead retains R forever. Capping R
+   at headroom/16 bounds that transient at ~5/16 < 1/2 of headroom, so a single
+   reclaim can never exceed the kept-whole baseline it replaces (at the default
+   gate, which only reclaims once ≥ fraction ≥ 1/2 of headroom is already
+   retained) and can never OOM on its own. A batch with a region larger than
+   this — a monster job, region ≫ batch — is always kept whole (exact: nothing
+   is reverted), so its region is never transiently multiplied. */
+static size_t reclaimRegionCeiling()
+{
+    return headroom() >> 4;
+}
+
 /* The statistics the tests read: the NIX_SHOW_STATS JSON
    (`unforceStatsJSON`) and the end-of-run summary (`printStatsAtExit`).
    Counters that fed neither were removed with the rest of the telemetry. */
@@ -120,6 +251,9 @@ struct Stats
        whose young closure exceeded the copy limit. */
     size_t ownerChanges = 0, ownerSegsPeak = 0, ownerConsumerPairsPeak = 0, ownerOverflowJobs = 0,
            ownerCopyLimitJobs = 0;
+    /* Heavy batches reclaimed (evacuated-then-freed) by the memory-pressure
+       gate instead of kept whole (`decideJob`, `eval-unforce-reclaim-fraction`). */
+    size_t heavyEvacuated = 0;
 } stats;
 
 /* Whether client code ran in the open job (`unforceNoteClientCode`). Per
@@ -135,11 +269,12 @@ static void printStatsAtExit()
     [[maybe_unused]] static bool registered =
         (std::atexit([] {
              std::cerr << fmt(
-                 "unforce: seen nominated %d, kept %d; jobs kept whole %d (%d KiB)\n",
+                 "unforce: seen nominated %d, kept %d; jobs kept whole %d (%d KiB); heavy reclaimed %d\n",
                  stats.seenNominated,
                  stats.seenKept,
                  stats.keptJobs,
-                 stats.keptJobBytes >> 10);
+                 stats.keptJobBytes >> 10,
+                 stats.heavyEvacuated);
          }),
          true);
 }
@@ -1606,6 +1741,45 @@ std::vector<bool> decideJob(
            (e.g. print-meta-200 copied
            1 101 MiB in one job). */
         auto copyLimit = std::max<size_t>(state.settings.unforceBatchSize / 4, ownerBudgetMin);
+
+        /* Memory-pressure-gated reclaim (`eval-unforce-reclaim-fraction`,
+           blocker (a)). A heavy batch (young closure over the copy limit) is
+           normally kept whole, retaining its region, to cap the end-of-batch
+           copy transient. When memory is tight — the bytes retained so far by
+           batches kept whole exceed a fraction of headroom — reclaim it
+           instead: raise the copy limit so Evac(S) is evacuated and the caller
+           reverts and frees the region (the ordinary revert path), trading one
+           re-force of the reverted values for the region's bytes. Only a batch
+           whose region fits under the transient-cap ceiling is reclaimed (the
+           raised limit *is* that ceiling, so Evac(S) ≤ region ≤ ceiling never
+           overshoots); a larger region — a monster job — stays kept whole.
+           Cold `decideJob` path: it reads only the cached headroom and the
+           internal `keptJobBytes` counter, never a syscall, and nothing here
+           touches the hot force/deref path. */
+        bool pressureReclaim = false;
+        if (keepWhole && youngBytes > copyLimit) {
+            float fraction = state.settings.unforceReclaimFraction;
+            size_t ceiling = reclaimRegionCeiling();
+            bool wantReclaim;
+            if (unforceTestForceReclaim) {
+                /* Force the path on any machine, regardless of the gate and the
+                   transient cap (test only). */
+                wantReclaim = true;
+                ceiling = ~size_t(0);
+            } else if (fraction >= 1.0f || headroom() == 0) {
+                /* Debug/bisection sentinel (fraction ≥ 1), or headroom unknown:
+                   keep whole, the pre-reclaim behaviour. */
+                wantReclaim = false;
+            } else {
+                size_t threshold = size_t(double(fraction) * double(headroom()));
+                wantReclaim = stats.keptJobBytes >= threshold;
+            }
+            if (wantReclaim && youngBytes <= ceiling) {
+                copyLimit = ceiling;
+                pressureReclaim = true;
+            }
+        }
+
         bool markFirst = keepWhole && (printed || youngBytes > copyLimit);
         std::optional<Closure<RegionMarks>> marker;
         if (markFirst) {
@@ -1663,6 +1837,12 @@ std::vector<bool> decideJob(
             *keepWhole = true;
         if (!keepWhole || !*keepWhole)
             copyPromoted();
+        /* Count a heavy batch the pressure gate actually reclaimed: it raised
+           the copy limit and the batch was not, in the end, kept whole (a
+           printing batch may still keep whole by the «repeated» half-rule
+           above). */
+        if (pressureReclaim && !*keepWhole)
+            stats.heavyEvacuated++;
         return promote;
     }
 
@@ -1729,12 +1909,13 @@ std::string unforceStatsJSON()
     if (!stats.jobs)
         return "";
     return fmt(
-        R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"ownerChanges":%d,)"
+        R"({"scopes":%d,"reverted":%d,"clientJobs":%d,"keptJobs":%d,"heavyEvacuated":%d,"ownerChanges":%d,)"
         R"("ownerSegsPeak":%d,"ownerConsumerPairsPeak":%d,"ownerOverflowJobs":%d,"ownerCopyLimitJobs":%d})",
         stats.jobs,
         stats.reverted,
         stats.clientJobs,
         stats.keptJobs,
+        stats.heavyEvacuated,
         stats.ownerChanges,
         stats.ownerSegsPeak,
         stats.ownerConsumerPairsPeak,
@@ -1763,6 +1944,21 @@ bool unforceEnabled(const EvalState & state)
 /* Test-only injection hook (see unforce.hh). Default false; set only by the
    unforce OOM death test. */
 bool unforceTestFailDecide = false;
+
+/* Test-only override (see unforce.hh). Default false; set only by the unforce
+   reclaim anti-rot test to force the pressure-gated reclaim path on any
+   machine. */
+bool unforceTestForceReclaim = false;
+
+size_t unforceHeavyEvacuatedCount()
+{
+    return stats.heavyEvacuated;
+}
+
+size_t unforceSeenNominatedCount()
+{
+    return stats.seenNominated;
+}
 
 UnforceBatch::UnforceBatch(EvalState & state, bool enabled)
     : state(enabled && unforceEnabled(state) ? &state : nullptr)

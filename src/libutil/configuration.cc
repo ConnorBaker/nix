@@ -322,6 +322,20 @@ std::string BaseSetting<bool>::to_string() const
 }
 
 template<>
+float BaseSetting<float>::parse(const std::string & str) const
+{
+    if (auto f = string2Float<float>(str))
+        return *f;
+    throw UsageError("setting '%s' has invalid value '%s'", name, str);
+}
+
+template<>
+std::string BaseSetting<float>::to_string() const
+{
+    return std::to_string(value);
+}
+
+template<>
 void BaseSetting<bool>::convertToArg(Args & args, const std::string & category)
 {
     args.addFlag({
@@ -550,6 +564,7 @@ template class BaseSetting<unsigned long>;
 template class BaseSetting<long long>;
 template class BaseSetting<unsigned long long>;
 template class BaseSetting<bool>;
+template class BaseSetting<float>;
 template class BaseSetting<std::string>;
 template class BaseSetting<std::list<std::filesystem::path>>;
 template class BaseSetting<Strings>;

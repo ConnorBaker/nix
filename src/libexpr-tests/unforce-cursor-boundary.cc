@@ -42,7 +42,7 @@ namespace {
 
 /* Run `f` as one job (outermost unforce scope) with batch size 0. */
 template<typename F>
-void job(EvalState & state, F && f)
+void cursorJob(EvalState & state, F && f)
 {
     UnforceBatch batch(state);
     {
@@ -95,7 +95,7 @@ TEST_F(UnforceCursorBoundaryTest, cursorHeldAcrossBatchBoundaryReForces)
 
     std::shared_ptr<AttrCursor> sCur;
     NixInt::Inner firstRead = 0;
-    job(state, [&] {
+    cursorJob(state, [&] {
         auto root = cache->getRoot();
         auto xCur = root->getAttr("x");
         sCur = xCur->getAttr("s");
@@ -110,7 +110,7 @@ TEST_F(UnforceCursorBoundaryTest, cursorHeldAcrossBatchBoundaryReForces)
     /* The job has ended: the generation advanced and the region that held the
        `s` cell was freed. Reuse that region with a second job so a stale read
        would see overwritten memory, not coincidentally-intact bytes. */
-    job(state, [&] {
+    cursorJob(state, [&] {
         auto filler = state.allocValue();
         state.eval(
             state.parseExprFromString(

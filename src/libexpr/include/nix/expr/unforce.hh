@@ -129,6 +129,35 @@ bool unforceEnabled(const EvalState & state);
 extern bool unforceTestFailDecide;
 
 /**
+ * Test-only override. When set to `true`, every *heavy* unforce batch (one
+ * whose young closure exceeds the per-batch copy limit) is reclaimed —
+ * evacuated and its region reverted and freed — regardless of the
+ * `eval-unforce-reclaim-fraction` pressure gate and regardless of the
+ * transient-cap region ceiling. It forces the pressure-gated reclaim path to
+ * run deterministically on any machine, whatever its memory headroom, so a
+ * test can assert the reclaim path is exercised and its output is
+ * byte-identical to keeping batches whole. Never set by normal evaluation;
+ * only the unforce reclaim anti-rot test sets it.
+ */
+extern bool unforceTestForceReclaim;
+
+/**
+ * The number of heavy unforce batches reclaimed (evacuated-then-freed) by the
+ * memory-pressure gate so far, process-wide. Zero unless the pressure gate (or
+ * the test override) chose to reclaim at least one heavy batch. The reclaim
+ * anti-rot test asserts this is non-zero to prove the path ran.
+ */
+size_t unforceHeavyEvacuatedCount();
+
+/**
+ * The number of targets a printer nominated (because it printed the container
+ * they hold), process-wide. Non-zero only once a printing/«repeated»-exercising
+ * traversal has run. The reclaim anti-rot test asserts this is non-zero to
+ * prove its workload exercises the printing path together with heavy batches.
+ */
+size_t unforceSeenNominatedCount();
+
+/**
  * Unforcing for a traversal that visits each element once
  * (printing or serialising a value, searching, checking): what visiting its
  * elements forced is unforced, and what it allocated freed, when their batch

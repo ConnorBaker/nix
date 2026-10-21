@@ -64,6 +64,7 @@ sources = files(
   'unforce-cursor-boundary.cc',
   'unforce-identity.cc',
   'unforce-oom.cc',
+  'unforce-reclaim.cc',
   'value/context.cc',
   'value/print.cc',
   'value/value.cc',
