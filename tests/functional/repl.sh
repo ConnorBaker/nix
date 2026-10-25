@@ -71,3 +71,7 @@ testRepl () {
 testRepl
 # Same thing (kind-of), but with a remote store.
 testRepl --store "$TEST_ROOT/other-root?real=$NIX_STORE_DIR"
+# Evaluation and build stores may also be distinct.
+testRepl \
+    --eval-store "$TEST_ROOT/repl-eval-store" \
+    --store "$TEST_ROOT/repl-build-store?real=$NIX_STORE_DIR"

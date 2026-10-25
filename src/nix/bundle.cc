@@ -112,12 +112,13 @@ struct CmdBundle : InstallableValueCommand
 
         auto outPath = evalState->coerceToStorePath(attr2->pos, *attr2->value, context2, "");
 
-        store->getBuilder()->buildPaths({
-            DerivedPath::Built{
-                .drvPath = makeConstantStorePathRef(drvPath),
-                .outputs = OutputsSpec::All{},
-            },
-        });
+        store->getBuilder(getEvalStore())
+            ->buildPaths({
+                DerivedPath::Built{
+                    .drvPath = makeConstantStorePathRef(drvPath),
+                    .outputs = OutputsSpec::All{},
+                },
+            });
 
         if (!outLink) {
             auto * attr = vRes->attrs()->get(evalState->s.name);

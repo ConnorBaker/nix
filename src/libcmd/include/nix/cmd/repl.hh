@@ -9,10 +9,12 @@ namespace nix {
 struct AbstractNixRepl
 {
     ref<EvalState> state;
+    ref<Store> buildStore;
     const Bindings * autoArgs;
 
-    AbstractNixRepl(ref<EvalState> state)
+    AbstractNixRepl(ref<EvalState> state, ref<Store> buildStore)
         : state(state)
+        , buildStore(buildStore)
     {
     }
 
@@ -38,6 +40,7 @@ struct AbstractNixRepl
     static std::unique_ptr<AbstractNixRepl> create(
         const LookupPath & lookupPath,
         ref<EvalState> state,
+        ref<Store> buildStore,
         fun<AnnotatedValues()> getValues,
         RunNix * runNix = nullptr);
 

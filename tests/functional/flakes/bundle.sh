@@ -42,5 +42,13 @@ mkDerivation {
   buildCommand = "echo hi > $out";
 }
 EOF
-nix bundle --bundler .#bundlers."$system".simple -f function.nix -o function-bundle
+# On NixOS, config.nix brings paths of the system store into context. No
+# substituter has them, so evaluation copies them from the build store
+# into the separate evaluation store. They are unsigned, so that store
+# must not require signatures (as in eval-store.sh).
+nix bundle \
+    --eval-store "$TEST_ROOT/bundle-eval-store?require-sigs=false" \
+    --bundler .#bundlers."$system".simple \
+    -f function.nix \
+    -o function-bundle
 [[ $(cat function-bundle) = hi ]]
