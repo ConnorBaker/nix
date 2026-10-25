@@ -17,6 +17,14 @@ out=$(nix build -f dependencies.nix --eval-store "$eval_store" --dry-run 2>&1)
 [[ $out != *"don't know how to build"* ]]
 [[ $out == *"will be built"* ]]
 
+# RemoteStore must not query the build store for a derivation that only exists
+# in the evaluation store. The builder copies it after the missing-path query.
+# Building through such a store needs the sandbox: see eval-store-remote.sh.
+remote_store="ssh-ng://localhost?remote-store=$TEST_ROOT/remote-build-store"
+out=$(nix build -f dependencies.nix --eval-store "$eval_store" --store "$remote_store" --dry-run 2>&1)
+[[ $out != *"don't know how to build"* ]]
+[[ $out == *"will be built"* ]]
+
 nix build -f dependencies.nix --eval-store "$eval_store" -o "$TEST_ROOT/result"
 [[ -e $TEST_ROOT/result/foobar ]]
 if [[ -z "${NIX_TESTS_CA_BY_DEFAULT:-}" ]]; then
