@@ -39,11 +39,13 @@ struct CmdShowDerivation : InstallablesCommand, MixPrintJSON
 
     void run(ref<Store> store, Installables && installables) override
     {
-        auto drvPaths = Installable::toDerivations(store, installables, true);
+        auto evalStore = getEvalStore();
+        auto drvPaths = Installable::toDerivations(evalStore, store, installables, true);
+        auto drvStore = Installable::getStoreForDerivations(evalStore, store, drvPaths);
 
         if (recursive) {
             StorePathSet closure;
-            store->computeFSClosure(drvPaths, closure);
+            drvStore->computeFSClosure(drvPaths, closure);
             drvPaths = std::move(closure);
         }
 
@@ -53,7 +55,7 @@ struct CmdShowDerivation : InstallablesCommand, MixPrintJSON
             if (!drvPath.isDerivation())
                 continue;
 
-            jsonRoot[drvPath.to_string()] = store->readDerivation(drvPath);
+            jsonRoot[drvPath.to_string()] = drvStore->readDerivation(drvPath);
         }
         printJSON(
             nlohmann::json{

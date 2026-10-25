@@ -177,7 +177,14 @@ struct Installable
         ref<Store> evalStore, ref<Store> store, Realise mode, OperateOn operateOn, ref<Installable> installable);
 
     static std::set<StorePath>
-    toDerivations(ref<Store> store, const Installables & installables, bool useDeriver = false);
+    toDerivations(ref<Store> evalStore, ref<Store> store, const Installables & installables, bool useDeriver = false);
+
+    /**
+     * Choose the store containing a complete set of derivations. Evaluation
+     * results normally live in `evalStore`, while explicit store-path
+     * arguments may refer to derivations already present in `store`.
+     */
+    static ref<Store> getStoreForDerivations(ref<Store> evalStore, ref<Store> store, const StorePathSet & drvPaths);
 
     static BuiltPaths toBuiltPaths(
         ref<Store> evalStore, ref<Store> store, Realise mode, OperateOn operateOn, const Installables & installables);
