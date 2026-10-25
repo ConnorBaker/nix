@@ -45,3 +45,17 @@ cat > "$flake_dir/flake.nix" <<EOF
 }
 EOF
 nix flake check --eval-store "$eval_store" --store "$remote_store" "path:$flake_dir"
+
+# The build hook reads derivations from the build store, so it must copy
+# them there from the evaluation store first (#13179). With --max-jobs 0,
+# only the hook can build.
+build_store=$TEST_ROOT/eval-store-build
+builder_root=$TEST_ROOT/eval-store-builder
+out=$(
+    nix build -f "$file" --arg busybox "$busybox" --eval-store "$eval_store" --store "$build_store" \
+        --max-jobs 0 \
+        --builders "ssh-ng://localhost?remote-store=$builder_root?system-features=foo%20bar%20baz - - 1 1 foo,bar,baz" \
+        --no-link --print-out-paths
+)
+grep 'FOO BAR BAZ' "$builder_root/$out"
+grep 'FOO BAR BAZ' "$build_store/$out"
