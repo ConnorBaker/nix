@@ -27,3 +27,24 @@ out=$(
         --no-link --print-out-paths
 )
 grep 'FOO BAR BAZ' "$remote_root/$out"
+
+# Flake checks must pass the evaluation store to the remote builder after the
+# client-side missing-path traversal has selected the checks to build.
+flake_dir=$TEST_ROOT/eval-store-flake
+mkdir -p "$flake_dir"
+# The builder must be an input to be in the remote's sandbox: a string with
+# no context, such as "$busybox", is not.
+cp "$busybox" "$flake_dir/busybox"
+cat > "$flake_dir/flake.nix" <<EOF
+{
+  outputs = { ... }: {
+    checks.$system.default = derivation {
+      name = "eval-store-flake-check";
+      system = "$system";
+      builder = ./busybox;
+      args = [ "sh" "-c" "echo checked > \$out" ];
+    };
+  };
+}
+EOF
+nix flake check --eval-store "$eval_store" --store "$remote_store" "path:$flake_dir"
