@@ -101,6 +101,11 @@ public:
 
     std::vector<PrimOp> extraPrimOps;
 
+    Setting<std::string> defaultEvalStore{
+        this, "", "eval-store",
+        "Default store URL for evaluation artifacts. An empty value uses the build store. "
+        "The --eval-store command-line argument takes precedence."};
+
     Setting<bool> enableNativeCode{this, false, "allow-unsafe-native-code-during-evaluation", R"(
         Enable built-in functions that allow executing native code.
 
