@@ -167,6 +167,8 @@ static int main_nix_instantiate(int argc, char ** argv)
             settings.readOnlyMode = true;
 
         auto store = openStore();
+        if (!myArgs.evalStoreUrl && !evalSettings.defaultEvalStore.get().empty())
+            myArgs.evalStoreUrl = StoreReference::parse(evalSettings.defaultEvalStore.get());
         auto evalStore = myArgs.evalStoreUrl ? openStore(StoreReference{*myArgs.evalStoreUrl}) : store;
 
         auto state = std::make_shared<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);

@@ -65,3 +65,21 @@ rm -rf "$eval_store"
 # Can't write .drv by default
 (! nix-instantiate dependencies.nix --eval-store "dummy://")
 nix-instantiate dependencies.nix --eval-store "dummy://?read-only=false"
+
+clearStore
+rm -rf "$eval_store"
+
+# The eval-store setting stands in for an absent --eval-store...
+nix-instantiate dependencies.nix --option eval-store "$eval_store"
+(! ls "$NIX_STORE_DIR"/*.drv)
+ls "$eval_store"/nix/store/*.drv
+(! nix-instantiate dependencies.nix --option eval-store "dummy://")
+# ...which takes precedence over it.
+nix-instantiate dependencies.nix --option eval-store "dummy://" --eval-store "dummy://?read-only=false"
+
+clearStore
+rm -rf "$eval_store"
+
+nix eval --raw --option eval-store "$eval_store" -f dependencies.nix drvPath
+(! ls "$NIX_STORE_DIR"/*.drv)
+ls "$eval_store"/nix/store/*.drv
