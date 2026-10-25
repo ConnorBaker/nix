@@ -11,6 +11,19 @@ needLocalStore "“--eval-store” doesn't achieve much with the daemon"
 
 eval_store=$TEST_ROOT/eval-store
 
+# Commands that inspect derivations must read metadata from the evaluation
+# store without first realizing or copying the derivations to the build store.
+drv=$(nix-instantiate dependencies.nix --eval-store "$eval_store")
+(! test -e "$NIX_STORE_DIR/$(basename "$drv")")
+nix derivation show --eval-store "$eval_store" -f dependencies.nix |
+    jq --exit-status --arg drv "$(basename "$drv")" '.derivations[$drv] != null'
+nix derivation show --recursive --eval-store "$eval_store" -f dependencies.nix |
+    jq --exit-status '.derivations | length > 1'
+nix path-info --derivation --eval-store "$eval_store" -f dependencies.nix |
+    grep -Fx "$drv"
+nix path-info --derivation --json --json-format 1 --eval-store "$eval_store" -f dependencies.nix |
+    jq --exit-status --arg drv "$drv" '.[$drv] != null'
+
 # The build store has not seen the .drv files yet. queryMissing must read
 # them from the eval store instead of reporting them as unknown.
 out=$(nix build -f dependencies.nix --eval-store "$eval_store" --dry-run 2>&1)

@@ -22,6 +22,7 @@
 #include "nix/fetchers/registry.hh"
 #include "nix/store/build-result.hh"
 
+#include <algorithm>
 #include <nlohmann/json.hpp>
 
 #include "nix/util/strings-inline.hh"
@@ -669,7 +670,7 @@ BuiltPaths Installable::toBuiltPaths(
             settings.readOnlyMode = true;
 
         BuiltPaths res;
-        for (auto & drvPath : Installable::toDerivations(store, installables, true))
+        for (auto & drvPath : Installable::toDerivations(evalStore, store, installables, true))
             res.emplace_back(BuiltPath::Opaque{drvPath});
         return res;
     }
@@ -708,7 +709,8 @@ StorePath Installable::toStorePath(
     return *paths.begin();
 }
 
-StorePathSet Installable::toDerivations(ref<Store> store, const Installables & installables, bool useDeriver)
+StorePathSet Installable::toDerivations(
+    ref<Store> evalStore, ref<Store> store, const Installables & installables, bool useDeriver)
 {
     StorePathSet drvPaths;
 
@@ -722,11 +724,31 @@ StorePathSet Installable::toDerivations(ref<Store> store, const Installables & i
                             : useDeriver           ? getDeriver(store, *i, bo.path)
                                          : throw Error("argument '%s' did not evaluate to a derivation", i->what()));
                     },
-                    [&](const DerivedPath::Built & bfd) { drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath)); },
+                    [&](const DerivedPath::Built & bfd) {
+                        drvPaths.insert(resolveDerivedPath(*store, *bfd.drvPath, &*evalStore));
+                    },
                 },
                 b.path.raw());
 
     return drvPaths;
+}
+
+ref<Store>
+Installable::getStoreForDerivations(ref<Store> evalStore, ref<Store> store, const StorePathSet & drvPaths)
+{
+    if (&*evalStore == &*store)
+        return store;
+
+    auto containsAll = [&](Store & candidate) {
+        return std::ranges::all_of(drvPaths, [&](const auto & drvPath) { return candidate.isValidPath(drvPath); });
+    };
+
+    if (containsAll(*evalStore))
+        return evalStore;
+    if (containsAll(*store))
+        return store;
+
+    throw Error("the requested derivations are not all available in either the evaluation store or the build store");
 }
 
 RawInstallablesCommand::RawInstallablesCommand()
