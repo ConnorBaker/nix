@@ -1025,23 +1025,28 @@ static RegisterPrimOp primop_throw(
          state.error<ThrownError>(s).setIsFromExpr().debugThrow();
      }});
 
+[[gnu::noinline, gnu::cold]] static void addErrorContextTrace(EvalState & state, Error & e, Value & vMessage)
+{
+    NixStringContext context;
+    auto message = state
+                       .coerceToString(
+                           noPos,
+                           vMessage,
+                           context,
+                           "while evaluating the error message passed to builtins.addErrorContext",
+                           false,
+                           false)
+                       .toOwned();
+    e.addTrace(nullptr, HintFmt(message), TracePrint::Always);
+}
+
 static void prim_addErrorContext(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     try {
         state.forceValue(*args[1], noPos);
         v = *args[1];
     } catch (Error & e) {
-        NixStringContext context;
-        auto message = state
-                           .coerceToString(
-                               noPos,
-                               *args[0],
-                               context,
-                               "while evaluating the error message passed to builtins.addErrorContext",
-                               false,
-                               false)
-                           .toOwned();
-        e.addTrace(nullptr, HintFmt(message), TracePrint::Always);
+        addErrorContextTrace(state, e, *args[0]);
         throw;
     }
 }
