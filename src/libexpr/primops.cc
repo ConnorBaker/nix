@@ -3658,7 +3658,7 @@ static void prim_catAttrs(EvalState & state, CallSite callSite, Value * const * 
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.catAttrs"));
     state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.catAttrs");
 
-    SmallValueVector<nonRecursiveStackReservation> res(args[1]->listSize());
+    SmallValueVector<conservativeStackReservation> res(args[1]->listSize());
     size_t found = 0;
 
     for (auto v2 : args[1]->listView()) {
@@ -4037,7 +4037,7 @@ static void prim_filter(EvalState & state, CallSite callSite, Value * const * ar
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.filter");
 
     auto len = args[1]->listSize();
-    SmallValueVector<nonRecursiveStackReservation> vs(len);
+    SmallValueVector<conservativeStackReservation> vs(len);
     size_t k = 0;
 
     bool same = true;
