@@ -303,6 +303,12 @@ RemoteStore::queryPartialDerivationOutputMap(const StorePath & path, Store * eva
             conn.processStderr();
             return WorkerProto::Serialise<std::map<std::string, std::optional<StorePath>>>::read(*this, *conn);
         } else {
+            // The server can only answer for derivations it has. One that so
+            // far exists only in the evaluation store reaches it when it is
+            // built, so answer from the evaluation store's copy, as the base
+            // implementation does.
+            if (!isValidPath(path))
+                return Store::queryPartialDerivationOutputMap(path, evalStore_);
             auto & evalStore = *evalStore_;
             auto outputs = evalStore.queryStaticPartialDerivationOutputMap(path);
             // union with the first branch overriding the statically-known ones
