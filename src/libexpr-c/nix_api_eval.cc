@@ -8,7 +8,8 @@
 #include "nix_api_util.h"
 #include "nix_api_util_internal.h"
 
-static const nix::Bindings & get_bindings_or_empty(nix::EvalState & state, nix_value * autoArgs)
+/* Out of line: keeps the forcing out of nix_value_auto_call_function's frame. */
+[[gnu::noinline]] static const nix::Bindings & get_bindings_or_empty(nix::EvalState & state, nix_value * autoArgs)
 {
     if (!autoArgs) {
         return nix::Bindings::emptyBindings;

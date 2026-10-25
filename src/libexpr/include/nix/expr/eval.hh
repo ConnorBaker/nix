@@ -745,6 +745,15 @@ public:
     inline void forceAttrs(Value & v, Callable getPos, std::string_view errorCtx);
 
     inline void forceList(Value & v, const PosIdx pos, std::string_view errorCtx);
+
+    /**
+     * The type errors of the inline `forceAttrs` and `forceList`.
+     */
+    [[noreturn, gnu::noinline, gnu::cold]] void
+    throwExpectedAttrs(Value & v, const PosIdx pos, std::string_view errorCtx);
+    [[noreturn, gnu::noinline, gnu::cold]] void
+    throwExpectedList(Value & v, const PosIdx pos, std::string_view errorCtx);
+
     /**
      * @param v either lambda or primop
      */

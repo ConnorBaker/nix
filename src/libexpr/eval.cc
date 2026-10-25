@@ -887,6 +887,12 @@ makeDebugTraceStacker(EvalState & state, Expr & expr, Env & env, PosIdx pos, con
         state, DebugTrace{.pos = pos, .expr = expr, .env = env, .hint = HintFmt(formatArgs...), .isError = false});
 }
 
+/* `e.addTrace(positions[pos], errorCtx)`, out of line and cold. */
+[[gnu::noinline, gnu::cold]] static void addTraceAt(EvalState & state, Error & e, PosIdx pos, std::string_view errorCtx)
+{
+    e.addTrace(state.positions[pos], errorCtx);
+}
+
 DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
     : evalState(evalState)
     , trace(std::move(t))
@@ -1139,11 +1145,11 @@ struct ExprParseFile : Expr, gc
             // Enforce that 'flake.nix' is a direct attrset, not a
             // computation.
             if (mustBeTrivial && !(dynamic_cast<ExprAttrs *>(e)))
-                state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
+                throwNotAttrs(state);
 
             state.eval(e, v);
         } catch (Error & e) {
-            state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
+            addFileTrace(state, e);
             throw;
         }
     }
@@ -1152,6 +1158,16 @@ struct ExprParseFile : Expr, gc
     {
         return makeDebugTraceStacker(
             state, e, state.baseEnv, e.getPos(), "while evaluating the file '%s':", path.to_string());
+    }
+
+    [[noreturn, gnu::noinline, gnu::cold]] void throwNotAttrs(EvalState & state)
+    {
+        state.error<EvalError>("file '%s' must be an attribute set", path).debugThrow();
+    }
+
+    [[gnu::noinline, gnu::cold]] void addFileTrace(EvalState & state, Error & e)
+    {
+        state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
     }
 };
 
@@ -1208,6 +1224,25 @@ void EvalState::eval(Expr * e, Value & v)
     e->eval(*this, baseEnv, v);
 }
 
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwEvalBoolTypeError(EvalState & state, Env & env, Expr & e, Value & v, PosIdx pos)
+{
+    state
+        .error<TypeError>(
+            "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(state, v, errorPrintOptions))
+        .atPos(pos)
+        .withFrame(env, e)
+        .debugThrow();
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwEvalAttrsTypeError(EvalState & state, Env & env, Expr & e, Value & v)
+{
+    state.error<TypeError>("expected a set but found %1%: %2%", showType(v), ValuePrinter(state, v, errorPrintOptions))
+        .withFrame(env, e)
+        .debugThrow();
+}
+
 inline bool EvalState::evalBool(Env & env, Expr * e, std::string_view errorCtx)
 {
     PosIdx pos = e->getPos();
@@ -1215,14 +1250,10 @@ inline bool EvalState::evalBool(Env & env, Expr * e, std::string_view errorCtx)
         Value v;
         e->eval(*this, env, v);
         if (v.type() != nBool)
-            error<TypeError>(
-                "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .withFrame(env, *e)
-                .debugThrow();
+            throwEvalBoolTypeError(*this, env, *e, v, pos);
         return v.boolean();
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 }
@@ -1233,12 +1264,9 @@ inline void EvalState::evalAttrs(Env & env, Expr * e, Value & v, std::string_vie
     try {
         e->eval(*this, env, v);
         if (v.type() != nAttrs)
-            error<TypeError>(
-                "expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .withFrame(env, *e)
-                .debugThrow();
+            throwEvalAttrsTypeError(*this, env, *e, v);
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 }
@@ -1248,7 +1276,7 @@ void Expr::eval(EvalState & state, Env & env, Value & v, std::string_view errorC
     try {
         eval(state, env, v);
     } catch (Error & e) {
-        e.addTrace(state.positions[getPos()], errorCtx);
+        addTraceAt(state, e, getPos(), errorCtx);
         throw;
     }
 }
@@ -1473,6 +1501,37 @@ selectDebugTraceStacker(EvalState & state, ExprSelect & sel, Env & env)
         showAttrSelectionPath(state, env, sel.getAttrPath()));
 }
 
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwMissingAttr(EvalState & state, Env & env, ExprSelect & sel, Value & vAttrs, Symbol name)
+{
+    StringSet allAttrNames;
+    for (auto & attr : *vAttrs.attrs())
+        allAttrNames.insert(std::string(state.symbols[attr.name]));
+    auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
+    state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
+        .withSuggestions(suggestions)
+        .withFrame(env, sel)
+        .debugThrow();
+}
+
+[[gnu::noinline, gnu::cold]] static void addSelectTraces(
+    EvalState & state, Env & env, ExprSelect & sel, Error & e, PosIdx attrPos, const AttrName * unresolvedOrEnd)
+{
+    // Traces are printed in reverse, so we add context before the main item.
+    if (attrPos) {
+        auto attrPosR = state.positions[attrPos];
+        auto origin = std::get_if<SourcePath>(&attrPosR.origin);
+        if (!(origin && *origin == state.derivationInternal)) {
+            auto successPath =
+                showAttrSelectionPath(state, env, std::span<const AttrName>(sel.attrPathStart, unresolvedOrEnd));
+            state.addErrorTrace(e, attrPos, "from the definition of '%1%'", successPath);
+        }
+    }
+    // Add main item: the selection site itself (`a.b`), ie the actual access
+    state.addErrorTrace(
+        e, sel.getPos(), "while evaluating the attribute '%1%'", showAttrSelectionPath(state, env, sel.getAttrPath()));
+}
+
 void EvalState::incrAttrSelect(PosIdx attrPos)
 {
     attrSelects->try_emplace_or_visit(attrPos, 1, [](auto & i) { i.second++; });
@@ -1504,16 +1563,8 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
                 }
             } else {
                 state.forceAttrs(*vAttrs, pos, "while selecting an attribute");
-                if (!(j = vAttrs->attrs()->get(name))) {
-                    StringSet allAttrNames;
-                    for (auto & attr : *vAttrs->attrs())
-                        allAttrNames.insert(std::string(state.symbols[attr.name]));
-                    auto suggestions = Suggestions::bestMatches(allAttrNames, state.symbols[name]);
-                    state.error<EvalError>("attribute '%1%' missing", state.symbols[name])
-                        .withSuggestions(suggestions)
-                        .withFrame(env, *this)
-                        .debugThrow();
-                }
+                if (!(j = vAttrs->attrs()->get(name)))
+                    throwMissingAttr(state, env, *this, *vAttrs, name);
             }
             vAttrs = j->value;
             attrPos = j->pos;
@@ -1525,19 +1576,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
         state.forceValue(*vAttrs, (attrPos ? attrPos : this->pos));
 
     } catch (Error & e) {
-        // Traces are printed in reverse, so we add context before the main item.
-        if (attrPos) {
-            auto attrPosR = state.positions[attrPos];
-            auto origin = std::get_if<SourcePath>(&attrPosR.origin);
-            if (!(origin && *origin == state.derivationInternal)) {
-                auto successPath =
-                    showAttrSelectionPath(state, env, std::span<const AttrName>(attrPathStart, unresolvedOrEnd));
-                state.addErrorTrace(e, attrPos, "from the definition of '%1%'", successPath);
-            }
-        }
-        // Add main item: the selection site itself (`a.b`), ie the actual access
-        state.addErrorTrace(
-            e, getPos(), "while evaluating the attribute '%1%'", showAttrSelectionPath(state, env, getAttrPath()));
+        addSelectTraces(state, env, *this, e, attrPos, unresolvedOrEnd);
         throw;
     }
 
@@ -1624,6 +1663,50 @@ void ExprLambda::eval(EvalState & state, Env & env, Value & v)
 
 /* The cold paths of EvalState::callFunction, out of line. */
 
+[[gnu::noinline, gnu::cold]] static void addCallSiteTrace(EvalState & state, Error & e, const PosIdx pos)
+{
+    if (pos)
+        e.addTrace(state.positions[pos], "from call site");
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwMissingArgument(EvalState & state, ExprLambda & lambda, const Env & env, const Formal & i, const PosIdx pos)
+{
+    state
+        .error<TypeError>(
+            "function '%1%' called without required argument '%2%'",
+            (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
+            state.symbols[i.name])
+        .atPos(lambda.pos)
+        .withTrace(pos, "from call site")
+        .withFrame(env, lambda)
+        .debugThrow();
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void throwUnexpectedArgument(
+    EvalState & state, ExprLambda & lambda, const Formals & formals, Value & arg, const Env & env, const PosIdx pos)
+{
+    /* Show the first unexpected argument to the user. */
+    for (auto & i : *arg.attrs())
+        if (!formals.has(i.name)) {
+            StringSet formalNames;
+            for (auto & formal : formals.formals)
+                formalNames.insert(std::string(state.symbols[formal.name]));
+            auto suggestions = Suggestions::bestMatches(formalNames, state.symbols[i.name]);
+            state
+                .error<TypeError>(
+                    "function '%1%' called with unexpected argument '%2%'",
+                    (lambda.name ? std::string(state.symbols[lambda.name]) : "anonymous lambda"),
+                    state.symbols[i.name])
+                .atPos(lambda.pos)
+                .withTrace(pos, "from call site")
+                .withSuggestions(suggestions)
+                .withFrame(env, lambda)
+                .debugThrow();
+        }
+    unreachable();
+}
+
 [[gnu::noinline, gnu::cold]] static std::unique_ptr<DebugTraceStacker>
 lambdaDebugTraceStacker(EvalState & state, ExprLambda & lambda, Env & env2)
 {
@@ -1634,6 +1717,38 @@ lambdaDebugTraceStacker(EvalState & state, ExprLambda & lambda, Env & env2)
         lambda.pos,
         "while calling %s",
         lambda.name ? concatStrings("'", state.symbols[lambda.name], "'") : "anonymous lambda");
+}
+
+[[gnu::noinline, gnu::cold]] static void
+addLambdaCallTraces(EvalState & state, Error & e, ExprLambda & lambda, const PosIdx pos)
+{
+    if (loggerSettings.showTrace.get()) {
+        state.addErrorTrace(
+            e,
+            lambda.pos,
+            "while calling %s",
+            lambda.name ? concatStrings("'", state.symbols[lambda.name], "'") : "anonymous lambda");
+        if (pos)
+            state.addErrorTrace(e, pos, "from call site");
+    }
+}
+
+[[gnu::noinline, gnu::cold]] static void
+addBuiltinTrace(EvalState & state, Error & e, const PosIdx pos, const PrimOp & fn)
+{
+    if (fn.addTrace)
+        state.addErrorTrace(e, pos, "while calling the '%1%' builtin", fn.name);
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void throwNotAFunction(EvalState & state, Value & vCur, const PosIdx pos)
+{
+    state
+        .error<TypeError>(
+            "attempt to call something which is not a function but %1%: %2%",
+            showType(vCur),
+            ValuePrinter(state, vCur, errorPrintOptions))
+        .atPos(pos)
+        .debugThrow();
 }
 
 /* Partial application of a primop. A function, not a lambda in callFunction,
@@ -1688,8 +1803,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                 try {
                     forceAttrs(*args[0], lambda.pos, "while evaluating the value passed for the lambda argument");
                 } catch (Error & e) {
-                    if (pos)
-                        e.addTrace(positions[pos], "from call site");
+                    addCallSiteTrace(*this, e, pos);
                     throw;
                 }
 
@@ -1703,16 +1817,8 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                 for (auto & i : formals->formals) {
                     auto j = args[0]->attrs()->get(i.name);
                     if (!j) {
-                        if (!i.def) {
-                            error<TypeError>(
-                                "function '%1%' called without required argument '%2%'",
-                                (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
-                                symbols[i.name])
-                                .atPos(lambda.pos)
-                                .withTrace(pos, "from call site")
-                                .withFrame(*vCur.lambda().env, lambda)
-                                .debugThrow();
-                        }
+                        if (!i.def)
+                            throwMissingArgument(*this, lambda, *vCur.lambda().env, i, pos);
                         env2.values[displ++] = i.def->maybeThunk(*this, env2);
                     } else {
                         attrsUsed++;
@@ -1722,27 +1828,8 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
                 /* Check that each actual argument is listed as a formal
                    argument (unless the attribute match specifies a `...'). */
-                if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size()) {
-                    /* Nope, so show the first unexpected argument to the
-                       user. */
-                    for (auto & i : *args[0]->attrs())
-                        if (!formals->has(i.name)) {
-                            StringSet formalNames;
-                            for (auto & formal : formals->formals)
-                                formalNames.insert(std::string(symbols[formal.name]));
-                            auto suggestions = Suggestions::bestMatches(formalNames, symbols[i.name]);
-                            error<TypeError>(
-                                "function '%1%' called with unexpected argument '%2%'",
-                                (lambda.name ? std::string(symbols[lambda.name]) : "anonymous lambda"),
-                                symbols[i.name])
-                                .atPos(lambda.pos)
-                                .withTrace(pos, "from call site")
-                                .withSuggestions(suggestions)
-                                .withFrame(*vCur.lambda().env, lambda)
-                                .debugThrow();
-                        }
-                    unreachable();
-                }
+                if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size())
+                    throwUnexpectedArgument(*this, lambda, *formals, *args[0], *vCur.lambda().env, pos);
             } else {
                 env2.values[displ++] = args[0];
             }
@@ -1757,15 +1844,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
                 lambda.body->eval(*this, env2, vCur);
             } catch (Error & e) {
-                if (loggerSettings.showTrace.get()) {
-                    addErrorTrace(
-                        e,
-                        lambda.pos,
-                        "while calling %s",
-                        lambda.name ? concatStrings("'", symbols[lambda.name], "'") : "anonymous lambda");
-                    if (pos)
-                        addErrorTrace(e, pos, "from call site");
-                }
+                addLambdaCallTraces(*this, e, lambda, pos);
                 throw;
             }
 
@@ -1791,8 +1870,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                 try {
                     fn->impl(*this, CallSite{pos}, args.data(), vCur);
                 } catch (Error & e) {
-                    if (fn->addTrace)
-                        addErrorTrace(e, pos, "while calling the '%1%' builtin", fn->name);
+                    addBuiltinTrace(*this, e, pos, *fn);
                     throw;
                 }
 
@@ -1841,8 +1919,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                     //    so the debugger allows to inspect the wrong parameters passed to the builtin.
                     fn->impl(*this, CallSite{pos}, vArgs, vCur);
                 } catch (Error & e) {
-                    if (fn->addTrace)
-                        addErrorTrace(e, pos, "while calling the '%1%' builtin", fn->name);
+                    addBuiltinTrace(*this, e, pos, *fn);
                     throw;
                 }
 
@@ -1857,19 +1934,14 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
             try {
                 callFunction(*functor->value, std::to_array({&(*allocValue() = vCur), args[0]}), vCur, functor->pos);
             } catch (Error & e) {
-                e.addTrace(positions[pos], "while calling a functor (an attribute set with a '__functor' attribute)");
+                addTraceAt(*this, e, pos, "while calling a functor (an attribute set with a '__functor' attribute)");
                 throw;
             }
             args = args.subspan(1);
         }
 
         else
-            error<TypeError>(
-                "attempt to call something which is not a function but %1%: %2%",
-                showType(vCur),
-                ValuePrinter(*this, vCur, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwNotAFunction(*this, vCur, pos);
     }
 
     vRes = vCur;
@@ -2402,6 +2474,16 @@ forceValueDeepTrace(EvalState & state, const Attr & i)
         state.symbols[i.name]);
 }
 
+[[gnu::noinline, gnu::cold]] static void addAttrTrace(EvalState & state, Error & e, const Attr & i)
+{
+    state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
+}
+
+[[gnu::noinline, gnu::cold]] static void addListElemTrace(EvalState & state, Error & e, size_t index)
+{
+    state.addErrorTrace(e, "while evaluating list element at index %1%", index);
+}
+
 void EvalState::forceValueDeep(Value & v)
 {
     std::set<const Value *> seen;
@@ -2422,7 +2504,7 @@ void EvalState::forceValueDeep(Value & v)
 
                     recurse(*i.value);
                 } catch (Error & e) {
-                    state.addErrorTrace(e, i.pos, "while evaluating the attribute '%1%'", state.symbols[i.name]);
+                    addAttrTrace(state, e, i);
                     throw;
                 }
         }
@@ -2434,11 +2516,25 @@ void EvalState::forceValueDeep(Value & v)
                     recurse(*v2);
                     index++;
                 } catch (Error & e) {
-                    state.addErrorTrace(e, "while evaluating list element at index %1%", index);
+                    addListElemTrace(state, e, index);
                     throw;
                 }
         }
     }(v);
+}
+
+void EvalState::throwExpectedAttrs(Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    error<TypeError>("expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
+        .withTrace(pos, errorCtx)
+        .debugThrow();
+}
+
+void EvalState::throwExpectedList(Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    error<TypeError>("expected a list but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
+        .withTrace(pos, errorCtx)
+        .debugThrow();
 }
 
 NixInt EvalState::forceInt(Value & v, const PosIdx pos, std::string_view errorCtx)
