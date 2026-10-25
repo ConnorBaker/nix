@@ -429,7 +429,9 @@ static int main_build_remote(int argc, char ** argv)
             if (auto localStore = store.dynamic_pointer_cast<LocalStore>())
                 for (auto & path : missingPaths)
                     localStore->locksHeld.insert(store->printStorePath(path)); /* FIXME: ugly */
-            copyPaths(*sshStore, *store, missingPaths, NoRepair, NoCheckSigs, NoSubstitute);
+            // Recursive builds can reference newly created paths that were
+            // absent from the submitting store's input closure.
+            copyClosure(*sshStore, *store, missingPaths, NoRepair, NoCheckSigs, NoSubstitute);
         }
         // XXX: Should be done as part of `copyPaths`
         for (auto & realisation : missingRealisations) {
