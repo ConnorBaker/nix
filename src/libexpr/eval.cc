@@ -2722,18 +2722,21 @@ void EvalState::throwExpectedList(Value & v, const PosIdx pos, std::string_view 
         .debugThrow();
 }
 
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwExpectedType(EvalState & state, const char * expected, Value & v, const PosIdx pos)
+{
+    state.error<TypeError>(expected, showType(v), ValuePrinter(state, v, errorPrintOptions)).atPos(pos).debugThrow();
+}
+
 NixInt EvalState::forceInt(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {
         forceValue(v, pos);
         if (v.type() != nInt)
-            error<TypeError>(
-                "expected an integer but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwExpectedType(*this, "expected an integer but found %1%: %2%", v, pos);
         return v.integer();
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 
@@ -2747,29 +2750,25 @@ NixFloat EvalState::forceFloat(Value & v, const PosIdx pos, std::string_view err
         if (v.type() == nInt)
             return v.integer().value;
         else if (v.type() != nFloat)
-            error<TypeError>(
-                "expected a float but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwExpectedType(*this, "expected a float but found %1%: %2%", v, pos);
         return v.fpoint();
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 }
 
-bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx)
+/* Not inlined: link-time optimisation would inline it into `builtins.sort`'s
+   recursive `peeksort`, 32 bytes more in each frame. */
+[[gnu::noinline]] bool EvalState::forceBool(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     try {
         forceValue(v, pos);
         if (v.type() != nBool)
-            error<TypeError>(
-                "expected a Boolean but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwExpectedType(*this, "expected a Boolean but found %1%: %2%", v, pos);
         return v.boolean();
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 
@@ -2795,12 +2794,9 @@ void EvalState::forceFunction(Value & v, const PosIdx pos, std::string_view erro
     try {
         forceValue(v, pos);
         if (v.type() != nFunction && !isFunctor(v))
-            error<TypeError>(
-                "expected a function but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwExpectedType(*this, "expected a function but found %1%: %2%", v, pos);
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 }
@@ -2810,13 +2806,10 @@ std::string_view EvalState::forceString(Value & v, const PosIdx pos, std::string
     try {
         forceValue(v, pos);
         if (v.type() != nString)
-            error<TypeError>(
-                "expected a string but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwExpectedType(*this, "expected a string but found %1%: %2%", v, pos);
         return v.string_view();
     } catch (Error & e) {
-        e.addTrace(positions[pos], errorCtx);
+        addTraceAt(*this, e, pos, errorCtx);
         throw;
     }
 }
@@ -2840,18 +2833,24 @@ std::string_view EvalState::forceString(
     return s;
 }
 
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwStringWithContext(EvalState & state, Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    auto ctxElem = NixStringContextElem::parse((*v.context()->begin())->view());
+    state
+        .error<EvalError>(
+            "the string '%1%' is not allowed to refer to a store path (such as '%2%')",
+            v.string_view(),
+            ctxElem.display(*state.store))
+        .withTrace(pos, errorCtx)
+        .debugThrow();
+}
+
 std::string_view EvalState::forceStringNoCtx(Value & v, const PosIdx pos, std::string_view errorCtx)
 {
     auto s = forceString(v, pos, errorCtx);
-    if (v.context()) {
-        auto ctxElem = NixStringContextElem::parse((*v.context()->begin())->view());
-        error<EvalError>(
-            "the string '%1%' is not allowed to refer to a store path (such as '%2%')",
-            v.string_view(),
-            ctxElem.display(*store))
-            .withTrace(pos, errorCtx)
-            .debugThrow();
-    }
+    if (v.context())
+        throwStringWithContext(*this, v, pos, errorCtx);
     return s;
 }
 
