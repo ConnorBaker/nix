@@ -198,7 +198,9 @@ private:
         }
     }
 
-    void printRepeated()
+    /* What `print` does besides recursing is out of line: `print` is on the
+       stack at every level of a nested value. */
+    [[gnu::noinline]] void printRepeated()
     {
         if (options.ansiColors)
             output << ANSI_MAGENTA;
@@ -207,7 +209,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printNullptr()
+    [[gnu::noinline]] void printNullptr()
     {
         if (options.ansiColors)
             output << ANSI_MAGENTA;
@@ -216,12 +218,12 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printElided(unsigned int value, const std::string_view single, const std::string_view plural)
+    [[gnu::noinline]] void printElided(unsigned int value, const std::string_view single, const std::string_view plural)
     {
         ::nix::printElided(output, value, single, plural, options.ansiColors);
     }
 
-    void printInt(Value & v)
+    [[gnu::noinline]] void printInt(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_CYAN;
@@ -230,7 +232,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printFloat(Value & v)
+    [[gnu::noinline]] void printFloat(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_CYAN;
@@ -239,7 +241,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printBool(Value & v)
+    [[gnu::noinline]] void printBool(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_CYAN;
@@ -248,12 +250,12 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printString(Value & v)
+    [[gnu::noinline]] void printString(Value & v)
     {
         printLiteralString(output, v.string_view(), options.maxStringLength, options.ansiColors);
     }
 
-    void printPath(Value & v)
+    [[gnu::noinline]] void printPath(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_GREEN;
@@ -262,7 +264,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printNull()
+    [[gnu::noinline]] void printNull()
     {
         if (options.ansiColors)
             output << ANSI_CYAN;
@@ -271,7 +273,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printDerivation(Value & v)
+    [[gnu::noinline]] void printDerivation(Value & v)
     {
         std::optional<StorePath> storePath;
         if (auto i = v.attrs()->get(state.s.drvPath)) {
@@ -329,9 +331,27 @@ private:
         return itemType == nList || itemType == nAttrs || itemType == nThunk;
     }
 
-    void printAttrs(Value & v, size_t depth)
+    [[gnu::noinline]] bool markSeen(const void * p)
     {
-        if (seen && !seen->insert(v.attrs()).second) {
+        return seen->insert(p).second;
+    }
+
+    [[gnu::noinline]] AttrVec sortedAttrs(Value & v)
+    {
+        AttrVec sorted;
+        for (auto & i : *v.attrs())
+            sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
+
+        if (options.maxAttrs == std::numeric_limits<size_t>::max())
+            std::sort(sorted.begin(), sorted.end());
+        else
+            std::sort(sorted.begin(), sorted.end(), ImportantFirstAttrNameCmp());
+        return sorted;
+    }
+
+    [[gnu::noinline]] void printAttrs(Value & v, size_t depth)
+    {
+        if (seen && !markSeen(v.attrs())) {
             printRepeated();
             return;
         }
@@ -342,14 +362,7 @@ private:
             increaseIndent();
             output << "{";
 
-            AttrVec sorted;
-            for (auto & i : *v.attrs())
-                sorted.emplace_back(std::pair(state.symbols[i.name], i.value));
-
-            if (options.maxAttrs == std::numeric_limits<size_t>::max())
-                std::sort(sorted.begin(), sorted.end());
-            else
-                std::sort(sorted.begin(), sorted.end(), ImportantFirstAttrNameCmp());
+            auto sorted = sortedAttrs(v);
 
             auto prettyPrint = shouldPrettyPrintAttrs(sorted);
 
@@ -382,7 +395,7 @@ private:
     /**
      * @note This may force items.
      */
-    bool shouldPrettyPrintList(std::span<Value * const> list)
+    [[gnu::noinline]] bool shouldPrettyPrintList(std::span<Value * const> list)
     {
         if (!options.shouldPrettyPrint() || list.empty()) {
             return false;
@@ -409,7 +422,7 @@ private:
 
     void printList(Value & v, size_t depth)
     {
-        if (seen && v.listSize() && !seen->insert(&v).second) {
+        if (seen && v.listSize() && !markSeen(&v)) {
             printRepeated();
             return;
         }
@@ -447,7 +460,7 @@ private:
         }
     }
 
-    void printFunction(Value & v)
+    [[gnu::noinline]] void printFunction(Value & v)
     {
         if (options.ansiColors)
             output << ANSI_BLUE;
@@ -485,7 +498,7 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printThunk(Value & v)
+    [[gnu::noinline]] void printThunk(Value & v)
     {
         if (v.isBlackhole()) {
             // Although we know for sure that it's going to be an infinite recursion
@@ -510,7 +523,7 @@ private:
         }
     }
 
-    void printFailed()
+    [[gnu::noinline]] void printFailed()
     {
         if (options.ansiColors)
             output << ANSI_MAGENTA;
@@ -521,12 +534,12 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printExternal(Value & v)
+    [[gnu::noinline]] void printExternal(Value & v)
     {
         v.external()->print(output);
     }
 
-    void printUnknown()
+    [[gnu::noinline]] void printUnknown()
     {
         if (options.ansiColors)
             output << ANSI_RED;
@@ -535,7 +548,12 @@ private:
             output << ANSI_NORMAL;
     }
 
-    void printError_(Error & e)
+    [[noreturn, gnu::noinline, gnu::cold]] void throwPrintDepth(Value & v)
+    {
+        state.error<StackOverflowError>().atPos(v.determinePos(noPos)).debugThrow();
+    }
+
+    [[gnu::noinline, gnu::cold]] void printError_(Error & e)
     {
         if (options.ansiColors)
             output << ANSI_RED;
@@ -557,7 +575,7 @@ private:
         // Other places do increment callDepth for simplicity, but that is
         // technically incorrect.
         if (depth > state.settings.maxCallDepth)
-            state.error<StackOverflowError>().atPos(v.determinePos(noPos)).debugThrow();
+            throwPrintDepth(v);
 
         try {
             if (options.force) {
