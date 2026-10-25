@@ -948,6 +948,11 @@ void Value::mkPath(const SourcePath & path, EvalMemory & mem)
     if (noEval)
         return nullptr;
 
+    return lookupVarWith(env, var);
+}
+
+Value * EvalState::lookupVarWith(Env * env, const ExprVar & var)
+{
     auto * fromWith = var.fromWith;
     while (1) {
         forceAttrs(*env->values[0], fromWith->pos, "while evaluating the first subexpression of a with expression");

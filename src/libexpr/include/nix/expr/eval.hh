@@ -983,6 +983,10 @@ public:
 private:
 
     inline Value * lookupVar(Env * env, const ExprVar & var, bool noEval);
+    /**
+     * lookupVar's search of the `with` scopes, out of ExprVar::eval's frame.
+     */
+    [[gnu::noinline]] Value * lookupVarWith(Env * env, const ExprVar & var);
 
     friend struct ExprVar;
     friend struct ExprAttrs;
