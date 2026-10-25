@@ -28,9 +28,34 @@ static void posToXML(EvalState & state, XMLAttrs & xmlAttrs, const Pos & pos)
 {
     if (auto path = std::get_if<SourcePath>(&pos.origin))
         xmlAttrs["path"] = path->path.abs();
-    xmlAttrs["line"] = fmt("%1%", pos.line);
-    xmlAttrs["column"] = fmt("%1%", pos.column);
+    xmlAttrs["line"] = std::to_string(pos.line);
+    xmlAttrs["column"] = std::to_string(pos.column);
 }
+
+/* Out of line: the tag's attributes are not needed while the value is printed. */
+[[gnu::noinline]] static void openAttrElement(EvalState & state, bool location, const Attr & a, XMLWriter & doc)
+{
+    XMLAttrs xmlAttrs;
+    xmlAttrs["name"] = state.symbols[a.name];
+    if (location && a.pos)
+        posToXML(state, xmlAttrs, state.positions[a.pos]);
+    doc.openElement("attr", xmlAttrs);
+}
+
+namespace {
+
+/* Closes the element that `openAttrElement` opened. */
+struct CloseAttrElement
+{
+    XMLWriter & doc;
+
+    ~CloseAttrElement()
+    {
+        doc.closeElement();
+    }
+};
+
+} // namespace
 
 static void showAttrs(
     EvalState & state,
@@ -41,20 +66,50 @@ static void showAttrs(
     NixStringContext & context,
     StringSet & drvsSeen)
 {
-    StringSet names;
-
     for (auto & a : attrs.lexicographicOrder(state.symbols)) {
-        XMLAttrs xmlAttrs;
-        xmlAttrs["name"] = state.symbols[a->name];
-        if (location && a->pos)
-            posToXML(state, xmlAttrs, state.positions[a->pos]);
-
-        XMLOpenElement _(doc, "attr", xmlAttrs);
+        openAttrElement(state, location, *a, doc);
+        CloseAttrElement _{doc};
         printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
     }
 }
 
-static void printValueAsXML(
+/* A derivation's element: its paths, and its attributes the first time it is seen. */
+[[gnu::noinline]] static void printDerivationAsXML(
+    EvalState & state,
+    bool strict,
+    bool location,
+    Value & v,
+    XMLWriter & doc,
+    NixStringContext & context,
+    StringSet & drvsSeen)
+{
+    XMLAttrs xmlAttrs;
+
+    std::string drvPath;
+    if (auto a = v.attrs()->get(state.s.drvPath)) {
+        if (strict)
+            state.forceValue(*a->value, a->pos);
+        if (a->value->type() == nString)
+            xmlAttrs["drvPath"] = drvPath = a->value->string_view();
+    }
+
+    if (auto a = v.attrs()->get(state.s.outPath)) {
+        if (strict)
+            state.forceValue(*a->value, a->pos);
+        if (a->value->type() == nString)
+            xmlAttrs["outPath"] = a->value->string_view();
+    }
+
+    XMLOpenElement _(doc, "derivation", xmlAttrs);
+
+    if (drvPath != "" && drvsSeen.insert(drvPath).second)
+        showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+    else
+        doc.writeEmptyElement("repeated");
+}
+
+/* printValueAsXML of a value that is not a list or an attribute set. */
+[[gnu::noinline]] static void printLeafAsXML(
     EvalState & state,
     bool strict,
     bool location,
@@ -64,13 +119,6 @@ static void printValueAsXML(
     StringSet & drvsSeen,
     const PosIdx pos)
 {
-    checkInterrupt();
-
-    auto _level = state.addCallDepth(pos);
-
-    if (strict)
-        state.forceValue(v, pos);
-
     switch (v.type()) {
 
     case nInt:
@@ -96,45 +144,8 @@ static void printValueAsXML(
         break;
 
     case nAttrs:
-        if (state.isDerivation(v)) {
-            XMLAttrs xmlAttrs;
-
-            std::string drvPath;
-            if (auto a = v.attrs()->get(state.s.drvPath)) {
-                if (strict)
-                    state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
-                    xmlAttrs["drvPath"] = drvPath = a->value->string_view();
-            }
-
-            if (auto a = v.attrs()->get(state.s.outPath)) {
-                if (strict)
-                    state.forceValue(*a->value, a->pos);
-                if (a->value->type() == nString)
-                    xmlAttrs["outPath"] = a->value->string_view();
-            }
-
-            XMLOpenElement _(doc, "derivation", xmlAttrs);
-
-            if (drvPath != "" && drvsSeen.insert(drvPath).second)
-                showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
-            else
-                doc.writeEmptyElement("repeated");
-        }
-
-        else {
-            XMLOpenElement _(doc, "attrs");
-            showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
-        }
-
-        break;
-
-    case nList: {
-        XMLOpenElement _(doc, "list");
-        for (auto v2 : v.listView())
-            printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);
-        break;
-    }
+    case nList:
+        unreachable();
 
     case nFunction: {
         if (!v.isLambda()) {
@@ -175,6 +186,56 @@ static void printValueAsXML(
     // reverted to the original thunk.
     case nFailed:
         doc.writeEmptyElement("unevaluated");
+        break;
+    }
+}
+
+static void printValueAsXML(
+    EvalState & state,
+    bool strict,
+    bool location,
+    Value & v,
+    XMLWriter & doc,
+    NixStringContext & context,
+    StringSet & drvsSeen,
+    const PosIdx pos)
+{
+    checkInterrupt();
+
+    auto _level = state.addCallDepth(pos);
+
+    if (strict)
+        state.forceValue(v, pos);
+
+    switch (v.type()) {
+
+    case nAttrs:
+        if (state.isDerivation(v))
+            printDerivationAsXML(state, strict, location, v, doc, context, drvsSeen);
+        else {
+            XMLOpenElement _(doc, "attrs");
+            showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
+        }
+        break;
+
+    case nList: {
+        XMLOpenElement _(doc, "list");
+        for (auto v2 : v.listView())
+            printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);
+        break;
+    }
+
+    case nThunk:
+    case nFailed:
+    case nInt:
+    case nFloat:
+    case nBool:
+    case nString:
+    case nPath:
+    case nNull:
+    case nFunction:
+    case nExternal:
+        printLeafAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
         break;
     }
 }
