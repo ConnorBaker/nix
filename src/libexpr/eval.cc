@@ -3247,6 +3247,19 @@ void EvalState::assertEqValues(Value & v1, Value & v2, const PosIdx pos, std::st
     }
 }
 
+/* eqValues of two same-sized attribute sets, one of them layered: the merge
+   iterators on the heap. */
+[[gnu::noinline]] static bool
+eqLayeredAttrs(EvalState & state, Value & v1, Value & v2, const PosIdx pos, std::string_view errorCtx)
+{
+    auto i = std::unique_ptr<Bindings::const_iterator>(new Bindings::const_iterator(v1.attrs()->begin()));
+    auto j = std::unique_ptr<Bindings::const_iterator>(new Bindings::const_iterator(v2.attrs()->begin()));
+    for (auto n = v1.attrs()->size(); n > 0; --n, ++*i, ++*j)
+        if ((*i)->name != (*j)->name || !state.eqValues(*(*i)->value, *(*j)->value, pos, errorCtx))
+            return false;
+    return true;
+}
+
 // This implementation must match assertEqValues
 bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_view errorCtx)
 {
@@ -3310,10 +3323,14 @@ bool EvalState::eqValues(Value & v1, Value & v2, const PosIdx pos, std::string_v
         if (v1.attrs()->size() != v2.attrs()->size())
             return false;
 
-        /* Otherwise, compare the attributes one by one. */
-        Bindings::const_iterator i, j;
-        for (i = v1.attrs()->begin(), j = v2.attrs()->begin(); i != v1.attrs()->end(); ++i, ++j)
-            if (i->name != j->name || !eqValues(*i->value, *j->value, pos, errorCtx))
+        /* Otherwise, compare the attributes one by one: by index, so that no
+           Bindings iterator is in this frame, unless a set is layered. */
+        if (v1.attrs()->isLayered() || v2.attrs()->isLayered()) [[unlikely]]
+            return eqLayeredAttrs(*this, v1, v2, pos, errorCtx);
+        auto attrs1 = v1.attrs()->unlayered();
+        auto attrs2 = v2.attrs()->unlayered();
+        for (size_t k = 0; k < attrs1.size(); ++k)
+            if (attrs1[k].name != attrs2[k].name || !eqValues(*attrs1[k].value, *attrs2[k].value, pos, errorCtx))
                 return false;
 
         return true;
