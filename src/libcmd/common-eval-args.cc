@@ -147,6 +147,12 @@ MixEvalArgs::MixEvalArgs()
     });
 }
 
+/* Out of line: keeps set_intersection's iterators out of getAutoArgs's frame. */
+[[gnu::noinline]] static const Bindings * finishAutoArgs(BindingsBuilder & res)
+{
+    return res.finish();
+}
+
 const Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
 {
     auto res = state.buildBindings(autoArgs.size());
@@ -169,7 +175,7 @@ const Bindings * MixEvalArgs::getAutoArgs(EvalState & state)
             arg);
         res.insert(state.symbols.create(name), v);
     }
-    return res.finish();
+    return finishAutoArgs(res);
 }
 
 SourcePath lookupFileArg(EvalState & state, std::string_view s, const std::filesystem::path * baseDir)

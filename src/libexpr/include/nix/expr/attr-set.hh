@@ -151,9 +151,10 @@ public:
             pointer current;
 
             /**
-             * One past the end pointer to the contiguous buffer of Attrs.
+             * How many Attrs of the contiguous buffer are left, from `current` on (a
+             * count, not an end pointer: a cursor is 16 bytes, not 24).
              */
-            pointer end;
+            size_type remaining;
 
             /**
              * Priority of the value. Lesser values have more priority (i.e. they override
@@ -173,18 +174,19 @@ public:
 
             bool empty() const noexcept
             {
-                return current == end;
+                return remaining == 0;
             }
 
             void increment() noexcept
             {
                 ++current;
+                --remaining;
             }
 
             void consume(Symbol name) noexcept
             {
                 while (!empty() && current->name <= name)
-                    ++current;
+                    increment();
             }
 
             GENERATE_CMP(BindingsCursor, me->current->name, me->priority)
@@ -269,7 +271,7 @@ public:
                 push(
                     BindingsCursor{
                         .current = first,
-                        .end = first + layer.numAttrs,
+                        .remaining = layer.numAttrs,
                         .priority = priority++,
                     });
             };
@@ -314,7 +316,7 @@ public:
         {
             if (!doMerge) {
                 ++current;
-                if (current == cursorHeap.front().end)
+                if (current == cursorHeap.front().current + cursorHeap.front().remaining)
                     return finished();
                 return *this;
             }
