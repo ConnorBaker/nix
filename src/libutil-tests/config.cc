@@ -1,5 +1,8 @@
 #include "nix/util/configuration.hh"
 
+#include <filesystem>
+#include <list>
+
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
@@ -303,6 +306,17 @@ TEST(Config, applyConfigWithReassignedSetting)
     config.getSettings(settings);
     ASSERT_FALSE(settings.empty());
     ASSERT_EQ(settings["name-of-the-setting"].value, "second-value");
+}
+
+TEST(Config, applyConfigAppendsToPathList)
+{
+    Config config;
+    Setting<std::list<std::filesystem::path>> setting{
+        &config, std::list<std::filesystem::path>{}, "name-of-the-setting", "description"};
+    config.applyConfig(
+        "name-of-the-setting = /a\n"
+        "extra-name-of-the-setting = /b /c\n");
+    ASSERT_EQ(setting.get(), (std::list<std::filesystem::path>{"/a", "/b", "/c"}));
 }
 
 TEST(Config, applyConfigFailsOnMissingIncludes)
