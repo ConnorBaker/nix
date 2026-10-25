@@ -524,6 +524,12 @@ private:
         fileEvalCache;
 
     /**
+     * The cell of `fileEvalCache` for the file at `path`, added as a thunk if
+     * it is not there.
+     */
+    [[gnu::noinline]] Value * fileEvalCell(const SourcePath & path, bool mustBeTrivial);
+
+    /**
      * Associate source positions of certain AST nodes with their preceding doc comment, if they have one.
      * Grouped by file.
      */

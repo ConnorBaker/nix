@@ -1178,7 +1178,7 @@ struct ExprParseFile : Expr, gc
 
 } // namespace
 
-void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
+Value * EvalState::fileEvalCell(const SourcePath & path, bool mustBeTrivial)
 {
     auto resolvedPath = getConcurrent(*importResolutionCache, path);
 
@@ -1187,11 +1187,8 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
         importResolutionCache->emplace(path, *resolvedPath);
     }
 
-    if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath)) {
-        forceValue(**v2, noPos);
-        v = **v2;
-        return;
-    }
+    if (auto v2 = getConcurrent(*fileEvalCache, *resolvedPath))
+        return *v2;
 
     Value * vExpr;
     // FIXME: put ExprParseFile on the stack instead of the heap once
@@ -1209,6 +1206,13 @@ void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
             i.second = vExpr;
         },
         [&](auto & i) { vExpr = i.second; });
+
+    return vExpr;
+}
+
+void EvalState::evalFile(const SourcePath & path, Value & v, bool mustBeTrivial)
+{
+    auto vExpr = fileEvalCell(path, mustBeTrivial);
 
     forceValue(*vExpr, noPos);
 
@@ -2966,13 +2970,19 @@ SourcePath EvalState::coerceToPath(const PosIdx pos, Value & v, NixStringContext
         });
 }
 
+[[gnu::noinline]] static StorePath
+coercedStorePath(EvalState & state, BackedStringView && s, const PosIdx pos, std::string_view errorCtx)
+{
+    auto path = std::move(s).toOwned();
+    if (auto storePath = state.store->maybeParseStorePath(path))
+        return *storePath;
+    state.error<EvalError>("path '%1%' is not in the Nix store", path).withTrace(pos, errorCtx).debugThrow();
+}
+
 StorePath
 EvalState::coerceToStorePath(const PosIdx pos, Value & v, NixStringContext & context, std::string_view errorCtx)
 {
-    auto path = coerceToString(pos, v, context, errorCtx, false, false, true).toOwned();
-    if (auto storePath = store->maybeParseStorePath(path))
-        return *storePath;
-    error<EvalError>("path '%1%' is not in the Nix store", path).withTrace(pos, errorCtx).debugThrow();
+    return coercedStorePath(*this, coerceToString(pos, v, context, errorCtx, false, false, true), pos, errorCtx);
 }
 
 std::pair<SingleDerivedPath, std::string_view> EvalState::coerceToSingleDerivedPathUnchecked(
@@ -3622,7 +3632,8 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
         auto rOpt = resolveLookupPathPath(i.path);
         if (!rOpt)
             continue;
-        auto r = *rOpt;
+        /* Not copied: this frame is on the stack while the path is resolved. */
+        const auto & r = *rOpt;
 
         auto suffixPath = CanonPath(suffix);
         if (auto cachedRes = getConcurrent(*rOpt->resolvedPaths, suffixPath)) {
