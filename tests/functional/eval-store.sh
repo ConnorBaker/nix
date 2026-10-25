@@ -63,6 +63,20 @@ EOF
 nix flake check --eval-store "$eval_store" --store "$remote_store" "path:$flake_dir"
 rm -rf "$remote_root"
 
+# The build hook reads derivations from the build store, so it must copy
+# them there from the evaluation store first (#13179). With --max-jobs 0,
+# only the hook can build.
+builder_root=$TEST_ROOT/eval-store-builder
+hook_out=$(
+    nix build -f dependencies.nix --eval-store "$eval_store" --max-jobs 0 \
+        --builders "ssh-ng://localhost?remote-store=$builder_root - - 1 1" \
+        --no-link --print-out-paths
+)
+[[ -e "$builder_root$hook_out/foobar" ]]
+[[ -e "$hook_out/foobar" ]]
+rm -rf "$builder_root"
+clearStore
+
 nix build -f dependencies.nix --eval-store "$eval_store" -o "$TEST_ROOT/result"
 [[ -e $TEST_ROOT/result/foobar ]]
 if [[ -z "${NIX_TESTS_CA_BY_DEFAULT:-}" ]]; then
