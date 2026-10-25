@@ -21,6 +21,12 @@
 namespace nix {
 
 template<>
+struct BaseSetting<std::list<std::filesystem::path>>::trait
+{
+    static constexpr bool appendable = true;
+};
+
+template<>
 struct BaseSetting<Strings>::trait
 {
     static constexpr bool appendable = true;
