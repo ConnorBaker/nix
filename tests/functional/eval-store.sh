@@ -32,50 +32,11 @@ out=$(nix build -f dependencies.nix --eval-store "$eval_store" --dry-run 2>&1)
 
 # RemoteStore must not query the build store for a derivation that only exists
 # in the evaluation store. The builder copies it after the missing-path query.
-remote_root=$TEST_ROOT/remote-build-store
-remote_store="ssh-ng://localhost?remote-store=$remote_root"
+# Building through such a store needs the sandbox: see eval-store-remote.sh.
+remote_store="ssh-ng://localhost?remote-store=$TEST_ROOT/remote-build-store"
 out=$(nix build -f dependencies.nix --eval-store "$eval_store" --store "$remote_store" --dry-run 2>&1)
 [[ $out != *"don't know how to build"* ]]
 [[ $out == *"will be built"* ]]
-remote_out=$(
-    nix build -f dependencies.nix --eval-store "$eval_store" --store "$remote_store" \
-        --no-link --print-out-paths
-)
-[[ -e "$remote_root$remote_out/foobar" ]]
-
-# Flake checks must pass the evaluation store to the remote builder after the
-# client-side missing-path traversal has selected the checks to build.
-flake_dir=$TEST_ROOT/eval-store-flake
-mkdir -p "$flake_dir"
-shell=$(nix eval --raw -f ./config.nix shell)
-cat > "$flake_dir/flake.nix" <<EOF
-{
-  outputs = { ... }: {
-    checks.$system.default = derivation {
-      name = "eval-store-flake-check";
-      system = "$system";
-      builder = "$shell";
-      args = [ "-c" "printf checked > \$out" ];
-    };
-  };
-}
-EOF
-nix flake check --eval-store "$eval_store" --store "$remote_store" "path:$flake_dir"
-rm -rf "$remote_root"
-
-# The build hook reads derivations from the build store, so it must copy
-# them there from the evaluation store first (#13179). With --max-jobs 0,
-# only the hook can build.
-builder_root=$TEST_ROOT/eval-store-builder
-hook_out=$(
-    nix build -f dependencies.nix --eval-store "$eval_store" --max-jobs 0 \
-        --builders "ssh-ng://localhost?remote-store=$builder_root - - 1 1" \
-        --no-link --print-out-paths
-)
-[[ -e "$builder_root$hook_out/foobar" ]]
-[[ -e "$hook_out/foobar" ]]
-rm -rf "$builder_root"
-clearStore
 
 nix build -f dependencies.nix --eval-store "$eval_store" -o "$TEST_ROOT/result"
 [[ -e $TEST_ROOT/result/foobar ]]
