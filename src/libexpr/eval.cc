@@ -1768,6 +1768,35 @@ void EvalState::incrPrimOpCall(const std::string & name)
     primOpCalls->try_emplace_or_visit(name, 1, [](auto & i) { i.second++; });
 }
 
+void EvalState::callPrimOpApp(
+    Value & vCur, Value * primOp, size_t argsDone, size_t argsLeft, std::span<Value * const> args, const PosIdx pos)
+{
+    Value * vArgs[maxPrimOpArity];
+    auto n = argsDone;
+    for (Value * arg = &vCur; arg->isPrimOpApp(); arg = arg->primOpApp().left)
+        vArgs[--n] = arg->primOpApp().right;
+
+    for (size_t i = 0; i < argsLeft; ++i)
+        vArgs[argsDone + i] = args[i];
+
+    auto fn = primOp->primOp();
+    nrPrimOpCalls++;
+    if (countCalls)
+        incrPrimOpCall(fn->name);
+
+    try {
+        // TODO:
+        // 1. Unify this and above code. Heavily redundant.
+        // 2. Create a fake env (arg1, arg2, etc.) and a fake expr (arg1: arg2: etc: builtins.name arg1 arg2
+        // etc)
+        //    so the debugger allows to inspect the wrong parameters passed to the builtin.
+        fn->impl(*this, CallSite{pos}, vArgs, vCur);
+    } catch (Error & e) {
+        addBuiltinTrace(*this, e, pos, *fn);
+        throw;
+    }
+}
+
 void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos)
 {
     forceValue(fun, pos);
@@ -1885,32 +1914,9 @@ void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, V
                 return;
             } else {
                 /* We have all the arguments, so call the primop with
-                   the previous and new arguments. */
-
-                Value * vArgs[maxPrimOpArity];
-                auto n = argsDone;
-                for (Value * arg = &vCur; arg->isPrimOpApp(); arg = arg->primOpApp().left)
-                    vArgs[--n] = arg->primOpApp().right;
-
-                for (size_t i = 0; i < argsLeft; ++i)
-                    vArgs[argsDone + i] = args[i];
-
-                auto fn = primOp->primOp();
-                nrPrimOpCalls++;
-                if (countCalls)
-                    incrPrimOpCall(fn->name);
-
-                try {
-                    // TODO:
-                    // 1. Unify this and above code. Heavily redundant.
-                    // 2. Create a fake env (arg1, arg2, etc.) and a fake expr (arg1: arg2: etc: builtins.name arg1 arg2
-                    // etc)
-                    //    so the debugger allows to inspect the wrong parameters passed to the builtin.
-                    fn->impl(*this, CallSite{pos}, vArgs, vCur);
-                } catch (Error & e) {
-                    addBuiltinTrace(*this, e, pos, *fn);
-                    throw;
-                }
+                   the previous and new arguments (out of line: the
+                   arguments' array stays out of this frame). */
+                callPrimOpApp(vCur, primOp, argsDone, argsLeft, args, pos);
 
                 args = args.subspan(argsLeft);
             }

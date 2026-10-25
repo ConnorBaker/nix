@@ -1042,6 +1042,16 @@ private:
     callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos);
     [[gnu::noinline, gnu::cold]] void
     callFunctionProfiled(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
+    /**
+     * Calls a partially applied primop with its last arguments.
+     */
+    [[gnu::noinline]] void callPrimOpApp(
+        Value & vCur,
+        Value * primOp,
+        size_t argsDone,
+        size_t argsLeft,
+        std::span<Value * const> args,
+        const PosIdx pos);
 
 public:
 
