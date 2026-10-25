@@ -878,13 +878,13 @@ void EvalState::addErrorTrace(Error & e, const PosIdx pos, const Args &... forma
     e.addTrace(positions[pos], HintFmt(formatArgs...));
 }
 
+/* Cold: the evaluator's recursive functions call this only under the debugger. */
 template<typename... Args>
-static std::unique_ptr<DebugTraceStacker> makeDebugTraceStacker(
-    EvalState & state, Expr & expr, Env & env, std::variant<Pos, PosIdx> pos, const Args &... formatArgs)
+[[gnu::noinline, gnu::cold]] static std::unique_ptr<DebugTraceStacker>
+makeDebugTraceStacker(EvalState & state, Expr & expr, Env & env, PosIdx pos, const Args &... formatArgs)
 {
     return std::make_unique<DebugTraceStacker>(
-        state,
-        DebugTrace{.pos = std::move(pos), .expr = expr, .env = env, .hint = HintFmt(formatArgs...), .isError = false});
+        state, DebugTrace{.pos = pos, .expr = expr, .env = env, .hint = HintFmt(formatArgs...), .isError = false});
 }
 
 DebugTraceStacker::DebugTraceStacker(EvalState & evalState, DebugTrace t)
@@ -1134,11 +1134,7 @@ struct ExprParseFile : Expr, gc
         auto e = state.parseExprFromFile(path);
 
         try {
-            auto dts =
-                state.debugRepl
-                    ? makeDebugTraceStacker(
-                          state, *e, state.baseEnv, e->getPos(), "while evaluating the file '%s':", path.to_string())
-                    : nullptr;
+            auto dts = state.debugRepl ? debugTraceStacker(state, *e) : nullptr;
 
             // Enforce that 'flake.nix' is a direct attrset, not a
             // computation.
@@ -1150,6 +1146,12 @@ struct ExprParseFile : Expr, gc
             state.addErrorTrace(e, "while evaluating the file '%s':", path.to_string());
             throw;
         }
+    }
+
+    [[gnu::noinline, gnu::cold]] std::unique_ptr<DebugTraceStacker> debugTraceStacker(EvalState & state, Expr & e)
+    {
+        return makeDebugTraceStacker(
+            state, e, state.baseEnv, e.getPos(), "while evaluating the file '%s':", path.to_string());
     }
 };
 
@@ -1457,6 +1459,20 @@ static std::string showAttrSelectionPath(EvalState & state, Env & env, std::span
     return out.str();
 }
 
+/* The cold paths of ExprSelect::eval, out of line. */
+
+[[gnu::noinline, gnu::cold]] static std::unique_ptr<DebugTraceStacker>
+selectDebugTraceStacker(EvalState & state, ExprSelect & sel, Env & env)
+{
+    return makeDebugTraceStacker(
+        state,
+        sel,
+        env,
+        sel.getPos(),
+        "while evaluating the attribute '%1%'",
+        showAttrSelectionPath(state, env, sel.getAttrPath()));
+}
+
 void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 {
     Value vTmp;
@@ -1469,14 +1485,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
     e->eval(state, env, vTmp, "while selecting an attribute");
 
     try {
-        auto dts = state.debugRepl ? makeDebugTraceStacker(
-                                         state,
-                                         *this,
-                                         env,
-                                         getPos(),
-                                         "while evaluating the attribute '%1%'",
-                                         showAttrSelectionPath(state, env, getAttrPath()))
-                                   : nullptr;
+        auto dts = state.debugRepl ? selectDebugTraceStacker(state, *this, env) : nullptr;
 
         for (auto & i : getAttrPath()) {
             state.nrLookups++;
@@ -1608,6 +1617,20 @@ void ExprLambda::eval(EvalState & state, Env & env, Value & v)
     v.mkLambda(&env, this);
 }
 
+/* The cold paths of EvalState::callFunction, out of line. */
+
+[[gnu::noinline, gnu::cold]] static std::unique_ptr<DebugTraceStacker>
+lambdaDebugTraceStacker(EvalState & state, ExprLambda & lambda, Env & env2)
+{
+    return makeDebugTraceStacker(
+        state,
+        *lambda.body,
+        env2,
+        lambda.pos,
+        "while calling %s",
+        lambda.name ? concatStrings("'", state.symbols[lambda.name], "'") : "anonymous lambda");
+}
+
 /* Partial application of a primop. A function, not a lambda in callFunction,
    so that its closure is never in callFunction's frame. */
 [[gnu::noinline]] static void makeAppChain(EvalState & state, Value & vCur, std::span<Value * const> args, Value & vRes)
@@ -1720,15 +1743,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
             /* Evaluate the body. */
             try {
-                auto dts = debugRepl
-                               ? makeDebugTraceStacker(
-                                     *this,
-                                     *lambda.body,
-                                     env2,
-                                     lambda.pos,
-                                     "while calling %s",
-                                     lambda.name ? concatStrings("'", symbols[lambda.name], "'") : "anonymous lambda")
-                               : nullptr;
+                auto dts = debugRepl ? lambdaDebugTraceStacker(*this, lambda, env2) : nullptr;
 
                 lambda.body->eval(*this, env2, vCur);
             } catch (Error & e) {
@@ -2364,6 +2379,19 @@ void EvalState::tryFixupBlackHolePos(Value & v, PosIdx pos)
     }
 }
 
+/* The debugger's trace of an attribute that `forceValueDeep` is about to force. */
+[[gnu::noinline, gnu::cold]] static std::unique_ptr<DebugTraceStacker>
+forceValueDeepTrace(EvalState & state, const Attr & i)
+{
+    return makeDebugTraceStacker(
+        state,
+        *i.value->thunk().expr,
+        *i.value->thunk().env,
+        i.pos,
+        "while evaluating the attribute '%1%'",
+        state.symbols[i.name]);
+}
+
 void EvalState::forceValueDeep(Value & v)
 {
     std::set<const Value *> seen;
@@ -2380,14 +2408,7 @@ void EvalState::forceValueDeep(Value & v)
             for (auto & i : *v.attrs())
                 try {
                     // If the value is a thunk, we're evaling. Otherwise no trace necessary.
-                    auto dts = state.debugRepl && i.value->isThunk() ? makeDebugTraceStacker(
-                                                                           state,
-                                                                           *i.value->thunk().expr,
-                                                                           *i.value->thunk().env,
-                                                                           i.pos,
-                                                                           "while evaluating the attribute '%1%'",
-                                                                           state.symbols[i.name])
-                                                                     : nullptr;
+                    auto dts = state.debugRepl && i.value->isThunk() ? forceValueDeepTrace(state, i) : nullptr;
 
                     recurse(*i.value);
                 } catch (Error & e) {
