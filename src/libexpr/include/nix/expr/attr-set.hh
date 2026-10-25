@@ -379,6 +379,16 @@ public:
     }
 
     /**
+     * The attributes of a Bindings that is not layered, without an iterator.
+     */
+    std::span<const Attr> unlayered() const
+    {
+        if (isLayered()) [[unlikely]]
+            unreachable();
+        return {attrs, numAttrs};
+    }
+
+    /**
      * Check if the layer chain is full.
      */
     bool isLayerListFull() const noexcept

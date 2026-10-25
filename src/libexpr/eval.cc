@@ -2587,6 +2587,16 @@ forceValueDeepTrace(EvalState & state, const Attr & i)
     state.addErrorTrace(e, "while evaluating list element at index %1%", index);
 }
 
+/* A layered set's attributes, with the merge iterator on the heap (built from
+   `begin()`'s prvalue; `std::make_unique` would put a temporary in this frame). */
+template<typename F>
+[[gnu::noinline]] static void forEachLayeredAttr(const Bindings & attrs, F & f)
+{
+    auto i = std::unique_ptr<Bindings::const_iterator>(new Bindings::const_iterator(attrs.begin()));
+    for (auto n = attrs.size(); n > 0; --n, ++*i)
+        f(**i);
+}
+
 void EvalState::forceValueDeep(Value & v)
 {
     std::set<const Value *> seen;
@@ -2600,7 +2610,7 @@ void EvalState::forceValueDeep(Value & v)
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
-            for (auto & i : *v.attrs())
+            auto deepAttr = [&](const Attr & i) {
                 try {
                     // If the value is a thunk, we're evaling. Otherwise no trace necessary.
                     auto dts = state.debugRepl && i.value->isThunk() ? forceValueDeepTrace(state, i) : nullptr;
@@ -2610,6 +2620,13 @@ void EvalState::forceValueDeep(Value & v)
                     addAttrTrace(state, e, i);
                     throw;
                 }
+            };
+            auto & attrs = *v.attrs();
+            if (!attrs.isLayered())
+                for (auto & i : attrs.unlayered())
+                    deepAttr(i);
+            else
+                forEachLayeredAttr(attrs, deepAttr);
         }
 
         else if (v.isList()) {
