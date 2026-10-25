@@ -1608,6 +1608,18 @@ void ExprLambda::eval(EvalState & state, Env & env, Value & v)
     v.mkLambda(&env, this);
 }
 
+/* Partial application of a primop. A function, not a lambda in callFunction,
+   so that its closure is never in callFunction's frame. */
+[[gnu::noinline]] static void makeAppChain(EvalState & state, Value & vCur, std::span<Value * const> args, Value & vRes)
+{
+    for (auto arg : args) {
+        auto fun2 = state.allocValue();
+        *fun2 = vCur;
+        vCur.mkPrimOpApp(fun2, arg);
+    }
+    vRes = vCur;
+}
+
 void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
 {
     auto _level = addCallDepth(pos);
@@ -1624,15 +1636,6 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
     forceValue(fun, pos);
 
     Value vCur(fun);
-
-    auto makeAppChain = [&]() {
-        for (auto arg : args) {
-            auto fun2 = allocValue();
-            *fun2 = vCur;
-            vCur.mkPrimOpApp(fun2, arg);
-        }
-        vRes = vCur;
-    };
 
     const Attr * functor;
 
@@ -1750,7 +1753,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
             if (args.size() < argsLeft) {
                 /* We don't have enough arguments, so create a tPrimOpApp chain. */
-                makeAppChain();
+                makeAppChain(*this, vCur, args, vRes);
                 return;
             } else {
                 /* We have all the arguments, so call the primop. */
@@ -1786,7 +1789,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
             if (args.size() < argsLeft) {
                 /* We still don't have enough arguments, so extend the tPrimOpApp chain. */
-                makeAppChain();
+                makeAppChain(*this, vCur, args, vRes);
                 return;
             } else {
                 /* We have all the arguments, so call the primop with
