@@ -1424,6 +1424,49 @@ static void prim_second(EvalState & state, CallSite callSite, Value * const * ar
 [[gnu::noinline]] static void
 derivationStrictInternal(EvalState & state, std::string_view name, const Bindings * attrs, Value & v);
 
+/* The traces that `prim_derivationStrict` adds to a failure, out of line. */
+[[gnu::noinline, gnu::cold]] static void addDerivationNameTrace(EvalState & state, Error & e, PosIdx namePos)
+{
+    e.addTrace(state.positions[namePos], "while evaluating the derivation attribute 'name'");
+}
+
+[[gnu::noinline, gnu::cold]] static void
+addDerivationTrace(EvalState & state, Error & e, std::string_view drvName, PosIdx namePos)
+{
+    Pos pos = state.positions[namePos];
+    /*
+     * Here we call addTrace in a slightly unusual way:
+     *
+     * 1. We print the location as a string (instead of passing it via the
+     * first argument to addTrace) to avoid a code snippet being printed.
+     * While the location of the name attribute is a good hint, the exact
+     * code there is irrelevant.
+     *
+     * Please keep in mind that error reporting is done on a best-effort
+     * basis in nix. There is no single accurate location for a derivation,
+     * as it often results from the composition of several functions
+     * (derivationStrict, derivation, mkDerivation, mkPythonModule, etc.)
+     *
+     * 2. We use TracePrint::Always so that users who have not enabled
+     * --show-trace will still get a full trace of the derivation
+     * dependency chain that led to an evaluation error. The user may be
+     * interested in the last item in the chain (the derivation with an
+     * eval issue), an item near the top of the chain (a package they added
+     * to their configuration), or an item in the middle of the chain (an
+     * optional dependency they can remove with an override somewhere
+     * because they don't need the corresponding functionality), so
+     * displaying the entire chain is worth the space.
+     */
+    e.addTrace(
+        nullptr,
+        HintFmt(
+            "while evaluating derivation '%s'\n"
+            "  whose name attribute is located at %s",
+            drvName,
+            pos),
+        TracePrint::Always);
+}
+
 /* Construct (as a unobservable side effect) a Nix derivation
    expression that performs the derivation described by the argument
    set.  Returns the original set extended with the following
@@ -1446,45 +1489,14 @@ static void prim_derivationStrict(EvalState & state, CallSite callSite, Value * 
         drvName = state.forceStringNoCtx(
             *nameAttr->value, noPos, "while evaluating the `name` attribute passed to builtins.derivationStrict");
     } catch (Error & e) {
-        e.addTrace(state.positions[nameAttr->pos], "while evaluating the derivation attribute 'name'");
+        addDerivationNameTrace(state, e, nameAttr->pos);
         throw;
     }
 
     try {
         derivationStrictInternal(state, drvName, attrs, v);
     } catch (Error & e) {
-        Pos pos = state.positions[nameAttr->pos];
-        /*
-         * Here we call addTrace in a slightly unusual way:
-         *
-         * 1. We print the location as a string (instead of passing it via the
-         * first argument to addTrace) to avoid a code snippet being printed.
-         * While the location of the name attribute is a good hint, the exact
-         * code there is irrelevant.
-         *
-         * Please keep in mind that error reporting is done on a best-effort
-         * basis in nix. There is no single accurate location for a derivation,
-         * as it often results from the composition of several functions
-         * (derivationStrict, derivation, mkDerivation, mkPythonModule, etc.)
-         *
-         * 2. We use TracePrint::Always so that users who have not enabled
-         * --show-trace will still get a full trace of the derivation
-         * dependency chain that led to an evaluation error. The user may be
-         * interested in the last item in the chain (the derivation with an
-         * eval issue), an item near the top of the chain (a package they added
-         * to their configuration), or an item in the middle of the chain (an
-         * optional dependency they can remove with an override somewhere
-         * because they don't need the corresponding functionality), so
-         * displaying the entire chain is worth the space.
-         */
-        e.addTrace(
-            nullptr,
-            HintFmt(
-                "while evaluating derivation '%s'\n"
-                "  whose name attribute is located at %s",
-                drvName,
-                pos),
-            TracePrint::Always);
+        addDerivationTrace(state, e, drvName, nameAttr->pos);
         throw;
     }
 }
@@ -1493,9 +1505,12 @@ static void prim_derivationStrict(EvalState & state, CallSite callSite, Value * 
  * Early validation for the derivation name, for better error message.
  * It is checked again when constructing store paths.
  *
+ * Out of line: inlined, its error's formatter would be part of the frame of
+ * `derivationStrictInternal`.
+ *
  * @todo Check that the `.drv` suffix also fits.
  */
-static void checkDerivationName(EvalState & state, std::string_view drvName)
+[[gnu::noinline]] static void checkDerivationName(EvalState & state, std::string_view drvName)
 {
     try {
         checkName(drvName);
@@ -1518,286 +1533,328 @@ addDerivationAttrTrace(EvalState & state, Error & e, PosIdx pos, const SymbolStr
     e.addTrace(state.positions[pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
 }
 
-static void derivationStrictInternal(EvalState & state, std::string_view drvName, const Bindings * attrs, Value & v)
+namespace {
+
+/* What `derivationStrictInternal` gathers from the attributes, on the heap:
+   it is live while every attribute is evaluated. */
+struct DerivationStrictState
 {
-    checkDerivationName(state, drvName);
-
-    /* Check whether attributes should be passed as a JSON file. */
-    using nlohmann::json;
-    std::optional<StructuredAttrs> jsonObject;
-    auto pos = v.determinePos(noPos);
-    auto attr = attrs->get(state.s.structuredAttrs);
-    if (attr
-        && state.forceBool(
-            *attr->value,
-            pos,
-            "while evaluating the `__structuredAttrs` "
-            "attribute passed to builtins.derivationStrict"))
-        jsonObject = StructuredAttrs{};
-
-    /* Check whether null attributes should be ignored. */
-    bool ignoreNulls = false;
-    attr = attrs->get(state.s.ignoreNulls);
-    if (attr)
-        ignoreNulls = state.forceBool(
-            *attr->value,
-            pos,
-            "while evaluating the `__ignoreNulls` attribute "
-            "passed to builtins.derivationStrict");
-
-    /* Build the derivation expression by processing the attributes. */
-    Derivation drv{
-        .name = std::string{drvName},
-    };
-
+    Derivation drv;
     NixStringContext context;
-
+    std::optional<StructuredAttrs> jsonObject;
+    bool ignoreNulls = false;
     bool contentAddressed = false;
     bool isImpure = false;
     bool isSubmittingOutputs = false;
     std::optional<std::string> outputHash;
     std::optional<HashAlgorithm> outputHashAlgo;
     std::optional<ContentAddressMethod> ingestionMethod;
-
     StringSet outputs;
-    outputs.insert("out");
+};
 
-    for (auto & i : attrs->lexicographicOrder(state.symbols)) {
-        if (i->name == state.s.ignoreNulls)
-            continue;
-        auto key = state.symbols[i->name];
-        vomit("processing attribute '%1%'", key);
+} // namespace
 
-        // Like `warn`, but with the position of the attribute and the derivation name as an added trace.
-        auto warnAttr = [&](HintFmt msg) {
-            ErrorInfo info{
-                .level = lvlWarn,
-                .msg = std::move(msg),
-                .pos = state.positions[i->pos],
-            };
-            info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
-            logWarning(info);
-        };
+[[gnu::noinline, gnu::cold]] static void vomitDerivationAttr(const SymbolStr & key)
+{
+    vomit("processing attribute '%1%'", key);
+}
 
-        auto handleHashMode = [&](const std::string_view s) {
-            if (s == "recursive") {
-                // back compat, new name is "nar"
-                ingestionMethod = ContentAddressMethod::Raw::NixArchive;
-            } else
-                try {
-                    ingestionMethod = ContentAddressMethod::parse(s);
-                } catch (UsageError &) {
-                    state.error<EvalError>("invalid value '%s' for 'outputHashMode' attribute", s)
-                        .atPos(v)
-                        .debugThrow();
-                }
-            if (ingestionMethod == ContentAddressMethod::Raw::Text)
-                experimentalFeatureSettings.require(
-                    Xp::DynamicDerivations, fmt("text-hashed derivation '%s', outputHashMode = \"text\"", drvName));
-            if (ingestionMethod == ContentAddressMethod::Raw::Git)
-                experimentalFeatureSettings.require(Xp::GitHashing);
-        };
+// Like `warn`, but with the position of the attribute and the derivation name as an added trace.
+[[gnu::noinline, gnu::cold]] static void
+warnDerivationAttr(EvalState & state, const Attr & i, std::string_view drvName, HintFmt msg)
+{
+    ErrorInfo info{
+        .level = lvlWarn,
+        .msg = std::move(msg),
+        .pos = state.positions[i.pos],
+    };
+    info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
+    logWarning(info);
+}
 
-        auto handleOutputs = [&](const Strings & ss) {
-            outputs.clear();
-            for (auto & j : ss) {
-                if (outputs.find(j) != outputs.end())
-                    state.error<EvalError>("duplicate derivation output '%1%'", j).atPos(v).debugThrow();
-                /* !!! Check whether j is a valid attribute
-                   name. */
-                /* Derivations cannot be named ‘drvPath’, because
-                   we already have an attribute ‘drvPath’ in
-                   the resulting set (see state.sDrvPath). */
-                if (j == "drvPath")
-                    state.error<EvalError>("invalid derivation output name 'drvPath'").atPos(v).debugThrow();
-                outputs.insert(j);
-            }
-            if (outputs.empty())
-                state.error<EvalError>("derivation cannot have an empty set of outputs").atPos(v).debugThrow();
-        };
-
+[[gnu::noinline]] static void handleDerivationHashMode(
+    EvalState & state, DerivationStrictState & d, std::string_view drvName, const std::string_view s, Value & v)
+{
+    if (s == "recursive") {
+        // back compat, new name is "nar"
+        d.ingestionMethod = ContentAddressMethod::Raw::NixArchive;
+    } else
         try {
-            // This try-catch block adds context for most errors.
-            // Use this empty error context to signify that we defer to it.
-            const std::string_view context_below("");
-
-            if (ignoreNulls) {
-                state.forceValue(*i->value, noPos);
-                if (i->value->type() == nNull)
-                    continue;
-            }
-
-            switch (i->name.getId()) {
-            case EvalState::s.contentAddressed.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
-                    contentAddressed = true;
-                    experimentalFeatureSettings.require(Xp::CaDerivations);
-                }
-                break;
-            case EvalState::s.impure.getId():
-                if (state.forceBool(*i->value, pos, context_below)) {
-                    isImpure = true;
-                    experimentalFeatureSettings.require(Xp::ImpureDerivations);
-                }
-                break;
-            /* The `args' attribute is special: it supplies the
-               command-line arguments to the builder. */
-            case EvalState::s.args.getId():
-                state.forceList(*i->value, pos, context_below);
-                for (auto elem : i->value->listView()) {
-                    auto s = state
-                                 .coerceToString(
-                                     pos, *elem, context, "while evaluating an element of the argument list", true)
-                                 .toOwned();
-                    drv.args.push_back(s);
-                }
-                break;
-            /* All other attributes are passed to the builder through
-               the environment. */
-            default:
-
-                if (jsonObject) {
-
-                    if (i->name == state.s.structuredAttrs)
-                        continue;
-
-                    jsonObject->structuredAttrs.emplace(key, printValueAsJSON(state, true, *i->value, pos, context));
-
-                    switch (i->name.getId()) {
-                    case EvalState::s.builder.getId():
-                        drv.builder = state.forceString(*i->value, context, pos, context_below);
-                        break;
-                    case EvalState::s.system.getId():
-                        drv.platform = state.forceStringNoCtx(*i->value, pos, context_below);
-                        break;
-                    case EvalState::s.outputHash.getId():
-                        outputHash = state.forceStringNoCtx(*i->value, pos, context_below);
-                        break;
-                    case EvalState::s.outputHashAlgo.getId():
-                        outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i->value, pos, context_below));
-                        break;
-                    case EvalState::s.outputHashMode.getId():
-                        handleHashMode(state.forceStringNoCtx(*i->value, pos, context_below));
-                        break;
-                    case EvalState::s.outputs.getId(): {
-                        /* Require 'outputs' to be a list of strings. */
-                        state.forceList(*i->value, pos, context_below);
-                        Strings ss;
-                        for (auto elem : i->value->listView())
-                            ss.emplace_back(state.forceStringNoCtx(*elem, pos, context_below));
-                        handleOutputs(ss);
-                        break;
-                    }
-                    case EvalState::s.requiredSystemFeatures.getId(): {
-                        /* Only parsed to detect `builder-rpc-v0`; skip
-                           entirely unless the experimental feature is
-                           enabled. */
-                        if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
-                            break;
-                        state.forceList(*i->value, pos, context_below);
-                        for (auto elem : i->value->listView()) {
-                            auto name = state.forceString(*elem, context, pos, context_below);
-                            if (name == drvFeatureBuilderRpcV0) {
-                                isSubmittingOutputs = true;
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    default:
-                        break;
-                    }
-
-                    switch (i->name.getId()) {
-                    case EvalState::s.allowedReferences.getId():
-                    case EvalState::s.allowedRequisites.getId():
-                    case EvalState::s.disallowedReferences.getId():
-                    case EvalState::s.disallowedRequisites.getId():
-                    case EvalState::s.maxSize.getId():
-                    case EvalState::s.maxClosureSize.getId():
-                        warnAttr(HintFmt(
-                            "'structuredAttrs' disables the effect of the derivation attribute '%1%'; use 'outputChecks.<output>.%1%' instead",
-                            key));
-                        break;
-                    default:
-                        break;
-                    }
-
-                } else {
-                    auto s = state.coerceToString(noPos, *i->value, context, context_below, true).toOwned();
-
-                    /* Re-interpret the attribute's value as a list of
-                       strings.
-
-                       We may wish to warn here better future-compat
-                       later, e.g. requiring that it be a list of
-                       strings without spaces to begin with. */
-                    auto forceStringList = [&] { return tokenizeString<Strings>(s); };
-
-                    if (i->name == state.s.json) {
-                        warnAttr(HintFmt(
-                            "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
-                        drv.structuredAttrs = StructuredAttrs::parse(s);
-                    } else {
-                        drv.env.emplace(key, s);
-                        switch (i->name.getId()) {
-                        case EvalState::s.builder.getId():
-                            drv.builder = std::move(s);
-                            break;
-                        case EvalState::s.system.getId():
-                            drv.platform = std::move(s);
-                            break;
-                        case EvalState::s.outputHash.getId():
-                            outputHash = std::move(s);
-                            break;
-                        case EvalState::s.outputHashAlgo.getId():
-                            outputHashAlgo = parseHashAlgoOpt(s);
-                            break;
-                        case EvalState::s.outputHashMode.getId():
-                            handleHashMode(s);
-                            break;
-                        case EvalState::s.outputs.getId():
-                            handleOutputs(forceStringList());
-                            break;
-                        case EvalState::s.requiredSystemFeatures.getId(): {
-                            /* Only parsed to detect `builder-rpc-v0`; skip
-                               entirely unless the experimental feature is
-                               enabled. */
-                            if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
-                                break;
-                            for (auto & name : forceStringList()) {
-                                if (name == drvFeatureBuilderRpcV0) {
-                                    isSubmittingOutputs = true;
-                                    break;
-                                }
-                            }
-                            break;
-                        }
-                        default:
-                            break;
-                        }
-                    }
-                }
-                break;
-            }
-
-        } catch (Error & e) {
-            addDerivationAttrTrace(state, e, i->pos, key, drvName);
-            throw;
+            d.ingestionMethod = ContentAddressMethod::parse(s);
+        } catch (UsageError &) {
+            state.error<EvalError>("invalid value '%s' for 'outputHashMode' attribute", s).atPos(v).debugThrow();
         }
+    if (d.ingestionMethod == ContentAddressMethod::Raw::Text)
+        experimentalFeatureSettings.require(
+            Xp::DynamicDerivations, fmt("text-hashed derivation '%s', outputHashMode = \"text\"", drvName));
+    if (d.ingestionMethod == ContentAddressMethod::Raw::Git)
+        experimentalFeatureSettings.require(Xp::GitHashing);
+}
+
+[[gnu::noinline]] static void
+handleDerivationOutputs(EvalState & state, DerivationStrictState & d, const Strings & ss, Value & v)
+{
+    d.outputs.clear();
+    for (auto & j : ss) {
+        if (d.outputs.find(j) != d.outputs.end())
+            state.error<EvalError>("duplicate derivation output '%1%'", j).atPos(v).debugThrow();
+        /* !!! Check whether j is a valid attribute
+           name. */
+        /* Derivations cannot be named ‘drvPath’, because
+           we already have an attribute ‘drvPath’ in
+           the resulting set (see state.sDrvPath). */
+        if (j == "drvPath")
+            state.error<EvalError>("invalid derivation output name 'drvPath'").atPos(v).debugThrow();
+        d.outputs.insert(j);
+    }
+    if (d.outputs.empty())
+        state.error<EvalError>("derivation cannot have an empty set of outputs").atPos(v).debugThrow();
+}
+
+/* The `args` attribute: the builder's command-line arguments. */
+[[gnu::noinline]] static void
+derivationArgsAttr(EvalState & state, DerivationStrictState & d, const Attr & i, PosIdx pos)
+{
+    const std::string_view context_below("");
+    state.forceList(*i.value, pos, context_below);
+    for (auto elem : i.value->listView()) {
+        auto s = state.coerceToString(pos, *elem, d.context, "while evaluating an element of the argument list", true)
+                     .toOwned();
+        d.drv.args.push_back(s);
+    }
+}
+
+[[gnu::noinline, gnu::cold]] static void
+warnStructuredAttrsIneffective(EvalState & state, const Attr & i, std::string_view drvName)
+{
+    warnDerivationAttr(
+        state,
+        i,
+        drvName,
+        HintFmt(
+            "'structuredAttrs' disables the effect of the derivation attribute '%1%'; use 'outputChecks.<output>.%1%' instead",
+            state.symbols[i.name]));
+}
+
+/* What a structured attribute sets besides its JSON, once the value is forced. */
+[[gnu::noinline]] static void derivationJsonAttrDone(
+    EvalState & state, DerivationStrictState & d, std::string_view drvName, const Attr & i, PosIdx pos, Value & v)
+{
+    const std::string_view context_below("");
+
+    switch (i.name.getId()) {
+    case EvalState::s.builder.getId():
+        d.drv.builder = state.forceString(*i.value, d.context, pos, context_below);
+        break;
+    case EvalState::s.system.getId():
+        d.drv.platform = state.forceStringNoCtx(*i.value, pos, context_below);
+        break;
+    case EvalState::s.outputHash.getId():
+        d.outputHash = state.forceStringNoCtx(*i.value, pos, context_below);
+        break;
+    case EvalState::s.outputHashAlgo.getId():
+        d.outputHashAlgo = parseHashAlgoOpt(state.forceStringNoCtx(*i.value, pos, context_below));
+        break;
+    case EvalState::s.outputHashMode.getId():
+        handleDerivationHashMode(state, d, drvName, state.forceStringNoCtx(*i.value, pos, context_below), v);
+        break;
+    case EvalState::s.outputs.getId(): {
+        /* Require 'outputs' to be a list of strings. */
+        state.forceList(*i.value, pos, context_below);
+        Strings ss;
+        for (auto elem : i.value->listView())
+            ss.emplace_back(state.forceStringNoCtx(*elem, pos, context_below));
+        handleDerivationOutputs(state, d, ss, v);
+        break;
+    }
+    case EvalState::s.requiredSystemFeatures.getId(): {
+        /* Only parsed to detect `builder-rpc-v0`; skip
+           entirely unless the experimental feature is
+           enabled. */
+        if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
+            break;
+        state.forceList(*i.value, pos, context_below);
+        for (auto elem : i.value->listView()) {
+            auto name = state.forceString(*elem, d.context, pos, context_below);
+            if (name == drvFeatureBuilderRpcV0) {
+                d.isSubmittingOutputs = true;
+                break;
+            }
+        }
+        break;
+    }
+    default:
+        break;
     }
 
-    if (jsonObject) {
+    switch (i.name.getId()) {
+    case EvalState::s.allowedReferences.getId():
+    case EvalState::s.allowedRequisites.getId():
+    case EvalState::s.disallowedReferences.getId():
+    case EvalState::s.disallowedRequisites.getId():
+    case EvalState::s.maxSize.getId():
+    case EvalState::s.maxClosureSize.getId():
+        warnStructuredAttrsIneffective(state, i, drvName);
+        break;
+    default:
+        break;
+    }
+}
+
+/* An attribute of a derivation with structured attributes: its JSON, the
+   value's evaluation, here, and the rest out of line. */
+[[gnu::noinline]] static void derivationJsonAttr(
+    EvalState & state, DerivationStrictState & d, std::string_view drvName, const Attr & i, PosIdx pos, Value & v)
+{
+    d.jsonObject->structuredAttrs.emplace(
+        state.symbols[i.name], printValueAsJSON(state, true, *i.value, pos, d.context));
+    derivationJsonAttrDone(state, d, drvName, i, pos, v);
+}
+
+/* An attribute of a derivation without structured attributes, once its
+   value is a string, `s`: passed to the builder through the environment. */
+[[gnu::noinline]] static void derivationEnvAttr(
+    EvalState & state, DerivationStrictState & d, std::string_view drvName, const Attr & i, std::string s, Value & v)
+{
+    /* Re-interpret the attribute's value as a list of
+       strings.
+
+       We may wish to warn here better future-compat
+       later, e.g. requiring that it be a list of
+       strings without spaces to begin with. */
+    auto forceStringList = [&] { return tokenizeString<Strings>(s); };
+
+    if (i.name == state.s.json) {
+        warnDerivationAttr(
+            state,
+            i,
+            drvName,
+            HintFmt(
+                "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
+        d.drv.structuredAttrs = StructuredAttrs::parse(s);
+    } else {
+        d.drv.env.emplace(state.symbols[i.name], s);
+        switch (i.name.getId()) {
+        case EvalState::s.builder.getId():
+            d.drv.builder = std::move(s);
+            break;
+        case EvalState::s.system.getId():
+            d.drv.platform = std::move(s);
+            break;
+        case EvalState::s.outputHash.getId():
+            d.outputHash = std::move(s);
+            break;
+        case EvalState::s.outputHashAlgo.getId():
+            d.outputHashAlgo = parseHashAlgoOpt(s);
+            break;
+        case EvalState::s.outputHashMode.getId():
+            handleDerivationHashMode(state, d, drvName, s, v);
+            break;
+        case EvalState::s.outputs.getId():
+            handleDerivationOutputs(state, d, forceStringList(), v);
+            break;
+        case EvalState::s.requiredSystemFeatures.getId(): {
+            /* Only parsed to detect `builder-rpc-v0`; skip
+               entirely unless the experimental feature is
+               enabled. */
+            if (!experimentalFeatureSettings.isEnabled(Xp::DynamicDerivations))
+                break;
+            for (auto & name : forceStringList()) {
+                if (name == drvFeatureBuilderRpcV0) {
+                    d.isSubmittingOutputs = true;
+                    break;
+                }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+}
+
+/* One attribute of a derivation, evaluated here; what is done with its value
+   is out of line, since this frame is on the stack while it is evaluated. */
+[[gnu::noinline]] static void derivationAttr(
+    EvalState & state, DerivationStrictState & d, std::string_view drvName, const Attr & i, PosIdx pos, Value & v)
+{
+    if (lvlVomit <= verbosity) [[unlikely]]
+        vomitDerivationAttr(state.symbols[i.name]);
+
+    try {
+        // This try-catch block adds context for most errors.
+        // Use this empty error context to signify that we defer to it.
+        const std::string_view context_below("");
+
+        if (d.ignoreNulls) {
+            state.forceValue(*i.value, noPos);
+            if (i.value->type() == nNull)
+                return;
+        }
+
+        switch (i.name.getId()) {
+        case EvalState::s.contentAddressed.getId():
+            if (state.forceBool(*i.value, pos, context_below)) {
+                d.contentAddressed = true;
+                experimentalFeatureSettings.require(Xp::CaDerivations);
+            }
+            break;
+        case EvalState::s.impure.getId():
+            if (state.forceBool(*i.value, pos, context_below)) {
+                d.isImpure = true;
+                experimentalFeatureSettings.require(Xp::ImpureDerivations);
+            }
+            break;
+        /* The `args' attribute is special: it supplies the
+           command-line arguments to the builder. */
+        case EvalState::s.args.getId():
+            derivationArgsAttr(state, d, i, pos);
+            break;
+        /* All other attributes are passed to the builder through
+           the environment. */
+        default:
+            if (d.jsonObject) {
+                if (i.name == state.s.structuredAttrs)
+                    return;
+                derivationJsonAttr(state, d, drvName, i, pos, v);
+            } else
+                derivationEnvAttr(
+                    state,
+                    d,
+                    drvName,
+                    i,
+                    state.coerceToString(noPos, *i.value, d.context, context_below, true).toOwned(),
+                    v);
+            break;
+        }
+
+    } catch (Error & e) {
+        addDerivationAttrTrace(state, e, i.pos, state.symbols[i.name], drvName);
+        throw;
+    }
+}
+
+/* What `derivationStrictInternal` does once every attribute is evaluated. */
+[[gnu::noinline]] static void
+finishDerivationStrict(EvalState & state, std::string_view drvName, DerivationStrictState & st, Value & v)
+{
+    auto & drv = st.drv;
+    auto & outputs = st.outputs;
+    auto & outputHash = st.outputHash;
+    auto & outputHashAlgo = st.outputHashAlgo;
+    auto & ingestionMethod = st.ingestionMethod;
+
+    if (st.jsonObject) {
         /* The only other way `drv.structuredAttrs` can be set is when
            `jsonObject` is not set. */
         assert(!drv.structuredAttrs);
-        drv.structuredAttrs = std::move(*jsonObject);
+        drv.structuredAttrs = std::move(*st.jsonObject);
     }
 
     /* Everything in the context of the strings in the derivation
        attributes should be added as dependencies of the resulting
        derivation. */
-    for (auto & c : context) {
+    for (auto & c : st.context) {
         std::visit(
             overloaded{
                 /* Since this allows the builder to gain access to every
@@ -1878,22 +1935,22 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                 },
         };
 
-        if (!isSubmittingOutputs)
+        if (!st.isSubmittingOutputs)
             drv.env["out"] = state.store->printStorePath(dof.path(*state.store, drvName, "out"));
         drv.outputs.insert_or_assign("out", std::move(dof));
     }
 
-    else if (contentAddressed || isImpure) {
-        if (contentAddressed && isImpure)
+    else if (st.contentAddressed || st.isImpure) {
+        if (st.contentAddressed && st.isImpure)
             state.error<EvalError>("derivation cannot be both content-addressed and impure").atPos(v).debugThrow();
 
         auto ha = outputHashAlgo.value_or(HashAlgorithm::SHA256);
         auto method = ingestionMethod.value_or(ContentAddressMethod::Raw::NixArchive);
 
         for (auto & i : outputs) {
-            if (!isSubmittingOutputs)
+            if (!st.isSubmittingOutputs)
                 drv.env[i] = hashPlaceholder(i);
-            if (isImpure)
+            if (st.isImpure)
                 drv.outputs.insert_or_assign(
                     i,
                     DerivationOutput::Impure{
@@ -1956,6 +2013,44 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         mkOutputString(state, result, drvPath, i);
 
     v.mkAttrs(result);
+}
+
+static void derivationStrictInternal(EvalState & state, std::string_view drvName, const Bindings * attrs, Value & v)
+{
+    checkDerivationName(state, drvName);
+
+    auto d = std::make_unique<DerivationStrictState>();
+    d->drv.name = std::string{drvName};
+    d->outputs.insert("out");
+
+    /* Check whether attributes should be passed as a JSON file. */
+    auto pos = v.determinePos(noPos);
+    auto attr = attrs->get(state.s.structuredAttrs);
+    if (attr
+        && state.forceBool(
+            *attr->value,
+            pos,
+            "while evaluating the `__structuredAttrs` "
+            "attribute passed to builtins.derivationStrict"))
+        d->jsonObject = StructuredAttrs{};
+
+    /* Check whether null attributes should be ignored. */
+    attr = attrs->get(state.s.ignoreNulls);
+    if (attr)
+        d->ignoreNulls = state.forceBool(
+            *attr->value,
+            pos,
+            "while evaluating the `__ignoreNulls` attribute "
+            "passed to builtins.derivationStrict");
+
+    /* Build the derivation expression by processing the attributes. */
+    for (auto & i : attrs->lexicographicOrder(state.symbols)) {
+        if (i->name == state.s.ignoreNulls)
+            continue;
+        derivationAttr(state, *d, drvName, *i, pos, v);
+    }
+
+    finishDerivationStrict(state, drvName, *d, v);
 }
 
 static RegisterPrimOp primop_derivationStrict(
