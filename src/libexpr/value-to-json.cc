@@ -9,6 +9,31 @@
 namespace nix {
 using json = nlohmann::json;
 
+/* The cold paths and the path case of printValueAsJSON, out of line. */
+
+[[gnu::noinline]] static json pathToJSON(EvalState & state, Value & v, NixStringContext & context, bool copyToStore)
+{
+    if (copyToStore)
+        return state.store->printStorePath(state.copyPathToStore(context, v.path()));
+    else
+        return v.path().path.abs();
+}
+
+[[gnu::noinline, gnu::cold]] static void addAttrTraceJSON(EvalState & state, Error & e, const Attr & a)
+{
+    e.addTrace(state.positions[a.pos], HintFmt("while evaluating attribute '%1%'", state.symbols[a.name]));
+}
+
+[[gnu::noinline, gnu::cold]] static void addListElemTraceJSON(EvalState & state, Error & e, const PosIdx pos, int i)
+{
+    e.addTrace(state.positions[pos], HintFmt("while evaluating list element at index %1%", i));
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void throwNotJSON(EvalState & state, Value & v, const PosIdx pos)
+{
+    state.error<TypeError>("cannot convert %1% to JSON", showType(v)).atPos(v.determinePos(pos)).debugThrow();
+}
+
 // TODO: rename. It doesn't print.
 json printValueAsJSON(
     EvalState & state, bool strict, Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
@@ -38,10 +63,7 @@ json printValueAsJSON(
         break;
 
     case nPath:
-        if (copyToStore)
-            out = state.store->printStorePath(state.copyPathToStore(context, v.path()));
-        else
-            out = v.path().path.abs();
+        out = pathToJSON(state, v, context, copyToStore);
         break;
 
     case nNull:
@@ -68,9 +90,7 @@ json printValueAsJSON(
                             state.symbols[a->name],
                             printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore));
                     } catch (Error & e) {
-                        e.addTrace(
-                            state.positions[a->pos],
-                            HintFmt("while evaluating attribute '%1%'", state.symbols[a->name]));
+                        addAttrTraceJSON(state, e, *a);
                         throw;
                     }
                 }
@@ -86,7 +106,7 @@ json printValueAsJSON(
             try {
                 out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore));
             } catch (Error & e) {
-                e.addTrace(state.positions[pos], HintFmt("while evaluating list element at index %1%", i));
+                addListElemTraceJSON(state, e, pos, i);
                 throw;
             }
             i++;
@@ -105,7 +125,7 @@ json printValueAsJSON(
     case nThunk:
     case nFailed:
     case nFunction:
-        state.error<TypeError>("cannot convert %1% to JSON", showType(v)).atPos(v.determinePos(pos)).debugThrow();
+        throwNotJSON(state, v, pos);
     }
     return out;
 }
