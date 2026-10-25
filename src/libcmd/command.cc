@@ -223,6 +223,7 @@ BuiltPathsCommand::BuiltPathsCommand(bool recursive)
 void BuiltPathsCommand::run(ref<Store> store, Installables && installables)
 {
     BuiltPaths rootPaths, allPaths;
+    auto operationStore = store;
 
     if (all) {
         if (installables.size())
@@ -235,6 +236,15 @@ void BuiltPathsCommand::run(ref<Store> store, Installables && installables)
         rootPaths = Installable::toBuiltPaths(getEvalStore(), store, realiseMode, operateOn, installables);
         allPaths = rootPaths;
 
+        if (operateOn == OperateOn::Derivation) {
+            StorePathSet drvPaths;
+            for (auto & root : rootPaths) {
+                auto rootOutPaths = root.outPaths();
+                drvPaths.insert(rootOutPaths.begin(), rootOutPaths.end());
+            }
+            operationStore = Installable::getStoreForDerivations(getEvalStore(), store, drvPaths);
+        }
+
         if (recursive) {
             // XXX: This only computes the store path closure, ignoring
             // intermediate realisations
@@ -243,13 +253,13 @@ void BuiltPathsCommand::run(ref<Store> store, Installables && installables)
                 auto rootFromThis = root.outPaths();
                 pathsRoots.insert(rootFromThis.begin(), rootFromThis.end());
             }
-            store->computeFSClosure(pathsRoots, pathsClosure);
+            operationStore->computeFSClosure(pathsRoots, pathsClosure);
             for (auto & path : pathsClosure)
                 allPaths.emplace_back(BuiltPath::Opaque{path});
         }
     }
 
-    run(store, std::move(allPaths), std::move(rootPaths));
+    run(operationStore, std::move(allPaths), std::move(rootPaths));
 }
 
 StorePathsCommand::StorePathsCommand(bool recursive)

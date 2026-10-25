@@ -481,7 +481,7 @@ struct Common : InstallableCommand, MixProfile
         if (path && hasSuffix(path->to_string(), "-env"))
             return *path;
         else {
-            auto drvs = Installable::toDerivations(store, {installable});
+            auto drvs = Installable::toDerivations(getEvalStore(), store, {installable});
 
             if (drvs.size() != 1)
                 throw Error(
