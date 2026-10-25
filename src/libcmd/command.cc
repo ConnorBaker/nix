@@ -158,8 +158,12 @@ EvalCommand::~EvalCommand()
 
 ref<Store> EvalCommand::getEvalStore()
 {
-    if (!evalStore)
-        evalStore = evalStoreUrl ? openStore(StoreReference{*evalStoreUrl}) : getStore();
+    if (!evalStore) {
+        auto url = evalStoreUrl;
+        if (!url && !evalSettings.defaultEvalStore.get().empty())
+            url = StoreReference::parse(evalSettings.defaultEvalStore.get());
+        evalStore = url ? openStore(StoreReference{*url}) : getStore();
+    }
     return ref<Store>(evalStore);
 }
 
