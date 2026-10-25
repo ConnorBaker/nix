@@ -1228,9 +1228,14 @@ HookReply DerivationBuildingGoal::tryBuildHook(const DerivationOptions<StorePath
 #ifdef _WIN32 // TODO enable build hook on Windows
     return rpDecline;
 #else
-    /* This should use `worker.evalStore`, but per #13179 the build hook
-       doesn't work with eval store anyways. */
-    if (worker.settings.buildHook.get().empty() || !worker.tryBuildHook || !worker.store.isValidPath(drvPath))
+    if (worker.settings.buildHook.get().empty() || !worker.tryBuildHook)
+        return rpDecline;
+
+    // The subprocess hook reads the derivation from the build store, not
+    // the evaluation store. In-memory remote BuildDerivation requests may
+    // have neither copy.
+    bool drvInBuildStore = worker.store.isValidPath(drvPath);
+    if (!drvInBuildStore && !worker.evalStore.isValidPath(drvPath))
         return rpDecline;
 
     if (!worker.hook)
@@ -1289,6 +1294,12 @@ HookReply DerivationBuildingGoal::tryBuildHook(const DerivationOptions<StorePath
         } else
             throw;
     }
+
+    // Copy the derivation only once the hook has taken the build, before
+    // it reads the derivation: a build that stays local must leave the
+    // build store without it.
+    if (!drvInBuildStore)
+        copyClosure(worker.evalStore, worker.store, StorePathSet{drvPath}, NoRepair, NoCheckSigs);
 
     return rpAccept;
 #endif
