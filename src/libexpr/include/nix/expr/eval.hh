@@ -1193,7 +1193,10 @@ private:
     /** Evaluation/call profiler. */
     MultiEvalProfiler profiler;
 
-    void incrFunctionCall(ExprLambda * fun);
+    /* The call and selection counters (`countCalls`), out of line and cold. */
+    [[gnu::noinline, gnu::cold]] void incrFunctionCall(ExprLambda * fun);
+    [[gnu::noinline, gnu::cold]] void incrPrimOpCall(const std::string & name);
+    [[gnu::noinline, gnu::cold]] void incrAttrSelect(PosIdx attrPos);
 
     typedef boost::concurrent_flat_map<PosIdx, size_t, std::hash<PosIdx>> AttrSelects;
     const ref<AttrSelects> attrSelects;

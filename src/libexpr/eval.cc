@@ -1473,6 +1473,11 @@ selectDebugTraceStacker(EvalState & state, ExprSelect & sel, Env & env)
         showAttrSelectionPath(state, env, sel.getAttrPath()));
 }
 
+void EvalState::incrAttrSelect(PosIdx attrPos)
+{
+    attrSelects->try_emplace_or_visit(attrPos, 1, [](auto & i) { i.second++; });
+}
+
 void ExprSelect::eval(EvalState & state, Env & env, Value & v)
 {
     Value vTmp;
@@ -1514,7 +1519,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
             attrPos = j->pos;
             unresolvedOrEnd = &i + 1;
             if (state.countCalls)
-                state.attrSelects->try_emplace_or_visit(attrPos, 1, [](auto & i) { i.second++; });
+                state.incrAttrSelect(attrPos);
         }
 
         state.forceValue(*vAttrs, (attrPos ? attrPos : this->pos));
@@ -1641,6 +1646,11 @@ lambdaDebugTraceStacker(EvalState & state, ExprLambda & lambda, Env & env2)
         vCur.mkPrimOpApp(fun2, arg);
     }
     vRes = vCur;
+}
+
+void EvalState::incrPrimOpCall(const std::string & name)
+{
+    primOpCalls->try_emplace_or_visit(name, 1, [](auto & i) { i.second++; });
 }
 
 void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
@@ -1776,7 +1786,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
                 nrPrimOpCalls++;
                 if (countCalls)
-                    primOpCalls->try_emplace_or_visit(fn->name, 1, [](auto & i) { i.second++; });
+                    incrPrimOpCall(fn->name);
 
                 try {
                     fn->impl(*this, CallSite{pos}, args.data(), vCur);
@@ -1821,7 +1831,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
                 auto fn = primOp->primOp();
                 nrPrimOpCalls++;
                 if (countCalls)
-                    primOpCalls->try_emplace_or_visit(fn->name, 1, [](auto & i) { i.second++; });
+                    incrPrimOpCall(fn->name);
 
                 try {
                     // TODO:
