@@ -87,6 +87,7 @@ suites = [
       'derivation-advanced-attributes.sh',
       'derivation-json.sh',
       'dump-db.sh',
+      'eval-recursion-depth.sh',
       'eval-store.sh',
       'eval.sh',
       'experimental-features.sh',
