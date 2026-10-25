@@ -828,7 +828,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
             Activity act(*logger, lvlInfo, actUnknown, fmt("running %d flake checks", toBuild.size()));
             // once we get rid of the temporary hack above, this tenary operator will also go away
-            results = store->getBuilder()->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
+            results = store->getBuilder(getEvalStore())
+                          ->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
 
             // Report build failures with attribute paths
             for (auto & result : results) {

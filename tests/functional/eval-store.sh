@@ -29,6 +29,25 @@ remote_out=$(
         --no-link --print-out-paths
 )
 [[ -e "$remote_root$remote_out/foobar" ]]
+
+# Flake checks must pass the evaluation store to the remote builder after the
+# client-side missing-path traversal has selected the checks to build.
+flake_dir=$TEST_ROOT/eval-store-flake
+mkdir -p "$flake_dir"
+shell=$(nix eval --raw -f ./config.nix shell)
+cat > "$flake_dir/flake.nix" <<EOF
+{
+  outputs = { ... }: {
+    checks.$system.default = derivation {
+      name = "eval-store-flake-check";
+      system = "$system";
+      builder = "$shell";
+      args = [ "-c" "printf checked > \$out" ];
+    };
+  };
+}
+EOF
+nix flake check --eval-store "$eval_store" --store "$remote_store" "path:$flake_dir"
 rm -rf "$remote_root"
 
 nix build -f dependencies.nix --eval-store "$eval_store" -o "$TEST_ROOT/result"

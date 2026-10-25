@@ -42,5 +42,9 @@ mkDerivation {
   buildCommand = "echo hi > $out";
 }
 EOF
-nix bundle --bundler .#bundlers."$system".simple -f function.nix -o function-bundle
+nix bundle \
+    --eval-store "$TEST_ROOT/bundle-eval-store" \
+    --bundler .#bundlers."$system".simple \
+    -f function.nix \
+    -o function-bundle
 [[ $(cat function-bundle) = hi ]]
