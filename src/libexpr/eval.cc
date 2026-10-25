@@ -1280,6 +1280,19 @@ inline void EvalState::evalAttrs(Env & env, Expr * e, Value & v, std::string_vie
     }
 }
 
+/* The overload below, inlined, so that the operand is not evaluated under
+   a frame of its own. */
+[[gnu::always_inline]] static inline void
+evalInContext(Expr & e, EvalState & state, Env & env, Value & v, std::string_view errorCtx)
+{
+    try {
+        e.eval(state, env, v);
+    } catch (Error & err) {
+        addTraceAt(state, err, e.getPos(), errorCtx);
+        throw;
+    }
+}
+
 void Expr::eval(EvalState & state, Env & env, Value & v, std::string_view errorCtx)
 {
     try {
@@ -1555,7 +1568,7 @@ void ExprSelect::eval(EvalState & state, Env & env, Value & v)
     // cursor, result if successful
     Value * vAttrs = &vTmp;
 
-    e->eval(state, env, vTmp, "while selecting an attribute");
+    evalInContext(*e, state, env, vTmp, "while selecting an attribute");
 
     try {
         auto dts = state.debugRepl ? selectDebugTraceStacker(state, *this, env) : nullptr;
@@ -1640,7 +1653,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
     {
         Value vTmp;
 
-        e->eval(state, env, vTmp, "in the argument of '?'");
+        evalInContext(*e, state, env, vTmp, "in the argument of '?'");
 
         if (attrPath.empty()) {
             v.mkBool(true);
@@ -2147,18 +2160,18 @@ void ExprOpNot::eval(EvalState & state, Env & env, Value & v)
 void ExprOpEq::eval(EvalState & state, Env & env, Value & v)
 {
     Value v1;
-    e1->eval(state, env, v1, "in the left operand of '=='");
+    evalInContext(*e1, state, env, v1, "in the left operand of '=='");
     Value v2;
-    e2->eval(state, env, v2, "in the right operand of '=='");
+    evalInContext(*e2, state, env, v2, "in the right operand of '=='");
     v.mkBool(state.eqValues(v1, v2, pos, "while testing two values for equality"));
 }
 
 void ExprOpNEq::eval(EvalState & state, Env & env, Value & v)
 {
     Value v1;
-    e1->eval(state, env, v1, "in the left operand of '!='");
+    evalInContext(*e1, state, env, v1, "in the left operand of '!='");
     Value v2;
-    e2->eval(state, env, v2, "in the right operand of '!='");
+    evalInContext(*e2, state, env, v2, "in the right operand of '!='");
     v.mkBool(!state.eqValues(v1, v2, pos, "while testing two values for inequality"));
 }
 
@@ -2297,9 +2310,9 @@ void ExprOpUpdate::evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, 
 void ExprOpConcatLists::eval(EvalState & state, Env & env, Value & v)
 {
     Value v1;
-    e1->eval(state, env, v1, "in the left operand of '++'");
+    evalInContext(*e1, state, env, v1, "in the left operand of '++'");
     Value v2;
-    e2->eval(state, env, v2, "in the right operand of '++'");
+    evalInContext(*e2, state, env, v2, "in the right operand of '++'");
     Value * lists[2] = {&v1, &v2};
     state.concatLists(v, lists, pos, "while evaluating one of the elements to concatenate");
 }
@@ -2439,7 +2452,13 @@ template<size_t N>
 
     for (auto & [i_pos, i] : es) {
         Value & vTmp = *vTmpP++;
-        i->eval(state, env, vTmp, "in an operand of '+'");
+        /* `Expr::eval` with an error context, inlined. */
+        try {
+            i->eval(state, env, vTmp);
+        } catch (Error & e) {
+            addTraceAt(state, e, i->getPos(), "in an operand of '+'");
+            throw;
+        }
 
         /* If the first element is a path, then the result will also
            be a path, we don't copy anything (yet - that's done later,
