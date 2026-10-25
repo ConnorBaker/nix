@@ -1999,6 +1999,33 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 /* ExprCall::eval's work, tail-called: a call with one argument does not
    reserve a small vector's room. */
 
+/* The function is evaluated as `ExprVar::eval` does, without the copy. */
+void EvalState::callVar1(ExprCall & call, ExprVar & var, Env & env, Value & vRes)
+{
+    Value * fun = lookupVar(&env, var, false);
+    forceValue(*fun, var.pos);
+
+    Value * arg = (*call.args)[0]->maybeThunk(*this, env);
+
+    std::span<Value * const> args(&arg, 1);
+    auto _level = addCallDepth(call.pos);
+
+    if (profiler.getNeededHooks().any()) [[unlikely]]
+        return callFunctionProfiled(*fun, args, vRes, call.pos);
+
+    callFunctionBody(*fun, args, vRes, call.pos);
+}
+
+void EvalState::callFunctionInline(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
+{
+    auto _level = addCallDepth(pos);
+
+    if (profiler.getNeededHooks().any()) [[unlikely]]
+        return callFunctionProfiled(fun, args, vRes, pos);
+
+    callFunctionBody(fun, args, vRes, pos);
+}
+
 [[gnu::noinline]] static void evalCall1(ExprCall & call, EvalState & state, Env & env, Value & v)
 {
     Value vFun;
@@ -2006,7 +2033,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
 
     Value * arg = (*call.args)[0]->maybeThunk(state, env);
 
-    state.callFunction(vFun, std::span<Value * const>(&arg, 1), v, call.pos);
+    state.callFunctionInline(vFun, std::span<Value * const>(&arg, 1), v, call.pos);
 }
 
 [[gnu::noinline]] static void evalCallN(ExprCall & call, EvalState & state, Env & env, Value & v)
@@ -2024,7 +2051,7 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
     for (size_t i = 0; i < call.args->size(); ++i)
         vArgs[i] = (*call.args)[i]->maybeThunk(state, env);
 
-    state.callFunction(vFun, vArgs, v, call.pos);
+    state.callFunctionInline(vFun, vArgs, v, call.pos);
 }
 
 /* Under the debugger: the same, with the trace stacker alive across it. */
@@ -2042,8 +2069,11 @@ void ExprCall::eval(EvalState & state, Env & env, Value & v)
 {
     if (state.debugRepl) [[unlikely]]
         return evalCallDebug(*this, state, env, v);
-    if (args->size() == 1)
+    if (args->size() == 1) {
+        if (funIsVar)
+            return state.callVar1(*this, static_cast<ExprVar &>(*fun), env, v);
         return evalCall1(*this, state, env, v);
+    }
     return evalCallN(*this, state, env, v);
 }
 

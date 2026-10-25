@@ -1044,6 +1044,18 @@ public:
 
     void callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
 
+    /**
+     * `call` of the variable `var` with one argument: `callFunction` of the
+     * variable's value where its environment keeps it, reached by tail calls.
+     */
+    [[gnu::noinline]] void callVar1(ExprCall & call, ExprVar & var, Env & env, Value & vRes);
+
+    /**
+     * `callFunction`, inlined into the ExprCall::eval helpers.
+     */
+    [[gnu::always_inline]] inline void
+    callFunctionInline(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
+
 private:
     /**
      * callFunction's work, inlined into callFunction and callFunctionProfiled.

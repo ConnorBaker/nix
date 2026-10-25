@@ -2,6 +2,7 @@
 ///@file
 
 #include <map>
+#include <typeinfo>
 #include <span>
 #include <memory>
 #include <vector>
@@ -606,12 +607,17 @@ struct ExprCall : Expr
     std::optional<std::pmr::vector<Expr *>> args;
     PosIdx pos;
     std::optional<PosIdx> cursedOrEndPos; // used during parsing to warn about https://github.com/NixOS/nix/issues/11118
+    /**
+     * Whether `fun` is an `ExprVar` (`EvalState::callVar1`).
+     */
+    bool funIsVar;
 
     ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
         : fun(fun)
         , args(args)
         , pos(pos)
         , cursedOrEndPos({})
+        , funIsVar(typeid(*fun) == typeid(ExprVar))
     {
     }
 
@@ -620,6 +626,7 @@ struct ExprCall : Expr
         , args(args)
         , pos(pos)
         , cursedOrEndPos(cursedOrEndPos)
+        , funIsVar(typeid(*fun) == typeid(ExprVar))
     {
     }
 
