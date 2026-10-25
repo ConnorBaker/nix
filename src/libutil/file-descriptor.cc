@@ -5,6 +5,7 @@
 
 #include "file-descriptor-private.hh"
 
+#include <memory>
 #include <span>
 #include <fcntl.h>
 #include <unistd.h>
@@ -153,11 +154,13 @@ void drainFD(Descriptor fd, Sink & sink, DrainFdSinkOpts opts)
 #endif
 
     size_t bytesRead = 0;
-    std::array<std::byte, 64 * 1024> buf;
+    /* On the heap: this may be called deep in the evaluator's recursion. */
+    static constexpr size_t bufSize = 64 * 1024;
+    auto buf = std::make_unique_for_overwrite<std::byte[]>(bufSize);
     while (1) {
         checkInterrupt();
 
-        size_t toRead = buf.size();
+        size_t toRead = bufSize;
         if (opts.expectedSize) {
             size_t remaining = *opts.expectedSize - bytesRead;
             if (remaining == 0)
@@ -167,7 +170,7 @@ void drainFD(Descriptor fd, Sink & sink, DrainFdSinkOpts opts)
 
         size_t n;
         try {
-            n = read(fd, std::span(buf.data(), toRead));
+            n = read(fd, std::span(buf.get(), toRead));
         } catch (SystemError & e) {
 #ifndef _WIN32
             if (!opts.block
@@ -184,7 +187,7 @@ void drainFD(Descriptor fd, Sink & sink, DrainFdSinkOpts opts)
         }
 
         bytesRead += n;
-        sink(std::string_view(reinterpret_cast<const char *>(buf.data()), n));
+        sink(std::string_view(reinterpret_cast<const char *>(buf.get()), n));
     }
 }
 
@@ -227,15 +230,16 @@ void copyFdRange(Descriptor fd, off_t offset, size_t nbytes, Sink & sink, bool t
     }
 
     auto left = nbytes;
-    std::array<std::byte, copyBufferSize> buf;
+    /* On the heap: this may be called deep in the evaluator's recursion. */
+    auto buf = std::make_unique_for_overwrite<std::byte[]>(copyBufferSize);
 
     while (left) {
-        auto limit = std::min<size_t>(left, buf.size());
-        auto n = readOffset(fd, offset, std::span(buf.data(), limit));
+        auto limit = std::min<size_t>(left, copyBufferSize);
+        auto n = readOffset(fd, offset, std::span(buf.get(), limit));
         if (n == 0)
             throw EndOfFile("unexpected end-of-file reading from %1%", PathFmt(descriptorToPath(fd)));
         assert(n <= left);
-        sink(std::string_view(reinterpret_cast<const char *>(buf.data()), n));
+        sink(std::string_view(reinterpret_cast<const char *>(buf.get()), n));
         offset += n;
         left -= n;
     }

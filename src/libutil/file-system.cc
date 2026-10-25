@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <memory>
 
 #include <fcntl.h>
 #include <sys/types.h>
@@ -309,17 +310,19 @@ void writeFile(const std::filesystem::path & path, Source & source, mode_t mode,
 
 void writeFile(Descriptor fd, Source & source, FsSync sync, const std::filesystem::path * origPath)
 {
-    std::array<char, 64 * 1024> buf;
+    /* On the heap: this may be called deep in the evaluator's recursion. */
+    static constexpr size_t bufSize = 64 * 1024;
+    auto buf = std::make_unique_for_overwrite<char[]>(bufSize);
 
     try {
         while (true) {
             size_t n;
             try {
-                n = source.read(buf.data(), buf.size());
+                n = source.read(buf.get(), bufSize);
             } catch (EndOfFile &) {
                 break;
             }
-            writeFull(fd, {buf.data(), n});
+            writeFull(fd, {buf.get(), n});
         }
     } catch (Error & e) {
         e.addTrace({}, "writing file %1%", origPath ? PathFmt(*origPath) : PathFmt(descriptorToPath(fd)));
