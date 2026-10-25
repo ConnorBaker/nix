@@ -1546,17 +1546,20 @@ Symbol ExprSelect::evalExceptFinalSelect(EvalState & state, Env & env, Value & a
     return name;
 }
 
-void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
+[[gnu::noinline, gnu::cold]] static void forceHasAttrOperand(EvalState & state, Value & v, const Expr & e)
 {
-    Value vTmp;
-    Value * vAttrs = &vTmp;
+    state.forceValue(v, e.getPos());
+}
 
-    e->eval(state, env, vTmp, "in the argument of '?'");
-
-    for (auto & i : attrPath) {
-        state.forceValue(*vAttrs, getPos());
+/* The rest of `e`'s attribute path, from `vAttrs`. Tail-called, so that
+   `ExprOpHasAttr::eval`'s frame is not on the stack while it forces. */
+[[gnu::noinline]] static void
+hasAttrPath(EvalState & state, Env & env, const ExprOpHasAttr & e, Value * vAttrs, Value & v)
+{
+    for (size_t k = 1; k < e.attrPath.size(); ++k) {
+        state.forceValue(*vAttrs, e.getPos());
         const Attr * j;
-        auto name = getName(i, state, env);
+        auto name = getName(e.attrPath[k], state, env);
         if (vAttrs->type() == nAttrs && (j = vAttrs->attrs()->get(name))) {
             vAttrs = j->value;
         } else {
@@ -1566,6 +1569,38 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
     }
 
     v.mkBool(true);
+}
+
+void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
+{
+    Value * vAttrs;
+
+    {
+        Value vTmp;
+
+        e->eval(state, env, vTmp, "in the argument of '?'");
+
+        if (attrPath.empty()) {
+            v.mkBool(true);
+            return;
+        }
+
+        if (vTmp.isThunk() || vTmp.isApp() || vTmp.isFailed()) [[unlikely]]
+            forceHasAttrOperand(state, vTmp, *this);
+        const Attr * j;
+        auto name = getName(attrPath[0], state, env);
+        if (vTmp.type() != nAttrs || !(j = vTmp.attrs()->get(name))) {
+            v.mkBool(false);
+            return;
+        }
+        vAttrs = j->value;
+    }
+
+    if (attrPath.size() == 1) {
+        v.mkBool(true);
+        return;
+    }
+    hasAttrPath(state, env, *this, vAttrs, v);
 }
 
 void ExprLambda::eval(EvalState & state, Env & env, Value & v)
