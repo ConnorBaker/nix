@@ -12,6 +12,8 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/util.hh"
 
+nix::merkle::DirectorySink::~DirectorySink() {}
+
 namespace nix::git {
 
 static std::string getStringUntil(Source & source, char byte)
