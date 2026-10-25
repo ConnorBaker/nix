@@ -1313,15 +1313,21 @@ static RegisterPrimOp primop_deepSeq({
     .impl = prim_deepSeq,
 });
 
+/* Out of line: not in prim_trace's frame while the second argument is forced. */
+[[gnu::noinline]] static void printTraceMessage(EvalState & state, Value & msg)
+{
+    if (msg.type() == nString)
+        printError("trace: %1%", msg.string_view());
+    else
+        printError("trace: %1%", ValuePrinter(state, msg));
+}
+
 /* Evaluate the first expression and print it on standard error.  Then
    return the second expression.  Useful for debugging. */
 static void prim_trace(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceValue(*args[0], noPos);
-    if (args[0]->type() == nString)
-        printError("trace: %1%", args[0]->string_view());
-    else
-        printError("trace: %1%", ValuePrinter(state, *args[0]));
+    printTraceMessage(state, *args[0]);
     if (state.settings.builtinsTraceDebugger) {
         state.runDebugRepl(nullptr);
     }

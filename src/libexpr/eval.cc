@@ -2094,28 +2094,32 @@ void ExprIf::eval(EvalState & state, Env & env, Value & v)
     (state.evalBool(env, cond, "while evaluating a branch condition") ? then : else_)->eval(state, env, v);
 }
 
+[[noreturn, gnu::noinline, gnu::cold]] static void throwAssertionFailed(EvalState & state, Env & env, ExprAssert & a)
+{
+    std::ostringstream out;
+    a.cond->show(state.symbols, out);
+    auto exprStr = out.view();
+
+    if (auto eq = dynamic_cast<ExprOpEq *>(a.cond)) {
+        try {
+            Value v1;
+            eq->e1->eval(state, env, v1);
+            Value v2;
+            eq->e2->eval(state, env, v2);
+            state.assertEqValues(v1, v2, eq->pos, "in an equality assertion");
+        } catch (AssertionError & e) {
+            e.addTrace(state.positions[a.pos], "while evaluating the condition of the assertion '%s'", exprStr);
+            throw;
+        }
+    }
+
+    state.error<AssertionError>("assertion '%1%' failed", exprStr).atPos(a.pos).withFrame(env, a).debugThrow();
+}
+
 void ExprAssert::eval(EvalState & state, Env & env, Value & v)
 {
-    if (!state.evalBool(env, cond, "in the condition of the assert statement")) {
-        std::ostringstream out;
-        cond->show(state.symbols, out);
-        auto exprStr = out.view();
-
-        if (auto eq = dynamic_cast<ExprOpEq *>(cond)) {
-            try {
-                Value v1;
-                eq->e1->eval(state, env, v1);
-                Value v2;
-                eq->e2->eval(state, env, v2);
-                state.assertEqValues(v1, v2, eq->pos, "in an equality assertion");
-            } catch (AssertionError & e) {
-                e.addTrace(state.positions[pos], "while evaluating the condition of the assertion '%s'", exprStr);
-                throw;
-            }
-        }
-
-        state.error<AssertionError>("assertion '%1%' failed", exprStr).atPos(pos).withFrame(env, *this).debugThrow();
-    }
+    if (!state.evalBool(env, cond, "in the condition of the assert statement"))
+        throwAssertionFailed(state, env, *this);
     body->eval(state, env, v);
 }
 
