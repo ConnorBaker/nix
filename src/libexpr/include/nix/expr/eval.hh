@@ -1034,6 +1034,17 @@ public:
 
     void callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
 
+private:
+    /**
+     * callFunction's work, inlined into callFunction and callFunctionProfiled.
+     */
+    [[gnu::always_inline]] inline void
+    callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos);
+    [[gnu::noinline, gnu::cold]] void
+    callFunctionProfiled(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
+
+public:
+
     void callFunction(Value & fun, Value & arg, Value & vRes, const PosIdx pos)
     {
         callFunction(fun, std::to_array({&arg}), vRes, pos);

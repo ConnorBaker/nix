@@ -1768,19 +1768,8 @@ void EvalState::incrPrimOpCall(const std::string & name)
     primOpCalls->try_emplace_or_visit(name, 1, [](auto & i) { i.second++; });
 }
 
-void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
+void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos)
 {
-    auto _level = addCallDepth(pos);
-
-    auto neededHooks = profiler.getNeededHooks();
-    if (neededHooks.test(EvalProfiler::preFunctionCall)) [[unlikely]]
-        profiler.preFunctionCallHook(*this, fun, args, pos);
-
-    Finally traceExit_{[&]() {
-        if (profiler.getNeededHooks().test(EvalProfiler::postFunctionCall)) [[unlikely]]
-            profiler.postFunctionCallHook(*this, fun, args, pos);
-    }};
-
     forceValue(fun, pos);
 
     Value vCur(fun);
@@ -1945,6 +1934,31 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
     }
 
     vRes = vCur;
+}
+
+void EvalState::callFunctionProfiled(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
+{
+    auto neededHooks = profiler.getNeededHooks();
+    if (neededHooks.test(EvalProfiler::preFunctionCall)) [[unlikely]]
+        profiler.preFunctionCallHook(*this, fun, args, pos);
+
+    Finally traceExit_{[&]() {
+        if (profiler.getNeededHooks().test(EvalProfiler::postFunctionCall)) [[unlikely]]
+            profiler.postFunctionCallHook(*this, fun, args, pos);
+    }};
+
+    callFunctionBody(fun, args, vRes, pos);
+}
+
+void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos)
+{
+    auto _level = addCallDepth(pos);
+
+    /* The profiler's hooks, out of line. */
+    if (profiler.getNeededHooks().any()) [[unlikely]]
+        return callFunctionProfiled(fun, args, vRes, pos);
+
+    callFunctionBody(fun, args, vRes, pos);
 }
 
 /* ExprCall::eval's work, tail-called: a call with one argument does not
