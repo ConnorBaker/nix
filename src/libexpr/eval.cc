@@ -1802,6 +1802,45 @@ void EvalState::callPrimOpApp(
     }
 }
 
+/* Binds the formals of `lambda` to the attributes of `arg` in `env2`. */
+[[gnu::noinline]] static void
+bindFormals(EvalState & state, ExprLambda & lambda, const Env & env, Env & env2, Value * arg, const PosIdx pos)
+{
+    auto formals = lambda.getFormals();
+    Displacement displ = 0;
+
+    try {
+        state.forceAttrs(*arg, lambda.pos, "while evaluating the value passed for the lambda argument");
+    } catch (Error & e) {
+        addCallSiteTrace(state, e, pos);
+        throw;
+    }
+
+    if (lambda.arg)
+        env2.values[displ++] = arg;
+
+    /* For each formal argument, get the actual argument.  If
+       there is no matching actual argument but the formal
+       argument has a default, use the default. */
+    size_t attrsUsed = 0;
+    for (auto & i : formals->formals) {
+        auto j = arg->attrs()->get(i.name);
+        if (!j) {
+            if (!i.def)
+                throwMissingArgument(state, lambda, env, i, pos);
+            env2.values[displ++] = i.def->maybeThunk(state, env2);
+        } else {
+            attrsUsed++;
+            env2.values[displ++] = j->value;
+        }
+    }
+
+    /* Check that each actual argument is listed as a formal
+       argument (unless the attribute match specifies a `...'). */
+    if (!formals->ellipsis && attrsUsed != arg->attrs()->size())
+        throwUnexpectedArgument(state, lambda, *formals, *arg, env, pos);
+}
+
 void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos)
 {
     forceValue(fun, pos);
@@ -1820,42 +1859,10 @@ void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, V
             Env & env2(mem.allocEnv(size));
             env2.up = vCur.lambda().env;
 
-            Displacement displ = 0;
-
-            if (auto formals = lambda.getFormals()) {
-                try {
-                    forceAttrs(*args[0], lambda.pos, "while evaluating the value passed for the lambda argument");
-                } catch (Error & e) {
-                    addCallSiteTrace(*this, e, pos);
-                    throw;
-                }
-
-                if (lambda.arg)
-                    env2.values[displ++] = args[0];
-
-                /* For each formal argument, get the actual argument.  If
-                   there is no matching actual argument but the formal
-                   argument has a default, use the default. */
-                size_t attrsUsed = 0;
-                for (auto & i : formals->formals) {
-                    auto j = args[0]->attrs()->get(i.name);
-                    if (!j) {
-                        if (!i.def)
-                            throwMissingArgument(*this, lambda, *vCur.lambda().env, i, pos);
-                        env2.values[displ++] = i.def->maybeThunk(*this, env2);
-                    } else {
-                        attrsUsed++;
-                        env2.values[displ++] = j->value;
-                    }
-                }
-
-                /* Check that each actual argument is listed as a formal
-                   argument (unless the attribute match specifies a `...'). */
-                if (!formals->ellipsis && attrsUsed != args[0]->attrs()->size())
-                    throwUnexpectedArgument(*this, lambda, *formals, *args[0], *vCur.lambda().env, pos);
-            } else {
-                env2.values[displ++] = args[0];
-            }
+            if (lambda.getFormals())
+                bindFormals(*this, lambda, *vCur.lambda().env, env2, args[0], pos);
+            else
+                env2.values[0] = args[0];
 
             nrFunctionCalls++;
             if (countCalls)
