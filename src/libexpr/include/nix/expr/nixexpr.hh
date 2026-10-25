@@ -802,6 +802,13 @@ struct ExprConcatStrings : Expr
     }
 
     COMMON_METHODS
+
+private:
+    /**
+     * `eval`, with room on the stack for `N` operand values.
+     */
+    template<size_t N>
+    void evalWith(EvalState & state, Env & env, Value & v);
 };
 
 struct ExprPos : Expr

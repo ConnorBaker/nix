@@ -2268,6 +2268,92 @@ void EvalState::concatLists(Value & v, std::span<Value * const> lists, const Pos
 
 void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
 {
+    /* Most concatenations are binary: room for two operands, not
+       `conservativeStackReservation`'s. */
+    if (es.size() <= 2)
+        return evalWith<2>(state, env, v);
+    return evalWith<conservativeStackReservation>(state, env, v);
+}
+
+/* What evalWith does besides evaluating operands, out of line: its frame is
+   on the stack while the later operands are evaluated. */
+
+[[noreturn, gnu::noinline, gnu::cold]] static void throwAddOverflow(EvalState & state, NixInt n, NixInt m, PosIdx pos)
+{
+    state.error<EvalError>("integer overflow in adding %1% + %2%", n, m).atPos(pos).debugThrow();
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwCannotAddToInt(EvalState & state, Env & env, ExprConcatStrings & e, Value & vTmp, PosIdx pos)
+{
+    state.error<EvalError>("cannot add %1% to an integer", showType(vTmp)).atPos(pos).withFrame(env, e).debugThrow();
+}
+
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwCannotAddToFloat(EvalState & state, Env & env, ExprConcatStrings & e, Value & vTmp, PosIdx pos)
+{
+    state.error<EvalError>("cannot add %1% to a float", showType(vTmp)).atPos(pos).withFrame(env, e).debugThrow();
+}
+
+[[gnu::noinline]] static void appendStringPart(
+    EvalState & state,
+    PosIdx i_pos,
+    Value & vTmp,
+    NixStringContext & context,
+    std::vector<BackedStringView> & strings,
+    size_t & sSize,
+    size_t nParts,
+    ValueType firstType,
+    bool first)
+{
+    if (strings.empty())
+        strings.reserve(nParts);
+    /* skip canonization of first path, which would only be not
+    canonized in the first place if it's coming from a ./${foo} type
+    path */
+    auto part = state.coerceToString(
+        i_pos, vTmp, context, "while evaluating a path segment", false, firstType == nString, !first);
+    sSize += part->size();
+    strings.emplace_back(std::move(part));
+}
+
+[[gnu::noinline]] static void finishConcatStrings(
+    EvalState & state,
+    Env & env,
+    ExprConcatStrings & e,
+    Value & v,
+    ValueType firstType,
+    NixStringContext & context,
+    std::vector<BackedStringView> & strings,
+    size_t sSize)
+{
+    if (firstType == nPath) {
+        if (!context.empty())
+            state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
+                .atPos(e.pos)
+                .withFrame(env, e)
+                .debugThrow();
+        std::string resultStr;
+        resultStr.reserve(sSize);
+        for (const auto & part : strings) {
+            resultStr += *part;
+        }
+        v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
+    } else {
+        auto & resultStr = StringData::alloc(state.mem, sSize);
+        auto * tmp = resultStr.data();
+        for (const auto & part : strings) {
+            std::memcpy(tmp, part->data(), part->size());
+            tmp += part->size();
+        }
+        *tmp = '\0';
+        v.mkStringMove(resultStr, context, state.mem);
+    }
+}
+
+template<size_t N>
+[[gnu::noinline]] void ExprConcatStrings::evalWith(EvalState & state, Env & env, Value & v)
+{
     NixStringContext context;
     std::vector<BackedStringView> strings;
     size_t sSize = 0;
@@ -2278,7 +2364,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
     ValueType firstType = nString;
 
     // List of returned strings. References to these Values must NOT be persisted.
-    SmallTemporaryValueVector<conservativeStackReservation> values(es.size());
+    SmallTemporaryValueVector<N> values(es.size());
     Value * vTmpP = values.data();
 
     for (auto & [i_pos, i] : es) {
@@ -2299,9 +2385,7 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
                 if (auto checked = newN.valueChecked(); checked.has_value()) {
                     n = NixInt(*checked);
                 } else {
-                    state.error<EvalError>("integer overflow in adding %1% + %2%", n, vTmp.integer())
-                        .atPos(i_pos)
-                        .debugThrow();
+                    throwAddOverflow(state, n, vTmp.integer(), i_pos);
                 }
             } else if (vTmp.type() == nFloat) {
                 // Upgrade the type from int to float;
@@ -2309,31 +2393,16 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
                 nf = n.value;
                 nf += vTmp.fpoint();
             } else
-                state.error<EvalError>("cannot add %1% to an integer", showType(vTmp))
-                    .atPos(i_pos)
-                    .withFrame(env, *this)
-                    .debugThrow();
+                throwCannotAddToInt(state, env, *this, vTmp, i_pos);
         } else if (firstType == nFloat) {
             if (vTmp.type() == nInt) {
                 nf += vTmp.integer().value;
             } else if (vTmp.type() == nFloat) {
                 nf += vTmp.fpoint();
             } else
-                state.error<EvalError>("cannot add %1% to a float", showType(vTmp))
-                    .atPos(i_pos)
-                    .withFrame(env, *this)
-                    .debugThrow();
-        } else {
-            if (strings.empty())
-                strings.reserve(es.size());
-            /* skip canonization of first path, which would only be not
-            canonized in the first place if it's coming from a ./${foo} type
-            path */
-            auto part = state.coerceToString(
-                i_pos, vTmp, context, "while evaluating a path segment", false, firstType == nString, !first);
-            sSize += part->size();
-            strings.emplace_back(std::move(part));
-        }
+                throwCannotAddToFloat(state, env, *this, vTmp, i_pos);
+        } else
+            appendStringPart(state, i_pos, vTmp, context, strings, sSize, es.size(), firstType, first);
 
         first = false;
     }
@@ -2342,28 +2411,8 @@ void ExprConcatStrings::eval(EvalState & state, Env & env, Value & v)
         v.mkInt(n);
     } else if (firstType == nFloat) {
         v.mkFloat(nf);
-    } else if (firstType == nPath) {
-        if (!context.empty())
-            state.error<EvalError>("a string that refers to a store path cannot be appended to a path")
-                .atPos(pos)
-                .withFrame(env, *this)
-                .debugThrow();
-        std::string resultStr;
-        resultStr.reserve(sSize);
-        for (const auto & part : strings) {
-            resultStr += *part;
-        }
-        v.mkPath(state.rootPath(CanonPath(resultStr)), state.mem);
-    } else {
-        auto & resultStr = StringData::alloc(state.mem, sSize);
-        auto * tmp = resultStr.data();
-        for (const auto & part : strings) {
-            std::memcpy(tmp, part->data(), part->size());
-            tmp += part->size();
-        }
-        *tmp = '\0';
-        v.mkStringMove(resultStr, context, state.mem);
-    }
+    } else
+        finishConcatStrings(state, env, *this, v, firstType, context, strings, sSize);
 }
 
 void ExprPos::eval(EvalState & state, Env & env, Value & v)
