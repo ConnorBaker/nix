@@ -1947,13 +1947,23 @@ void EvalState::callFunction(Value & fun, std::span<Value * const> args, Value &
     vRes = vCur;
 }
 
-void ExprCall::eval(EvalState & state, Env & env, Value & v)
-{
-    auto dts =
-        state.debugRepl ? makeDebugTraceStacker(state, *this, env, getPos(), "while calling a function") : nullptr;
+/* ExprCall::eval's work, tail-called: a call with one argument does not
+   reserve a small vector's room. */
 
+[[gnu::noinline]] static void evalCall1(ExprCall & call, EvalState & state, Env & env, Value & v)
+{
     Value vFun;
-    fun->eval(state, env, vFun);
+    call.fun->eval(state, env, vFun);
+
+    Value * arg = (*call.args)[0]->maybeThunk(state, env);
+
+    state.callFunction(vFun, std::span<Value * const>(&arg, 1), v, call.pos);
+}
+
+[[gnu::noinline]] static void evalCallN(ExprCall & call, EvalState & state, Env & env, Value & v)
+{
+    Value vFun;
+    call.fun->eval(state, env, vFun);
 
     // Empirical arity of Nixpkgs lambdas by regex e.g. ([a-zA-Z]+:(\s|(/\*.*\/)|(#.*\n))*){5}
     // 2: over 4000
@@ -1961,11 +1971,31 @@ void ExprCall::eval(EvalState & state, Env & env, Value & v)
     // 4: about 60
     // 5: under 10
     // This excluded attrset lambdas (`{...}:`). Contributions of mixed lambdas appears insignificant at ~150 total.
-    SmallValueVector<4> vArgs(args->size());
-    for (size_t i = 0; i < args->size(); ++i)
-        vArgs[i] = (*args)[i]->maybeThunk(state, env);
+    SmallValueVector<4> vArgs(call.args->size());
+    for (size_t i = 0; i < call.args->size(); ++i)
+        vArgs[i] = (*call.args)[i]->maybeThunk(state, env);
 
-    state.callFunction(vFun, vArgs, v, pos);
+    state.callFunction(vFun, vArgs, v, call.pos);
+}
+
+/* Under the debugger: the same, with the trace stacker alive across it. */
+[[gnu::noinline, gnu::cold]] static void evalCallDebug(ExprCall & call, EvalState & state, Env & env, Value & v)
+{
+    auto dts = makeDebugTraceStacker(state, call, env, call.getPos(), "while calling a function");
+
+    if (call.args->size() == 1)
+        evalCall1(call, state, env, v);
+    else
+        evalCallN(call, state, env, v);
+}
+
+void ExprCall::eval(EvalState & state, Env & env, Value & v)
+{
+    if (state.debugRepl) [[unlikely]]
+        return evalCallDebug(*this, state, env, v);
+    if (args->size() == 1)
+        return evalCall1(*this, state, env, v);
+    return evalCallN(*this, state, env, v);
 }
 
 // Lifted out of callFunction() because it creates a temporary that
