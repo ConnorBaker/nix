@@ -93,7 +93,10 @@ typedef std::vector<AttrName> AttrSelectionPath;
 
 std::string showAttrSelectionPath(const SymbolTable & symbols, std::span<const AttrName> attrPath);
 
-using UpdateQueue = SmallTemporaryValueVector<conservativeStackReservation>;
+/**
+ * The operands of a chain of `//`, evaluated.
+ */
+using UpdateQueue = SmallTemporaryValueVector<conservativeStackReservation>::base_type;
 
 /* Abstract syntax of Nix expressions. */
 
@@ -136,6 +139,15 @@ struct Expr
      * applying them.
      */
     virtual void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx);
+
+    /**
+     * How many values `evalForUpdate` pushes.
+     */
+    virtual size_t updateOperands() const
+    {
+        return 1;
+    }
+
     virtual void setName(Symbol name);
     virtual void setDocComment(DocComment docComment) {};
 
@@ -767,10 +779,20 @@ private:
     /** Special case for merging of two attrsets. */
     void eval(EvalState & state, Value & v, Value & v1, Value & v2);
     void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q);
+    /**
+     * `eval`, with room on the stack for `N` operand values.
+     */
+    template<size_t N>
+    void evalWith(EvalState & state, Env & env, Value & v);
 
 public:
     MakeBinOpMembers(ExprOpUpdate, "//");
     virtual void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx) override;
+
+    size_t updateOperands() const override
+    {
+        return e1->updateOperands() + e2->updateOperands();
+    }
 };
 
 struct ExprConcatStrings : Expr

@@ -2303,7 +2303,17 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)
 {
-    UpdateQueue q;
+    /* Most chains are one `//`: room for its two operands, not
+       `conservativeStackReservation`'s (as ExprConcatStrings::eval). */
+    if (updateOperands() <= 2)
+        return evalWith<2>(state, env, v);
+    return evalWith<conservativeStackReservation>(state, env, v);
+}
+
+template<size_t N>
+[[gnu::noinline]] void ExprOpUpdate::evalWith(EvalState & state, Env & env, Value & v)
+{
+    SmallTemporaryValueVector<N> q;
     evalForUpdate(state, env, q);
 
     Value vTmp;
