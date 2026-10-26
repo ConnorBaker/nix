@@ -2819,7 +2819,55 @@ bool EvalState::isDerivation(Value & v)
     return i->value->string_view().compare("derivation") == 0;
 }
 
-BackedStringView EvalState::coerceToString(
+void addPeelTrace(EvalState & state, Error & e, PosIdx pos, PeelTrace what, const Value & v)
+{
+    switch (what) {
+    case PeelTrace::CallToString:
+        e.addTrace(state.positions[pos], "while calling the `__toString` attribute");
+        break;
+    case PeelTrace::UseToStringResult:
+        e.addTrace(state.positions[pos], "while %s the result of the `__toString` attribute", WhileTryingToUse{v});
+        break;
+    case PeelTrace::UseOutPath:
+        e.addTrace(state.positions[pos], "while %s the `outPath` attribute", WhileTryingToUse{v});
+        break;
+    }
+}
+
+void throwToStringReturn(EvalState & state, Value & v, PosIdx pos, bool should)
+{
+    if (should)
+        state
+            .error<TypeError>(
+                "`__toString` should return a string, but got %1%: %2%",
+                showType(v),
+                ValuePrinter(state, v, errorPrintOptions))
+            .atPos(pos)
+            .debugThrow();
+    state
+        .error<TypeError>(
+            "`__toString` must return a string, but got %1%: %2%",
+            showType(v),
+            ValuePrinter(state, v, errorPrintOptions))
+        .atPos(pos)
+        .debugThrow();
+}
+
+/* coerceToString's leaves, lists and errors, out of line: its frame is on
+   the stack at each level of a recursion through `outPath` or `__toString`. */
+
+[[noreturn, gnu::noinline, gnu::cold]] static void
+throwCannotCoerceToString(EvalState & state, Value & v, const PosIdx pos, std::string_view errorCtx)
+{
+    state.error<TypeError>("cannot coerce %1% to a string: %2%", showType(v), ValuePrinter(state, v, errorPrintOptions))
+        .withTrace(pos, errorCtx)
+        .debugThrow();
+}
+
+/* A path, an external value, and with `coerceMore` a Boolean, a number or
+   null; otherwise the error. */
+[[gnu::noinline]] static BackedStringView coerceLeafToString(
+    EvalState & state,
     const PosIdx pos,
     Value & v,
     NixStringContext & context,
@@ -2828,58 +2876,21 @@ BackedStringView EvalState::coerceToString(
     bool copyToStore,
     bool canonicalizePath)
 {
-    auto _level = addCallDepth(pos);
-
-    forceValue(v, pos);
-
-    if (v.type() == nString) {
-        copyContext(v, context);
-        return v.string_view();
-    }
-
     if (v.type() == nPath) {
         if (!canonicalizePath && !copyToStore) {
             // FIXME: hack to preserve path literals that end in a
             // slash, as in /foo/${x}.
             return v.pathStrView();
         } else if (copyToStore) {
-            return store->printStorePath(copyPathToStore(context, v.path()));
+            return state.store->printStorePath(state.copyPathToStore(context, v.path()));
         } else {
             return std::string{v.path().path.abs()};
         }
     }
 
-    if (v.type() == nAttrs) {
-        return peelToStringOutPath(
-            pos,
-            v,
-            /*checkToStringReturn=*/false, // Historical quirk
-            [&](Value * peeled, bool) -> BackedStringView {
-                if (peeled->type() == nAttrs) {
-                    error<TypeError>(
-                        "cannot coerce %1% to a string: %2%",
-                        showType(*peeled),
-                        ValuePrinter(*this, *peeled, errorPrintOptions))
-                        .withTrace(pos, errorCtx)
-                        .debugThrow();
-                }
-                /* `canonicalizePath=false` is `ExprConcat`'s hack for
-                   preserving the trailing slash on source-parsed path
-                   literals like the `/foo/` in `/foo/${x}`. Any attrset
-                   in that slot is a computed value with no
-                   source-fidelity intent — the peeled path came from
-                   user code, not from the interpolation syntax. Force
-                   canonicalisation on the peel result regardless of
-                   which peel path (`__toString` or `outPath`) got us
-                   here. */
-                return coerceToString(
-                    pos, *peeled, context, errorCtx, coerceMore, copyToStore, /*canonicalizePath=*/true);
-            });
-    }
-
     if (v.type() == nExternal) {
         try {
-            return v.external()->coerceToString(*this, pos, context, coerceMore, copyToStore);
+            return v.external()->coerceToString(state, pos, context, coerceMore, copyToStore);
         } catch (Error & e) {
             e.addTrace(nullptr, errorCtx);
             throw;
@@ -2899,36 +2910,89 @@ BackedStringView EvalState::coerceToString(
             return std::to_string(v.fpoint());
         if (v.type() == nNull)
             return "";
-
-        if (v.isList()) {
-            std::string result;
-            auto listView = v.listView();
-            for (auto [n, v2] : enumerate(listView)) {
-                try {
-                    result += *coerceToString(
-                        pos,
-                        *v2,
-                        context,
-                        "while evaluating one element of the list",
-                        coerceMore,
-                        copyToStore,
-                        canonicalizePath);
-                } catch (Error & e) {
-                    e.addTrace(positions[pos], errorCtx);
-                    throw;
-                }
-                if (n < v.listSize() - 1
-                    /* !!! not quite correct */
-                    && (!v2->isList() || v2->listSize() != 0))
-                    result += " ";
-            }
-            return result;
-        }
     }
 
-    error<TypeError>("cannot coerce %1% to a string: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-        .withTrace(pos, errorCtx)
-        .debugThrow();
+    throwCannotCoerceToString(state, v, pos, errorCtx);
+}
+
+[[gnu::noinline, gnu::cold]] static void
+addListElementTrace(EvalState & state, Error & e, const PosIdx pos, std::string_view errorCtx)
+{
+    e.addTrace(state.positions[pos], errorCtx);
+}
+
+/* A list, with `coerceMore`: its elements' strings, separated by spaces. */
+[[gnu::noinline]] static BackedStringView coerceListToString(
+    EvalState & state,
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    bool copyToStore,
+    bool canonicalizePath)
+{
+    std::string result;
+    auto listView = v.listView();
+    for (auto [n, v2] : enumerate(listView)) {
+        try {
+            result += *state.coerceToString(
+                pos, *v2, context, "while evaluating one element of the list", true, copyToStore, canonicalizePath);
+        } catch (Error & e) {
+            addListElementTrace(state, e, pos, errorCtx);
+            throw;
+        }
+        if (n < v.listSize() - 1
+            /* !!! not quite correct */
+            && (!v2->isList() || v2->listSize() != 0))
+            result += " ";
+    }
+    return result;
+}
+
+BackedStringView EvalState::coerceToString(
+    const PosIdx pos,
+    Value & v,
+    NixStringContext & context,
+    std::string_view errorCtx,
+    bool coerceMore,
+    bool copyToStore,
+    bool canonicalizePath)
+{
+    auto _level = addCallDepth(pos);
+
+    forceValue(v, pos);
+
+    if (v.type() == nString) {
+        copyContext(v, context);
+        return v.string_view();
+    }
+
+    if (v.type() == nAttrs) {
+        return peelToStringOutPath(
+            pos,
+            v,
+            /*checkToStringReturn=*/false, // Historical quirk
+            [&](Value * peeled, bool) -> BackedStringView {
+                if (peeled->type() == nAttrs)
+                    throwCannotCoerceToString(*this, *peeled, pos, errorCtx);
+                /* `canonicalizePath=false` is `ExprConcat`'s hack for
+                   preserving the trailing slash on source-parsed path
+                   literals like the `/foo/` in `/foo/${x}`. Any attrset
+                   in that slot is a computed value with no
+                   source-fidelity intent — the peeled path came from
+                   user code, not from the interpolation syntax. Force
+                   canonicalisation on the peel result regardless of
+                   which peel path (`__toString` or `outPath`) got us
+                   here. */
+                return coerceToString(
+                    pos, *peeled, context, errorCtx, coerceMore, copyToStore, /*canonicalizePath=*/true);
+            });
+    }
+
+    if (coerceMore && v.isList())
+        return coerceListToString(*this, pos, v, context, errorCtx, copyToStore, canonicalizePath);
+
+    return coerceLeafToString(*this, pos, v, context, errorCtx, coerceMore, copyToStore, canonicalizePath);
 }
 
 StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePath & path)

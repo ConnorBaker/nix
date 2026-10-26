@@ -170,6 +170,21 @@ inline CallDepth EvalState::addCallDepth(const PosIdx pos)
     return CallDepth(callDepth);
 };
 
+/**
+ * The cold paths of `EvalState::peelToStringOutPath`'s peeling step, out of
+ * line: its frame is on the stack while `outPath` or `__toString` is evaluated.
+ */
+enum class PeelTrace { CallToString, UseToStringResult, UseOutPath };
+
+[[gnu::noinline, gnu::cold]] void
+addPeelTrace(EvalState & state, Error & e, PosIdx pos, PeelTrace what, const Value & v);
+
+/**
+ * `__toString`'s result is not a string: `should` for a result that is no
+ * attribute set, otherwise one that cannot be peeled further.
+ */
+[[noreturn, gnu::noinline, gnu::cold]] void throwToStringReturn(EvalState & state, Value & v, PosIdx pos, bool should);
+
 template<typename Cb>
 std::invoke_result_t<Cb, Value *, bool>
 EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringReturn, Cb && cb)
@@ -190,13 +205,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
                string" contract.
                */
             if (checkToStringReturn && cameThroughToString && vType != nString && vType != nPath && vType != nExternal)
-                state
-                    .error<TypeError>(
-                        "`__toString` should return a string, but got %1%: %2%",
-                        showType(v),
-                        ValuePrinter(state, v, errorPrintOptions))
-                    .atPos(pos)
-                    .debugThrow();
+                throwToStringReturn(state, v, pos, /*should=*/true);
             return std::forward<Cb>(cb)(&v, cameThroughToString);
         }
         if (auto i = v.attrs()->get(state.s.toString)) {
@@ -204,7 +213,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
             try {
                 state.callFunction(*i->value, v, v1, i->pos);
             } catch (Error & e) {
-                e.addTrace(state.positions[i->pos], "while calling the `__toString` attribute");
+                addPeelTrace(state, e, i->pos, PeelTrace::CallToString, v1);
                 throw;
             }
             cameThroughToString = true;
@@ -212,8 +221,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
                 auto _level = state.addCallDepth(pos);
                 return peel(i->pos, v1);
             } catch (Error & e) {
-                e.addTrace(
-                    state.positions[i->pos], "while %s the result of the `__toString` attribute", WhileTryingToUse{v1});
+                addPeelTrace(state, e, i->pos, PeelTrace::UseToStringResult, v1);
                 throw;
             }
         }
@@ -223,7 +231,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
                 auto _level = state.addCallDepth(pos);
                 return peel(i->pos, *i->value);
             } catch (Error & e) {
-                e.addTrace(state.positions[i->pos], "while %s the `outPath` attribute", WhileTryingToUse{*i->value});
+                addPeelTrace(state, e, i->pos, PeelTrace::UseOutPath, *i->value);
                 throw;
             }
         }
@@ -231,13 +239,7 @@ EvalState::peelToStringOutPath(const PosIdx pos, Value & v, bool checkToStringRe
            If we came through a `__toString` call at any depth, this violates
            the string-return contract. (usually not enforced) */
         if (checkToStringReturn && cameThroughToString)
-            state
-                .error<TypeError>(
-                    "`__toString` must return a string, but got %1%: %2%",
-                    showType(v),
-                    ValuePrinter(state, v, errorPrintOptions))
-                .atPos(pos)
-                .debugThrow();
+            throwToStringReturn(state, v, pos, /*should=*/false);
         return std::forward<Cb>(cb)(&v, cameThroughToString);
     };
     return peel(pos, v);
