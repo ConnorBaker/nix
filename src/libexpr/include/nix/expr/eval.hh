@@ -1073,11 +1073,13 @@ private:
     struct UndoEntry
     {
         Value * target;
-        /* The call depth and position of the force: a reverted target is
-           re-forced at this depth, and a reverted application called again
-           at this position. */
+        /* The call depth, position and native stack room (in 16-byte units;
+           0: unknown) of the force: a reverted target is re-forced at this
+           depth, with at least this room, and a reverted application called
+           again at this position. */
         uint32_t depth;
         PosIdx pos;
+        uint32_t room;
         Value preImage;
     };
 
