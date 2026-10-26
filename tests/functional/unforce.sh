@@ -7,10 +7,11 @@ source common.sh
 
 clearStoreIfPossible
 
-# The number of unforce jobs that `$@` ran, or "-" in a build that has none.
+# The number of unforce jobs that `$@` ran, or "-" in a build with Boehm GC,
+# which has none: its statistics have "gc" in place of "unforce".
 jobsOf() {
     NIX_SHOW_STATS=1 NIX_SHOW_STATS_PATH="$TEST_ROOT/stats.json" "$@" > "$TEST_ROOT/out"
-    jq -r '.unforce.jobs // "-"' "$TEST_ROOT/stats.json"
+    jq -r 'if has("gc") then "-" else .unforce.jobs end' "$TEST_ROOT/stats.json"
 }
 
 expectJobs() {
@@ -33,9 +34,10 @@ expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 1
 [[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
-# Only on 64-bit Linux do jobs have a region, from which they free.
-if [[ $system == *-linux && $system != i686-linux ]]; then
-    [[ $(jq -r '.unforce.bytesFreed // 1' "$TEST_ROOT/stats.json") -gt 0 ]]
+# Only on 64-bit Linux, without Boehm GC, do jobs have a region, from which
+# they free.
+if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
 fi
 
 # A trace is shown once: the cell whose evaluation showed it keeps its
