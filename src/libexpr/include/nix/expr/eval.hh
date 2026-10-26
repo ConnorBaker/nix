@@ -1273,7 +1273,9 @@ struct DebugTraceStacker
 {
     DebugTraceStacker(EvalState & evalState, DebugTrace t);
 
-    ~DebugTraceStacker()
+    /* Out of line: inlined, it (with the two `DebugTrace`s it destroys)
+       takes room in its holder's frame, under the evaluation it traces. */
+    [[gnu::noinline]] ~DebugTraceStacker()
     {
         evalState.debugTraces.pop_front();
     }
