@@ -25,6 +25,18 @@ expectJobs "$(jobsOf nix eval --json --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 3
 
+# --strict forces each element in a job before anything is printed: what
+# it forced stays forced (a reverted cell prints as `<CODE>`), and what an
+# element built besides is freed.
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 3
+[[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 1
+[[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
+# Only on 64-bit Linux do jobs have a region, from which they free.
+if [[ $system == *-linux && $system != i686-linux ]]; then
+    [[ $(jq -r '.unforce.bytesFreed // 1' "$TEST_ROOT/stats.json") -gt 0 ]]
+fi
+
 # A derivation found in an earlier job is dropped in a later one; one job
 # per attribute, then one per derivation found (its name, its drvPath).
 cat > "$TEST_ROOT/drvs.nix" <<EOF

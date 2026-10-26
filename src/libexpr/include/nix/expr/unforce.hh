@@ -81,6 +81,15 @@ public:
 
     /** A job ended: nothing this holds is in a job's memory any more. */
     virtual void ended() = 0;
+
+    /**
+     * At a job's end: whether `cell`, older than the job, which forced it,
+     * keeps its value, and with it what the value reaches.
+     */
+    virtual bool keeps(const Value * cell) const
+    {
+        return false;
+    }
 };
 
 /**

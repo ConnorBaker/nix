@@ -805,9 +805,11 @@ public:
 
     /**
      * Force a value, then recursively force list elements and
-     * attributes.
+     * attributes. A front end that keeps nothing of the evaluation but `v`
+     * passes `traversal`: then each element of `v` is forced in an unforce
+     * job (`UnforceJobs`), and what was forced deeply stays forced.
      */
-    void forceValueDeep(Value & v);
+    void forceValueDeep(Value & v, bool traversal = false);
 
     /**
      * Force `v`, and then verify that it has the expected type.

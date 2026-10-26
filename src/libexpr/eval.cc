@@ -2695,25 +2695,50 @@ template<typename F>
         f(**i);
 }
 
-void EvalState::forceValueDeep(Value & v)
-{
-    std::set<const Value *> seen;
+namespace {
 
-    [&, &state(*this)](this const auto & recurse, Value & v) {
+/* The cells that `forceValueDeep` walked: at the end of a job of its
+   traversal, they keep their values, which its caller reads next. */
+struct DeepSeen : UnforceSeen
+{
+    bool keeps(const Value * cell) const override
+    {
+        return contains(cell);
+    }
+};
+
+} // namespace
+
+void EvalState::forceValueDeep(Value & v, bool traversal)
+{
+    /* On the heap: this frame is below the walk. */
+    auto seen = std::make_unique<DeepSeen>();
+    /* Its last job ends here, while `seen` holds what it walked. */
+    std::optional<UnforceJobs> jobs;
+    if (traversal)
+        jobs.emplace(*this, &v);
+
+    /* `top`: whether `v` is the top level, whose elements are jobs if
+       `jobs` is open. A type: the levels below have no room for it, nor
+       their closures for a reference to it or to `jobs` (whose next job
+       `unforceElementStart` starts). */
+    auto walk = [&, &state(*this)](this const auto & recurse, Value & v, auto top) {
         auto _level = state.addCallDepth(v.determinePos(noPos));
 
-        if (!seen.insert(&v).second)
+        if (!seen->see(&v, UnforceHolder::Kind::value))
             return;
 
         state.forceValue(v, v.determinePos(noPos));
 
         if (v.type() == nAttrs) {
             auto deepAttr = [&](const Attr & i) {
+                if constexpr (decltype(top)::value)
+                    unforceElementStart();
                 try {
                     // If the value is a thunk, we're evaling. Otherwise no trace necessary.
                     auto dts = state.debugRepl && i.value->isThunk() ? forceValueDeepTrace(state, i) : nullptr;
 
-                    recurse(*i.value);
+                    recurse(*i.value, std::false_type{});
                 } catch (Error & e) {
                     addAttrTrace(state, e, i);
                     throw;
@@ -2729,16 +2754,23 @@ void EvalState::forceValueDeep(Value & v)
 
         else if (v.isList()) {
             size_t index = 0;
-            for (auto v2 : v.listView())
+            for (auto v2 : v.listView()) {
+                if constexpr (decltype(top)::value)
+                    unforceElementStart();
                 try {
-                    recurse(*v2);
+                    recurse(*v2, std::false_type{});
                     index++;
                 } catch (Error & e) {
                     addListElemTrace(state, e, index);
                     throw;
                 }
+            }
         }
-    }(v);
+    };
+    if (jobs)
+        walk(v, std::true_type{});
+    else
+        walk(v, std::false_type{});
 }
 
 void EvalState::throwExpectedAttrs(Value & v, const PosIdx pos, std::string_view errorCtx)

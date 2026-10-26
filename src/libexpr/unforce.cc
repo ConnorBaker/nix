@@ -1685,7 +1685,8 @@ static bool decide(
     };
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
-        if (log[i].target->isFailed() || log[i].consumed || (p.isThunk() && unforceIsReverted(p.thunk().expr)))
+        if (log[i].target->isFailed() || log[i].consumed || (p.isThunk() && unforceIsReverted(p.thunk().expr))
+            || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             nominate(targets.ofEntry[i]);
     }
 
