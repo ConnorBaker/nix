@@ -3093,6 +3093,14 @@ static void addPath(
     }
 }
 
+/* Out of line: the copy of the path that `addPath` takes, inlined into
+   prim_filterSource, spills two registers into the frame that forces the
+   filter function. */
+[[gnu::noinline]] static SourcePath copyPath(const SourcePath & path)
+{
+    return path;
+}
+
 static void prim_filterSource(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     NixStringContext context;
@@ -3103,7 +3111,15 @@ static void prim_filterSource(EvalState & state, CallSite callSite, Value * cons
         "while evaluating the second argument (the path to filter) passed to 'builtins.filterSource'");
     state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.filterSource");
 
-    addPath(state, path.baseName(), path, args[0], ContentAddressMethod::Raw::NixArchive, std::nullopt, v, context);
+    addPath(
+        state,
+        path.baseName(),
+        copyPath(path),
+        args[0],
+        ContentAddressMethod::Raw::NixArchive,
+        std::nullopt,
+        v,
+        context);
 }
 
 static RegisterPrimOp primop_filterSource({
@@ -4421,6 +4437,14 @@ static RegisterPrimOp primop_sort({
 
 [[gnu::noinline]] static void partitionResult(EvalState & state, ValueVector & right, ValueVector & wrong, Value & v);
 
+/* Out of line, the element passed in a register: `push_back` takes its
+   address, and a vector's growth, inlined or not, takes room in the frame
+   that evaluates the elements. */
+[[gnu::noinline]] static void pushElem(ValueVector & vec, Value * elem)
+{
+    vec.push_back(elem);
+}
+
 /* Tail-called by prim_partition: only this frame is on the stack while the
    elements and their tests are evaluated. */
 [[gnu::noinline]] static void partitionElems(EvalState & state, Value & pred, Value & list, Value & v)
@@ -4436,9 +4460,9 @@ static RegisterPrimOp primop_sort({
         state.callFunction(pred, *vElem, res, noPos);
         if (state.forceBool(
                 res, noPos, "while evaluating the return value of the partition function passed to builtins.partition"))
-            right.push_back(vElem);
+            pushElem(right, vElem);
         else
-            wrong.push_back(vElem);
+            pushElem(wrong, vElem);
     }
 
     partitionResult(state, right, wrong, v);
@@ -4509,7 +4533,7 @@ static void prim_groupBy(EvalState & state, CallSite callSite, Value * const * a
             res, noPos, "while evaluating the return value of the grouping function passed to builtins.groupBy");
         auto sym = state.symbols.create(name);
         auto vector = attrs.try_emplace<ValueVector>(sym, {}).first;
-        vector->second.push_back(vElem);
+        pushElem(vector->second, vElem);
     }
 
     auto attrs2 = state.buildBindings(attrs.size());
