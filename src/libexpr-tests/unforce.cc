@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 
 #include "nix/expr/tests/libexpr.hh"
+#include "nix/expr/get-drvs.hh"
+#include "nix/expr/print.hh"
 #include "nix/expr/unforce.hh"
 
 #include <cstdint>
@@ -42,6 +44,18 @@ protected:
     {
         state.forceValueDeep(v);
         return printValue(state, v);
+    }
+
+    /* `v` printed as `nix eval` prints it, its elements forced in jobs if `jobs`. */
+    std::string printed(Value & v, bool jobs)
+    {
+        state.forceValue(v, noPos);
+        std::ostringstream out;
+        std::optional<UnforceJobs> traversal;
+        if (jobs)
+            traversal.emplace(state, &v);
+        printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true});
+        return out.str();
     }
 };
 
@@ -299,6 +313,31 @@ TEST_F(UnforceTest, seenHoldsContainers)
     EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
     state.endUnforceScope();
     EXPECT_EQ(deep(*b), "{ x = 1; }");
+}
+
+/* A traversal runs each element of its root in a job of its own: a
+   printer prints what it prints without, «repeated» included, and the
+   elements are thunks again afterwards. */
+TEST_F(UnforceTest, printerJobs)
+{
+    auto expr = "let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }";
+    auto v = oldThunk(expr);
+    EXPECT_EQ(printed(*v, true), printed(*oldThunk(expr), false));
+    EXPECT_TRUE(v->attrs()->get(createSymbol("c"))->value->isThunk());
+}
+
+/* `getDerivations` finds each derivation in a job, drops one found in an
+   earlier job, and the attributes of those it finds outlive the jobs. */
+TEST_F(UnforceTest, getDerivationsJobs)
+{
+    auto v = oldThunk(
+        "rec { x = derivation { name = \"x\"; system = \"s\"; builder = \"b\"; }; y = x; z = derivation { name = \"z\"; system = \"s\"; builder = \"b\"; outputs = [ \"dev\" ]; }; w = { a = 1; }; }");
+    state.forceValue(*v, noPos);
+    PackageInfos drvs;
+    getDerivations(state, *v, "", Bindings::emptyBindings, drvs, false);
+    EXPECT_TRUE(v->attrs()->get(createSymbol("w"))->value->isThunk());
+    ASSERT_EQ(drvs.size(), 2);
+    EXPECT_EQ(drvs.back().queryOutputName(), "dev");
 }
 
 /* Native code turns unforcing off: here, `importNative`. */

@@ -1894,6 +1894,56 @@ void unforceNoteEffect()
         keepWhole = true;
 }
 
+/* ---------------------------------------------------------------------------
+   Traversals (`UnforceJobs`), the innermost last. `opener` is the frame of
+   the level whose element runs in the job that the traversal opened, if
+   one is open.
+   --------------------------------------------------------------------------- */
+
+struct Traversal
+{
+    EvalState & state;
+    bool unforce;
+    const Value * savedRoot;
+    const char * opener = nullptr;
+};
+
+static thread_local std::vector<Traversal> traversals;
+
+void unforceJobsBegin(EvalState & state, const Value * root)
+{
+    auto unforce = unforceEnabled(state);
+    traversals.push_back({state, unforce, state.unforceRoot});
+    state.unforceRoot = unforce ? root : nullptr;
+}
+
+void unforceJobsEnd()
+{
+    auto t = traversals.back();
+    traversals.pop_back();
+    t.state.unforceRoot = t.savedRoot;
+    if (t.opener)
+        t.state.endUnforceScope(__builtin_dwarf_cfa());
+}
+
+void unforceElementStart()
+{
+    auto & t = traversals.back();
+    /* The level's stack pointer, below which its element's frames lie. */
+    auto level = (const char *) __builtin_dwarf_cfa();
+    if (!t.unforce || (t.opener && t.opener != level))
+        return;
+    if (t.opener) {
+        t.opener = nullptr;
+        t.state.endUnforceScope(level);
+    }
+    /* In a job, of which the traversal is part. */
+    if (jobOwner.load())
+        return;
+    t.state.beginUnforceScope(level);
+    t.opener = level;
+}
+
 void unforceKeepJob()
 {
     if (jobOwner.load())
@@ -1917,21 +1967,26 @@ void EvalState::beginUnforceScope(const void * stackMark)
     openSeg = evalRegion.base;
 }
 
-void EvalState::endUnforceScope()
+void EvalState::endUnforceScope(const void * ender)
 {
     if (NIX_USE_BOEHMGC || --isolationDepth)
         return;
-    endUnforceJob();
+    endUnforceJob((const char *) (ender ? ender : __builtin_dwarf_cfa()));
 }
 
-void EvalState::endUnforceJob()
+void EvalState::endUnforceJob(const char * ender)
 {
     /* A cell whose failure was retried is kept with the whole job: its
        re-force would run at the depth of its first force, which failed
        (`ExprReforce`). So is a job during which native code came to be able
-       to run. */
+       to run, and one that logged a slot of a frame that has returned since
+       (between the job's opener and `ender`), which must be neither read
+       nor written. */
     bool keep = keepWhole || youngFailuresLost || !evalRegion.base || unforceNativeCode(*this)
-                || std::any_of(undoLog.begin(), undoLog.end(), [](auto & e) { return e.preImage.isFailed(); });
+                || std::any_of(undoLog.begin(), undoLog.end(), [&](auto & e) {
+                       return e.preImage.isFailed()
+                              || ((const char *) e.target >= jobStackMark && (const char *) e.target < ender);
+                   });
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is
        written, or keeps its value (no `target`). Everything that may fail to

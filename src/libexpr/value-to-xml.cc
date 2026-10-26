@@ -1,6 +1,7 @@
 #include "nix/expr/value-to-xml.hh"
 #include "nix/util/xml-writer.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/util/signals.hh"
 
 #include <cstdlib>
@@ -108,6 +109,35 @@ static void showAttrs(
         doc.writeEmptyElement("repeated");
 }
 
+/* The root of a traversal (`UnforceJobs`), each element of it in a job of
+   its own. Out of line, so that the levels below have no room for it. */
+[[gnu::noinline]] static void printElementsAsXML(
+    EvalState & state,
+    bool strict,
+    bool location,
+    Value & v,
+    XMLWriter & doc,
+    NixStringContext & context,
+    StringSet & drvsSeen,
+    const PosIdx pos)
+{
+    if (v.type() == nAttrs) {
+        XMLOpenElement _(doc, "attrs");
+        for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
+            unforceElement(state, v);
+            openAttrElement(state, location, *a, doc);
+            CloseAttrElement _{doc};
+            printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
+        }
+    } else {
+        XMLOpenElement _(doc, "list");
+        for (auto v2 : v.listView()) {
+            unforceElement(state, v);
+            printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);
+        }
+    }
+}
+
 /* printValueAsXML of a value that is not a list or an attribute set. */
 [[gnu::noinline]] static void printLeafAsXML(
     EvalState & state,
@@ -212,6 +242,8 @@ static void printValueAsXML(
     case nAttrs:
         if (state.isDerivation(v))
             printDerivationAsXML(state, strict, location, v, doc, context, drvsSeen);
+        else if (state.unforceRoot == &v) [[unlikely]]
+            printElementsAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
         else {
             XMLOpenElement _(doc, "attrs");
             showAttrs(state, strict, location, *v.attrs(), doc, context, drvsSeen);
@@ -219,6 +251,10 @@ static void printValueAsXML(
         break;
 
     case nList: {
+        if (state.unforceRoot == &v) [[unlikely]] {
+            printElementsAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
+            break;
+        }
         XMLOpenElement _(doc, "list");
         for (auto v2 : v.listView())
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);

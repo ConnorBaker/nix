@@ -1,5 +1,6 @@
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/path-with-outputs.hh"
@@ -196,16 +197,21 @@ const Bindings * PackageInfo::getMeta()
     if (!a)
         return 0;
     state->forceAttrs(*a->value, a->pos, "while evaluating the 'meta' attribute of a derivation");
-    meta = a->value->attrs();
-    return meta;
+    /* Not remembered if an unforce job built it, which the job's end may
+       free: `attrs` gives it again. */
+    auto m = a->value->attrs();
+    if (!evalRegion.contains(m))
+        meta = m;
+    return m;
 }
 
 StringSet PackageInfo::queryMetaNames()
 {
     StringSet res;
-    if (!getMeta())
+    auto m = getMeta();
+    if (!m)
         return res;
-    for (auto & i : *meta)
+    for (auto & i : *m)
         res.emplace(state->symbols[i.name]);
     return res;
 }
@@ -233,9 +239,10 @@ bool PackageInfo::checkMeta(Value & v)
 
 Value * PackageInfo::queryMeta(const std::string & name)
 {
-    if (!getMeta())
+    auto m = getMeta();
+    if (!m)
         return 0;
-    auto a = meta->get(state->symbols.create(name));
+    auto a = m->get(state->symbols.create(name));
     if (!a || !checkMeta(*a->value))
         return 0;
     return a->value;
@@ -301,20 +308,60 @@ bool PackageInfo::queryMetaBool(const std::string & name, bool def)
 
 void PackageInfo::setMeta(const std::string & name, Value * v)
 {
-    getMeta();
-    auto attrs = state->buildBindings(1 + (meta ? meta->size() : 0));
+    auto m = getMeta();
+    auto attrs = state->buildBindings(1 + (m ? m->size() : 0));
     auto sym = state->symbols.create(name);
-    if (meta)
-        for (auto i : *meta)
+    if (m)
+        for (auto i : *m)
             if (i.name != sym)
                 attrs.insert(i);
     if (v)
         attrs.insert(sym, v);
     meta = attrs.finish();
+    /* Nothing holds the set but this. */
+    if (evalRegion.contains(meta))
+        unforceKeepJob();
 }
 
-/* Cache for already considered attrsets. */
-typedef std::set<const Bindings *> Done;
+/* The attrsets already considered. Those that the open unforce job built
+   are held (`UnforceSeen`), and so are the derivations found for them. */
+struct DerivationsSeen : UnforceSeen
+{
+    std::vector<PackageInfo *> found;
+
+    ~DerivationsSeen()
+    {
+        /* What it found outlives it (`getDerivation`'s derivation): the
+           open job keeps it. */
+        if (!found.empty())
+            unforceKeepJob();
+    }
+
+    void held(Hold & hold) override;
+
+    void ended() override
+    {
+        UnforceSeen::ended();
+        found.clear();
+    }
+
+    /* `drvs`' last derivation was just found: held if the open job built
+       it. Out of line, out of the walk's frames. */
+    [[gnu::noinline]] void noteFound(PackageInfos & drvs)
+    {
+        if (evalRegion.contains(drvs.back().attrs))
+            found.push_back(&drvs.back());
+    }
+};
+
+void DerivationsSeen::held(Hold & hold)
+{
+    UnforceSeen::held(hold);
+    for (auto drv : found)
+        drv->attrs = (const Bindings *) hold(drv->attrs, Kind::bindings);
+}
+
+typedef DerivationsSeen Done;
 
 /* Evaluate value `v'.  If it evaluates to a set of type `derivation',
    then put information about it in `drvs' (unless it's already in `done').
@@ -335,7 +382,7 @@ static bool getDerivation(
 
         /* Remove spurious duplicates (e.g., a set like `rec { x =
            derivation {...}; y = x;}'. */
-        if (!done.insert(v.attrs()).second)
+        if (!done.see(v.attrs(), UnforceHolder::Kind::bindings))
             return false;
 
         PackageInfo drv(state, attrPath, v.attrs());
@@ -343,6 +390,7 @@ static bool getDerivation(
         drv.queryName();
 
         drvs.push_back(drv);
+        done.noteFound(drvs);
 
         return false;
 
@@ -355,9 +403,10 @@ static bool getDerivation(
 
 std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures)
 {
-    Done done;
+    /* On the heap: this frame is below `v`'s evaluation. */
+    auto done = std::make_unique<Done>();
     PackageInfos drvs;
-    getDerivation(state, v, "", drvs, done, ignoreAssertionFailures);
+    getDerivation(state, v, "", drvs, *done, ignoreAssertionFailures);
     if (drvs.size() != 1)
         return {};
     return std::move(drvs.front());
@@ -424,6 +473,7 @@ static void getDerivations(
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
                     continue;
+                unforceElement(state, vIn);
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
                     getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -450,6 +500,7 @@ static void getDerivations(
     else if (v.type() == nList) {
         auto listView = v.listView();
         for (auto [n, elem] : enumerate(listView)) {
+            unforceElement(state, vIn);
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *elem, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -468,8 +519,12 @@ void getDerivations(
     PackageInfos & drvs,
     bool ignoreAssertionFailures)
 {
-    Done done;
-    getDerivations(state, v, pathPrefix, autoArgs, drvs, done, ignoreAssertionFailures);
+    /* On the heap: this frame is below the walk. */
+    auto done = std::make_unique<Done>();
+    /* Each attribute (or element) of `v` is found in a job of its own, the
+       last one ending while `done` holds what it found. */
+    UnforceJobs jobs(state, &v);
+    getDerivations(state, v, pathPrefix, autoArgs, drvs, *done, ignoreAssertionFailures);
 }
 
 } // namespace nix

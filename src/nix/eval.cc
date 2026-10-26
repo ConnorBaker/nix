@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/value-to-json.hh"
+#include "nix/expr/unforce.hh"
 
 #include <nlohmann/json.hpp>
 
@@ -115,10 +116,12 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         }
 
         else if (json) {
+            UnforceJobs jobs(*state, v);
             printJSON(printValueAsJSON(*state, true, *v, pos, context, false));
         }
 
         else {
+            UnforceJobs jobs(*state, v);
             ValuePrinter printer(*state, *v, PrintOptions{.force = true, .derivationPaths = true}, &context);
             logger->cout("%s", printer);
         }

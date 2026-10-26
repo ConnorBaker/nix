@@ -24,6 +24,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/cmd/legacy.hh"
@@ -685,7 +686,9 @@ static void main_nix_build(int argc, char ** argv)
 
         std::map<StorePath, std::pair<size_t, StringSet>> drvMap;
 
+        UnforceJobs jobs(*state);
         for (auto & packageInfo : drvs) {
+            jobs.element();
             auto drvPath = packageInfo.requireDrvPath();
 
             auto outputName = packageInfo.queryOutputName();

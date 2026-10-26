@@ -99,6 +99,52 @@ public:
     void ended() override;
 };
 
+[[gnu::noinline]] void unforceJobsBegin(EvalState & state, const Value * root);
+[[gnu::noinline]] void unforceJobsEnd();
+[[gnu::noinline]] void unforceElementStart();
+
+/**
+ * Unforce jobs for a traversal of independent elements (the derivations of
+ * a package set, the attributes that a printer prints): each element runs
+ * in a job of its own, which ends when the next element starts or when this
+ * ends, unless the traversal itself runs in a job. The traversal is a loop
+ * in the caller's frame that calls `element` before each element, or a
+ * recursive walk of `root` whose levels call `unforceElement`: only the
+ * outermost level's elements are jobs. Nothing a job allocated may outlive
+ * its element but through the cells it forced or a holder
+ * (`UnforceHolder`). This holds nothing, and covers one call of the
+ * traversal: a level is told by its frame.
+ */
+class UnforceJobs
+{
+public:
+    [[gnu::always_inline]] explicit UnforceJobs(EvalState & state, const Value * root = nullptr)
+    {
+        unforceJobsBegin(state, root);
+    }
+
+    [[gnu::always_inline]] ~UnforceJobs()
+    {
+        unforceJobsEnd();
+    }
+
+    UnforceJobs(const UnforceJobs &) = delete;
+    UnforceJobs & operator=(const UnforceJobs &) = delete;
+
+    /** An element of the caller's loop starts. */
+    [[gnu::always_inline]] void element()
+    {
+        unforceElementStart();
+    }
+};
+
+/** An element of `v` starts, in a level of a traversal (`UnforceJobs`). */
+[[gnu::always_inline]] inline void unforceElement(EvalState & state, const Value & v)
+{
+    if (state.unforceRoot == &v) [[unlikely]]
+        unforceElementStart();
+}
+
 /** Whether a thunk of `expr` is a cell that unforcing reverted. */
 bool unforceIsReverted(const Expr * expr);
 

@@ -34,6 +34,9 @@ private:
 
     const Bindings *attrs = nullptr, *meta = nullptr;
 
+    /* Rewrites `attrs` where an unforce job's end moves it. */
+    friend struct DerivationsSeen;
+
     const Bindings * getMeta();
 
     bool checkMeta(Value & v);

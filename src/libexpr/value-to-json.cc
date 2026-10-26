@@ -1,5 +1,6 @@
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/signals.hh"
 
@@ -85,6 +86,7 @@ json printValueAsJSON(
                 // All that remains is to return a JSON object.
                 json obj = json::object();
                 for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
+                    unforceElement(state, *peeled);
                     try {
                         obj.emplace(
                             state.symbols[a->name],
@@ -103,6 +105,7 @@ json printValueAsJSON(
         out = json::array();
         int i = 0;
         for (auto elem : v.listView()) {
+            unforceElement(state, v);
             try {
                 out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore));
             } catch (Error & e) {

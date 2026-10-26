@@ -4,6 +4,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/expr/value-to-xml.hh"
 #include "nix/expr/value-to-json.hh"
@@ -57,9 +58,11 @@ void processExpr(
                 std::cout << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
             // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
             // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
-            else if (output == okXML)
+            else if (output == okXML) {
+                UnforceJobs jobs(state, &vRes);
                 printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
-            else if (output == okJSON) {
+            } else if (output == okJSON) {
+                UnforceJobs jobs(state, &vRes);
                 printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
                 std::cout << std::endl;
             } else {
@@ -72,7 +75,9 @@ void processExpr(
         } else {
             PackageInfos drvs;
             getDerivations(state, v, "", autoArgs, drvs, false);
+            UnforceJobs jobs(state);
             for (auto & i : drvs) {
+                jobs.element();
                 auto drvPath = i.requireDrvPath();
                 auto drvPathS = state.store->printStorePath(drvPath);
 

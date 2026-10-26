@@ -5,6 +5,7 @@
 #include "nix/store/outputs-query.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/globals.hh"
 #include "nix/util/config-global.hh"
 #include "nix/store/names.hh"
@@ -221,10 +222,14 @@ static void loadDerivations(
 
     /* Filter out all derivations not applicable to the current
        system. */
+    UnforceJobs jobs(state);
     for (PackageInfos::iterator i = elems.begin(), j; i != elems.end(); i = j) {
         j = i;
         j++;
-        if (systemFilter != "*" && i->querySystem() != systemFilter)
+        if (systemFilter == "*")
+            continue;
+        jobs.element();
+        if (i->querySystem() != systemFilter)
             elems.erase(i);
     }
 }
@@ -900,7 +905,9 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
 {
     using nlohmann::json;
     json topObj = json::object();
+    UnforceJobs jobs(*globals.state);
     for (auto & i : elems) {
+        jobs.element();
         try {
             if (i.hasFailed())
                 continue;
@@ -1058,8 +1065,10 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     StorePathSet substitutablePaths;
     if (printStatus || globals.prebuiltOnly) {
         StorePathSet paths;
+        UnforceJobs jobs(*globals.state);
         for (auto & i : elems)
             try {
+                jobs.element();
                 paths.insert(i.queryOutPath());
             } catch (AssertionError & e) {
                 printMsg(
@@ -1085,7 +1094,9 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     XMLWriter xml(true, *(xmlOutput ? &std::cout : &dummy));
     XMLOpenElement xmlRoot(xml, "items");
 
+    UnforceJobs jobs(*globals.state);
     for (auto & i : elems) {
+        jobs.element();
         try {
             if (i.hasFailed())
                 continue;

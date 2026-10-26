@@ -1101,6 +1101,9 @@ public:
     /** Why native code may run in this evaluator, or null (`unforceNativeCode`). */
     std::atomic<const char *> unforceNativeCodeReason = nullptr;
 
+    /** The root of the traversal whose elements run in unforce jobs (`UnforceJobs`), or null. */
+    const Value * unforceRoot = nullptr;
+
     /**
      * Open an unforce scope. The outermost is a job: it allocates in a region
      * of its own, and the thunks older than it that are forced until its
@@ -1113,9 +1116,10 @@ public:
      * Close an unforce scope. At a job's end each thunk it logged is reverted
      * or keeps its value, and the job's region is freed if nothing kept
      * points into it. Only call it when nothing outside its forced thunks
-     * refers to what the job allocated.
+     * refers to what the job allocated. `ender` is the caller's stack
+     * pointer, by default the caller's: the frames below it have returned.
      */
-    void endUnforceScope();
+    [[gnu::noinline]] void endUnforceScope(const void * ender = nullptr);
 
 private:
 
@@ -1138,7 +1142,7 @@ private:
 
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, PosIdx pos);
     [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v, bool completed);
-    [[gnu::noinline]] void endUnforceJob();
+    [[gnu::noinline]] void endUnforceJob(const char * ender);
 
 public:
 

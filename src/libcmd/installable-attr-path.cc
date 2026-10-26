@@ -7,6 +7,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/flake/flake.hh"
 
 #include <nlohmann/json.hpp>
@@ -61,7 +62,9 @@ DerivedPathsWithInfo InstallableAttrPath::toDerivedPaths()
     // helps keep .all output together.
     std::map<StorePath, OutputsSpec> byDrvPath;
 
+    UnforceJobs jobs(*state);
     for (auto & packageInfo : packageInfos) {
+        jobs.element();
         auto drvPath = packageInfo.queryDrvPath();
         if (!drvPath)
             throw Error("'%s' is not a derivation", what());

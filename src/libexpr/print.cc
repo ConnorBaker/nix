@@ -8,6 +8,7 @@
 #include "nix/util/terminal.hh"
 #include "nix/util/english.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
 
@@ -153,7 +154,6 @@ struct ImportantFirstAttrNameCmp
     }
 };
 
-typedef std::set<const void *> ValuesSeen;
 typedef std::vector<std::pair<std::string, Value *>> AttrVec;
 
 class Printer
@@ -163,7 +163,8 @@ private:
     EvalState & state;
     PrintOptions options;
     NixStringContext * context;
-    std::optional<ValuesSeen> seen;
+    /* On the heap: the printer's frame is below every value printed. */
+    std::unique_ptr<UnforceSeen> seen;
     size_t totalAttrsPrinted = 0;
     size_t totalListItemsPrinted = 0;
     std::string indent;
@@ -331,9 +332,9 @@ private:
         return itemType == nList || itemType == nAttrs || itemType == nThunk;
     }
 
-    [[gnu::noinline]] bool markSeen(const void * p)
+    [[gnu::noinline]] bool markSeen(const void * p, UnforceHolder::Kind kind)
     {
-        return seen->insert(p).second;
+        return seen->see(p, kind);
     }
 
     [[gnu::noinline]] AttrVec sortedAttrs(Value & v)
@@ -351,7 +352,7 @@ private:
 
     [[gnu::noinline]] void printAttrs(Value & v, size_t depth)
     {
-        if (seen && !markSeen(v.attrs())) {
+        if (seen && !markSeen(v.attrs(), UnforceHolder::Kind::bindings)) {
             printRepeated();
             return;
         }
@@ -378,6 +379,7 @@ private:
 
                 printAttributeName(output, i.first);
                 output << " = ";
+                unforceElement(state, v);
                 print(*i.second, depth + 1);
                 output << ";";
                 totalAttrsPrinted++;
@@ -422,7 +424,7 @@ private:
 
     void printList(Value & v, size_t depth)
     {
-        if (seen && v.listSize() && !markSeen(&v)) {
+        if (seen && v.listSize() && !markSeen(&v, UnforceHolder::Kind::value)) {
             printRepeated();
             return;
         }
@@ -444,6 +446,7 @@ private:
                 }
 
                 if (elem) {
+                    unforceElement(state, v);
                     print(*elem, depth + 1);
                 } else {
                     printNullptr();
@@ -669,12 +672,11 @@ public:
         indent.clear();
 
         if (options.trackRepeated) {
-            seen.emplace();
+            seen = std::make_unique<UnforceSeen>();
         } else {
             seen.reset();
         }
 
-        ValuesSeen seen;
         print(v, 0);
     }
 };
