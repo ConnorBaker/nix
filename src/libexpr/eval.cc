@@ -3622,6 +3622,17 @@ void EvalState::printStatistics()
         {"totalBytes", totalBytes},
         {"cycles", gcCycles},
     };
+#else
+    topObj["unforce"] = {
+        {"jobs", unforceStats.jobs},
+        {"jobsKeptWhole", unforceStats.jobsKeptWhole},
+        {"cellsReverted", unforceStats.cellsReverted},
+        {"cellsPromoted", unforceStats.cellsPromoted},
+        {"bytesKept", unforceStats.bytesKept},
+        {"bytesFreed", unforceStats.bytesFreed},
+    };
+    if (auto reason = unforceNativeCode(*this))
+        topObj["unforce"]["off"] = reason;
 #endif
 
     if (countCalls) {

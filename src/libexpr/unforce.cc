@@ -305,6 +305,8 @@ static boost::unordered_flat_set<ExprReforce *, ReforceHash, ReforceEq> reforces
 
 bool unforceAnyReverted = false;
 
+UnforceStats unforceStats;
+
 static ExprReforce * internReforce(const ReforceKey & key, uint32_t room)
 {
     auto i = reforces.find(key);
@@ -2026,13 +2028,18 @@ void EvalState::endUnforceJob(const char * ender)
             keep = true;
         }
     }
+    unforceStats.jobs++;
+    unforceStats.jobsKeptWhole += keep;
     if (!keep) {
         /* Newest first, so that a cell logged more than once ends with its
            oldest entry's: its value before the job, re-forced at the depth of
            its outermost force, which completed last. */
         for (auto i = undoLog.rbegin(); i != undoLog.rend(); ++i)
-            if (i->target)
+            if (i->target) {
                 *i->target = i->preImage;
+                unforceStats.cellsReverted++;
+            }
+        unforceStats.cellsPromoted += promoted.size();
         /* Forward every pointer into Evac(S); nothing has moved yet. */
         if (walk) {
             for (auto t : promoted)
@@ -2053,8 +2060,12 @@ void EvalState::endUnforceJob(const char * ender)
     decltype(youngFailures)().swap(youngFailures);
     youngFailuresLost = false;
     curOwner = noOwner;
-    if (evalRegion.base)
-        closeRegion(keep ? evalRegion.cur : live ? live->slide() : evalRegion.base);
+    if (evalRegion.base) {
+        auto top = keep ? evalRegion.cur : live ? live->slide() : evalRegion.base;
+        unforceStats.bytesKept += top - evalRegion.base;
+        unforceStats.bytesFreed += evalRegion.cur - top;
+        closeRegion(top);
+    }
     /* No re-force is running. */
     releaseSegments();
     keepWhole = false;

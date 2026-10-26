@@ -154,6 +154,14 @@ bool unforceIsReverted(const Expr * expr);
 /** Whether unforcing has reverted a cell in this process. */
 extern bool unforceAnyReverted;
 
+/** What unforcing did in this process (`NIX_SHOW_STATS`). */
+struct UnforceStats
+{
+    uint64_t jobs = 0, jobsKeptWhole = 0, cellsReverted = 0, cellsPromoted = 0, bytesKept = 0, bytesFreed = 0;
+};
+
+extern UnforceStats unforceStats;
+
 /**
  * Whether front ends open unforce jobs in `state`: not with Boehm GC, nor
  * with the debugger, nor where native code may run (`unforceNativeCode`).
