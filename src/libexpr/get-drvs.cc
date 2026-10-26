@@ -459,6 +459,31 @@ static void getDerivations(
     const Bindings & autoArgs,
     PackageInfos & drvs,
     Done & done,
+    bool ignoreAssertionFailures);
+
+/* A channel of nix-env's combined channels, walked as a traversal of its
+   own: its attributes (the packages), not the channel, are the elements
+   found in jobs of their own. Out of line, out of the walk's frames. */
+[[gnu::noinline]] static void getChannelDerivations(
+    EvalState & state,
+    Value & channel,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    PackageInfos & drvs,
+    Done & done,
+    bool ignoreAssertionFailures)
+{
+    UnforceJobs jobs(state, &channel);
+    getDerivations(state, channel, pathPrefix, autoArgs, drvs, done, ignoreAssertionFailures);
+}
+
+static void getDerivations(
+    EvalState & state,
+    Value & vIn,
+    const std::string & pathPrefix,
+    const Bindings & autoArgs,
+    PackageInfos & drvs,
+    Done & done,
     bool ignoreAssertionFailures)
 {
     auto _level = state.addCallDepth(vIn.determinePos(noPos));
@@ -487,10 +512,11 @@ static void getDerivations(
                 debug("evaluating attribute '%1%'", symbol);
                 if (!isAttrPathComponent(symbol))
                     continue;
-                unforceElement(state, vIn);
+                if (!combineChannels)
+                    unforceElement(state, vIn);
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
-                    getDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
+                    getChannelDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
                 else if (getDerivation(state, *i->value, pathPrefix2, drvs, done, ignoreAssertionFailures)) {
                     /* If the value of this attribute is itself a set,
                     should we recurse into it?  => Only if it has a

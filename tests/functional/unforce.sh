@@ -73,6 +73,11 @@ rec {
 EOF
 expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 5
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
+# So in each of nix-env's channels (a directory of expressions).
+mkdir -p "$TEST_ROOT/channels"
+cp "$TEST_ROOT/drvs.nix" "$TEST_ROOT/channels/"
+expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 5
+[[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
 expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 5
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
 # search visits each attribute in a job.
