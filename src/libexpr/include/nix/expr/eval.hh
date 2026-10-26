@@ -408,6 +408,9 @@ struct UnforceUndoEntry
     uint32_t depth;
     PosIdx pos;
     uint32_t room;
+    /* Whether the force has ended, and whether a young cell that it
+       allocated was forced after that. */
+    bool ended, consumed;
     Value preImage;
 };
 

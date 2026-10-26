@@ -265,6 +265,19 @@ TEST_F(UnforceTest, compactsPromoted)
     EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
 }
 
+/* A cell whose value's young cell is forced after its force ended keeps
+   its value: reverted, it would rebuild that cell unforced. */
+TEST_F(UnforceTest, keepsConsumedOwner)
+{
+    auto v = oldThunk("{ a = 1 + 1; }");
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    state.forceValue(*v->attrs()->get(createSymbol("a"))->value, noPos);
+    state.endUnforceScope();
+    EXPECT_FALSE(v->isThunk());
+    EXPECT_EQ(deep(*v), "{ a = 2; }");
+}
+
 /* A seen set keeps the containers it holds, moved by the job's end, so
    that one seen again in a later job is found. */
 TEST_F(UnforceTest, seenHoldsContainers)

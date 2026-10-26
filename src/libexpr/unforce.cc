@@ -1541,8 +1541,12 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    frames and its trace differs), and the owners of young cells that failed
    and that their owner's value reaches; and the targets that an earlier job
    reverted, which are evidently shared between jobs: reverting them again
-   would only make each job evaluate them anew. What holders hold (see
-   unforce.hh) is marked as the promoted values are.
+   would only make each job evaluate them anew. And the targets a young cell
+   of which was forced after their force ended, by a consumer of their value:
+   reverted, they would rebuild the cell unforced, and a later read would
+   force it deeper in calls or on the stack than its first force, which
+   could fail where Nix without unforcing reads a value. What holders hold
+   (see unforce.hh) is marked as the promoted values are.
 
    Evac(S) is then compacted in place (Lisp-2 sliding, as by the Compressor
    or GHC's compacting collector): each of its objects moves down by the
@@ -1679,7 +1683,7 @@ static bool decide(
     };
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
-        if (log[i].target->isFailed() || (p.isThunk() && unforceIsReverted(p.thunk().expr)))
+        if (log[i].target->isFailed() || log[i].consumed || (p.isThunk() && unforceIsReverted(p.thunk().expr)))
             nominate(targets.ofEntry[i]);
     }
 
@@ -2013,6 +2017,11 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
         auto o = ownerOf(p);
         if (o == curOwner)
             return;
+        /* A consumer of the owner's value forces it: reverting the owner
+           would rebuild the cell unforced, to be forced wherever a consumer
+           reads it next, deeper in calls or on the stack than here. */
+        if (o != noOwner && undoLog[o].ended)
+            undoLog[o].consumed = true;
         roomFor(segments, opens.size() + 2);
         roomFor(opens, 1);
         return openForce(v, noOwner, o);
@@ -2026,7 +2035,7 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
     auto entry = uint32_t(undoLog.size());
     /* The stack pointer of `forceValue`'s caller, where the force's
        evaluation starts. */
-    undoLog.push_back({&v, uint32_t(callDepth), pos, stackRoom((const char *) __builtin_dwarf_cfa()), v});
+    undoLog.push_back({&v, uint32_t(callDepth), pos, stackRoom((const char *) __builtin_dwarf_cfa()), false, false, v});
     openForce(v, entry, entry);
 }
 
@@ -2052,6 +2061,8 @@ void EvalState::endLoggedForceSlow(Value & v, bool completed)
         }
         return;
     }
+    if (f.entry != noOwner)
+        undoLog[f.entry].ended = true;
     setOwner(f.saved);
 }
 
