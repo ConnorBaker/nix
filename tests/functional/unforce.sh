@@ -24,6 +24,7 @@ expectJobs "$(jobsOf nix eval --expr "$expr")" 3
 expectJobs "$(jobsOf nix eval --json --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 3
+expectJobs "$(jobsOf nix repl <<< ":p $expr")" 3
 
 # --strict forces each element in a job before anything is printed: what
 # it forced stays forced (a reverted cell prints as `<CODE>`), and what an
@@ -55,6 +56,8 @@ cat > "$flakeDir/flake.nix" <<EOF
 }
 EOF
 expectJobs "$(jobsOf nix flake check "$flakeDir")" 2
+# flake show shows each package in one.
+expectJobs "$(jobsOf nix flake show "$flakeDir")" 1
 
 # A derivation found in an earlier job is dropped in a later one; one job
 # per attribute, then one per derivation found (its name, its drvPath).
@@ -70,3 +73,5 @@ expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 5
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
 expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 5
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
+# search visits each attribute in a job.
+expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 3

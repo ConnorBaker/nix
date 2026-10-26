@@ -7,6 +7,7 @@
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/expr/eval-cache.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/attr-path.hh"
 #include "nix/util/hilite.hh"
 #include "nix/util/strings-inline.hh"
@@ -98,7 +99,11 @@ struct CmdSearch : InstallableValueCommand, MixJSON
             Activity act(*logger, lvlTalkative, actUnknown, fmt("evaluating '%s'", attrPathStr));
             try {
                 auto recurse = [&]() {
+                    /* A job per attribute of the outermost level that
+                       recurses (that of the packages). */
+                    UnforceJobs jobs(*state);
                     for (const auto & attr : cursor.getAttrs()) {
+                        jobs.element();
                         auto cursor2 = cursor.getAttr(state->symbols[attr]);
                         auto attrPath2(attrPath);
                         attrPath2.push_back(attr);

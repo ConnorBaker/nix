@@ -1368,6 +1368,9 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                             logger->warn(fmt("%s omitted (use '--all-systems' to show)", attrPath.to_string(*state)));
                         }
                     } else {
+                        /* A job per derivation shown. */
+                        UnforceJobs jobs(*state);
+                        jobs.element();
                         try {
                             if (visitor.isDerivation())
                                 showDerivation();
@@ -1389,6 +1392,12 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                 }
 
                 else if (attrPath.size() > 0 && attrPathS[0] == "hydraJobs") {
+                    /* A job per job or jobset below the top. */
+                    std::optional<UnforceJobs> jobs;
+                    if (attrPath.size() > 1) {
+                        jobs.emplace(*state);
+                        jobs->element();
+                    }
                     try {
                         if (visitor.isDerivation())
                             showDerivation();
@@ -1425,6 +1434,12 @@ struct CmdFlakeShow : FlakeCommand, MixJSON
                             logger->warn(fmt("%s omitted (use '--all-systems' to show)", attrPath.to_string(*state)));
                         }
                     } else {
+                        /* A job per package, not for the set of them. */
+                        std::optional<UnforceJobs> jobs;
+                        if (attrPath.size() > 2) {
+                            jobs.emplace(*state);
+                            jobs->element();
+                        }
                         try {
                             if (visitor.isDerivation())
                                 showDerivation();

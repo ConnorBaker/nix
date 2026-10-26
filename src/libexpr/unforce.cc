@@ -1619,6 +1619,34 @@ UnforceHolder::~UnforceHolder()
 
 UnforceHolder::Hold::~Hold() = default;
 
+namespace {
+
+struct HeldRoot : UnforceHolder
+{
+    Value * v;
+
+    explicit HeldRoot(Value * v)
+        : v(v)
+    {
+    }
+
+    void held(Hold & hold) override
+    {
+        if (evalRegion.contains(v))
+            v = (Value *) hold(v, Kind::value);
+    }
+
+    void ended() override {}
+};
+
+} // namespace
+
+RootValue unforceHeldRoot(Value * v)
+{
+    auto root = std::make_shared<HeldRoot>(v);
+    return RootValue(root, &root->v);
+}
+
 bool UnforceSeen::see(const void * p, Kind kind)
 {
     if (!insert(p).second)

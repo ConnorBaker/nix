@@ -462,6 +462,20 @@ TEST_F(UnforceTest, lookupPathHookKeepsJob)
     EXPECT_FALSE(v->isThunk());
 }
 
+/* A root made in a job (as the evaluation cache's cursors make them) keeps
+   what it points to past the job's end, and with it its owner. */
+TEST_F(UnforceTest, rootHoldsValue)
+{
+    auto v = oldThunk("{ a = { b = 1; }; }");
+    RootValue root;
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    root = allocRootValue(v->attrs()->get(createSymbol("a"))->value);
+    state.endUnforceScope();
+    ASSERT_FALSE(v->isThunk());
+    EXPECT_EQ(deep(**root), "{ b = 1; }");
+}
+
 /* What a job allocates while the region is paused outlives it. */
 TEST_F(UnforceTest, pause)
 {

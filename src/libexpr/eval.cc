@@ -105,6 +105,8 @@ const StringData & StringData::make(EvalMemory & mem, std::string_view s)
 
 RootValue allocRootValue(Value * v)
 {
+    if (!NIX_USE_BOEHMGC && evalRegion.contains(v)) [[unlikely]]
+        return unforceHeldRoot(v);
     return std::allocate_shared<Value *>(traceable_allocator<Value *>(), v);
 }
 

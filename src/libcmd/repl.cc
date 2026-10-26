@@ -16,6 +16,7 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/cmd/get-build-log.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/outputs-query.hh"
 #include "nix/store/globals.hh"
@@ -107,6 +108,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     {
         // Hide the progress bar during printing because it might interfere
         auto suspension = logger->suspend();
+        UnforceJobs jobs(*state, &v);
         ::nix::printValue(
             *state,
             str,

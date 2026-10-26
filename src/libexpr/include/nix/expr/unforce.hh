@@ -56,6 +56,13 @@ void unforceNoteDiagnostic(EvalState & state);
 void unforceKeepJob();
 
 /**
+ * `allocRootValue` of `v`, in the open job's memory: while the root lives,
+ * the job's end keeps what it points to (an `UnforceHolder`), and it points
+ * to where that moves.
+ */
+RootValue unforceHeldRoot(Value * v);
+
+/**
  * C++ state that points into the open job's memory from outside any cell (a
  * printer's set of the containers it has printed, the derivations that
  * `getDerivations` found). While it is registered (from its construction to
