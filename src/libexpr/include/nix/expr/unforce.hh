@@ -31,6 +31,9 @@ struct PauseRegion
     PauseRegion & operator=(const PauseRegion &) = delete;
 };
 
+/** `v`'s force just failed in an open scope. */
+[[gnu::noinline, gnu::cold]] void unforceNoteFailure(const Value & v) noexcept;
+
 /**
  * An effect that running again could give another result (a download, a
  * copy that nothing remembers, a build) or show again (a trace, a warning)

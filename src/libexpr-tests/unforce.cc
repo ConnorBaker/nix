@@ -74,21 +74,6 @@ TEST_F(UnforceTest, keepsYoungFreeValue)
     EXPECT_EQ(w->attrs(), s->attrs());
 }
 
-/* A cell an earlier job reverted is reverted again, and keeps its value
-   outside jobs. */
-TEST_F(UnforceTest, revertsAgain)
-{
-    auto v = oldThunk("{ a = 1; }");
-    for (int i = 0; i < 3; ++i) {
-        state.beginUnforceScope();
-        state.forceValue(*v, noPos);
-        state.endUnforceScope();
-        EXPECT_TRUE(v->isThunk());
-    }
-    state.forceValue(*v, noPos);
-    EXPECT_EQ(deep(*v), "{ a = 1; }");
-}
-
 /* A reverted application is called again. */
 TEST_F(UnforceTest, revertsApplication)
 {
@@ -196,8 +181,9 @@ TEST_F(UnforceTest, nestedScope)
     EXPECT_TRUE(v->isThunk());
 }
 
-/* A failed cell stays failed, with its error, and the job is kept whole. */
-TEST_F(UnforceTest, failureKeepsJob)
+/* A failed cell stays failed, with its error; the job's other cells are
+   reverted. */
+TEST_F(UnforceTest, failureStaysFailed)
 {
     auto v = oldThunk("{ a = 1; }");
     auto f = oldThunk("throw \"no\"");
@@ -205,8 +191,7 @@ TEST_F(UnforceTest, failureKeepsJob)
     state.forceValue(*v, noPos);
     EXPECT_THROW(state.forceValue(*f, noPos), ThrownError);
     state.endUnforceScope();
-    EXPECT_EQ(v->type(), nAttrs);
-    EXPECT_EQ(deep(*v), "{ a = 1; }");
+    EXPECT_TRUE(v->isThunk());
     ASSERT_TRUE(f->isFailed());
     try {
         state.forceValue(*f, noPos);
@@ -216,7 +201,39 @@ TEST_F(UnforceTest, failureKeepsJob)
     }
 }
 
-/* So is a job in which an effect ran. */
+/* A cell that an earlier job reverted keeps the value a later job gives
+   it. */
+TEST_F(UnforceTest, promotesRevertedCell)
+{
+    auto v = oldThunk("{ a = 1; }");
+    for (int i = 0; i < 2; ++i) {
+        state.beginUnforceScope();
+        state.forceValue(*v, noPos);
+        state.endUnforceScope();
+    }
+    ASSERT_EQ(v->type(), nAttrs);
+    EXPECT_EQ(deep(*v), "{ a = 1; }");
+}
+
+/* A cell that a promoted value reaches is the cell its owner holds: the
+   owner is promoted too. `b`'s value has a failed cell of its own, which
+   promotes it, and `a`'s cell `f`. */
+TEST_F(UnforceTest, promotesOwner)
+{
+    auto a = oldThunk("{ f = x: x; }");
+    auto b = state.allocValue();
+    b->mkApp(oldThunk("a: builtins.attrValues a ++ [ (throw \"no\") ]"), a);
+    state.beginUnforceScope();
+    state.forceValue(*b, noPos);
+    EXPECT_THROW(state.forceValue(*b->listView()[1], noPos), ThrownError);
+    state.endUnforceScope();
+    ASSERT_EQ(a->type(), nAttrs);
+    ASSERT_EQ(b->type(), nList);
+    EXPECT_EQ(b->listView()[0], a->attrs()->get(createSymbol("f"))->value);
+    EXPECT_TRUE(b->listView()[1]->isFailed());
+}
+
+/* A job in which an effect ran is kept whole. */
 TEST_F(UnforceTest, effectKeepsJob)
 {
     auto v = oldThunk("{ a = 1; }");

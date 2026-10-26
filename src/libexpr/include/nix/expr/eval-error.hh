@@ -90,9 +90,9 @@ public:
     /**
      * Memory location of the Value that was found to be a blackhole, used to
      * mark where the recursion starts in the printed trace. Only pointer
-     * identity is of interest.
+     * identity is of interest. Unforcing clears it when the cell is freed.
      */
-    const Value * const v;
+    const Value * v;
 
     template<typename... Args>
     explicit InfiniteRecursionError(EvalState & state, const Value * v, const Args &... args)

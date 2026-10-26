@@ -99,8 +99,10 @@ Env & EvalMemory::allocEnv(size_t size)
         GC_NEXT(p) = nullptr;
         env = (Env *) p;
     } else
-#endif
         env = (Env *) allocBytes<Value *, sizeof(Env)>(size);
+#else
+    env = (Env *) evalCallocEnv(size);
+#endif
 
     /* We assume that env->values has been cleared by the allocator; maybeThunk() and lookupVar fromWith expect this. */
 
@@ -111,7 +113,8 @@ Env & EvalMemory::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
-        /* Before anything is loaded, so that nothing is live across it. */
+        /* Before anything is loaded, so that nothing is live across it. A
+           force that throws is ended by the handler. */
         logPreImage(v, pos);
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
@@ -126,7 +129,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
-        endLoggedForce(v);
+        endLoggedForce(v, true);
     } else if (v.isApp()) {
         logPreImage(v, pos);
         Value savedApp = v;
@@ -136,7 +139,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
-        endLoggedForce(v);
+        endLoggedForce(v, true);
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

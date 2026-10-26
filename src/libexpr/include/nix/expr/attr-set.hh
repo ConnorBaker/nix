@@ -126,6 +126,23 @@ public:
         return numAttrsInChain;
     }
 
+    /* This layer's own attributes and the layer below it, for unforcing,
+       which tells what a Bindings points to. */
+    size_type layerSize() const
+    {
+        return numAttrs;
+    }
+
+    const Bindings * layerBase() const
+    {
+        return baseLayer;
+    }
+
+    Value * layerValue(size_type i) const
+    {
+        return attrs[i].value;
+    }
+
     bool empty() const
     {
         return size() == 0;

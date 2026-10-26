@@ -386,7 +386,30 @@ extern EvalRegion evalRegion;
  * inlined, have the frames they have without unforcing.
  */
 [[gnu::noinline]] void * evalCalloc(size_t n);
+
+/**
+ * A zeroed `Env` of `size` values, in the open job's region (its size
+ * recorded) while there is one. Out of line, as `evalCalloc`.
+ */
+[[gnu::noinline]] void * evalCallocEnv(size_t size);
 #endif
+
+/**
+ * An unforce job's record of a thunk older than the job that it forced
+ * (see `EvalState::beginUnforceScope`).
+ */
+struct UnforceUndoEntry
+{
+    Value * target;
+    /* The call depth, position and native stack room (in 16-byte units;
+       0: unknown) of the force: a reverted target is re-forced at this
+       depth, with at least this room, and a reverted application called
+       again at this position. */
+    uint32_t depth;
+    PosIdx pos;
+    uint32_t room;
+    Value preImage;
+};
 
 class EvalMemory
 {
@@ -1066,24 +1089,7 @@ private:
     /* Reads and rebases `callDepth` for a re-force (unforce.cc). */
     friend struct UnforceDepth;
 
-    /**
-     * An unforce job's record of a thunk older than the job that it forced
-     * (see `beginUnforceScope`).
-     */
-    struct UndoEntry
-    {
-        Value * target;
-        /* The call depth, position and native stack room (in 16-byte units;
-           0: unknown) of the force: a reverted target is re-forced at this
-           depth, with at least this room, and a reverted application called
-           again at this position. */
-        uint32_t depth;
-        PosIdx pos;
-        uint32_t room;
-        Value preImage;
-    };
-
-    std::vector<UndoEntry> undoLog;
+    std::vector<UnforceUndoEntry> undoLog;
     /** The open unforce scopes; the outermost is a job. */
     unsigned isolationDepth = 0;
 
@@ -1117,15 +1123,15 @@ private:
             logPreImageSlow(v, pos);
     }
 
-    /** The end of a force of `v` that completed with a value. */
-    [[gnu::always_inline]] void endLoggedForce(Value & v)
+    /** The end of a force of `v`; `completed`: with a value, not by throwing. */
+    [[gnu::always_inline]] void endLoggedForce(Value & v, bool completed)
     {
         if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
-            endLoggedForceSlow(v);
+            endLoggedForceSlow(v, completed);
     }
 
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, PosIdx pos);
-    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
+    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v, bool completed);
     [[gnu::noinline]] void endUnforceJob();
 
 public:

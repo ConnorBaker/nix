@@ -2574,6 +2574,7 @@ void ExprBlackHole::eval(EvalState & state, [[maybe_unused]] Env & env, Value & 
 [[gnu::noinline]]
 void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, const PosIdx pos)
 {
+    endLoggedForce(v, false);
     if (!env)
         tryFixupBlackHolePos(v, pos);
 
@@ -2602,11 +2603,14 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         recovery->mkThunk(env, expr);
     }
     v.mkFailed(e, recovery);
+    if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+        unforceNoteFailure(v);
 }
 
 [[gnu::noinline]]
 void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
 {
+    endLoggedForce(v, false);
     auto e = std::current_exception();
     Value * recovery = nullptr;
     try {
@@ -2621,6 +2625,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         *recovery = savedApp;
     }
     v.mkFailed(e, recovery);
+    if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+        unforceNoteFailure(v);
 }
 
 [[gnu::noinline]]
@@ -2628,8 +2634,10 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
 {
     assert(v.isFailed());
     if (auto recoveryValue = v.failed().recoveryValue) {
-        /* A write of the cell, which a job must be able to revert. */
+        /* A write of the cell, which a job must be able to revert: logged as
+           a force that ends at once. The force below is logged on its own. */
         logPreImage(v, pos);
+        endLoggedForce(v, false);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {
