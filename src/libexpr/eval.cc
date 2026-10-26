@@ -207,6 +207,11 @@ PosIdx Value::determinePos(const PosIdx pos) const
         return lambda().fun->pos;
     case tApp:
         return app().left->determinePos(pos);
+    case tThunk:
+        /* A cell that unforcing reverted has its value's position. */
+        if (unforceAnyReverted) [[unlikely]]
+            return unforceRevertedPos(thunk().expr, pos);
+        return pos;
     default:
         return pos;
     }
@@ -215,10 +220,12 @@ PosIdx Value::determinePos(const PosIdx pos) const
 
 bool Value::isTrivial() const
 {
+    /* A cell that unforcing reverted holds a value without unforcing. */
     return !isa<tApp, tPrimOpApp>()
            && (!isa<tThunk>()
                || (dynamic_cast<ExprAttrs *>(thunk().expr) && ((ExprAttrs *) thunk().expr)->dynamicAttrs->empty())
-               || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr));
+               || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr)
+               || unforceIsReverted(thunk().expr));
 }
 
 static Symbol getName(const AttrName & name, EvalState & state, Env & env)
@@ -2622,7 +2629,7 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
     assert(v.isFailed());
     if (auto recoveryValue = v.failed().recoveryValue) {
         /* A write of the cell, which a job must be able to revert. */
-        logPreImage(v);
+        logPreImage(v, pos);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {

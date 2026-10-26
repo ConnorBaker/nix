@@ -13,6 +13,9 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/util/config.hh"
+#include "nix/util/std-hash.hh"
+
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include <algorithm>
 #include <atomic>
@@ -104,6 +107,202 @@ static void closeRegion(bool keep)
     auto paused = evalRegion.paused;
     evalRegion = EvalRegion{};
     evalRegion.paused = paused;
+}
+
+/* ---------------------------------------------------------------------------
+   Re-forcing at the first force's call depth.
+
+   Without unforcing, a thunk is evaluated once, at the call depth of its
+   first force. A target reverted at a job's end is evaluated again by
+   whatever forces it next, which may be deeper, and could then exceed
+   `max-call-depth` where the evaluation without unforcing does not. So a
+   reverted target holds its pre-image wrapped in an `ExprReforce` that
+   carries the call depth of its first force: forcing it evaluates at that
+   depth, and restores the depth it found afterwards.
+
+   That is exact. Evaluation is deterministic, so a re-force only repeats
+   work that the evaluation without unforcing did, and the rest of the work
+   is done in the same order, by the same chains of calls, at the same
+   depths, as every re-force restores the depth it found (on return and on
+   throw). A re-force runs at the depth where its first force completed (a
+   job that leaves a target failed, or retries a failure, is kept whole), and
+   the re-forces nested in it are rebased in turn: it fails nowhere that the
+   evaluation without unforcing did not.
+
+   An application's pre-image becomes a thunk whose environment is the
+   function and its argument, called at its first force's position (a primop
+   may put its call's position in its value). The wrapper also keeps the
+   position of the value the cell held (`unforceRevertedPos`).
+   --------------------------------------------------------------------------- */
+
+/** `EvalState`'s private call depth, for re-forces. */
+struct UnforceDepth
+{
+    /** Sets the call depth until destroyed. */
+    struct Rebase
+    {
+        EvalState & state;
+        size_t saved;
+
+        Rebase(EvalState & state, uint32_t depth)
+            : state(state)
+            , saved(std::exchange(state.callDepth, depth))
+        {
+        }
+
+        ~Rebase()
+        {
+            state.callDepth = saved;
+        }
+    };
+};
+
+struct ReforceKey
+{
+    /** The pre-image's expression, or null for an application. */
+    Expr * expr;
+    uint32_t depth;
+    /** An application's call position. */
+    PosIdx pos;
+    /** The position of the value the cells held when they were reverted, if it has one. */
+    std::optional<PosIdx> valuePos;
+
+    bool operator==(const ReforceKey &) const = default;
+};
+
+/** A reverted cell's pre-image (see above): one per distinct key, never freed. */
+struct ExprReforce : Expr, ReforceKey
+{
+    ExprReforce(const ReforceKey & key)
+        : ReforceKey(key)
+    {
+    }
+
+    void eval(EvalState & state, Env & env, Value & v) override
+    {
+        UnforceDepth::Rebase rebase(state, depth);
+        if (expr)
+            expr->eval(state, env, v);
+        else {
+            /* Not an `Env`: the application's operands (`reforcePreImage`).
+               The cell holds the application while it is called, as it did. */
+            auto operands = reinterpret_cast<Value * const *>(&env);
+            v.mkApp(operands[0], operands[1]);
+            state.callFunction(*operands[0], *operands[1], v, pos);
+        }
+    }
+
+    PosIdx getPos() const override
+    {
+        return expr ? expr->getPos() : pos;
+    }
+
+    void show(const SymbolTable & symbols, std::ostream & str) const override
+    {
+        if (expr)
+            expr->show(symbols, str);
+    }
+
+    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override {}
+};
+
+struct ReforceHash
+{
+    using is_transparent = void;
+
+    size_t operator()(const ReforceKey & k) const
+    {
+        size_t h = 0;
+        hash_combine(h, k.expr, k.depth, k.pos, k.valuePos);
+        return h;
+    }
+
+    size_t operator()(const ExprReforce * r) const
+    {
+        return (*this)(static_cast<const ReforceKey &>(*r));
+    }
+};
+
+struct ReforceEq
+{
+    using is_transparent = void;
+
+    static const ReforceKey & key(const ReforceKey & k)
+    {
+        return k;
+    }
+
+    static const ReforceKey & key(const ExprReforce * r)
+    {
+        return *r;
+    }
+
+    bool operator()(const auto & a, const auto & b) const
+    {
+        return key(a) == key(b);
+    }
+};
+
+/* Never freed: reverted cells refer to them for the rest of the process. */
+static boost::unordered_flat_set<ExprReforce *, ReforceHash, ReforceEq> reforces;
+
+bool unforceAnyReverted = false;
+
+static ExprReforce * internReforce(const ReforceKey & key)
+{
+    if (auto i = reforces.find(key); i != reforces.end())
+        return *i;
+    auto r = new ExprReforce(key);
+    reforces.insert(r);
+    unforceAnyReverted = true;
+    return r;
+}
+
+/* What `Value::determinePos` gives for `v` whatever its fallback, if it
+   gives something else. */
+static std::optional<PosIdx> ownPos(const Value & v)
+{
+    if (v.isApp())
+        return ownPos(*v.app().left);
+    if (v.type() == nAttrs)
+        return v.attrs()->pos;
+    if (v.isLambda())
+        return v.lambda().fun->pos;
+    return std::nullopt;
+}
+
+/* What a target that holds `now` at the job's end is reverted to: its
+   pre-image, to be re-forced at its force's depth and position. A pre-image
+   wrapped already (reverted before), or that is neither a thunk nor an
+   application, stays as it is. Allocates: outside the region, which the
+   caller pauses. */
+static Value reforcePreImage(EvalState & state, const Value & preImage, uint32_t depth, PosIdx pos, const Value & now)
+{
+    Value v = preImage;
+    if (preImage.isThunk() && !preImage.isBlackhole()) {
+        auto t = preImage.thunk();
+        if (!unforceIsReverted(t.expr))
+            v.mkThunk(t.env, internReforce({t.expr, depth, noPos, ownPos(now)}));
+    } else if (preImage.isApp()) {
+        auto a = preImage.app();
+        auto operands = (Value **) state.mem.allocBytes(2 * sizeof(Value *));
+        operands[0] = a.left;
+        operands[1] = a.right;
+        v.mkThunk((Env *) operands, internReforce({nullptr, depth, pos, ownPos(now)}));
+    }
+    return v;
+}
+
+bool unforceIsReverted(const Expr * expr)
+{
+    return dynamic_cast<const ExprReforce *>(expr);
+}
+
+PosIdx unforceRevertedPos(const Expr * expr, PosIdx pos)
+{
+    if (auto r = dynamic_cast<const ExprReforce *>(expr); r && r->valuePos)
+        return *r->valuePos;
+    return pos;
 }
 
 #if !NIX_USE_BOEHMGC
@@ -243,16 +442,31 @@ void EvalState::endUnforceJob()
 {
     /* Failed thunks stay failed: a failure cannot be recomputed (a fresh
        force runs under other frames, so its trace differs), so it is never
-       reverted. */
-    bool keep = keepWhole || !evalRegion.base
-                || std::any_of(undoLog.begin(), undoLog.end(), [](auto & e) { return e.target->isFailed(); });
+       reverted. Nor is a cell whose failure was retried (`ExprReforce`). */
+    bool keep = keepWhole || !evalRegion.base || std::any_of(undoLog.begin(), undoLog.end(), [](auto & e) {
+                    return e.target->isFailed() || e.preImage.isFailed();
+                });
+    /* What each entry reverts its cell to, decided from the cell's value at
+       the job's end before any is written: no target, for a cell that keeps
+       its value. */
+    if (!keep) {
+        PauseRegion pause;
+        try {
+            for (auto & e : undoLog)
+                if (youngFree(*e.target))
+                    e.target = nullptr;
+                else
+                    e.preImage = reforcePreImage(*this, e.preImage, e.depth, e.pos, *e.target);
+        } catch (std::bad_alloc &) {
+            keep = true;
+        }
+    }
     /* Newest first, so that a cell logged more than once ends with its
-       oldest pre-image, its value before the job. A cell whose value stays
-       keeps it at all of its entries: one that is reverted holds a thunk or
-       an application, never young-free, at the older ones. */
+       oldest entry's: its value before the job, re-forced at the depth of
+       its outermost force, which completed last. */
     if (!keep)
         for (auto i = undoLog.rbegin(); i != undoLog.rend(); ++i)
-            if (!youngFree(*i->target))
+            if (i->target)
                 *i->target = i->preImage;
     undoLog.clear();
     undoLog.shrink_to_fit();
@@ -262,12 +476,13 @@ void EvalState::endUnforceJob()
     jobOwner = nullptr;
 }
 
-void EvalState::logPreImageSlow(Value & v)
+void EvalState::logPreImageSlow(Value & v, PosIdx pos)
 {
     /* A young cell is freed with the region, or kept with it. */
     if (evalRegion.contains(&v) || isJobStackSlot(&v))
         return;
-    undoLog.push_back({&v, v});
+    assert(callDepth <= UINT32_MAX);
+    undoLog.push_back({&v, uint32_t(callDepth), pos, v});
 }
 
 void EvalState::endLoggedForceSlow(Value & v)

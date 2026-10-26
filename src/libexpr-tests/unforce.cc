@@ -82,6 +82,54 @@ TEST_F(UnforceTest, revertsAgain)
     EXPECT_EQ(deep(*v), "{ a = 1; }");
 }
 
+/* A reverted application is called again. */
+TEST_F(UnforceTest, revertsApplication)
+{
+    auto w = state.allocValue();
+    w->mkApp(oldThunk("x: { inherit x; }"), oldThunk("1"));
+    state.beginUnforceScope();
+    state.forceValue(*w, noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(w->isThunk());
+    EXPECT_EQ(deep(*w), "{ x = 1; }");
+}
+
+/* A cell is re-forced at the call depth of its first force, however deep
+   the force that finds it reverted. */
+TEST_F(UnforceTest, reforceAtFirstDepth)
+{
+    evalSettings.maxCallDepth = 100;
+    auto v = oldThunk("let f = n: if n == 0 then { inherit n; } else f (n - 1); in f 60");
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(v->isThunk());
+    /* 60 calls deep: 120 in all without the rebase. */
+    Value r;
+    state.callFunction(*oldThunk("v: let g = n: if n == 0 then v else g (n - 1); in g 60"), *v, r, noPos);
+    state.forceValue(r, noPos);
+    EXPECT_EQ(r.type(), nAttrs);
+}
+
+/* A reverted cell has the position of the value it held, and is trivial,
+   as a cell that holds a value is. */
+TEST_F(UnforceTest, revertedPosition)
+{
+    auto e = state.parseExprFromString("let x = 1; in { a = x; }", state.rootPath(CanonPath::root));
+    auto v = state.allocValue(), w = state.allocValue();
+    v->mkThunk(&state.baseEnv, e);
+    w->mkThunk(&state.baseEnv, e);
+    EXPECT_FALSE(v->isTrivial());
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    state.endUnforceScope();
+    state.forceValue(*w, noPos);
+    ASSERT_TRUE(v->isThunk());
+    EXPECT_NE(w->determinePos(noPos), noPos);
+    EXPECT_EQ(v->determinePos(noPos), w->determinePos(noPos));
+    EXPECT_TRUE(v->isTrivial());
+}
+
 /* Only the outermost scope is a job. */
 TEST_F(UnforceTest, nestedScope)
 {

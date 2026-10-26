@@ -1063,6 +1063,9 @@ private:
      */
     size_t callDepth = 0;
 
+    /* Reads and rebases `callDepth` for a re-force (unforce.cc). */
+    friend struct UnforceDepth;
+
     /**
      * An unforce job's record of a thunk older than the job that it forced
      * (see `beginUnforceScope`).
@@ -1070,6 +1073,11 @@ private:
     struct UndoEntry
     {
         Value * target;
+        /* The call depth and position of the force: a reverted target is
+           re-forced at this depth, and a reverted application called again
+           at this position. */
+        uint32_t depth;
+        PosIdx pos;
         Value preImage;
     };
 
@@ -1098,13 +1106,13 @@ public:
 private:
 
     /**
-     * The start of a force of `v`: logged if a job must be able to revert
-     * it.
+     * The start of a force of `v` at `pos`: logged if a job must be able to
+     * revert it.
      */
-    [[gnu::always_inline]] void logPreImage(Value & v)
+    [[gnu::always_inline]] void logPreImage(Value & v, PosIdx pos)
     {
         if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
-            logPreImageSlow(v);
+            logPreImageSlow(v, pos);
     }
 
     /** The end of a force of `v` that completed with a value. */
@@ -1114,7 +1122,7 @@ private:
             endLoggedForceSlow(v);
     }
 
-    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, PosIdx pos);
     [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
     [[gnu::noinline]] void endUnforceJob();
 

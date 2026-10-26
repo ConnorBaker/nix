@@ -112,7 +112,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
         /* Before anything is loaded, so that nothing is live across it. */
-        logPreImage(v);
+        logPreImage(v, pos);
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
@@ -128,7 +128,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
         }
         endLoggedForce(v);
     } else if (v.isApp()) {
-        logPreImage(v);
+        logPreImage(v, pos);
         Value savedApp = v;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);

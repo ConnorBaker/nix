@@ -38,4 +38,13 @@ struct PauseRegion
  */
 void unforceNoteEffect();
 
+/** Whether a thunk of `expr` is a cell that unforcing reverted. */
+bool unforceIsReverted(const Expr * expr);
+
+/** `Value::determinePos` of a thunk of `expr`: a reverted cell's value's position, or `pos`. */
+[[gnu::noinline, gnu::cold]] PosIdx unforceRevertedPos(const Expr * expr, PosIdx pos);
+
+/** Whether unforcing has reverted a cell in this process. */
+extern bool unforceAnyReverted;
+
 } // namespace nix
