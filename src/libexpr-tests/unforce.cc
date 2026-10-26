@@ -406,6 +406,34 @@ TEST_F(UnforceTest, effectKeepsJob)
     EXPECT_EQ(deep(*v), "{ a = 1; }");
 }
 
+/* A trace keeps the value of the cell whose evaluation showed it, here in
+   the force of a young cell that `t` owns; the job's other cells revert. */
+TEST_F(UnforceTest, traceKeepsItsCell)
+{
+    auto v = oldThunk("{ a = 1; }");
+    auto t = oldThunk("let x = builtins.trace \"t\" { b = 2; }; in builtins.seq x { inherit x; }");
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    state.forceValue(*t, noPos);
+    state.endUnforceScope();
+    EXPECT_TRUE(v->isThunk());
+    EXPECT_FALSE(t->isThunk());
+}
+
+/* Shown outside any cell's force, it keeps the job whole. */
+TEST_F(UnforceTest, driverTraceKeepsJob)
+{
+    auto v = oldThunk("{ a = 1; }");
+    auto f = oldThunk("x: builtins.trace x x");
+    state.forceValue(*f, noPos);
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    Value r;
+    state.callFunction(*f, *oldThunk("\"s\""), r, noPos);
+    state.endUnforceScope();
+    EXPECT_FALSE(v->isThunk());
+}
+
 /* So is one in which a plugin's lookup path hook ran. */
 TEST_F(UnforceTest, lookupPathHookKeepsJob)
 {

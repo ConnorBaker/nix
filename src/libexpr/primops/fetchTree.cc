@@ -305,12 +305,13 @@ static void fetchTree(
         input = lookupInRegistries(state.fetchSettings, *state.store, input, fetchers::UseRegistries::Limited).first;
 
     if (state.settings.pureEval && !input.isLocked(state.fetchSettings)) {
-        if (input.getNarHash())
+        if (input.getNarHash()) {
+            unforceNoteDiagnostic(state);
             warn(
                 "Input '%s' is unlocked (e.g. lacks a Git revision) but is checked by NAR hash. "
                 "This is not reproducible and will break after garbage collection or when shared.",
                 input.to_string());
-        else
+        } else
             state
                 .error<EvalError>(
                     "in pure evaluation mode, '%s' doesn't fetch unlocked input '%s'", fetcher, input.to_string())

@@ -9,8 +9,9 @@
    region (see "Promotion" below). A cell whose value holds no pointer into
    the region (`youngFree`) keeps it as it is. What the promoted values
    reach is compacted to the region's bottom and kept, and the rest freed:
-   no old cell points into it any more. A job in which an effect ran is kept
-   whole instead: nothing is reverted, and its memory stays. */
+   no old cell points into it any more. A job in which an effect other than
+   a trace or a warning ran (those promote a cell) is kept whole instead:
+   nothing is reverted, and its memory stays. */
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/unforce.hh"
@@ -1547,8 +1548,11 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    of which was forced after their force ended, by a consumer of their value:
    reverted, they would rebuild the cell unforced, and a later read would
    force it deeper in calls or on the stack than its first force, which
-   could fail where Nix without unforcing reads a value. What holders hold
-   (see unforce.hh) is marked as the promoted values are.
+   could fail where Nix without unforcing reads a value. And the targets
+   that were the current owner when a trace or a warning was shown: only
+   their re-force runs that evaluation again, which would show it again.
+   What holders hold (see unforce.hh) is marked as the promoted values
+   are.
 
    Evac(S) is then compacted in place (Lisp-2 sliding, as by the Compressor
    or GHC's compacting collector): each of its objects moves down by the
@@ -1685,7 +1689,7 @@ static bool decide(
     };
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
-        if (log[i].target->isFailed() || log[i].consumed || (p.isThunk() && unforceIsReverted(p.thunk().expr))
+        if (log[i].target->isFailed() || log[i].keep || (p.isThunk() && unforceIsReverted(p.thunk().expr))
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             nominate(targets.ofEntry[i]);
     }
@@ -1892,8 +1896,23 @@ UnforceBuiltinsCheck::~UnforceBuiltinsCheck()
 
 void unforceNoteEffect()
 {
-    /* Running it again could give another result, or show it again. */
+    /* Running it again could give another result. */
     if (jobOwner.load())
+        keepWhole = true;
+}
+
+void unforceNoteDiagnostic(EvalState & state)
+{
+    /* Running in the current owner's force, or in that of a young cell it
+       owns, which only its re-force builds again. Outside any (the
+       driver's), or in another evaluator than the job's: the job is kept
+       whole. */
+    auto job = jobOwner.load();
+    if (!job)
+        return;
+    if (job == &state && curOwner != noOwner)
+        state.undoLog[curOwner].keep = true;
+    else
         keepWhole = true;
 }
 
@@ -2088,7 +2107,7 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
            would rebuild the cell unforced, to be forced wherever a consumer
            reads it next, deeper in calls or on the stack than here. */
         if (o != noOwner && undoLog[o].ended)
-            undoLog[o].consumed = true;
+            undoLog[o].keep = true;
         roomFor(segments, opens.size() + 2);
         roomFor(opens, 1);
         return openForce(v, noOwner, o);

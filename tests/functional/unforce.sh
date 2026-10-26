@@ -37,6 +37,11 @@ if [[ $system == *-linux && $system != i686-linux ]]; then
     [[ $(jq -r '.unforce.bytesFreed // 1' "$TEST_ROOT/stats.json") -gt 0 ]]
 fi
 
+# A trace is shown once: the cell whose evaluation showed it keeps its
+# value, and the job reverts the rest.
+nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
+[[ $(grep -c '^trace: s$' "$TEST_ROOT/err") == 1 ]]
+
 # A derivation found in an earlier job is dropped in a later one; one job
 # per attribute, then one per derivation found (its name, its drvPath).
 cat > "$TEST_ROOT/drvs.nix" <<EOF

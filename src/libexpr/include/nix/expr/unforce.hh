@@ -40,10 +40,17 @@ struct PauseRegion
 
 /**
  * An effect that running again could give another result (a download, a
- * copy that nothing remembers, a build) or show again (a trace, a warning)
- * ran: the open job, if any, keeps its result.
+ * copy that nothing remembers, a build) ran: the open job, if any, keeps
+ * its result.
  */
 void unforceNoteEffect();
+
+/**
+ * A trace or a warning is about to be shown, which running again would show
+ * again: the open job, if any, keeps the value of the cell whose re-force
+ * would show it again.
+ */
+void unforceNoteDiagnostic(EvalState & state);
 
 /** The caller keeps something it built in the open job outside any cell: the job, if any, keeps all its memory. */
 void unforceKeepJob();
