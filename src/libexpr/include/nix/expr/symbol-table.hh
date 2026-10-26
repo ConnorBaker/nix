@@ -287,8 +287,11 @@ public:
 
     /**
      * Converts a string into a symbol.
+     *
+     * Out of line: inlined, its frame would be under the evaluation that
+     * its callers (an attribute name's, a primop argument's) do after it.
      */
-    Symbol create(std::string_view s)
+    [[gnu::noinline]] Symbol create(std::string_view s)
     {
         Symbol res;
         symbols.insert_and_cvisit(
