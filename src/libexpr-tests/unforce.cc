@@ -3,7 +3,12 @@
 #include "nix/expr/tests/libexpr.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/print.hh"
+#include "nix/expr/print-ambiguous.hh"
 #include "nix/expr/unforce.hh"
+#include "nix/expr/value-to-json.hh"
+#include "nix/expr/value-to-xml.hh"
+#include "nix/util/finally.hh"
+#include "nix/util/tests/test-data.hh"
 
 #include <cstdint>
 
@@ -426,6 +431,98 @@ TEST_F(UnforceTest, pause)
     }
     state.endUnforceScope();
     EXPECT_THAT(*kept, IsStringEq("kept"));
+}
+
+/* The front ends' traversals, as the commands run them. */
+static const std::vector<std::pair<std::string, std::function<std::string(EvalState &, Value &)>>> frontEnds = {
+    {"nix-instantiate --eval --strict",
+     [](EvalState & state, Value & v) {
+         state.forceValueDeep(v, true);
+         std::set<const void *> seen;
+         std::ostringstream out;
+         printAmbiguous(state, v, out, &seen);
+         return out.str();
+     }},
+    {"nix-instantiate --eval --strict --xml",
+     [](EvalState & state, Value & v) {
+         NixStringContext context;
+         std::ostringstream out;
+         UnforceJobs jobs(state, &v);
+         printValueAsXML(state, true, false, v, out, context, noPos);
+         return out.str();
+     }},
+    {"nix eval --json",
+     [](EvalState & state, Value & v) {
+         NixStringContext context;
+         std::ostringstream out;
+         UnforceJobs jobs(state, &v);
+         printValueAsJSON(state, true, v, noPos, out, context, false);
+         return out.str();
+     }},
+    {"nix eval",
+     [](EvalState & state, Value & v) {
+         std::ostringstream out;
+         UnforceJobs jobs(state, &v);
+         printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true});
+         return out.str();
+     }},
+    {"nix-instantiate",
+     [](EvalState & state, Value & v) {
+         PackageInfos drvs;
+         getDerivations(state, v, "", Bindings::emptyBindings, drvs, false);
+         std::ostringstream out;
+         UnforceJobs jobs(state);
+         for (auto & i : drvs) {
+             jobs.element();
+             out << state.store->printStorePath(i.requireDrvPath()) << "!" << i.queryOutputName() << "\n";
+         }
+         return out.str();
+     }},
+};
+
+/* The corpus, the .nix files in data/unforce (a function is called with
+   its defaults): each program, as each front end evaluates it, prints
+   what it prints in an evaluator without unforcing, or fails as it fails
+   there, traces included. In an evaluator of its own each time, so that
+   nothing is forced before. */
+TEST_F(UnforceTest, corpus)
+{
+    auto showTrace = loggerSettings.showTrace.get();
+    loggerSettings.showTrace = true;
+    Finally restore([&] { loggerSettings.showTrace = showTrace; });
+    std::vector<std::filesystem::path> programs;
+    for (auto & entry : std::filesystem::directory_iterator(getUnitTestData() / "unforce"))
+        if (entry.path().extension() == ".nix")
+            programs.push_back(entry.path());
+    std::ranges::sort(programs);
+    ASSERT_FALSE(programs.empty());
+    for (auto & program : programs) {
+        uint64_t jobs = 0;
+        for (auto & [frontEnd, run] : frontEnds) {
+            SCOPED_TRACE(program.filename().string() + ", " + frontEnd);
+            auto output = [&](bool unforce) {
+                EvalState fresh({}, store, fetchSettings, evalSettings, nullptr);
+                if (!unforce)
+                    fresh.unforceNativeCodeReason = "a test's evaluator without unforcing";
+                auto before = unforceStats.jobs;
+                std::string out;
+                try {
+                    Value f, v;
+                    fresh.evalFile(fresh.rootPath(CanonPath(program.string())), f);
+                    fresh.autoCallFunction(Bindings::emptyBindings, f, v);
+                    fresh.forceValue(v, noPos);
+                    out = run(fresh, v);
+                } catch (Error & e) {
+                    out = std::string("error: ") + e.what();
+                }
+                if (unforce)
+                    jobs += unforceStats.jobs - before;
+                return out;
+            };
+            EXPECT_EQ(output(true), output(false));
+        }
+        EXPECT_GT(jobs, 0) << program;
+    }
 }
 
 } // namespace nix
