@@ -4,6 +4,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/fetch-tree.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/build.hh"
 #include "nix/fetchers/fetchers.hh"
@@ -591,6 +592,9 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
         auto storePath = state.mountInput(cachedInput.lockedInput, input, cachedInput.accessor);
         state.mkStorePathString(storePath, v);
     } else {
+        /* A download that, unlike the unpacked case above, nothing in this
+           process remembers. */
+        unforceNoteEffect();
         auto storePath = fetchers::downloadFile(*state.store, state.fetchSettings, *url, name).storePath;
         if (expectedHash) {
             auto hash = hashPath(

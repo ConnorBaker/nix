@@ -1,6 +1,7 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/util/url-parts.hh"
 
@@ -8,6 +9,8 @@ namespace nix {
 
 static void prim_fetchMercurial(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    /* A fetch that nothing in this process remembers. */
+    unforceNoteEffect();
     std::string url;
     std::optional<Hash> rev;
     std::optional<std::string> ref;

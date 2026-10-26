@@ -14,6 +14,7 @@
 #include "nix/store/derivations.hh"
 #include "nix/store/downstream-placeholder.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/filetransfer.hh"
 #include "nix/expr/function-trace.hh"
 #include "nix/store/profiles.hh"
@@ -1201,6 +1202,8 @@ Value * EvalState::fileEvalCell(const SourcePath & path, bool mustBeTrivial)
         *resolvedPath,
         nullptr,
         [&](auto & i) {
+            /* The cache outlives any job's region. */
+            PauseRegion pause;
             vExpr = allocValue();
             vExpr->mkThunk(&baseEnv, expr);
             i.second = vExpr;
@@ -2618,6 +2621,8 @@ void EvalState::handleEvalFailed(Value & v, const PosIdx pos)
 {
     assert(v.isFailed());
     if (auto recoveryValue = v.failed().recoveryValue) {
+        /* A write of the cell, which a job must be able to revert. */
+        logPreImage(v);
         v = *recoveryValue;
         forceValue(v, pos);
     } else {

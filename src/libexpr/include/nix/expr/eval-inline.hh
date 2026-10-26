@@ -19,7 +19,7 @@ inline void * EvalMemory::allocBytes(size_t n)
 #if NIX_USE_BOEHMGC
     p = GC_MALLOC(n);
 #else
-    p = calloc(n, 1);
+    p = evalCalloc(n);
 #endif
     if (!p)
         throw std::bad_alloc();
@@ -111,6 +111,8 @@ Env & EvalMemory::allocEnv(size_t size)
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
     if (v.isThunk()) {
+        /* Before anything is loaded, so that nothing is live across it. */
+        logPreImage(v);
         Env * env = v.thunk().env;
         assert(env || v.isBlackhole());
         Expr * expr = v.thunk().expr;
@@ -124,7 +126,9 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForThunk(env, expr, v, pos);
             throw;
         }
+        endLoggedForce(v);
     } else if (v.isApp()) {
+        logPreImage(v);
         Value savedApp = v;
         try {
             callFunction(*v.app().left, *v.app().right, v, pos);
@@ -132,6 +136,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             handleEvalExceptionForApp(v, savedApp);
             throw;
         }
+        endLoggedForce(v);
     } else if (v.isFailed()) {
         handleEvalFailed(v, pos);
     }

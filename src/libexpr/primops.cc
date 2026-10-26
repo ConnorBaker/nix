@@ -5,6 +5,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/gc-small-vector.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/json-to-value.hh"
 #include "nix/expr/static-string-data.hh"
 #include "nix/store/globals.hh"
@@ -115,6 +116,8 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
         return {};
 
     if (isIFD) {
+        /* A build during evaluation. */
+        unforceNoteEffect();
         if (!settings.enableImportFromDerivation)
             error<IFDError>(
                 "cannot build '%1%' during evaluation because the option 'allow-import-from-derivation' is disabled",
@@ -1321,6 +1324,8 @@ static RegisterPrimOp primop_deepSeq({
 /* Out of line: not in prim_trace's frame while the second argument is forced. */
 [[gnu::noinline]] static void printTraceMessage(EvalState & state, Value & msg)
 {
+    /* Forced again, it would print again. */
+    unforceNoteEffect();
     if (msg.type() == nString)
         printError("trace: %1%", msg.string_view());
     else
@@ -1372,6 +1377,7 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
             // Do not indent relative to the "evaluation warning: " prefix if the message starts with a newline.
             .noIndent = msgStr.starts_with("\n"),
         };
+        unforceNoteEffect();
         logWarning(info);
     }
 
@@ -1574,6 +1580,7 @@ warnDerivationAttr(EvalState & state, const Attr & i, std::string_view drvName, 
         .pos = state.positions[i.pos],
     };
     info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
+    unforceNoteEffect();
     logWarning(info);
 }
 
@@ -3051,6 +3058,10 @@ static void addPath(
                 name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
         if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
+            /* A filtered copy, or one with references, is remembered nowhere
+               in this process, and without a hash it is made again. */
+            if ((filterFun || !refs.empty()) && !expectedHash)
+                unforceNoteEffect();
             // FIXME: support refs in fetchToStore()?
             auto dstPath = refs.empty() ? fetchToStore(
                                               state.fetchSettings,

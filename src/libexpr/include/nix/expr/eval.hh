@@ -343,6 +343,51 @@ struct StaticEvalSymbols
     }
 };
 
+/**
+ * The bump region an unforce job (see `EvalState::beginUnforceScope`)
+ * allocates in, in builds without a garbage collector.
+ */
+struct EvalRegion
+{
+    char * base = nullptr;
+    char * cur = nullptr;
+    char * end = nullptr;
+    /** The `PauseRegion`s alive: while non-zero, allocate elsewhere. */
+    unsigned paused = 0;
+
+    bool active() const noexcept
+    {
+        return cur && !paused;
+    }
+
+    bool contains(const void * p) const noexcept
+    {
+        return (const char *) p >= base && (const char *) p < cur;
+    }
+
+    /** 16-byte aligned, as `malloc`'s allocations are. */
+    [[gnu::always_inline]] void * bump(size_t n)
+    {
+        n = (n + 15) & ~size_t(15);
+        if (size_t(end - cur) < n) [[unlikely]]
+            throw std::bad_alloc();
+        auto p = cur;
+        cur += n;
+        return p;
+    }
+};
+
+extern EvalRegion evalRegion;
+
+#if !NIX_USE_BOEHMGC
+/**
+ * `calloc(n, 1)`, in the open job's region while there is one. Out of line,
+ * so that the evaluator's recursive functions, into which `allocBytes` is
+ * inlined, have the frames they have without unforcing.
+ */
+[[gnu::noinline]] void * evalCalloc(size_t n);
+#endif
+
 class EvalMemory
 {
 public:
@@ -1017,6 +1062,61 @@ private:
      * out of system stack.
      */
     size_t callDepth = 0;
+
+    /**
+     * An unforce job's record of a thunk older than the job that it forced
+     * (see `beginUnforceScope`).
+     */
+    struct UndoEntry
+    {
+        Value * target;
+        Value preImage;
+    };
+
+    std::vector<UndoEntry> undoLog;
+    /** The open unforce scopes; the outermost is a job. */
+    unsigned isolationDepth = 0;
+
+public:
+
+    /**
+     * Open an unforce scope. The outermost is a job: it allocates in a region
+     * of its own, and the thunks older than it that are forced until its
+     * `endUnforceScope` are logged. `stackMark` bounds the stack frames that
+     * the job outlives; by default the caller's.
+     */
+    [[gnu::noinline]] void beginUnforceScope(const void * stackMark = nullptr);
+
+    /**
+     * Close an unforce scope. At a job's end each thunk it logged is reverted
+     * or keeps its value, and the job's region is freed if nothing kept
+     * points into it. Only call it when nothing outside its forced thunks
+     * refers to what the job allocated.
+     */
+    void endUnforceScope();
+
+private:
+
+    /**
+     * The start of a force of `v`: logged if a job must be able to revert
+     * it.
+     */
+    [[gnu::always_inline]] void logPreImage(Value & v)
+    {
+        if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+            logPreImageSlow(v);
+    }
+
+    /** The end of a force of `v` that completed with a value. */
+    [[gnu::always_inline]] void endLoggedForce(Value & v)
+    {
+        if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+            endLoggedForceSlow(v);
+    }
+
+    [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v);
+    [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v);
+    [[gnu::noinline]] void endUnforceJob();
 
 public:
 
