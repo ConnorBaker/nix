@@ -1,4 +1,5 @@
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/value.hh"
 
 #include "nix_api_expr.h"
@@ -177,6 +178,8 @@ ExternalValue * nix_create_external_value(nix_c_context * context, NixCExternalV
     if (context)
         context->last_err_code = NIX_OK;
     try {
+        /* Its callbacks are client code, which may now run in any evaluator. */
+        nix::unforceNoteCApiCode();
         auto ret = new
 #if NIX_USE_BOEHMGC
             (GC)

@@ -15,6 +15,7 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/attr-set.hh"
+#include "nix/expr/primops.hh"
 #include "nix/util/config.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/std-hash.hh"
@@ -1635,6 +1636,172 @@ static bool decide(
     return mark.count;
 }
 
+/* ---------------------------------------------------------------------------
+   Native code (see unforce.hh). Nix's own primops are recorded by name and
+   function before plugins load: an evaluator whose primops differ in any
+   entry may run a plugin's code. Nix's own `extraPrimOps` entries and lookup
+   path hooks are recorded where Nix adds them: any other is a plugin's. A
+   function is identified by its target's type and, for a plain function
+   pointer, the pointer.
+   --------------------------------------------------------------------------- */
+
+struct NativeEntry
+{
+    std::string name;
+    const std::type_info * type;
+    const void * fn;
+
+    bool operator==(const NativeEntry & other) const
+    {
+        return name == other.name && *type == *other.type && fn == other.fn;
+    }
+};
+
+template<typename Sig>
+static NativeEntry nativeEntry(std::string name, const fun<Sig> & f)
+{
+    auto & g = f.get_fn();
+    auto p = g.template target<Sig *>();
+    return {std::move(name), &g.target_type(), p ? reinterpret_cast<const void *>(*p) : nullptr};
+}
+
+static std::vector<NativeEntry> nativeEntries(const std::vector<PrimOp> & primOps)
+{
+    std::vector<NativeEntry> r;
+    for (auto & p : primOps)
+        r.push_back(nativeEntry(p.name, p.impl));
+    return r;
+}
+
+/* Written before any evaluator is built. */
+static std::optional<std::vector<NativeEntry>> ownPrimOps;
+static std::vector<NativeEntry> ownExtraPrimOps, ownLookupPathHooks;
+static std::atomic<bool> cApiCode = false;
+
+void unforceNotePluginsLoading()
+{
+    ownPrimOps = nativeEntries(RegisterPrimOp::primOps());
+}
+
+void unforceNoteOwnExtraPrimOp(const PrimOp & primOp)
+{
+    ownExtraPrimOps.push_back(nativeEntry(primOp.name, primOp.impl));
+}
+
+void unforceNoteOwnLookupPathHooks(const EvalSettings::LookupPathHooks & hooks)
+{
+    for (auto & [scheme, hook] : hooks)
+        ownLookupPathHooks.push_back(nativeEntry(scheme, hook));
+}
+
+void unforceNoteCApiCode()
+{
+    cApiCode = true;
+}
+
+/* For the unit tests, which share their process with the C API's. */
+void unforceTestResetNativeCode();
+
+void unforceTestResetNativeCode()
+{
+    cApiCode = false;
+}
+
+void unforceNoteCApiState(EvalState & state)
+{
+    const char * none = nullptr;
+    state.unforceNativeCodeReason.compare_exchange_strong(none, "C API host");
+}
+
+void unforceDecideNativeCode(EvalState & state)
+{
+    auto & settings = state.settings;
+    /* `importNative` is in the evaluator if the setting was on when it was
+       built, whatever the setting says later. */
+    if (settings.enableNativeCode)
+        state.unforceNativeCodeReason = "allow-unsafe-native-code-during-evaluation";
+    else if (ownPrimOps && nativeEntries(RegisterPrimOp::primOps()) != *ownPrimOps)
+        state.unforceNativeCodeReason = "plugin primop";
+    else if (std::ranges::any_of(nativeEntries(settings.extraPrimOps), [](auto & e) {
+                 return !std::ranges::contains(ownExtraPrimOps, e);
+             }))
+        state.unforceNativeCodeReason = "plugin extraPrimOps entry";
+}
+
+const char * unforceNativeCode(const EvalState & state)
+{
+    if (auto r = state.unforceNativeCodeReason.load())
+        return r;
+    return cApiCode ? "C API client code" : nullptr;
+}
+
+bool unforceEnabled(const EvalState & state)
+{
+    if (NIX_USE_BOEHMGC || state.debugRepl)
+        return false;
+    if (auto reason = unforceNativeCode(state)) {
+        static std::atomic<const char *> reported = nullptr;
+        if (reported.exchange(reason) != reason)
+            debug("unforcing is off: native code may run (%s)", reason);
+        return false;
+    }
+    return true;
+}
+
+bool unforceNoteLookupPathHook(const EvalSettings & settings, const std::string & scheme)
+{
+    /* Hooks are read at each lookup, so one added after the evaluator was
+       built counts too. */
+    if (auto * hook = get(settings.lookupPathHooks, scheme);
+        hook && std::ranges::contains(ownLookupPathHooks, nativeEntry(scheme, *hook)))
+        return false;
+    /* What the hook allocates, or keeps of what it reaches in the job, would
+       be freed with the job's region. */
+    if (jobOwner.load())
+        keepWhole = true;
+    return true;
+}
+
+/* The evaluator's builtins: per base environment slot and `builtins`
+   attribute, its cell and, if it holds a primop, the primop and its
+   function. */
+static std::vector<const void *> builtinsFingerprint(EvalState & state)
+{
+    std::vector<const void *> r;
+    auto entry = [&](const Value * v) {
+        r.push_back(v);
+        if (v && v->isPrimOp()) {
+            auto e = nativeEntry("", v->primOp()->impl);
+            r.insert(r.end(), {v->primOp(), e.type, e.fn});
+        } else
+            r.insert(r.end(), {nullptr, nullptr, nullptr});
+    };
+    for (auto & [symbol, displ] : state.staticBaseEnv->vars)
+        entry(state.baseEnv.values[displ]);
+    if (auto & builtins = state.getBuiltins(); builtins.type() == nAttrs)
+        for (auto & attr : *builtins.attrs())
+            entry(attr.value);
+    return r;
+}
+
+UnforceBuiltinsCheck::UnforceBuiltinsCheck(EvalState & state)
+    : state(state)
+    , before(builtinsFingerprint(state))
+{
+}
+
+UnforceBuiltinsCheck::~UnforceBuiltinsCheck()
+{
+    try {
+        if (builtinsFingerprint(state) == before)
+            return;
+    } catch (...) {
+        /* Could not look: as if they changed. */
+    }
+    const char * none = nullptr;
+    state.unforceNativeCodeReason.compare_exchange_strong(none, "plugin primop installed at runtime");
+}
+
 void unforceNoteEffect()
 {
     /* Running it again could give another result, or show it again. */
@@ -1670,8 +1837,9 @@ void EvalState::endUnforceJob()
 {
     /* A cell whose failure was retried is kept with the whole job: its
        re-force would run at the depth of its first force, which failed
-       (`ExprReforce`). */
-    bool keep = keepWhole || youngFailuresLost || !evalRegion.base
+       (`ExprReforce`). So is a job during which native code came to be able
+       to run. */
+    bool keep = keepWhole || youngFailuresLost || !evalRegion.base || unforceNativeCode(*this)
                 || std::any_of(undoLog.begin(), undoLog.end(), [](auto & e) { return e.preImage.isFailed(); });
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is

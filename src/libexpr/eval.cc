@@ -386,6 +386,9 @@ EvalState::EvalState(
 
     createBaseEnv(settings);
 
+    /* Needs the primops in place. */
+    unforceDecideNativeCode(*this);
+
     /* Register function call tracer. */
     if (settings.traceFunctionCalls)
         profiler.addProfiler(make_ref<FunctionCallTrace>());
@@ -3812,6 +3815,16 @@ SourcePath EvalState::findFile(const LookupPath & lookupPath, const std::string_
         .debugThrow();
 }
 
+/* A plugin's lookup path hook (`unforceNoteLookupPathHook`), with the
+   region paused. */
+[[gnu::noinline]] static std::optional<SourcePath>
+callPluginLookupPathHook(EvalState & state, const fun<EvalSettings::LookupPathHook> & hook, std::string_view rest)
+{
+    PauseRegion pause;
+    UnforceBuiltinsCheck builtinsCheck(state);
+    return hook(state, rest);
+}
+
 std::shared_ptr<EvalState::LookupPathResolvedState>
 EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAccessControl)
 {
@@ -3846,7 +3859,8 @@ EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAcces
         auto scheme = value.substr(0, colPos);
         auto rest = value.substr(colPos + 1);
         if (auto * hook = get(settings.lookupPathHooks, scheme)) {
-            auto res = (*hook)(*this, rest);
+            auto res = unforceNoteLookupPathHook(settings, scheme) ? callPluginLookupPathHook(*this, *hook, rest)
+                                                                   : (*hook)(*this, rest);
             if (res)
                 return finish(std::move(*res));
         }

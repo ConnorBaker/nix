@@ -6,6 +6,7 @@
 #include "nix/expr/eval-gc.hh"
 #include "nix/store/globals.hh"
 #include "nix/expr/eval-settings.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/util/ref.hh"
 
 #include "nix_api_expr.h"
@@ -174,6 +175,8 @@ EvalState * nix_eval_state_build(nix_c_context * context, nix_eval_state_builder
         auto ownedState =
             std::make_shared<nix::EvalState>(builder->lookupPath, builder->store, *fetchSettings, *settings);
         auto & stateRef = *ownedState;
+        /* The host's code may run in it. */
+        nix::unforceNoteCApiState(stateRef);
         void * p = ::operator new(sizeof(EvalState), static_cast<std::align_val_t>(alignof(EvalState)));
         return new (p) EvalState{stateRef, std::move(fetchSettings), std::move(settings), std::move(ownedState)};
     }

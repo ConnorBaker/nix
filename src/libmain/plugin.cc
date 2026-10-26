@@ -7,6 +7,7 @@
 #include "nix/util/config-global.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/file-system.hh"
+#include "nix/expr/unforce.hh"
 
 namespace nix {
 
@@ -75,6 +76,8 @@ static GlobalConfig::Register rPluginSettings(&pluginSettings);
 void initPlugins()
 {
     assert(!pluginSettings.pluginFiles.pluginsLoaded);
+    /* Any primop but Nix's own is a plugin's (`unforceNativeCode`). */
+    unforceNotePluginsLoading();
     for (const auto & pluginFile : pluginSettings.pluginFiles.get()) {
         std::vector<std::filesystem::path> pluginFiles;
         try {

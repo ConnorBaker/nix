@@ -1095,6 +1095,9 @@ private:
 
 public:
 
+    /** Why native code may run in this evaluator, or null (`unforceNativeCode`). */
+    std::atomic<const char *> unforceNativeCodeReason = nullptr;
+
     /**
      * Open an unforce scope. The outermost is a job: it allocates in a region
      * of its own, and the thunks older than it that are forced until its

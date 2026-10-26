@@ -18,9 +18,18 @@ namespace nix {
    stack size. */
 std::pair<size_t, size_t> unforceTestReforceStack();
 
+/* Defined in unforce.cc for these tests: forget that C API client code,
+   which other tests in this process create, may run. */
+void unforceTestResetNativeCode();
+
 class UnforceTest : public LibExprTest
 {
 protected:
+    void SetUp() override
+    {
+        unforceTestResetNativeCode();
+    }
+
     /* A cell allocated outside any job: a thunk of `expr`. */
     Value * oldThunk(std::string_view expr)
     {
@@ -256,6 +265,55 @@ TEST_F(UnforceTest, compactsPromoted)
     EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
 }
 
+/* Native code turns unforcing off: here, `importNative`. */
+TEST_F(UnforceTest, nativeCodeTurnsOff)
+{
+    EXPECT_TRUE(unforceEnabled(state));
+    evalSettings.enableNativeCode = true;
+    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
+    EXPECT_FALSE(unforceEnabled(other));
+}
+
+/* So does a plugin's `extraPrimOps` entry. */
+TEST_F(UnforceTest, extraPrimOpTurnsOff)
+{
+    evalSettings.extraPrimOps.push_back({
+        .name = "__unforceTest",
+        .arity = 1,
+        .impl = [](EvalState &, CallSite, Value * const * args, Value & v) { v = *args[0]; },
+    });
+    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
+    EXPECT_FALSE(unforceEnabled(other));
+}
+
+/* And C API code: in a state a C API host built, or once a client's
+   primop or external value exists, in any state. */
+TEST_F(UnforceTest, cApiTurnsOff)
+{
+    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
+    unforceNoteCApiState(other);
+    EXPECT_FALSE(unforceEnabled(other));
+    EXPECT_TRUE(unforceEnabled(state));
+    unforceNoteCApiCode();
+    EXPECT_FALSE(unforceEnabled(state));
+}
+
+/* And a plugin's lookup path hook that changed the builtins, from then on. */
+TEST_F(UnforceTest, builtinsChangeTurnsOff)
+{
+    auto & slot = state.baseEnv.values[state.staticBaseEnv->vars.begin()->second];
+    {
+        UnforceBuiltinsCheck check(state);
+    }
+    EXPECT_TRUE(unforceEnabled(state));
+    {
+        UnforceBuiltinsCheck check(state);
+        slot = state.allocValue();
+        slot->mkNull();
+    }
+    EXPECT_FALSE(unforceEnabled(state));
+}
+
 /* A job in which an effect ran is kept whole. */
 TEST_F(UnforceTest, effectKeepsJob)
 {
@@ -266,6 +324,19 @@ TEST_F(UnforceTest, effectKeepsJob)
     state.endUnforceScope();
     EXPECT_FALSE(v->isThunk());
     EXPECT_EQ(deep(*v), "{ a = 1; }");
+}
+
+/* So is one in which a plugin's lookup path hook ran. */
+TEST_F(UnforceTest, lookupPathHookKeepsJob)
+{
+    evalSettings.lookupPathHooks.insert_or_assign(
+        "unforce-test", [](EvalState &, std::string_view) -> std::optional<SourcePath> { return std::nullopt; });
+    auto v = oldThunk("{ a = 1; }");
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    EXPECT_TRUE(unforceNoteLookupPathHook(evalSettings, "unforce-test"));
+    state.endUnforceScope();
+    EXPECT_FALSE(v->isThunk());
 }
 
 /* What a job allocates while the region is paused outlives it. */

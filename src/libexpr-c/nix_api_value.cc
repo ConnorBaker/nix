@@ -1,6 +1,7 @@
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/eval-error.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/path.hh"
 #include "nix/expr/primops.hh"
 #include "nix/expr/value.hh"
@@ -112,6 +113,8 @@ PrimOp * nix_alloc_primop(
     if (context)
         context->last_err_code = NIX_OK;
     try {
+        /* Client code may now run in any evaluator of the process. */
+        nix::unforceNoteCApiCode();
         using namespace std::placeholders;
         auto p = new
 #if NIX_USE_BOEHMGC

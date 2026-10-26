@@ -3,6 +3,7 @@
 #include "nix/cmd/common-eval-args.hh"
 #include "nix/util/config-global.hh"
 #include "nix/expr/eval.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/fetchers/fetchers.hh"
 #include "nix/fetchers/registry.hh"
 #include "nix/flake/flakeref.hh"
@@ -44,6 +45,9 @@ EvalSettings evalSettings{
 };
 
 static GlobalConfig::Register rEvalSettings(&evalSettings);
+
+/* Nix's own lookup path hooks: not a plugin's (`unforceNoteLookupPathHook`). */
+static int rOwnLookupPathHooks = (unforceNoteOwnLookupPathHooks(evalSettings.lookupPathHooks), 0);
 
 flake::Settings flakeSettings;
 
