@@ -7,6 +7,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/get-drvs.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/derived-path.hh"
 #include "nix/util/os-string.hh"
 #include "nix/util/signals.hh"
@@ -412,20 +413,19 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
         auto checkDerivation =
             [&](const std::string & attrPath, Value & v, const PosIdx pos) -> std::optional<StorePath> {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking derivation %s", attrPath));
-                auto packageInfo = getDerivation(*state, v, false);
-                if (!packageInfo)
+                std::optional<StorePath> storePath;
+                // FIXME: check meta attributes
+                if (!getDerivation(
+                        *state, v, false, [&](PackageInfo & packageInfo) { storePath = packageInfo.queryDrvPath(); }))
                     throw Error("flake attribute '%s' is not a derivation", attrPath);
-                else {
-                    // FIXME: check meta attributes
-                    auto storePath = packageInfo->queryDrvPath();
-                    if (storePath) {
-                        logger->log(
-                            lvlInfo, fmt("derivation evaluated to %s", store->printStorePath(storePath.value())));
-                    }
-                    return storePath;
+                if (storePath) {
+                    logger->log(lvlInfo, fmt("derivation evaluated to %s", store->printStorePath(storePath.value())));
                 }
+                return storePath;
             } catch (Error & e) {
                 e.addTrace(resolve(pos), HintFmt("while checking the derivation '%s'", attrPath));
                 reportError(e);
@@ -436,6 +436,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         std::map<DerivedPath, std::vector<AttrPath>> attrPathsByDrv;
 
         auto checkApp = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking app '%s'", attrPath));
                 state->forceAttrs(v, pos, "");
@@ -477,6 +479,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkOverlay = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking overlay '%s'", attrPath));
                 state->forceValue(v, pos);
@@ -494,6 +498,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkModule = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS module '%s'", attrPath));
                 state->forceValue(v, pos);
@@ -514,6 +520,9 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
                     throw Error("jobset should not be a derivation at top-level");
 
                 for (auto & attr : *v.attrs()) {
+                    /* A job per job or jobset, at the top level only. */
+                    UnforceJobs jobs(*state);
+                    jobs.element();
                     state->forceAttrs(*attr.value, attr.pos, "");
                     auto attrPath2 = concatStrings(attrPath, ".", state->symbols[attr.name]);
                     if (state->isDerivation(*attr.value)) {
@@ -530,6 +539,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkNixOSConfiguration = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking NixOS configuration '%s'", attrPath));
                 const Bindings & bindings = Bindings::emptyBindings;
@@ -544,6 +555,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkTemplate = [&](std::string_view attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking template '%s'", attrPath));
 
@@ -577,6 +590,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
         };
 
         auto checkBundler = [&](const std::string & attrPath, Value & v, const PosIdx pos) {
+            UnforceJobs jobs(*state);
+            jobs.element();
             try {
                 Activity act(*logger, lvlInfo, actUnknown, fmt("checking bundler '%s'", attrPath));
                 state->forceValue(v, pos);

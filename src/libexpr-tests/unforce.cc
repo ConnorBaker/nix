@@ -345,6 +345,21 @@ TEST_F(UnforceTest, getDerivationsJobs)
     EXPECT_EQ(drvs.back().queryOutputName(), "dev");
 }
 
+/* The derivation that `getDerivation` hands to a callback keeps nothing of
+   the job past the call: the job's other cells revert. */
+TEST_F(UnforceTest, getDerivationCallback)
+{
+    auto v = oldThunk("derivation { name = \"x\"; system = \"s\"; builder = \"b\"; }");
+    auto w = oldThunk("{ a = 1; }");
+    std::string name;
+    state.beginUnforceScope();
+    state.forceValue(*w, noPos);
+    EXPECT_TRUE(getDerivation(state, *v, false, [&](PackageInfo & drv) { name = drv.queryName(); }));
+    state.endUnforceScope();
+    EXPECT_EQ(name, "x");
+    EXPECT_TRUE(w->isThunk());
+}
+
 /* Native code turns unforcing off: here, `importNative`. */
 TEST_F(UnforceTest, nativeCodeTurnsOff)
 {

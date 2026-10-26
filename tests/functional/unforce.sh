@@ -42,6 +42,20 @@ fi
 nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
 [[ $(grep -c '^trace: s$' "$TEST_ROOT/err") == 1 ]]
 
+# flake check checks each output in a job of its own.
+flakeDir=$TEST_ROOT/flake
+mkdir -p "$flakeDir"
+cp "${config_nix}" "$flakeDir/"
+cat > "$flakeDir/flake.nix" <<EOF
+{
+  outputs = { self }: with import ./config.nix; {
+    packages.$system.x = mkDerivation { name = "x"; builder = "/b"; };
+    overlays.default = final: prev: { };
+  };
+}
+EOF
+expectJobs "$(jobsOf nix flake check "$flakeDir")" 2
+
 # A derivation found in an earlier job is dropped in a later one; one job
 # per attribute, then one per derivation found (its name, its drvPath).
 cat > "$TEST_ROOT/drvs.nix" <<EOF

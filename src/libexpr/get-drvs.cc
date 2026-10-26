@@ -412,6 +412,20 @@ std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool igno
     return std::move(drvs.front());
 }
 
+bool getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures, fun<void(PackageInfo &)> use)
+{
+    /* On the heap: this frame is below `v`'s evaluation. */
+    auto done = std::make_unique<Done>();
+    PackageInfos drvs;
+    getDerivation(state, v, "", drvs, *done, ignoreAssertionFailures);
+    if (drvs.size() != 1)
+        return false;
+    use(drvs.front());
+    /* Nothing found outlives this. */
+    done->found.clear();
+    return true;
+}
+
 static std::string addToPath(const std::string & s1, std::string_view s2)
 {
     return s1.empty() ? std::string(s2) : s1 + "." + s2;

@@ -111,6 +111,13 @@ typedef std::list<PackageInfo, traceable_allocator<PackageInfo>> PackageInfos;
  */
 std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures);
 
+/**
+ * If value `v` denotes a derivation, hand a PackageInfo object describing
+ * it to `use`, which must not keep it: unlike the one returned above, it
+ * keeps no unforce job's memory past the call. Returns whether it did.
+ */
+bool getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures, fun<void(PackageInfo &)> use);
+
 void getDerivations(
     EvalState & state,
     Value & v,
