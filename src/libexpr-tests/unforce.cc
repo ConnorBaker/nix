@@ -233,6 +233,29 @@ TEST_F(UnforceTest, promotesOwner)
     EXPECT_TRUE(b->listView()[1]->isFailed());
 }
 
+/* A promoted value keeps what it reaches, moved down over what the job
+   freed (`junk`), and later jobs reuse the memory freed. */
+TEST_F(UnforceTest, compactsPromoted)
+{
+    auto v = oldThunk(
+        "let junk = builtins.genList (x: { inherit x; }) 100; in { a = builtins.length (builtins.deepSeq junk junk); b = [ 1 2 3 ]; }");
+    for (int i = 0; i < 2; ++i) {
+        state.beginUnforceScope();
+        state.forceValue(*v, noPos);
+        state.forceValue(*v->attrs()->get(createSymbol("a"))->value, noPos);
+        state.forceValueDeep(*v->attrs()->get(createSymbol("b"))->value);
+        state.endUnforceScope();
+    }
+    ASSERT_EQ(v->type(), nAttrs);
+    for (int i = 0; i < 3; ++i) {
+        auto w = oldThunk("builtins.genList (x: { y = x; }) 200");
+        state.beginUnforceScope();
+        state.forceValueDeep(*w);
+        state.endUnforceScope();
+    }
+    EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
+}
+
 /* A job in which an effect ran is kept whole. */
 TEST_F(UnforceTest, effectKeepsJob)
 {

@@ -127,7 +127,7 @@ public:
     }
 
     /* This layer's own attributes and the layer below it, for unforcing,
-       which tells what a Bindings points to. */
+       which tells what a Bindings points to and moves it. */
     size_type layerSize() const
     {
         return numAttrs;
@@ -141,6 +141,16 @@ public:
     Value * layerValue(size_type i) const
     {
         return attrs[i].value;
+    }
+
+    void setLayerBase(const Bindings * b)
+    {
+        baseLayer = b;
+    }
+
+    void setLayerValue(size_type i, Value * v)
+    {
+        attrs[i].value = v;
     }
 
     bool empty() const

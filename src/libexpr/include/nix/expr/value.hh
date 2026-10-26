@@ -1549,7 +1549,8 @@ public:
         return getStorage<Lambda>();
     }
 
-    /* The raw payload, for unforcing, which tells what a value points to. */
+    /* The raw payload, for unforcing, which tells what a value points to and
+       moves it. */
     InternalType internalType() const noexcept
     {
         return getInternalType();
@@ -1573,6 +1574,16 @@ public:
     SmallList rawSmallList() const noexcept
     {
         return getStorage<SmallList>();
+    }
+
+    void setRawList(List l) noexcept
+    {
+        setStorage(l);
+    }
+
+    void setRawSmallList(SmallList l) noexcept
+    {
+        setStorage(l);
     }
 
     ClosureThunk thunk() const noexcept
