@@ -1419,7 +1419,10 @@ static void prim_second(EvalState & state, CallSite callSite, Value * const * ar
  * Derivations
  *************************************************************/
 
-static void derivationStrictInternal(EvalState & state, std::string_view name, const Bindings * attrs, Value & v);
+/* Not inlined: its frame would be prim_derivationStrict's, on the stack while
+   the derivation's attributes are evaluated. */
+[[gnu::noinline]] static void
+derivationStrictInternal(EvalState & state, std::string_view name, const Bindings * attrs, Value & v);
 
 /* Construct (as a unobservable side effect) a Nix derivation
    expression that performs the derivation described by the argument
@@ -1507,6 +1510,12 @@ static void checkDerivationName(EvalState & state, std::string_view drvName)
                 "invalid derivation name: %s. Please pass a different '%s'.", Uncolored(e.message()), "name")
             .debugThrow();
     }
+}
+
+[[gnu::noinline, gnu::cold]] static void
+addDerivationAttrTrace(EvalState & state, Error & e, PosIdx pos, const SymbolStr & key, std::string_view drvName)
+{
+    e.addTrace(state.positions[pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
 }
 
 static void derivationStrictInternal(EvalState & state, std::string_view drvName, const Bindings * attrs, Value & v)
@@ -1773,8 +1782,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             }
 
         } catch (Error & e) {
-            e.addTrace(
-                state.positions[i->pos], HintFmt("while evaluating attribute '%1%' of derivation '%2%'", key, drvName));
+            addDerivationAttrTrace(state, e, i->pos, key, drvName);
             throw;
         }
     }
@@ -3666,34 +3674,32 @@ static RegisterPrimOp primop_mapAttrs({
     .impl = prim_mapAttrs,
 });
 
-static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+namespace {
+
+struct ZipAttrsItem
 {
-    // we will first count how many values are present for each given key.
-    // we then allocate a single attrset and pre-populate it with lists of
-    // appropriate sizes, stash the pointers to the list elements of each,
-    // and populate the lists. after that we replace the list in the every
-    // attribute with the merge function application. this way we need not
-    // use (slightly slower) temporary storage the GC does not know about.
+    size_t size = 0;
+    size_t pos = 0;
+    std::optional<ListBuilder> list;
+};
 
-    struct Item
-    {
-        size_t size = 0;
-        size_t pos = 0;
-        std::optional<ListBuilder> list;
-    };
+using ZipAttrsSeen =
+    std::map<Symbol, ZipAttrsItem, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, ZipAttrsItem>>>;
 
-    std::map<Symbol, Item, std::less<Symbol>, traceable_allocator<std::pair<const Symbol, Item>>> attrsSeen;
+} // namespace
 
-    state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.zipAttrsWith");
-    state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.zipAttrsWith");
-    const auto listItems = args[1]->listView();
+/* Out of line, as is zipAttrsWithResult: not in prim_zipAttrsWith's frame
+   while it forces the elements. */
+[[gnu::noinline]] static void countZipAttrs(ZipAttrsSeen & attrsSeen, const Bindings & attrs)
+{
+    for (auto & attr : attrs)
+        attrsSeen.try_emplace(attr.name).first->second.size++;
+}
 
-    for (auto & vElem : listItems) {
-        state.forceAttrs(
-            *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
-        for (auto & attr : *vElem->attrs())
-            attrsSeen.try_emplace(attr.name).first->second.size++;
-    }
+[[gnu::noinline]] static void
+zipAttrsWithResult(EvalState & state, Value * f, Value & list, ZipAttrsSeen & attrsSeen, Value & v)
+{
+    const auto listItems = list.listView();
 
     for (auto & [sym, elem] : attrsSeen)
         elem.list.emplace(state.buildList(elem.size));
@@ -3710,7 +3716,7 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     for (auto & [sym, elem] : attrsSeen) {
         auto name = Value::toPtr(state.symbols[sym]);
         auto call1 = state.allocValue();
-        call1->mkApp(args[0], name);
+        call1->mkApp(f, name);
         auto call2 = state.allocValue();
         auto arg = state.allocValue();
         arg->mkList(*elem.list);
@@ -3719,6 +3725,30 @@ static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * cons
     }
 
     v.mkAttrs(attrs.alreadySorted());
+}
+
+static void prim_zipAttrsWith(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+{
+    // we will first count how many values are present for each given key.
+    // we then allocate a single attrset and pre-populate it with lists of
+    // appropriate sizes, stash the pointers to the list elements of each,
+    // and populate the lists. after that we replace the list in the every
+    // attribute with the merge function application. this way we need not
+    // use (slightly slower) temporary storage the GC does not know about.
+
+    ZipAttrsSeen attrsSeen;
+
+    state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.zipAttrsWith");
+    state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.zipAttrsWith");
+    const auto listItems = args[1]->listView();
+
+    for (auto & vElem : listItems) {
+        state.forceAttrs(
+            *vElem, noPos, "while evaluating a value of the list passed as second argument to builtins.zipAttrsWith");
+        countZipAttrs(attrsSeen, *vElem->attrs());
+    }
+
+    zipAttrsWithResult(state, args[0], *args[1], attrsSeen, v);
 }
 
 static RegisterPrimOp primop_zipAttrsWith({
@@ -4278,20 +4308,21 @@ static RegisterPrimOp primop_sort({
     .impl = prim_sort,
 });
 
-static void prim_partition(EvalState & state, CallSite callSite, Value * const * args, Value & v)
-{
-    state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.partition");
-    state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.partition");
+[[gnu::noinline]] static void partitionResult(EvalState & state, ValueVector & right, ValueVector & wrong, Value & v);
 
-    auto len = args[1]->listSize();
+/* Tail-called by prim_partition: only this frame is on the stack while the
+   elements and their tests are evaluated. */
+[[gnu::noinline]] static void partitionElems(EvalState & state, Value & pred, Value & list, Value & v)
+{
+    auto len = list.listSize();
 
     ValueVector right, wrong;
 
     for (size_t n = 0; n < len; ++n) {
-        auto vElem = args[1]->listView()[n];
+        auto vElem = list.listView()[n];
         state.forceValue(*vElem, noPos);
         Value res;
-        state.callFunction(*args[0], *vElem, res, noPos);
+        state.callFunction(pred, *vElem, res, noPos);
         if (state.forceBool(
                 res, noPos, "while evaluating the return value of the partition function passed to builtins.partition"))
             right.push_back(vElem);
@@ -4299,6 +4330,18 @@ static void prim_partition(EvalState & state, CallSite callSite, Value * const *
             wrong.push_back(vElem);
     }
 
+    partitionResult(state, right, wrong, v);
+}
+
+static void prim_partition(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+{
+    state.forceFunction(*args[0], noPos, "while evaluating the first argument passed to builtins.partition");
+    state.forceList(*args[1], noPos, "while evaluating the second argument passed to builtins.partition");
+    partitionElems(state, *args[0], *args[1], v);
+}
+
+static void partitionResult(EvalState & state, ValueVector & right, ValueVector & wrong, Value & v)
+{
     auto attrs = state.buildBindings(2);
 
     auto rsize = right.size();
