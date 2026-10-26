@@ -1220,6 +1220,19 @@ struct Walk
     void root(Value & v)
     {
         scan(v);
+        drain();
+    }
+
+    /* Walk what `p`, a held object of `kind`, reaches; returns where it goes. */
+    const void * from(const void * p, Obj kind)
+    {
+        auto to = edge(p, kind, 0);
+        drain();
+        return to;
+    }
+
+    void drain()
+    {
         for (;;) {
             if (!values.empty()) {
                 auto next = values.back();
@@ -1528,7 +1541,8 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    frames and its trace differs), and the owners of young cells that failed
    and that their owner's value reaches; and the targets that an earlier job
    reverted, which are evidently shared between jobs: reverting them again
-   would only make each job evaluate them anew.
+   would only make each job evaluate them anew. What holders hold (see
+   unforce.hh) is marked as the promoted values are.
 
    Evac(S) is then compacted in place (Lisp-2 sliding, as by the Compressor
    or GHC's compacting collector): each of its objects moves down by the
@@ -1576,8 +1590,72 @@ struct Targets
     }
 };
 
+/* The holders alive (see unforce.hh), roots of a job's end besides the
+   promoted values. Per thread: a holder's thread is the one that runs the
+   jobs it sees. */
+static thread_local std::vector<UnforceHolder *> holders;
+
+UnforceHolder::UnforceHolder()
+{
+    if (!NIX_USE_BOEHMGC)
+        holders.push_back(this);
+}
+
+UnforceHolder::~UnforceHolder()
+{
+    if (!NIX_USE_BOEHMGC)
+        std::erase(holders, this);
+}
+
+UnforceHolder::Hold::~Hold() = default;
+
+bool UnforceSeen::see(const void * p, Kind kind)
+{
+    if (!insert(p).second)
+        return false;
+    if (evalRegion.contains(p))
+        young.emplace_back(p, kind);
+    return true;
+}
+
+void UnforceSeen::held(Hold & hold)
+{
+    /* In address order: compaction keeps it, so no entry is rewritten to
+       the address of one not rewritten yet. */
+    std::ranges::sort(young);
+    for (auto & [p, kind] : young)
+        if (auto to = hold(p, kind); to != p) {
+            auto node = extract(p);
+            node.value() = to;
+            insert(std::move(node));
+            p = to;
+        }
+}
+
+void UnforceSeen::ended()
+{
+    young.clear();
+}
+
+/* A holder's pointers as roots of `walk`. */
+template<typename W>
+struct WalkHold : UnforceHolder::Hold
+{
+    W & walk;
+
+    explicit WalkHold(W & walk)
+        : walk(walk)
+    {
+    }
+
+    const void * operator()(const void * p, UnforceHolder::Kind kind) override
+    {
+        return walk.from(p, kind == UnforceHolder::Kind::value ? Obj::value : Obj::bindings);
+    }
+};
+
 /* Which targets the job promotes (see above), marking what their values
-   reach, Evac(S), into `evac`; `failures`: the failures in Evac(S) whose
+   and the holders reach, Evac(S), into `evac`; `failures`: the failures in Evac(S) whose
    recovery values are young. Returns whether Evac(S) holds anything. */
 static bool decide(
     const std::vector<UnforceUndoEntry> & log,
@@ -1621,12 +1699,15 @@ static bool decide(
                 nominate(t);
     }
 
-    /* The closure. */
+    /* The closure, from what the holders hold too. */
     auto mark = Mark{evac, [&](const void * p) {
                          if (auto o = ownerOf(p); o != noOwner)
                              nominate(targetOf(o));
                      }};
     Walk walk{mark};
+    WalkHold hold{walk};
+    for (auto h : holders)
+        h->held(hold);
     while (!pending.empty()) {
         auto t = pending.back();
         pending.pop_back();
@@ -1809,6 +1890,12 @@ void unforceNoteEffect()
         keepWhole = true;
 }
 
+void unforceKeepJob()
+{
+    if (jobOwner.load())
+        keepWhole = true;
+}
+
 void EvalState::beginUnforceScope(const void * stackMark)
 {
     if (NIX_USE_BOEHMGC || isolationDepth++)
@@ -1891,10 +1978,15 @@ void EvalState::endUnforceJob()
         if (walk) {
             for (auto t : promoted)
                 walk->root(*t);
+            WalkHold hold{*walk};
+            for (auto h : holders)
+                h->held(hold);
             for (auto f : failures)
                 f->recoveryValue = (Value *) live->to(f->recoveryValue);
         }
     }
+    for (auto h : holders)
+        h->ended();
     undoLog.clear();
     undoLog.shrink_to_fit();
     decltype(segments)().swap(segments);

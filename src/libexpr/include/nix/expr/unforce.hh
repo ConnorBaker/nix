@@ -7,6 +7,9 @@
 #include "nix/expr/eval.hh"
 #include "nix/expr/eval-settings.hh"
 
+#include <set>
+#include <vector>
+
 namespace nix {
 
 [[gnu::noinline]] void unforcePauseBegin();
@@ -41,6 +44,60 @@ struct PauseRegion
  * ran: the open job, if any, keeps its result.
  */
 void unforceNoteEffect();
+
+/** The caller keeps something it built in the open job outside any cell: the job, if any, keeps all its memory. */
+void unforceKeepJob();
+
+/**
+ * C++ state that points into the open job's memory from outside any cell (a
+ * printer's set of the containers it has printed, the derivations that
+ * `getDerivations` found). While it is registered (from its construction to
+ * its destruction), a job's end keeps what it points to, as it keeps what a
+ * promoted value reaches, and rewrites its pointers to where that moves.
+ */
+class UnforceHolder
+{
+public:
+    enum class Kind { value, bindings };
+
+    struct Hold
+    {
+        virtual ~Hold();
+        /** Keep `p`, a `Value *` or a `Bindings *`; returns where it is from now on. */
+        virtual const void * operator()(const void * p, Kind kind) = 0;
+    };
+
+    UnforceHolder();
+    virtual ~UnforceHolder();
+    UnforceHolder(const UnforceHolder &) = delete;
+    UnforceHolder & operator=(const UnforceHolder &) = delete;
+
+    /**
+     * At a job's end: pass each pointer into the job's memory that this
+     * holds to `hold`, and store what it returns. Called once, and once more
+     * if anything moves; then `ended`. Allocates nothing.
+     */
+    virtual void held(Hold & hold) = 0;
+
+    /** A job ended: nothing this holds is in a job's memory any more. */
+    virtual void ended() = 0;
+};
+
+/**
+ * A set of the containers a traversal has seen, by address (to print
+ * «repeated», or to drop duplicates), that stays exact across jobs: its
+ * entries in the open job's memory are held.
+ */
+class UnforceSeen : public std::set<const void *>, public UnforceHolder
+{
+    std::vector<std::pair<const void *, Kind>> young;
+
+public:
+    /** Add `p`, of `kind`; returns whether it was not there yet. */
+    bool see(const void * p, Kind kind);
+    void held(Hold & hold) override;
+    void ended() override;
+};
 
 /** Whether a thunk of `expr` is a cell that unforcing reverted. */
 bool unforceIsReverted(const Expr * expr);

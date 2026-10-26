@@ -265,6 +265,29 @@ TEST_F(UnforceTest, compactsPromoted)
     EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
 }
 
+/* A seen set keeps the containers it holds, moved by the job's end, so
+   that one seen again in a later job is found. */
+TEST_F(UnforceTest, seenHoldsContainers)
+{
+    auto v = oldThunk(
+        "let s = builtins.seq (builtins.length (builtins.genList (x: { inherit x; }) 100)) { x = 1; }; in { a = s; b = s; }");
+    state.forceValue(*v, noPos);
+    auto a = v->attrs()->get(createSymbol("a"))->value;
+    auto b = v->attrs()->get(createSymbol("b"))->value;
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    state.forceValue(*a, noPos);
+    auto first = a->attrs();
+    EXPECT_TRUE(seen.see(first, UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    state.beginUnforceScope();
+    state.forceValue(*b, noPos);
+    EXPECT_NE(b->attrs(), first);
+    EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    EXPECT_EQ(deep(*b), "{ x = 1; }");
+}
+
 /* Native code turns unforcing off: here, `importNative`. */
 TEST_F(UnforceTest, nativeCodeTurnsOff)
 {
