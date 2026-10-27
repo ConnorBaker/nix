@@ -815,7 +815,7 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
             // For now, we skip building derivations whose outputs are already available
             // via substitution, as `nix flake check` only needs to verify buildability,
             // not actually produce the outputs.
-            auto missing = store->queryMissing(drvPaths);
+            auto missing = store->queryMissing(drvPaths, &*getEvalStore());
 
             std::vector<DerivedPath> toBuild;
             for (auto & path : missing.willBuild) {
@@ -828,7 +828,8 @@ struct CmdFlakeCheck : FlakeCommand, MixPrintOutPaths, MixOutLinkBase
 
             Activity act(*logger, lvlInfo, actUnknown, fmt("running %d flake checks", toBuild.size()));
             // once we get rid of the temporary hack above, this tenary operator will also go away
-            results = store->getBuilder()->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
+            results = store->getBuilder(getEvalStore())
+                          ->buildPathsWithResults((printOutputPaths || outLink) ? drvPaths : toBuild);
 
             // Report build failures with attribute paths
             for (auto & result : results) {

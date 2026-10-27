@@ -320,6 +320,8 @@ static void main_nix_build(int argc, char ** argv)
         throw UsageError("'-p' and '-E' are mutually exclusive");
 
     auto store = openStore();
+    if (!myArgs.evalStoreUrl && !evalSettings.defaultEvalStore.get().empty())
+        myArgs.evalStoreUrl = StoreReference::parse(evalSettings.defaultEvalStore.get());
     auto evalStore = myArgs.evalStoreUrl ? openStore(StoreReference{*myArgs.evalStoreUrl}) : store;
 
     auto state = std::make_shared<EvalState>(myArgs.lookupPath, evalStore, fetchSettings, evalSettings, store);
@@ -449,7 +451,7 @@ static void main_nix_build(int argc, char ** argv)
 
     auto buildPaths = [&](const std::vector<DerivedPath> & paths) {
         if (settings.printMissing)
-            printMissing(ref<Store>(store), paths);
+            printMissing(ref<Store>(store), paths, lvlInfo, &*evalStore);
 
         if (!dryRun)
             store->getBuilder(evalStore)->buildPaths(paths, buildMode);

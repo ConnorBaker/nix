@@ -88,6 +88,7 @@ suites = [
       'derivation-json.sh',
       'dump-db.sh',
       'eval-store.sh',
+      'eval-store-remote.sh',
       'eval.sh',
       'experimental-features.sh',
       'export-graph.sh',

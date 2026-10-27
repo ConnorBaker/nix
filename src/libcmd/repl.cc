@@ -80,7 +80,12 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
 
     std::unique_ptr<ReplInteracter> interacter;
 
-    NixRepl(const LookupPath & lookupPath, ref<EvalState> state, fun<AnnotatedValues()> getValues, RunNix * runNix);
+    NixRepl(
+        const LookupPath & lookupPath,
+        ref<EvalState> state,
+        ref<Store> buildStore,
+        fun<AnnotatedValues()> getValues,
+        RunNix * runNix);
     virtual ~NixRepl() = default;
 
     ReplExitStatus mainLoop() override;
@@ -132,8 +137,12 @@ std::string removeWhitespace(std::string s)
 }
 
 NixRepl::NixRepl(
-    const LookupPath & lookupPath, ref<EvalState> state, fun<NixRepl::AnnotatedValues()> getValues, RunNix * runNix)
-    : AbstractNixRepl(state)
+    const LookupPath & lookupPath,
+    ref<EvalState> state,
+    ref<Store> buildStore,
+    fun<NixRepl::AnnotatedValues()> getValues,
+    RunNix * runNix)
+    : AbstractNixRepl(state, buildStore)
     , debugTraceIndex(0)
     , getValues(getValues)
     , staticEnv(new StaticEnv(nullptr, state->staticBaseEnv))
@@ -547,31 +556,32 @@ ProcessLineResult NixRepl::processLine(std::string line)
         std::string drvPathRaw = state->store->printStorePath(drvPath);
 
         if (command == ":b" || command == ":bl") {
-            state->store->getBuilder()->buildPaths({
+            buildStore->getBuilder(state->store)->buildPaths({
                 DerivedPath::Built{
                     .drvPath = makeConstantStorePathRef(drvPath),
                     .outputs = OutputsSpec::All{},
                 },
             });
-            auto drv = state->store->readDerivation(drvPath);
             logger->cout("\nThis derivation produced the following outputs:");
-            for (auto & [outputName, outputPath] : deepQueryDerivationOutputMap(*state->store, drvPath)) {
-                auto localStore = state->store.dynamic_pointer_cast<LocalFSStore>();
+            for (auto & [outputName, outputPath] :
+                 deepQueryDerivationOutputMap(*buildStore, drvPath, &*state->store)) {
+                auto localStore = buildStore.dynamic_pointer_cast<LocalFSStore>();
                 if (localStore && command == ":bl") {
                     std::string symlink = "repl-result-" + outputName;
                     localStore->addPermRoot(outputPath, absPath(symlink));
-                    logger->cout("  ./%s -> %s", symlink, state->store->printStorePath(outputPath));
+                    logger->cout("  ./%s -> %s", symlink, buildStore->printStorePath(outputPath));
                 } else {
-                    logger->cout("  %s -> %s", outputName, state->store->printStorePath(outputPath));
+                    logger->cout("  %s -> %s", outputName, buildStore->printStorePath(outputPath));
                 }
             }
         } else if (command == ":i") {
+            copyClosure(*state->store, *buildStore, RealisedPath::Set{drvPath});
             runNix("nix-env", toOsStrings({"-i", drvPathRaw}));
         } else if (command == ":log") {
             settings.readOnlyMode = true;
             Finally roModeReset([&]() { settings.readOnlyMode = false; });
             RunPager pager;
-            auto log = fetchBuildLog(state->store, drvPath, drvPathRaw);
+            auto log = fetchBuildLog(buildStore, drvPath, drvPathRaw);
             logger->writeToStdout(log);
         } else {
             runNix("nix-shell", toOsStrings({drvPathRaw}));
@@ -959,9 +969,13 @@ void NixRepl::runNix(const std::string & program, OsStrings args)
 }
 
 std::unique_ptr<AbstractNixRepl> AbstractNixRepl::create(
-    const LookupPath & lookupPath, ref<EvalState> state, fun<AnnotatedValues()> getValues, RunNix * runNix)
+    const LookupPath & lookupPath,
+    ref<EvalState> state,
+    ref<Store> buildStore,
+    fun<AnnotatedValues()> getValues,
+    RunNix * runNix)
 {
-    return std::make_unique<NixRepl>(lookupPath, state, getValues, runNix);
+    return std::make_unique<NixRepl>(lookupPath, state, buildStore, getValues, runNix);
 }
 
 ReplExitStatus AbstractNixRepl::runSimple(ref<EvalState> evalState, const ValMap & extraEnv)
@@ -975,6 +989,7 @@ ReplExitStatus AbstractNixRepl::runSimple(ref<EvalState> evalState, const ValMap
     auto repl = std::make_unique<NixRepl>(
         lookupPath,
         evalState,
+        evalState->store,
         getValues,
         /*runNix=*/nullptr);
 
