@@ -24,15 +24,17 @@ expectJobs "$(jobsOf nix eval --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 expectJobs "$(jobsOf nix eval --json --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
-expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 3
+# nix-instantiate evaluates its root, and then each attribute path, in a job
+# of its own first.
+expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 5
 expectJobs "$(jobsOf nix repl <<< ":p $expr")" 3
 
 # --strict forces each element in a job before anything is printed: what
 # it forced stays forced (a reverted cell prints as `<CODE>`), and what an
 # element built besides is freed.
-expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 3
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 5
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
-expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 1
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 3
 [[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
 # Only on 64-bit Linux, without Boehm GC, do jobs have a region, from which
 # they free.
@@ -78,7 +80,7 @@ mkdir -p "$TEST_ROOT/channels"
 cp "$TEST_ROOT/drvs.nix" "$TEST_ROOT/channels/"
 expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 5
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
-expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 5
+expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 7
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
 # search visits each attribute in a job.
 expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 3

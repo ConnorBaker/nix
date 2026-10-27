@@ -40,12 +40,27 @@ void processExpr(
         return;
     }
 
+    /* The root and each attribute path are evaluated in a job of their own,
+       as a traversal's elements are. The job keeps all its memory: they are
+       written outside any cell's force, where its end would not see them. */
     Value vRoot;
-    state.eval(e, vRoot);
+    {
+        UnforceJobs jobs(state);
+        jobs.element();
+        unforceKeepJob();
+        state.eval(e, vRoot);
+    }
 
     for (auto & i : attrPaths) {
-        Value & v(*findAlongAttrPath(state, i, autoArgs, vRoot).first);
-        state.forceValue(v, v.determinePos(noPos));
+        Value * pv;
+        {
+            UnforceJobs jobs(state);
+            jobs.element();
+            unforceKeepJob();
+            pv = findAlongAttrPath(state, i, autoArgs, vRoot).first;
+            state.forceValue(*pv, pv->determinePos(noPos));
+        }
+        Value & v(*pv);
 
         NixStringContext context;
         if (evalOnly) {
