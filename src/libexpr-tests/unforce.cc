@@ -409,13 +409,13 @@ TEST_F(UnforceTest, builtinsChangeTurnsOff)
     EXPECT_FALSE(unforceEnabled(state));
 }
 
-/* A job in which an effect ran is kept whole. */
+/* A job in which an effect ran outside any cell's force is kept whole. */
 TEST_F(UnforceTest, effectKeepsJob)
 {
     auto v = oldThunk("{ a = 1; }");
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
-    unforceNoteEffect();
+    unforceNoteEffect(state);
     state.endUnforceScope();
     EXPECT_FALSE(v->isThunk());
     EXPECT_EQ(deep(*v), "{ a = 1; }");

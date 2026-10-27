@@ -595,7 +595,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
     } else {
         /* A download that, unlike the unpacked case above, nothing in this
            process remembers. */
-        unforceNoteEffect();
+        unforceNoteEffect(state);
         auto storePath = fetchers::downloadFile(*state.store, state.fetchSettings, *url, name).storePath;
         if (expectedHash) {
             auto hash = hashPath(

@@ -10,7 +10,7 @@ namespace nix {
 static void prim_fetchMercurial(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     /* A fetch that nothing in this process remembers. */
-    unforceNoteEffect();
+    unforceNoteEffect(state);
     std::string url;
     std::optional<Hash> rev;
     std::optional<std::string> ref;

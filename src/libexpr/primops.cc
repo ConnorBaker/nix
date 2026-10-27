@@ -117,7 +117,7 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 
     if (isIFD) {
         /* A build during evaluation. */
-        unforceNoteEffect();
+        unforceNoteEffect(*this);
         if (!settings.enableImportFromDerivation)
             error<IFDError>(
                 "cannot build '%1%' during evaluation because the option 'allow-import-from-derivation' is disabled",
@@ -3061,7 +3061,7 @@ static void addPath(
             /* A filtered copy, or one with references, is remembered nowhere
                in this process, and without a hash it is made again. */
             if ((filterFun || !refs.empty()) && !expectedHash)
-                unforceNoteEffect();
+                unforceNoteEffect(state);
             // FIXME: support refs in fetchToStore()?
             auto dstPath = refs.empty() ? fetchToStore(
                                               state.fetchSettings,

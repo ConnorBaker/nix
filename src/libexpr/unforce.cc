@@ -1922,19 +1922,16 @@ UnforceBuiltinsCheck::~UnforceBuiltinsCheck()
     state.unforceNativeCodeReason.compare_exchange_strong(none, "plugin primop installed at runtime");
 }
 
-void unforceNoteEffect()
+void unforceNoteEffect(EvalState & state)
 {
-    /* Running it again could give another result. */
-    if (jobOwner.load())
-        keepWhole = true;
+    unforceNoteDiagnostic(state);
 }
 
 void unforceNoteDiagnostic(EvalState & state)
 {
     /* Running in the current owner's force, or in that of a young cell it
-       owns, which only its re-force builds again. Outside any (the
-       driver's), or in another evaluator than the job's: the job is kept
-       whole. */
+       owns, which only its re-force runs again. Outside any (the driver's),
+       or in another evaluator than the job's: the job is kept whole. */
     auto job = jobOwner.load();
     if (!job)
         return;

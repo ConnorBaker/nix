@@ -47,6 +47,15 @@ fi
 nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
 [[ $(grep -c '^trace: s$' "$TEST_ROOT/err") == 1 ]]
 
+# So does an effect, here a filtered copy, which nothing remembers: the job
+# is not kept whole.
+mkdir -p "$TEST_ROOT/src"
+echo a > "$TEST_ROOT/src/a"
+jobsOf nix eval --expr "{ p = builtins.path { path = $TEST_ROOT/src; filter = _: _: true; }; q = { x = 1; }; }" > /dev/null
+if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 0 ]]
+fi
+
 # flake check checks each output in a job of its own.
 flakeDir=$TEST_ROOT/flake
 mkdir -p "$flakeDir"
