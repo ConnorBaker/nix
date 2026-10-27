@@ -20,6 +20,13 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         experimentalFeatureSettings.require(Xp::ExternalBuilders);
     }
 
+    void prepareSandbox() override
+    {
+        /* Sandboxing (including uid-range support) is the external
+           builder's responsibility; don't reject derivations the
+           local platform could not sandbox itself. */
+    }
+
     std::filesystem::path tmpDirInSandbox() override
     {
         /* In a sandbox, for determinism, always use the same temporary
@@ -35,9 +42,6 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
 
     void startChild() override
     {
-        if (drvOptions.getRequiredSystemFeatures(drv).count("recursive-nix"))
-            throw Error("'recursive-nix' is not supported yet by external derivation builders");
-
         auto json = nlohmann::json::object();
 
         json.emplace("version", 1);
@@ -108,6 +112,23 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
                 _exit(1);
             }
         });
+    }
+    SingleDrvOutputs registerOutputs(LocalStore & localStore) override
+    {
+        auto resultJsonPath = topTmpDir / "result.json";
+        if (pathExists(resultJsonPath)) {
+            auto result = nlohmann::json::parse(readFile(resultJsonPath));
+            auto added = result.find("addedPaths");
+            if (added != result.end() && added->is_array()) {
+                std::promise<void> done;
+                done.set_value();
+                auto ready = done.get_future().share();
+                auto state = state_.lock();
+                for (auto & p : *added)
+                    state->addedPaths.emplace(store->parseStorePath(p.get<std::string>()), ready);
+            }
+        }
+        return DerivationBuilderImpl::registerOutputs(localStore);
     }
 };
 

@@ -27,6 +27,9 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifndef _WIN32
+#  include <sys/wait.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -1055,6 +1058,20 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     if (!statusOk(status)) {
         builder->cleanupBuild(false);
         builder.reset();
+        if (localBuildCap.externalBuilder && WIFEXITED(status)
+            && WEXITSTATUS(status) == externalBuilderDeclinedExitCode) {
+            bool platformOk = drv->platform == settings.thisSystem.get()
+                              || settings.extraPlatforms.get().count(drv->platform) || drv->isBuiltin();
+            auto required = drvOptions.getRequiredSystemFeatures(*drv);
+            auto & available = worker.store.config.systemFeatures.get();
+            bool featuresOk =
+                std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
+            if (worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk) {
+                localBuildCap.externalBuilder = nullptr;
+                co_return co_await buildLocally(
+                    std::move(localBuildCap), inputPaths, initialOutputs, drvOptions, std::move(outputLocks));
+            }
+        }
         outputLocks.unlock();
         co_return fixupBuilderFailureErrorMessage(
             {
