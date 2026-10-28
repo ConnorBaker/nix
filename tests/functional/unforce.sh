@@ -42,13 +42,13 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
 fi
 
-# A trace is shown once: the cell whose evaluation showed it keeps its
-# value, and the job reverts the rest.
+# A trace keeps nothing: re-forcing the cell whose evaluation showed it may
+# show it again, and shows no other trace.
 nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
-[[ $(grep -c '^trace: s$' "$TEST_ROOT/err") == 1 ]]
+[[ $(grep '^trace: ' "$TEST_ROOT/err" | sort -u) == 'trace: s' ]]
 
-# So does an effect, here a filtered copy, which nothing remembers: the job
-# is not kept whole.
+# An effect, here a filtered copy, which nothing remembers, keeps the cell
+# whose evaluation ran it: the job is not kept whole.
 mkdir -p "$TEST_ROOT/src"
 echo a > "$TEST_ROOT/src/a"
 jobsOf nix eval --expr "{ p = builtins.path { path = $TEST_ROOT/src; filter = _: _: true; }; q = { x = 1; }; }" > /dev/null

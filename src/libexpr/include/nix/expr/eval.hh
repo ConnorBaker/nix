@@ -408,10 +408,9 @@ struct UnforceUndoEntry
     uint32_t depth;
     PosIdx pos;
     uint32_t room;
-    /* Whether the force has ended, and whether the target keeps its value: a
-       young cell that the force allocated was forced after that, or a trace
-       or a warning was shown while the force was the current owner. */
-    bool ended, keep;
+    /* Whether the target keeps its value: an effect ran while the force was
+       the current owner. */
+    bool keep;
     Value preImage;
 };
 
@@ -1094,7 +1093,7 @@ private:
 
     /* Reads and rebases `callDepth` for a re-force (unforce.cc). */
     friend struct UnforceDepth;
-    friend void unforceNoteDiagnostic(EvalState & state);
+    friend void unforceNoteEffect(EvalState & state);
 
     std::vector<UnforceUndoEntry> undoLog;
     /** The open unforce scopes; the outermost is a job. */

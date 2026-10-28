@@ -35,22 +35,12 @@ struct PauseRegion
     PauseRegion & operator=(const PauseRegion &) = delete;
 };
 
-/** `v`'s force just failed in an open scope. */
-[[gnu::noinline, gnu::cold]] void unforceNoteFailure(const Value & v) noexcept;
-
 /**
  * An effect that running again could give another result (a download, a
  * copy that nothing remembers, a build) is about to run: the open job, if
  * any, keeps the value of the cell whose re-force would run it again.
  */
 void unforceNoteEffect(EvalState & state);
-
-/**
- * A trace or a warning is about to be shown, which running again would show
- * again: the open job, if any, keeps the value of the cell whose re-force
- * would show it again.
- */
-void unforceNoteDiagnostic(EvalState & state);
 
 /** The caller keeps something it built in the open job outside any cell: the job, if any, keeps all its memory. */
 void unforceKeepJob();

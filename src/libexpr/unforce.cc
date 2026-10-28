@@ -169,14 +169,23 @@ static void closeRegion(char * keepTo)
    carries the call depth of its first force: forcing it evaluates at that
    depth, and restores the depth it found afterwards.
 
-   That is exact. Evaluation is deterministic, so a re-force only repeats
-   work that the evaluation without unforcing did, and the rest of the work
-   is done in the same order, by the same chains of calls, at the same
-   depths, as every re-force restores the depth it found (on return and on
-   throw). A re-force runs at the depth where its first force completed (a
-   job that leaves a target failed, or retries a failure, is kept whole), and
-   the re-forces nested in it are rebased in turn: it fails nowhere that the
-   evaluation without unforcing did not.
+   That is exact for the targets. Evaluation is deterministic, so a re-force
+   only repeats work that the evaluation without unforcing did, and the rest
+   of the work is done in the same order, by the same chains of calls, at
+   the same depths, as every re-force restores the depth it found (on return
+   and on throw). A re-force runs at the depth of its first force, and the
+   re-forces nested in it are rebased in turn. A failed target, reverted,
+   throws the same error again when re-forced; a failure that its job
+   retried (an interrupted or recoverable one) is reverted to the failure,
+   which retries again where it is forced next.
+
+   The cells a re-force builds again are not rebased. One that a consumer
+   forced after the target's first force ended, before the target was
+   reverted, is forced again wherever it is read next, which may be deeper
+   in calls or on the stack: recomputation may then fail on `max-call-depth`
+   or the stack where the evaluation without unforcing does not, which the
+   exactness contract allows (a chain that was forced front to back can be
+   forced back to front).
 
    An application's pre-image becomes a thunk whose environment is the
    function and its argument, called at its first force's position (a primop
@@ -1539,20 +1548,13 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    promoted values and adding the owner of each object marked, until no
    owner is added.
 
-   A job promotes the targets that hold a failure (failed thunks stay
-   failed: a failure cannot be recomputed, as a fresh force runs under other
-   frames and its trace differs), and the owners of young cells that failed
-   and that their owner's value reaches; and the targets that an earlier job
-   reverted, which are evidently shared between jobs: reverting them again
-   would only make each job evaluate them anew. And the targets a young cell
-   of which was forced after their force ended, by a consumer of their value:
-   reverted, they would rebuild the cell unforced, and a later read would
-   force it deeper in calls or on the stack than its first force, which
-   could fail where Nix without unforcing reads a value. And the targets
-   that were the current owner when a trace or a warning was shown: only
-   their re-force runs that evaluation again, which would show it again.
-   What holders hold (see unforce.hh) is marked as the promoted values
-   are.
+   A job promotes the targets that an earlier job reverted, which are
+   evidently shared between jobs: reverting them again would only make each
+   job evaluate them anew. A failed target is reverted like any other: its
+   re-force throws the same error again, later and under other frames, so
+   that its trace may differ and its message may show more of what is
+   evaluated by then, which the exactness contract allows. What holders hold
+   (see unforce.hh) is marked as the promoted values are.
 
    Evac(S) is then compacted in place (Lisp-2 sliding, as by the Compressor
    or GHC's compacting collector): each of its objects moves down by the
@@ -1563,22 +1565,6 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    through the same enumeration of pointers (`valueEdges`, `wideEdge`), each
    object's once.
    --------------------------------------------------------------------------- */
-
-/* The young cells whose force failed in the open job, and whether one could
-   not be recorded (then the job is kept whole). */
-static std::vector<const Value *> youngFailures;
-static bool youngFailuresLost = false;
-
-void unforceNoteFailure(const Value & v) noexcept
-{
-    if (!evalRegion.contains(&v))
-        return;
-    try {
-        youngFailures.push_back(&v);
-    } catch (std::bad_alloc &) {
-        youngFailuresLost = true;
-    }
-}
 
 /* A job's targets, each once, in the order of their first entries, and the
    target of each log entry. */
@@ -1717,25 +1703,9 @@ static bool decide(
     };
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
-        if (log[i].target->isFailed() || log[i].keep || (p.isThunk() && unforceIsReverted(p.thunk().expr))
+        if (log[i].keep || (p.isThunk() && unforceIsReverted(p.thunk().expr))
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             nominate(targets.ofEntry[i]);
-    }
-
-    /* The owners of young failures that their values reach. */
-    std::vector<std::pair<const Value *, uint32_t>> failed;
-    for (auto x : youngFailures)
-        if (auto o = ownerOf(x); x->isFailed() && o != noOwner && !promote[targetOf(o)])
-            failed.emplace_back(x, targetOf(o));
-    if (!failed.empty()) {
-        GranuleBits reached(evalRegion.base, evalRegion.cur);
-        auto mark = Mark{reached, [](const void *) {}};
-        Walk walk{mark};
-        for (auto [x, t] : failed)
-            walk.root(*targets.cells[t]);
-        for (auto [x, t] : failed)
-            if (reached.test(x))
-                nominate(t);
     }
 
     /* The closure, from what the holders hold too. */
@@ -1924,11 +1894,6 @@ UnforceBuiltinsCheck::~UnforceBuiltinsCheck()
 
 void unforceNoteEffect(EvalState & state)
 {
-    unforceNoteDiagnostic(state);
-}
-
-void unforceNoteDiagnostic(EvalState & state)
-{
     /* Running in the current owner's force, or in that of a young cell it
        owns, which only its re-force runs again. Outside any (the driver's),
        or in another evaluator than the job's: the job is kept whole. */
@@ -2023,16 +1988,13 @@ void EvalState::endUnforceScope(const void * ender)
 
 void EvalState::endUnforceJob(const char * ender)
 {
-    /* A cell whose failure was retried is kept with the whole job: its
-       re-force would run at the depth of its first force, which failed
-       (`ExprReforce`). So is a job during which native code came to be able
-       to run, and one that logged a slot of a frame that has returned since
+    /* A job during which native code came to be able to run is kept whole,
+       and so is one that logged a slot of a frame that has returned since
        (between the job's opener and `ender`), which must be neither read
        nor written. */
-    bool keep = keepWhole || youngFailuresLost || !evalRegion.base || unforceNativeCode(*this)
+    bool keep = keepWhole || !evalRegion.base || unforceNativeCode(*this)
                 || std::any_of(undoLog.begin(), undoLog.end(), [&](auto & e) {
-                       return e.preImage.isFailed()
-                              || ((const char *) e.target >= jobStackMark && (const char *) e.target < ender);
+                       return (const char *) e.target >= jobStackMark && (const char *) e.target < ender;
                    });
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is
@@ -2102,8 +2064,6 @@ void EvalState::endUnforceJob(const char * ender)
     undoLog.shrink_to_fit();
     decltype(segments)().swap(segments);
     decltype(opens)().swap(opens);
-    decltype(youngFailures)().swap(youngFailures);
-    youngFailuresLost = false;
     curOwner = noOwner;
     if (evalRegion.base) {
         auto top = keep ? evalRegion.cur : live ? live->slide() : evalRegion.base;
@@ -2128,11 +2088,6 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
         auto o = ownerOf(p);
         if (o == curOwner)
             return;
-        /* A consumer of the owner's value forces it: reverting the owner
-           would rebuild the cell unforced, to be forced wherever a consumer
-           reads it next, deeper in calls or on the stack than here. */
-        if (o != noOwner && undoLog[o].ended)
-            undoLog[o].keep = true;
         roomFor(segments, opens.size() + 2);
         roomFor(opens, 1);
         return openForce(v, noOwner, o);
@@ -2146,35 +2101,34 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
     auto entry = uint32_t(undoLog.size());
     /* The stack pointer of `forceValue`'s caller, where the force's
        evaluation starts. */
-    undoLog.push_back({&v, uint32_t(callDepth), pos, stackRoom((const char *) __builtin_dwarf_cfa()), false, false, v});
+    undoLog.push_back({&v, uint32_t(callDepth), pos, stackRoom((const char *) __builtin_dwarf_cfa()), false, v});
     openForce(v, entry, entry);
 }
 
 void EvalState::endLoggedForceSlow(Value & v, bool completed)
 {
-    if (opens.empty() || opens.back().cell != &v)
-        return;
-    auto f = opens.back();
-    opens.pop_back();
-    /* A logged force that completed with a young-free value drops its
-       entry, if it is still the last one and no closed segment has its
-       label: the job's end would keep the cell as it is anyway, so the log
-       and the timeline do not grow with such forces, however many a job
-       makes. What the force allocated in its segment is garbage (its value
-       reaches none of it, and a cell older than the force that reaches it
-       would have a later entry), and becomes the restored owner's. */
-    if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs && youngFree(v)) {
-        undoLog.pop_back();
-        curOwner = f.saved;
-        if (!segments.empty() && segments.back().owner == f.saved) {
-            openSeg = segStart(segments.back());
-            segments.pop_back();
-        }
-        return;
+    if (!opens.empty() && opens.back().cell == &v) {
+        auto f = opens.back();
+        opens.pop_back();
+        /* A logged force that completed with a young-free value drops its
+           entry, if it is still the last one and no closed segment has its
+           label: the job's end would keep the cell as it is anyway, so the
+           log and the timeline do not grow with such forces, however many a
+           job makes. What the force allocated in its segment is garbage (its
+           value reaches none of it, and a cell older than the force that
+           reaches it would have a later entry), and becomes the restored
+           owner's. */
+        if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs
+            && youngFree(v)) {
+            undoLog.pop_back();
+            curOwner = f.saved;
+            if (!segments.empty() && segments.back().owner == f.saved) {
+                openSeg = segStart(segments.back());
+                segments.pop_back();
+            }
+        } else
+            setOwner(f.saved);
     }
-    if (f.entry != noOwner)
-        undoLog[f.entry].ended = true;
-    setOwner(f.saved);
 }
 
 } // namespace nix

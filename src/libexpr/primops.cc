@@ -1324,8 +1324,6 @@ static RegisterPrimOp primop_deepSeq({
 /* Out of line: not in prim_trace's frame while the second argument is forced. */
 [[gnu::noinline]] static void printTraceMessage(EvalState & state, Value & msg)
 {
-    /* Forced again, it would print again. */
-    unforceNoteDiagnostic(state);
     if (msg.type() == nString)
         printError("trace: %1%", msg.string_view());
     else
@@ -1377,7 +1375,6 @@ static void prim_warn(EvalState & state, CallSite callSite, Value * const * args
             // Do not indent relative to the "evaluation warning: " prefix if the message starts with a newline.
             .noIndent = msgStr.starts_with("\n"),
         };
-        unforceNoteDiagnostic(state);
         logWarning(info);
     }
 
@@ -1580,7 +1577,6 @@ warnDerivationAttr(EvalState & state, const Attr & i, std::string_view drvName, 
         .pos = state.positions[i.pos],
     };
     info.traces.push_back(Trace{.hint = HintFmt{"while evaluating derivation '%1%'", drvName}});
-    unforceNoteDiagnostic(state);
     logWarning(info);
 }
 

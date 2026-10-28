@@ -7,7 +7,7 @@
 #include "nix/expr/unforce.hh"
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/value-to-xml.hh"
-#include "nix/util/finally.hh"
+#include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
 
 #include <cstdint>
@@ -209,9 +209,9 @@ TEST_F(UnforceTest, nestedScope)
     EXPECT_TRUE(v->isThunk());
 }
 
-/* A failed cell stays failed, with its error; the job's other cells are
-   reverted. */
-TEST_F(UnforceTest, failureStaysFailed)
+/* A failed cell is reverted, as the job's other cells are: forced again,
+   it throws the same error. */
+TEST_F(UnforceTest, failureReverts)
 {
     auto v = oldThunk("{ a = 1; }");
     auto f = oldThunk("throw \"no\"");
@@ -220,7 +220,7 @@ TEST_F(UnforceTest, failureStaysFailed)
     EXPECT_THROW(state.forceValue(*f, noPos), ThrownError);
     state.endUnforceScope();
     EXPECT_TRUE(v->isThunk());
-    ASSERT_TRUE(f->isFailed());
+    EXPECT_TRUE(f->isThunk());
     try {
         state.forceValue(*f, noPos);
         FAIL();
@@ -244,21 +244,22 @@ TEST_F(UnforceTest, promotesRevertedCell)
 }
 
 /* A cell that a promoted value reaches is the cell its owner holds: the
-   owner is promoted too. `b`'s value has a failed cell of its own, which
-   promotes it, and `a`'s cell `f`. */
+   owner is promoted too. A root keeps a cell of `b`'s own, which promotes
+   `b`, whose value reaches `a`'s cell `f`. */
 TEST_F(UnforceTest, promotesOwner)
 {
     auto a = oldThunk("{ f = x: x; }");
     auto b = state.allocValue();
-    b->mkApp(oldThunk("a: builtins.attrValues a ++ [ (throw \"no\") ]"), a);
+    b->mkApp(oldThunk("a: builtins.attrValues a ++ [ (1 + 1) ]"), a);
+    RootValue root;
     state.beginUnforceScope();
     state.forceValue(*b, noPos);
-    EXPECT_THROW(state.forceValue(*b->listView()[1], noPos), ThrownError);
+    root = allocRootValue(b->listView()[1]);
     state.endUnforceScope();
     ASSERT_EQ(a->type(), nAttrs);
     ASSERT_EQ(b->type(), nList);
     EXPECT_EQ(b->listView()[0], a->attrs()->get(createSymbol("f"))->value);
-    EXPECT_TRUE(b->listView()[1]->isFailed());
+    EXPECT_EQ(*root, b->listView()[1]);
 }
 
 /* A promoted value keeps what it reaches, moved down over what the job
@@ -284,16 +285,16 @@ TEST_F(UnforceTest, compactsPromoted)
     EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
 }
 
-/* A cell whose value's young cell is forced after its force ended keeps
-   its value: reverted, it would rebuild that cell unforced. */
-TEST_F(UnforceTest, keepsConsumedOwner)
+/* A cell whose value's young cell is forced after its force ended is
+   reverted like any other: its re-force builds that cell again, unforced. */
+TEST_F(UnforceTest, revertsConsumedOwner)
 {
     auto v = oldThunk("{ a = 1 + 1; }");
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
     state.forceValue(*v->attrs()->get(createSymbol("a"))->value, noPos);
     state.endUnforceScope();
-    EXPECT_FALSE(v->isThunk());
+    EXPECT_TRUE(v->isThunk());
     EXPECT_EQ(deep(*v), "{ a = 2; }");
 }
 
@@ -421,35 +422,26 @@ TEST_F(UnforceTest, effectKeepsJob)
     EXPECT_EQ(deep(*v), "{ a = 1; }");
 }
 
-/* A trace keeps the value of the cell whose evaluation showed it, here in
-   the force of a young cell that `t` owns; the job's other cells revert. */
-TEST_F(UnforceTest, traceKeepsItsCell)
+/* A trace keeps nothing: the cell whose evaluation showed it, here in the
+   force of a young cell that `t` owns, reverts with the job's other cells,
+   and so does a job in which one was shown outside any cell's force. */
+TEST_F(UnforceTest, traceKeepsNothing)
 {
     auto v = oldThunk("{ a = 1; }");
     auto t = oldThunk("let x = builtins.trace \"t\" { b = 2; }; in builtins.seq x { inherit x; }");
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.forceValue(*t, noPos);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-    EXPECT_FALSE(t->isThunk());
-}
-
-/* Shown outside any cell's force, it keeps the job whole. */
-TEST_F(UnforceTest, driverTraceKeepsJob)
-{
-    auto v = oldThunk("{ a = 1; }");
     auto f = oldThunk("x: builtins.trace x x");
     state.forceValue(*f, noPos);
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
+    state.forceValue(*t, noPos);
     Value r;
     state.callFunction(*f, *oldThunk("\"s\""), r, noPos);
     state.endUnforceScope();
-    EXPECT_FALSE(v->isThunk());
+    EXPECT_TRUE(v->isThunk());
+    EXPECT_TRUE(t->isThunk());
 }
 
-/* So is one in which a plugin's lookup path hook ran. */
+/* A job in which a plugin's lookup path hook ran is kept whole. */
 TEST_F(UnforceTest, lookupPathHookKeepsJob)
 {
     evalSettings.lookupPathHooks.insert_or_assign(
@@ -537,16 +529,94 @@ static const std::vector<std::pair<std::string, std::function<std::string(EvalSt
      }},
 };
 
+/* The end of the value printed at `j` in `s`: a bracketed one, a string, a
+   «…» marker, or a word; npos if it does not end. */
+static size_t endOfPrinted(std::string_view s, size_t j)
+{
+    if (j >= s.size())
+        return std::string_view::npos;
+    if (s.substr(j).starts_with("«")) {
+        auto e = s.find("»", j);
+        return e == std::string_view::npos ? e : e + std::string_view("»").size();
+    }
+    if (s[j] == '"') {
+        for (++j; j < s.size(); ++j)
+            if (s[j] == '\\')
+                ++j;
+            else if (s[j] == '"')
+                return j + 1;
+        return std::string_view::npos;
+    }
+    if (s[j] == '{' || s[j] == '[' || s[j] == '(') {
+        int depth = 0;
+        while (j < s.size()) {
+            if (s[j] == '"') {
+                j = endOfPrinted(s, j);
+                if (j == std::string_view::npos)
+                    return j;
+                continue;
+            }
+            if (s[j] == '{' || s[j] == '[' || s[j] == '(')
+                ++depth;
+            else if ((s[j] == '}' || s[j] == ']' || s[j] == ')') && --depth == 0)
+                return j + 1;
+            ++j;
+        }
+        return std::string_view::npos;
+    }
+    auto e = s.find_first_of(" ;]})'", j);
+    return e == std::string_view::npos ? s.size() : e;
+}
+
+/* Whether `got` prints what `want` prints, but that inside an error message
+   it may print a value where `want` prints «thunk»: a failed cell is
+   reverted, and its re-force fails later, its message showing what is
+   evaluated by then (the exactness contract allows that much). */
+static bool printsAsOrMoreEvaluated(std::string want, std::string got)
+{
+    want = filterANSIEscapes(want, true);
+    got = filterANSIEscapes(got, true);
+    const std::string_view thunk = "«thunk»", open = "«", close = "»", error = "«error: ";
+    /* The nesting of «…» in `want`, and the depth of the error message it
+       is in (0: all of it; -1: none). */
+    int depth = 0, inError = want.starts_with("error: ") ? 0 : -1;
+    size_t i = 0, j = 0;
+    while (i < want.size()) {
+        auto rest = std::string_view(want).substr(i);
+        if (inError >= 0 && rest.starts_with(thunk)) {
+            i += thunk.size();
+            j = endOfPrinted(got, j);
+            if (j == std::string_view::npos)
+                return false;
+            continue;
+        }
+        if (rest.starts_with(open)) {
+            ++depth;
+            if (inError < 0 && rest.starts_with(error))
+                inError = depth;
+        } else if (rest.starts_with(close)) {
+            if (depth == inError)
+                inError = -1;
+            --depth;
+        }
+        if (j >= got.size() || got[j] != want[i])
+            return false;
+        ++i;
+        ++j;
+    }
+    return j == got.size();
+}
+
 /* The corpus, the .nix files in data/unforce (a function is called with
    its defaults): each program, as each front end evaluates it, prints
-   what it prints in an evaluator without unforcing, or fails as it fails
-   there, traces included. In an evaluator of its own each time, so that
-   nothing is forced before. */
+   what it prints in an evaluator without unforcing, or fails with the same
+   error at the same position (its trace may differ: a failed cell is
+   reverted, and its re-force throws again under other frames), but that a
+   failure's message may show more of what is evaluated
+   (`printsAsOrMoreEvaluated`). In an evaluator of its own each time, so
+   that nothing is forced before. */
 TEST_F(UnforceTest, corpus)
 {
-    auto showTrace = loggerSettings.showTrace.get();
-    loggerSettings.showTrace = true;
-    Finally restore([&] { loggerSettings.showTrace = showTrace; });
     std::vector<std::filesystem::path> programs;
     for (auto & entry : std::filesystem::directory_iterator(getUnitTestData() / "unforce"))
         if (entry.path().extension() == ".nix")
@@ -570,13 +640,17 @@ TEST_F(UnforceTest, corpus)
                     fresh.forceValue(v, noPos);
                     out = run(fresh, v);
                 } catch (Error & e) {
-                    out = std::string("error: ") + e.what();
+                    std::ostringstream pos;
+                    if (auto p = e.info().pos)
+                        pos << *p;
+                    out = "error: " + e.message() + " at " + pos.str();
                 }
                 if (unforce)
                     jobs += unforceStats.jobs - before;
                 return out;
             };
-            EXPECT_EQ(output(true), output(false));
+            auto got = output(true), want = output(false);
+            EXPECT_TRUE(printsAsOrMoreEvaluated(want, got)) << "with unforcing:    " << got << "\nwithout unforcing: " << want;
         }
         EXPECT_GT(jobs, 0) << program;
     }

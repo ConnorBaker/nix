@@ -1,0 +1,8 @@
+# shellcheck shell=bash
+set -euo pipefail
+testcaseBasename=$1
+
+# Unforcing may show a trace again where it re-forces the value whose
+# evaluation showed it (the exactness contract allows it): each line once.
+awk '!seen[$0]++' "$testcaseBasename.err" > "$testcaseBasename.err.once"
+mv "$testcaseBasename.err.once" "$testcaseBasename.err"
