@@ -22,6 +22,27 @@ namespace nix {
    which other tests in this process create, may run. */
 void unforceTestResetNativeCode();
 
+/* Defined in unforce.cc for these tests: while set, every mapping a job asks
+   for fails. */
+extern bool unforceTestFailMapping;
+
+/* While alive, a job's region cannot be mapped (`unforceTestFailMapping`). */
+struct FailMapping
+{
+    FailMapping()
+    {
+        unforceTestFailMapping = true;
+    }
+
+    ~FailMapping()
+    {
+        unforceTestFailMapping = false;
+    }
+
+    FailMapping(const FailMapping &) = delete;
+    FailMapping & operator=(const FailMapping &) = delete;
+};
+
 class UnforceTest : public LibExprTest
 {
 protected:
@@ -418,6 +439,76 @@ TEST_F(UnforceTest, pause)
     }
     state.endUnforceScope();
     EXPECT_THAT(*kept, IsStringEq("kept"));
+}
+
+/* A job keeps the memory of what it promotes up to the end of its last
+   object, here the string a promoted cell holds: a later job allocates
+   above it. */
+TEST_F(UnforceTest, keptEndIsLive)
+{
+    auto v = oldThunk("let a = \"0123456789abcdef\"; b = \"0123456789abcde\"; in a + b");
+    for (int i = 0; i < 2; ++i) {
+        state.beginUnforceScope();
+        state.forceValue(*v, noPos);
+        state.endUnforceScope();
+    }
+    auto want = "0123456789abcdef0123456789abcde";
+    EXPECT_THAT(*v, IsStringEq(want));
+    state.beginUnforceScope();
+    state.mem.allocBytes(64);
+    state.endUnforceScope();
+    EXPECT_THAT(*v, IsStringEq(want));
+}
+
+#  if NIX_ASAN_ENABLED
+/* What a job's end frees is poisoned until a later job allocates it. */
+TEST_F(UnforceTest, poisonsFreed)
+{
+    auto v = oldThunk("{ a = 1; }");
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    auto freed = (const char *) state.mem.allocBytes(1024);
+    state.endUnforceScope();
+    ASSERT_TRUE(v->isThunk());
+    EXPECT_TRUE(__asan_address_is_poisoned(freed));
+    state.beginUnforceScope();
+    auto again = (const char *) state.mem.allocBytes(1024);
+    EXPECT_FALSE(__asan_address_is_poisoned(again));
+    EXPECT_FALSE(__asan_address_is_poisoned(again + 1023));
+    state.endUnforceScope();
+}
+#  endif
+
+/* A job does not run without its region: where none can be mapped, opening
+   the job runs out of memory, and leaves no job open. A job first maps all
+   it needs but the region, which the next job maps again. */
+TEST_F(UnforceTest, unmappableRegionThrows)
+{
+    auto v = oldThunk("{ a = 1; }");
+    state.beginUnforceScope();
+    state.endUnforceScope();
+    {
+        FailMapping fail;
+        EXPECT_THROW(state.beginUnforceScope(), std::bad_alloc);
+    }
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    state.endUnforceScope();
+    EXPECT_TRUE(v->isThunk());
+}
+
+/* Not even where a traversal prints an element's error and goes on: that is
+   no element's failure. */
+TEST_F(UnforceTest, unmappableRegionNotSwallowed)
+{
+    auto v = oldThunk("{ a = 1; }");
+    state.beginUnforceScope();
+    state.endUnforceScope();
+    state.forceValue(*v, noPos);
+    FailMapping fail;
+    std::ostringstream out;
+    UnforceJobs jobs(state, v);
+    EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
 }
 
 /* The front ends' traversals, as the commands run them. */

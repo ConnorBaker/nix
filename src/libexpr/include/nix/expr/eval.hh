@@ -20,6 +20,11 @@
 
 // For `NIX_USE_BOEHMGC`, and if that's set, `GC_THREADS`
 #include "nix/expr/config.hh"
+#include "nix/util/config.hh"
+
+#if NIX_ASAN_ENABLED
+#  include <sanitizer/asan_interface.h>
+#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/concurrent_flat_map_fwd.hpp>
@@ -365,16 +370,24 @@ struct EvalRegion
         return (const char *) p >= base && (const char *) p < cur;
     }
 
-    /** 16-byte aligned, as `malloc`'s allocations are. */
+    /** 16-byte aligned, as `malloc`'s allocations are; zeroed. */
     [[gnu::always_inline]] void * bump(size_t n)
     {
         n = (n + 15) & ~size_t(15);
         if (size_t(end - cur) < n) [[unlikely]]
-            throw std::bad_alloc();
+            return more(n);
         auto p = cur;
         cur += n;
+#if NIX_ASAN_ENABLED
+        /* What a job's end freed is poisoned until it is handed out again
+           (unforce.cc `closeRegion`). */
+        ASAN_UNPOISON_MEMORY_REGION(p, n);
+#endif
         return p;
     }
+
+    /** `bump(n)` past `end`, the end of the memory known to be zero. */
+    [[gnu::noinline]] void * more(size_t n);
 };
 
 extern EvalRegion evalRegion;

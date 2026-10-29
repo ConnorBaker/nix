@@ -66,6 +66,9 @@ static char * pageUp(char * p)
     return (char *) (((uintptr_t) p + pageSize() - 1) & ~(uintptr_t) (pageSize() - 1));
 }
 
+/* The highest the open job's region reached. */
+static char * jobTop = nullptr;
+
 #if defined(__linux__)
 
 /* Jobs share a mapping of two regions: [mapping, keptTop) holds what kept
@@ -74,25 +77,19 @@ static char * pageUp(char * p)
 static char * mapping = nullptr;
 static char * keptTop = nullptr;
 
-/* Zero [from, to): in place in the first page, and above it by returning
-   whole pages to the system, which zero-fills private anonymous memory when
-   it is touched again. */
-static void zeroMemory(char * from, char * to)
-{
-    if (to <= from)
-        return;
-    auto up = std::min(pageUp(from), to);
-    memset(from, 0, up - from);
-    if (to > up && madvise(up, pageUp(to) - up, MADV_DONTNEED) != 0)
-        memset(up, 0, to - up);
-}
+/* The end of the open job's room, and the top of the mapping's memory that
+   jobs wrote: above it, the system's zero-filled pages. The evaluator
+   expects allocations zeroed, so what lies below it is zeroed as the bump
+   cursor reaches it (`EvalRegion::more`), a page at a time. */
+static char * roomEnd = nullptr;
+static char * dirtyTop = nullptr;
 
 #endif
 
 /* The sizes of the Envs in the open job's region, which nothing else
    records: a byte per granule, where an Env starts, or 255 for one of 255
-   values or more, whose size is in `bigEnvSizes`. Only the pages that a
-   job's Envs touch are memory. */
+   values or more, whose size is in `bigEnvSizes`. Only the pages that
+   jobs' Envs touched are memory. */
 static uint8_t * envSizes = nullptr;
 static boost::unordered_flat_map<const void *, size_t> bigEnvSizes;
 
@@ -107,9 +104,27 @@ static size_t envSizeOf(const Env * e)
     return s < 255 ? s : bigEnvSizes.at(e);
 }
 
-/* Open the job's region, where the system has room for one (only Linux is
-   supported): without one, the job allocates as outside any job, and its
-   end reverts nothing. */
+/* For the unit tests: while set, a job maps its region afresh, and every
+   mapping fails, as where the system has no room for one. Never set by
+   evaluation. */
+extern bool unforceTestFailMapping;
+bool unforceTestFailMapping = false;
+
+#if defined(__linux__)
+/* `bytes` of address space, of which only the pages written become memory. */
+static void * mapAnonymous(size_t bytes)
+{
+    if (unforceTestFailMapping)
+        return MAP_FAILED;
+    return mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+}
+#endif
+
+/* Open the job's region. Only Linux on a 64-bit system has one: elsewhere,
+   the job allocates as outside any job, and its end reverts nothing. Failing
+   to map one is running out of memory (`std::bad_alloc`): the job does not
+   run without one. Not an `Error`, which traversals take for an element's
+   failure and print or skip. */
 static void openRegion()
 {
 #if defined(__linux__)
@@ -117,38 +132,72 @@ static void openRegion()
     if (!envSizes) {
         if (!regionBytes)
             return;
-        auto p =
-            mmap(nullptr, regionBytes >> 4, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        auto p = mapAnonymous(regionBytes >> 4);
         if (p == MAP_FAILED)
-            return;
+            throw std::bad_alloc();
         envSizes = (uint8_t *) p;
     }
-    if (!mapping || size_t(mapping + mappingBytes - keptTop) < regionBytes) {
-        auto p =
-            mmap(nullptr, mappingBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (!mapping || unforceTestFailMapping || size_t(mapping + mappingBytes - keptTop) < regionBytes) {
+        auto p = mapAnonymous(mappingBytes);
         if (p == MAP_FAILED)
-            return;
+            throw std::bad_alloc();
         /* The old mapping keeps the pages of what its jobs kept. */
         if (mapping)
             munmap(pageUp(keptTop), mapping + mappingBytes - pageUp(keptTop));
-        mapping = keptTop = (char *) p;
+        mapping = keptTop = dirtyTop = (char *) p;
     }
-    evalRegion.base = evalRegion.cur = keptTop;
-    evalRegion.end = keptTop + regionBytes;
+    evalRegion.base = evalRegion.cur = jobTop = keptTop;
+    roomEnd = keptTop + regionBytes;
+    evalRegion.end = dirtyTop > keptTop ? keptTop : roomEnd;
 #endif
 }
 
+void * EvalRegion::more(size_t n)
+{
+#if defined(__linux__)
+    if (size_t(roomEnd - cur) >= n) {
+        auto to = pageUp(cur + n);
+        if (end < dirtyTop) {
+            auto zeroed = size_t(std::min(to, dirtyTop) - end);
+#  if NIX_ASAN_ENABLED
+            /* Zeroed while poisoned (`closeRegion`); `bump` unpoisons what
+               it hands out. */
+            ASAN_UNPOISON_MEMORY_REGION(end, zeroed);
+#  endif
+            memset(end, 0, zeroed);
+#  if NIX_ASAN_ENABLED
+            ASAN_POISON_MEMORY_REGION(end, zeroed);
+#  endif
+        }
+        end = to < dirtyTop ? to : roomEnd;
+        return bump(n);
+    }
+#endif
+    throw std::bad_alloc();
+}
+
 /* End the job's region: its memory below `keepTo` stays, for the rest of
-   the process; above it, it is freed, and zeroed for the next job, since
-   the evaluator expects allocations zeroed. Its Env sizes are not needed
-   any more. */
+   the process; above it, the next job's region reuses it. What earlier jobs
+   wrote above where this one reached goes back to the system. Its Env sizes
+   are not needed any more: one is written where an Env is allocated, and
+   read only there. */
 static void closeRegion(char * keepTo)
 {
 #if defined(__linux__)
-    zeroMemory((char *) envSizes, (char *) envSizes + granuleOf(evalRegion.cur));
+    auto top = std::max(jobTop, evalRegion.cur);
+#  if NIX_ASAN_ENABLED
+    /* What the job's end freed is poisoned until handed out again
+       (`EvalRegion::bump`) or unmapped, so that a read through a pointer
+       the end missed fails at once instead of finding the old bytes. */
+    if (top > keepTo)
+        ASAN_POISON_MEMORY_REGION(keepTo, top - keepTo);
+#  endif
     decltype(bigEnvSizes)().swap(bigEnvSizes);
-    zeroMemory(keepTo, evalRegion.cur);
+    dirtyTop = std::max(dirtyTop, top);
+    if (pageUp(top) < dirtyTop && madvise(pageUp(top), pageUp(dirtyTop) - pageUp(top), MADV_DONTNEED) == 0)
+        dirtyTop = pageUp(top);
     keptTop = keepTo;
+    jobTop = nullptr;
 #endif
     auto paused = evalRegion.paused;
     evalRegion = EvalRegion{};
@@ -1568,8 +1617,18 @@ void EvalState::beginUnforceScope(const void * stackMark)
     /* On a stack other than the thread's (a coroutine's), or one that is
        not known, the frames entered during the job cannot be told apart. */
     keepWhole = !(jobStackMark > threadStack.first && size_t(jobStackMark - threadStack.first) <= threadStack.second);
-    openRegion();
-    openSeg = evalRegion.base;
+    try {
+        openRegion();
+        openSeg = evalRegion.base;
+    } catch (...) {
+        /* Memory for the job could not be mapped: no job is open. */
+        if (evalRegion.base)
+            closeRegion(evalRegion.base);
+        keepWhole = false;
+        isolationDepth = 0;
+        jobOwner = nullptr;
+        throw;
+    }
 }
 
 void EvalState::endUnforceScope(const void * ender)
