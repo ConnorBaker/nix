@@ -169,9 +169,9 @@ TEST_F(UnforceTest, nestedScope)
     EXPECT_TRUE(v->isThunk());
 }
 
-/* A failed cell is reverted, as the job's other cells are: forced again,
-   it throws the same error. */
-TEST_F(UnforceTest, failureReverts)
+/* An old cell whose force failed keeps its failure, as the job's other
+   cells are reverted: read again, it throws the same error. */
+TEST_F(UnforceTest, failureKept)
 {
     auto v = oldThunk("{ a = 1; }");
     auto f = oldThunk("throw \"no\"");
@@ -180,13 +180,48 @@ TEST_F(UnforceTest, failureReverts)
     EXPECT_THROW(state.forceValue(*f, noPos), ThrownError);
     state.endUnforceScope();
     EXPECT_TRUE(v->isThunk());
-    EXPECT_TRUE(f->isThunk());
+    EXPECT_TRUE(f->isFailed());
     try {
         state.forceValue(*f, noPos);
         FAIL();
     } catch (ThrownError & e) {
         EXPECT_THAT(e.msg(), ::testing::HasSubstr("no"));
     }
+}
+
+/* A failure on max-call-depth in a job, here met from deeper than a first
+   force that fitted, is retried by later reads at their own depth: an old
+   cell, a young cell of a promoted owner and an application give their
+   values when read again from less deep. */
+TEST_F(UnforceTest, depthFailureRetried)
+{
+    evalSettings.maxCallDepth = 100;
+    std::string f = "let f = n: v: if n == 0 then v else f (n - 1) v; in ";
+    auto app = [&](std::string fun, Value * arg) {
+        auto v = state.allocValue();
+        v->mkApp(oldThunk(fun), arg);
+        return v;
+    };
+    std::string d = "let d = n: x: if n == 0 then builtins.seq x x else d (n - 1) x; in ";
+    auto c = oldThunk(f + "f 50 (builtins.genList (x: x) 3)");
+    auto s = oldThunk(f + "{ c = f 50 (builtins.genList (x: x) 3); }");
+    auto a = app(f + "f 50", c);
+    state.beginUnforceScope();
+    state.forceValue(*c, noPos);
+    state.forceValue(*app("s: s.c", s), noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(c->isThunk() && s->isThunk());
+    state.beginUnforceScope();
+    for (auto x : {app(d + "d 90", c), app("s: " + d + "d 90 s.c", s), app(d + "d 90", a)})
+        EXPECT_THROW(state.forceValue(*x, noPos), StackOverflowError);
+    state.endUnforceScope();
+    state.beginUnforceScope();
+    for (auto x : {c, app("s: s.c", s), a}) {
+        std::string out;
+        EXPECT_NO_THROW(out = deep(*x));
+        EXPECT_EQ(out, "[ 0 1 2 ]");
+    }
+    state.endUnforceScope();
 }
 
 /* A cell that an earlier job reverted keeps the value a later job gives
@@ -578,9 +613,17 @@ TEST_F(UnforceTest, interruptedKeepsJob)
 
 /* Every failure a job made forgets the job's cells: here an infinite
    recursion found in a young cell, by a young cell that survives the job
-   with its owner. */
+   with its owner, and by an old cell, which keeps its failure. */
 TEST_F(UnforceTest, keptFailureForgetsYoungCell)
 {
+    auto forgets = [](const Value & c) {
+        ASSERT_TRUE(c.isFailed());
+        try {
+            std::rethrow_exception(c.failed().exRef->ex);
+        } catch (InfiniteRecursionError & e) {
+            EXPECT_EQ(e.v, nullptr);
+        }
+    };
     auto u = oldThunk("{ s = { r = let x = { a = x.a; }; in x.a; }; }");
     UnforceSeen seen;
     state.beginUnforceScope();
@@ -591,12 +634,47 @@ TEST_F(UnforceTest, keptFailureForgetsYoungCell)
     auto & r = *s.attrs()->get(createSymbol("r"))->value;
     EXPECT_THROW(state.forceValue(r, noPos), InfiniteRecursionError);
     state.endUnforceScope();
-    ASSERT_TRUE(r.isFailed());
+    forgets(r);
+
+    auto o = oldThunk("let x = { a = x.a; }; in x.a");
+    state.beginUnforceScope();
+    EXPECT_THROW(state.forceValue(*o, noPos), InfiniteRecursionError);
+    state.endUnforceScope();
+    forgets(*o);
+}
+
+/* A failure of an old cell, forced in one job, stays a failure at the
+   job's end: read in the next job, it throws the first force's error
+   again, with that force's frames ("while evaluating the attribute 'c'"
+   where `a` selected it). */
+TEST_F(UnforceTest, failureKeepsFirstTrace)
+{
+    std::string expr = "let s = { c = builtins.throw \"boom\"; }; in { inherit s; a = builtins.tryEval s.c; b = s.c; }";
+    uint32_t column = expr.find("s.c; b") + 1;
+    auto v = oldThunk(expr);
+    state.forceValue(*v, noPos);
+    /* `s` and its cell `c` are old. */
+    auto & sv = *v->attrs()->get(createSymbol("s"))->value;
+    state.forceValue(sv, noPos);
+    auto & c = *sv.attrs()->get(createSymbol("c"))->value;
+    auto & a = *v->attrs()->get(createSymbol("a"))->value;
+    auto & b = *v->attrs()->get(createSymbol("b"))->value;
+    state.beginUnforceScope();
+    state.forceValue(a, noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(c.isFailed());
+    state.beginUnforceScope();
+    bool first = false;
     try {
-        std::rethrow_exception(r.failed().exRef->ex);
-    } catch (InfiniteRecursionError & e) {
-        EXPECT_EQ(e.v, nullptr);
+        state.forceValue(b, noPos);
+        ADD_FAILURE() << "b did not throw";
+    } catch (EvalError & e) {
+        for (auto & t : e.info().traces)
+            first = first || (t.pos && t.pos->column == column);
+        EXPECT_NE(e.info().msg.str().find("boom"), std::string::npos);
     }
+    state.endUnforceScope();
+    EXPECT_TRUE(first);
 }
 
 /* `foldl'`'s steps, in one force in a job. Each case's `r` is forced after
@@ -905,9 +983,10 @@ static size_t endOfPrinted(std::string_view s, size_t j)
 }
 
 /* Whether `got` prints what `want` prints, but that inside an error message
-   it may print a value where `want` prints «thunk»: a failed cell is
-   reverted, and its re-force fails later, its message showing what is
-   evaluated by then (the exactness contract allows that much). */
+   it may print a value where `want` prints «thunk»: a failed young cell
+   inside a reverted owner is built again, and its re-force fails later, its
+   message showing what is evaluated by then (the exactness contract allows
+   that much). An old failed cell keeps its failure. */
 static bool printsAsOrMoreEvaluated(std::string want, std::string got)
 {
     want = filterANSIEscapes(want, true);
@@ -946,9 +1025,10 @@ static bool printsAsOrMoreEvaluated(std::string want, std::string got)
 /* The corpus, the .nix files in data/unforce (a function is called with
    its defaults): each program, as each front end evaluates it, prints
    what it prints in an evaluator without unforcing, or fails with the same
-   error at the same position (its trace may differ: a failed cell is
-   reverted, and its re-force throws again under other frames), but that a
-   failure's message may show more of what is evaluated
+   error at the same position (its trace may differ: a failed young cell
+   inside a reverted owner is built again, and its re-force throws again
+   under other frames), but that a failure's message may show more of what
+   is evaluated
    (`printsAsOrMoreEvaluated`). In an evaluator of its own each time, so
    that nothing is forced before. */
 TEST_F(UnforceTest, corpus)

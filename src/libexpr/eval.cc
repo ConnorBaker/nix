@@ -2600,6 +2600,10 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         if (env && ir.v == &v)
             ir.addTrace(
                 nullptr, HintFmt(ANSI_WARNING "entering the infinite recursion" ANSI_NORMAL), TracePrint::Always);
+    } catch (const StackOverflowError & e) {
+        /* In a job, a later read retries it at its own depth (unforce.cc, Re-forcing). */
+        if (!NIX_USE_BOEHMGC && isolationDepth)
+            recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {
@@ -2622,6 +2626,9 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         std::rethrow_exception(e);
     } catch (const Interrupted & e) {
         recovery = allocValue();
+    } catch (const StackOverflowError & e) {
+        if (!NIX_USE_BOEHMGC && isolationDepth)
+            recovery = allocValue();
     } catch (const RecoverableEvalError & e) {
         recovery = allocValue();
     } catch (...) {

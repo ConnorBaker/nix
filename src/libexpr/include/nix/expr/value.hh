@@ -462,8 +462,9 @@ struct ValueBase
         ExceptionRef * exRef;
 
         /**
-         * Optional value for recovering `RecoverableEvalError`
-         * Must be set iff `ex` is an instance of `RecoverableEvalError`.
+         * Optional value for recovering: what a later read forces instead of
+         * rethrowing. Set iff `ex` is an `Interrupted`, a `RecoverableEvalError`,
+         * or a `StackOverflowError` (max-call-depth) thrown inside an unforce job.
          */
         Value * recoveryValue;
 

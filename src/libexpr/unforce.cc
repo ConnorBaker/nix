@@ -197,13 +197,15 @@ static void closeRegion(char * keepTo)
    instead of giving its value or its error, or overflow the native stack,
    which ends the process; the exactness contract allows both.
 
-   A failed target, reverted, throws the same error again when re-forced (or
-   fails on `max-call-depth` first, as above). A failure on `max-call-depth`
-   depends on the depth of the force that met it: re-forced from less deep,
-   it may succeed where the evaluation without unforcing fails, which the
-   exactness contract also allows. A failure that its job retried (an
-   interrupted or recoverable one) is reverted to the failure, which retries
-   again where it is forced next.
+   An old target whose force failed keeps its failure (see Promotion). A
+   failed young cell inside a reverted owner is built again, and throws the
+   same error again when re-forced (or fails on `max-call-depth` first, as
+   above). A failure on `max-call-depth` depends on the depth of the force
+   that met it, so one met in a job has a recovery value, as an interrupted
+   or recoverable one has: every later read retries it at its own depth,
+   where it may succeed, also where the evaluation without unforcing fails,
+   which the exactness contract allows. A failure that its job retried is
+   reverted to the failure, which retries again where it is forced next.
 
    An application's pre-image becomes a thunk whose environment is the
    function and its argument, called at its first force's position (a primop
@@ -513,14 +515,15 @@ static void valueEdges(const Value & v, E && edge)
     }
 }
 
-/* Whether `v` is a value (not a thunk, an application or a failure) that
-   holds no pointer into the job's region. Such a target stays as it is:
+/* Whether `v` is a value (not a thunk or an application) that holds no
+   pointer into the job's region. A failure's record lies outside it, and
+   its recovery value is an edge. Such a target stays as it is:
    reverting it would free nothing, and its value is what the evaluation
    without unforcing keeps. Its objects are old, so nothing builds them
    again. */
 static bool youngFree(const Value & v)
 {
-    if (v.isThunk() || v.isApp() || v.isFailed() || v.internalType() == tUninitialized)
+    if (v.isThunk() || v.isApp() || v.internalType() == tUninitialized)
         return false;
     bool young = false;
     valueEdges(v, [&](const void * p) { young = young || evalRegion.contains(p); });
@@ -691,11 +694,12 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    between jobs (reverting them again would only make each job evaluate
    them anew); those a holder keeps; and the owners of the young objects
    holders hold (see unforce.hh). A young object a holder holds that the
-   driver owns keeps the job whole. A failed target is not nominated: it is
-   reverted like any other, and its re-force throws the same error again,
-   later and under other frames, so that its trace may differ and its
-   message may show more of what is evaluated by then, which the exactness
-   contract allows.
+   driver owns keeps the job whole. A failed target is not nominated. Its
+   failure (`Value::Failed` and its exception) is allocated outside the
+   region, so one whose value holds no pointer into it (no young recovery
+   value, `youngFree`) keeps its value, as the evaluation without unforcing
+   does: later reads throw the first force's error again, with its frames.
+   A failed young cell inside a reverted owner is still built again.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
@@ -1379,8 +1383,8 @@ void EvalState::endUnforceJob(const char * ender)
                        return (const char *) e.target >= jobStackMark && (const char *) e.target < ender;
                    });
     /* No walk tells which of the failures the job made outlive it: one whose
-       recovery value (only an interrupted or a recoverable failure has one)
-       is young keeps the job whole. */
+       recovery value (an interrupted, a recoverable or a max-call-depth
+       failure has one) is young keeps the job whole. */
     auto youngRecovery = [](const Value * v) {
         return v->isFailed() && evalRegion.contains(v->failed().recoveryValue);
     };
