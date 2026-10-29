@@ -15,6 +15,7 @@
 #include "man-pages.hh"
 
 #include <iostream>
+#include <optional>
 
 namespace nix {
 
@@ -74,10 +75,17 @@ void processExpr(
             // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
             // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
             else if (output == okXML) {
-                UnforceJobs jobs(state, &vRes);
+                /* A traversal runs its elements in jobs only if it forces what
+                   it reads: without --strict, the printer reads cells as they
+                   are, which an earlier element's job end may have reverted. */
+                std::optional<UnforceJobs> jobs;
+                if (strict)
+                    jobs.emplace(state, &vRes);
                 printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
             } else if (output == okJSON) {
-                UnforceJobs jobs(state, &vRes);
+                std::optional<UnforceJobs> jobs;
+                if (strict)
+                    jobs.emplace(state, &vRes);
                 printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
                 std::cout << std::endl;
             } else {

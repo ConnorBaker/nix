@@ -42,6 +42,15 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
 fi
 
+# Without --strict, no element runs in a job of its own: an element's job end
+# would revert what it forced (a's outPath for JSON, a's type for XML), which
+# a later element reads as it is.
+pexpr='let t = "x" + "y"; a = { outPath = t; }; in builtins.seq a { inherit a; b = t; }'
+expectJobs "$(jobsOf nix-instantiate --eval --json -E "$pexpr")" 2
+[[ $(< "$TEST_ROOT/out") == '{"a":"xy","b":"xy"}' ]]
+expectJobs "$(jobsOf nix-instantiate --eval --xml -E "${pexpr/outPath/type}")" 2
+[[ $(grep -c '<string value="xy" />' "$TEST_ROOT/out") == 2 ]]
+
 # A trace keeps nothing: re-forcing the cell whose evaluation showed it may
 # show it again, and shows no other trace.
 nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
