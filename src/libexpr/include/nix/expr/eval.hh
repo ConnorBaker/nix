@@ -828,6 +828,14 @@ public:
     void ensureLazyPathsCopied(const NixStringContext & context);
 
     /**
+     * Make a store path valid in the evaluation store (`store`), by
+     * substitution as `Builder::ensurePath()` does. If that fails and
+     * the build store (`buildStore`) is a different store that has the
+     * path, copy the path's closure from the build store instead.
+     */
+    void ensurePath(const StorePath & path);
+
+    /**
      * String coercion.
      *
      * Converts strings, paths and derivations to a
