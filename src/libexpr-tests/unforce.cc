@@ -275,28 +275,26 @@ TEST_F(UnforceTest, revertsConsumedOwner)
     EXPECT_EQ(deep(*v), "{ a = 2; }");
 }
 
-/* A seen set keeps the containers it holds, where they are (nothing moves),
-   so that one seen again in a later job is found; also with
-   unforce-always-revert. */
-TEST_F(UnforceTest, seenHoldsContainers)
+/* A seen set forgets a set that is the value of a cell the job reverts (`s`,
+   which `a` and `b` are), and the cell's re-force in a later job puts the
+   set it builds in its place, so that it is found when seen again; also
+   with unforce-always-revert. */
+TEST_F(UnforceTest, seenForgetsReverted)
 {
     for (bool always : {false, true}) {
         evalSettings.unforceAlwaysRevert = always;
         auto v = oldThunk("let s = { x = 1; }; in { a = s; b = s; }");
-        auto junk = oldThunk("builtins.genList (x: { inherit x; }) 100");
         state.forceValue(*v, noPos);
         auto a = v->attrs()->get(createSymbol("a"))->value;
         auto b = v->attrs()->get(createSymbol("b"))->value;
         UnforceSeen seen;
         state.beginUnforceScope();
-        state.forceValue(*junk, noPos);
         state.forceValue(*a, noPos);
-        auto first = a->attrs();
-        EXPECT_TRUE(seen.see(first, UnforceHolder::Kind::bindings));
+        EXPECT_TRUE(seen.see(a->attrs(), UnforceHolder::Kind::bindings));
         state.endUnforceScope();
+        EXPECT_TRUE(b->isThunk());
         state.beginUnforceScope();
         state.forceValue(*b, noPos);
-        EXPECT_EQ(b->attrs(), first);
         EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
         state.endUnforceScope();
         EXPECT_EQ(deep(*b), "{ x = 1; }");
@@ -305,13 +303,23 @@ TEST_F(UnforceTest, seenHoldsContainers)
 
 /* A traversal runs each element of its root in a job of its own: a
    printer prints what it prints without, «repeated» included, and the
-   elements are thunks again afterwards. */
+   elements are thunks again afterwards. A set whose cell an element's job
+   reverts (`s`, in `a`'s) is forgotten, and found again once a later
+   element forces the cell again (`b`); a set that the next job builds where
+   it lay is not found. One whose cell the job keeps stays found: `a`'s set
+   `u` promotes `a`, and `s` with it by time. A cell that held an
+   application (`map`'s) is found again as it is re-forced too. */
 TEST_F(UnforceTest, printerJobs)
 {
-    auto expr = "let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }";
-    auto v = oldThunk(expr);
-    EXPECT_EQ(printed(*v, true), printed(*oldThunk(expr), false));
-    EXPECT_TRUE(v->attrs()->get(createSymbol("c"))->value->isThunk());
+    auto attr = [&](const char * expr, const char * name) {
+        auto v = oldThunk(expr);
+        EXPECT_EQ(printed(*v, true), printed(*oldThunk(expr), false)) << expr;
+        return v->attrs()->get(createSymbol(name))->value;
+    };
+    EXPECT_TRUE(attr("let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }", "c")->isThunk());
+    EXPECT_TRUE(attr("let s = { x = 1; }; in { a = s; b = { y = 2; }; }", "a")->isThunk());
+    attr("let s = { x = 1; }; in { a = { t = s; u = { z = 1; }; }; b = s; }", "b");
+    attr("let l = map (n: { inherit n; }) [ 1 2 ]; in builtins.seq (builtins.length l) { a = builtins.head l; b = builtins.head l; c = builtins.elemAt l 1; }", "a");
 }
 
 /* `getDerivations` finds each derivation in a job, drops one found in an
@@ -558,10 +566,11 @@ TEST_F(UnforceTest, unmappableRegionNotSwallowed)
     EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
 }
 
-/* A job's memory 64 GiB and more above its start: v's set, which a holder
+/* A job's memory 64 GiB and more above its start: v's set, which a seen set
    holds, lies there, below the start of the segment that u's force opened
-   once a 32-bit offset wraps. The set names v, which is promoted, and u
-   with it by time. Only where the system maps a region that large. */
+   once a 32-bit offset wraps. The set names v, its value, which the seen set
+   forgets: u and v are reverted, where the wrong owner would promote u (or
+   keep the job whole). Only where the system maps a region that large. */
 TEST_F(UnforceTest, regionBeyond64GiB)
 {
     auto u = oldThunk("builtins.genList (i: i) 1000");
@@ -580,25 +589,25 @@ TEST_F(UnforceTest, regionBeyond64GiB)
     EXPECT_TRUE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
     state.endUnforceScope();
     EXPECT_EQ(unforceStats.jobsKeptWhole, whole);
-    EXPECT_FALSE(u->isThunk());
-    EXPECT_FALSE(v->isThunk());
+    EXPECT_TRUE(u->isThunk());
+    EXPECT_TRUE(v->isThunk());
 }
 
-/* The cut is where the last force a promoted target owns ended. `before`
-   ended earlier, so the time closure promotes it; `after` ended later, so
-   it is reverted and its memory freed, which a later job allocates again
-   zeroed, as all memory is. */
+/* The cut is where the last force a promoted target owns ended: `held`'s,
+   whose list a seen set holds. `before` ended earlier, so the time closure
+   promotes it; `after` ended later, so it is reverted and its memory freed,
+   which a later job allocates again zeroed, as all memory is. */
 TEST_F(UnforceTest, timeClosure)
 {
     auto before = oldThunk("{ x = 1; }");
-    auto held = oldThunk("{ y = 2; }");
+    auto held = oldThunk("{ y = [ 2 ]; }");
     auto after = oldThunk("builtins.genList (i: { inherit i; }) 100");
     UnforceSeen seen;
     auto freed = unforceStats.bytesFreed;
     state.beginUnforceScope();
     state.forceValue(*before, noPos);
     state.forceValue(*held, noPos);
-    EXPECT_TRUE(seen.see(held->attrs(), UnforceHolder::Kind::bindings));
+    EXPECT_TRUE(seen.see(held->attrs()->get(createSymbol("y"))->value, UnforceHolder::Kind::value));
     state.forceValue(*after, noPos);
     state.endUnforceScope();
     EXPECT_FALSE(before->isThunk());
@@ -660,7 +669,7 @@ TEST_F(UnforceTest, stringKeptByCopy)
 }
 
 /* A value the driver allocated in the job, which a holder holds, is no
-   target's: the job is kept whole. */
+   target's: the job is kept whole, and a seen set forgets nothing. */
 TEST_F(UnforceTest, driverHoldKeepsJob)
 {
     auto v = oldThunk("{ a = 1; }");
@@ -668,12 +677,14 @@ TEST_F(UnforceTest, driverHoldKeepsJob)
     auto whole = unforceStats.jobsKeptWhole;
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
+    EXPECT_TRUE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
     auto w = state.allocValue();
     w->mkInt(1);
     EXPECT_TRUE(seen.see(w, UnforceHolder::Kind::value));
     state.endUnforceScope();
     EXPECT_EQ(unforceStats.jobsKeptWhole, whole + 1);
     EXPECT_FALSE(v->isThunk());
+    EXPECT_FALSE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
     EXPECT_THAT(*w, IsIntEq(1));
 }
 
@@ -712,6 +723,26 @@ TEST_F(UnforceTest, interruptedKeepsJob)
     ASSERT_TRUE(b.isFailed());
     state.forceValue(b, noPos);
     EXPECT_THAT(b, IsStringEq("[1,2,3]"));
+}
+
+/* A cell whose force recovers from an interrupt in a later job is reverted
+   to its failure, whose recovery evaluates the cell's expression, not a
+   re-force: a seen set keeps the set it holds, and with it the cell. */
+TEST_F(UnforceTest, seenKeepsRecovered)
+{
+    auto v = oldThunk("builtins.seq (builtins.toJSON [ 1 2 3 ]) { x = 1; }");
+    state.beginUnforceScope();
+    setInterrupted(true);
+    EXPECT_THROW(state.forceValue(*v, noPos), Interrupted);
+    setInterrupted(false);
+    state.endUnforceScope();
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    EXPECT_TRUE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    state.forceValue(*v, noPos);
+    EXPECT_FALSE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
 }
 
 /* Every failure a job made forgets the job's cells: here an infinite
@@ -885,7 +916,7 @@ TEST_F(UnforceTest, stepsThenPromote)
     auto ends = unforceStats.stepEnds;
     state.forceValueDeep(r);
     EXPECT_GT(unforceStats.stepEnds, ends);
-    EXPECT_TRUE(seen.see(r.attrs(), UnforceHolder::Kind::bindings));
+    EXPECT_TRUE(seen.see(r.attrs()->get(createSymbol("l"))->value, UnforceHolder::Kind::value));
     state.endUnforceScope();
     EXPECT_FALSE(r.isThunk());
     auto big = oldThunk("builtins.length (builtins.genList (i: { inherit i; }) 10000)");

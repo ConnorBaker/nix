@@ -253,8 +253,11 @@ struct ExprReforce : Expr, ReforceKey
     void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override {}
 };
 
+static void noteRebuilt(const Value & cell);
+
 /* Out of line: a class whose virtual functions are all inline has its
-   vtable emitted in every translation unit (Clang's -Wweak-vtables). */
+   vtable emitted in every translation unit (Clang's -Wweak-vtables). `v` is
+   the reverted cell: only `forceValue` evaluates a thunk, into its cell. */
 void ExprReforce::eval(EvalState & state, Env & env, Value & v)
 {
     if (expr)
@@ -266,6 +269,7 @@ void ExprReforce::eval(EvalState & state, Env & env, Value & v)
         v.mkApp(operands[0], operands[1]);
         state.callFunction(*operands[0], *operands[1], v, pos);
     }
+    noteRebuilt(v);
 }
 
 struct ReforceHash
@@ -333,6 +337,13 @@ static std::optional<PosIdx> ownPos(const Value & v)
     return std::nullopt;
 }
 
+/* Whether a cell reverted to `preImage` holds a thunk that
+   `ExprReforce::eval` evaluates (`reforcePreImage`). */
+static bool reforceable(const Value & preImage)
+{
+    return (preImage.isThunk() && !preImage.isBlackhole()) || preImage.isApp();
+}
+
 /* What a target that holds `now` at the job's end is reverted to: its
    pre-image, an application to be called again at its force's position. A
    pre-image wrapped already (reverted before), or that is neither a thunk
@@ -341,11 +352,13 @@ static std::optional<PosIdx> ownPos(const Value & v)
 static Value reforcePreImage(EvalState & state, const Value & preImage, PosIdx pos, const Value & now)
 {
     Value v = preImage;
-    if (preImage.isThunk() && !preImage.isBlackhole()) {
+    if (!reforceable(preImage))
+        return v;
+    if (preImage.isThunk()) {
         auto t = preImage.thunk();
         if (!unforceIsReverted(t.expr))
             v.mkThunk(t.env, internReforce({t.expr, noPos, ownPos(now)}));
-    } else if (preImage.isApp()) {
+    } else {
         auto a = preImage.app();
         auto operands = (Value **) state.mem.allocBytes(2 * sizeof(Value *));
         operands[0] = a.left;
@@ -724,14 +737,30 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    of its value above the cut (its bytes, its context array with the
    array's elements) are copied out of the region (`copyStringOut`), and the
    cell, at its own address, keeps its value.
+
+   A seen set's entry for a set (`UnforceSeen`) stands only for its
+   address, which the set compares. One that is the value of the target
+   whose force built it (its owner) does not nominate the target: if the
+   target is reverted, nothing the job keeps reaches the set (what does was
+   made after the target's force ended, so that its promotion would
+   promote the target by time), and only the target's re-force builds what
+   stands for it from then on. So the set forgets the address, which the
+   job may free, and records the cell, which is reverted to a thunk that
+   `ExprReforce::eval` evaluates (`rebuilds`): the re-force puts the set it
+   builds in the entry's place before anything reads the cell. Other
+   entries (a list's cell, a set inside a value, one the driver owns)
+   nominate as before.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
-   target of each log entry. */
+   target of each log entry. `rebuilds`: whether a target, reverted to its
+   first entry's pre-image, holds a thunk that `ExprReforce::eval`
+   evaluates. */
 struct Targets
 {
     std::vector<Value *> cells;
     std::vector<uint32_t> ofEntry;
+    std::vector<bool> rebuilds;
 
     Targets(const std::vector<UnforceUndoEntry> & log)
     {
@@ -739,11 +768,23 @@ struct Targets
         ofEntry.reserve(log.size());
         for (auto & e : log) {
             auto [i, added] = index.try_emplace(e.target, cells.size());
-            if (added)
+            if (added) {
                 cells.push_back(e.target);
+                rebuilds.push_back(reforceable(e.preImage));
+            }
             ofEntry.push_back(i->second);
         }
     }
+};
+
+/* A seen set's entry that a job's end forgets (see above), and its cell's
+   record, allocated before the end writes anything. */
+struct SeenEntry
+{
+    UnforceSeen * set;
+    const void * p;
+    uint32_t target;
+    UnforceSeen::Owner owner;
 };
 
 /* The holders alive (see unforce.hh), roots of a job's end besides the
@@ -813,13 +854,37 @@ bool UnforceSeen::see(const void * p, Kind kind)
 void UnforceSeen::held(Hold & hold)
 {
     for (auto & [p, kind] : young)
-        hold(p, kind);
+        if (kind == Kind::bindings)
+            hold.identity(p, *this);
+        else
+            hold(p, kind);
 }
 
 void UnforceSeen::ended()
 {
     young.clear();
     youngTop = nullptr;
+}
+
+void UnforceSeen::forget(const void * p, Owner owner)
+{
+    erase(p);
+    owners.insert(std::move(owner));
+}
+
+void UnforceSeen::rebuilt(const Value & cell)
+{
+    if (auto i = owners.find(&cell); i != owners.end()) {
+        if (cell.type() == nAttrs)
+            see(cell.attrs(), Kind::bindings);
+        owners.erase(i);
+    }
+}
+
+static void noteRebuilt(const Value & cell)
+{
+    for (auto h : holders)
+        h->rebuilt(cell);
 }
 
 /* The young cells whose force failed in the open job, and whether one could
@@ -843,16 +908,19 @@ void unforceNoteFailure(const Value & v) noexcept
 namespace {
 
 /* A holder's young pointers, each nominating its owner's target, or, for
-   one that the driver owns, keeping the job whole. */
+   one that the driver owns, keeping the job whole; a seen set's entry that
+   is its owner's value, a candidate to forget instead (see Promotion). */
 struct OwnerHold : UnforceHolder::Hold
 {
     const Targets & targets;
     std::vector<bool> & promote;
+    std::vector<SeenEntry> & forget;
     bool driver = false;
 
-    OwnerHold(const Targets & targets, std::vector<bool> & promote)
+    OwnerHold(const Targets & targets, std::vector<bool> & promote, std::vector<SeenEntry> & forget)
         : targets(targets)
         , promote(promote)
+        , forget(forget)
     {
     }
 
@@ -864,6 +932,23 @@ struct OwnerHold : UnforceHolder::Hold
             driver = true;
         else
             promote[targets.ofEntry[o]] = true;
+    }
+
+    /* The record names the cell by address, so it must outlive the set: it
+       does for every seen set today, whose cells are older than the frames
+       of the call that owns the set. */
+    void identity(const void * p, UnforceSeen & set) override
+    {
+        if (evalRegion.contains(p))
+            if (auto o = ownerOf(p); o != noOwner) {
+                auto t = targets.ofEntry[o];
+                auto cell = targets.cells[t];
+                if (cell->type() == nAttrs && cell->attrs() == p && targets.rebuilds[t]) {
+                    forget.push_back({&set, p, t, {}});
+                    return;
+                }
+            }
+        (*this)(p, UnforceHolder::Kind::bindings);
     }
 };
 
@@ -894,13 +979,15 @@ static void copyStringOut(EvalState & state, Value & v, const char * keep)
 
 /* Which targets keep their values (`promote`: S, and the strings kept by
    copy; see above), and the top of the memory the job keeps; null to keep
-   it whole. No object is visited. */
+   it whole. No object is visited. `forget`: the seen sets' entries whose
+   cells are reverted if not promoted. */
 static char * keepPrefix(
     EvalState & state,
     const std::vector<UnforceUndoEntry> & log,
     const Targets & targets,
     std::vector<bool> & promote,
-    bool alwaysRevert)
+    bool alwaysRevert,
+    std::vector<SeenEntry> & forget)
 {
     std::vector<EntryEnds> per(targets.cells.size(), EntryEnds{0, 0, nullptr});
     for (size_t i = 0; i < log.size(); ++i) {
@@ -926,7 +1013,7 @@ static char * keepPrefix(
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             (byCopy(t) ? copy : promote)[t] = true;
     }
-    OwnerHold hold{targets, promote};
+    OwnerHold hold{targets, promote, forget};
     for (auto h : holders)
         h->held(hold);
     if (hold.driver)
@@ -1613,22 +1700,32 @@ void EvalState::endUnforceJob(const char * ender)
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is
        written, or keeps its value (no `target`). Everything that may fail to
-       allocate is done before anything is written, but for a string kept by
-       copy (`copyStringOut`), whose cell then holds the same content outside
-       the region: harmless if the job is kept whole after all. */
+       allocate is done before anything is written, the seen sets' records
+       included (the entries the end forgets go with the reverts), but for a
+       string kept by copy (`copyStringOut`), whose cell then holds the same
+       content outside the region: harmless if the job is kept whole after
+       all. */
     size_t promoted = 0;
     /* The top of what the job keeps. */
     char * keptTo = nullptr;
+    std::vector<SeenEntry> forget;
     if (!keep) {
         PauseRegion pause;
         try {
             Targets targets(undoLog);
             std::vector<bool> promote(targets.cells.size());
-            keptTo = keepPrefix(*this, undoLog, targets, promote, settings.unforceAlwaysRevert);
+            keptTo = keepPrefix(*this, undoLog, targets, promote, settings.unforceAlwaysRevert, forget);
             /* Null: a holder holds what the driver allocated in the job. */
             if (!keptTo)
                 keep = true;
             else {
+                /* The seen sets' entries whose cells the job reverts, each
+                   with its cell's record. */
+                std::erase_if(forget, [&](auto & e) { return promote[e.target]; });
+                for (auto & e : forget) {
+                    std::set<const Value *> owner{targets.cells[e.target]};
+                    e.owner = owner.extract(owner.begin());
+                }
                 /* Each failure the job made forgets the job's cells. */
                 for (auto & e : undoLog)
                     if (e.target->isFailed())
@@ -1661,6 +1758,8 @@ void EvalState::endUnforceJob(const char * ender)
                 unforceStats.cellsReverted++;
             }
         unforceStats.cellsPromoted += promoted;
+        for (auto & e : forget)
+            e.set->forget(e.p, std::move(e.owner));
     }
     for (auto h : holders)
         h->ended();

@@ -57,12 +57,15 @@ void unforceKeepJob();
  */
 RootValue unforceHeldRoot(Value * v);
 
+class UnforceSeen;
+
 /**
  * C++ state that points into the open job's memory from outside any cell (a
  * printer's set of the containers it has printed, the derivations that
  * `getDerivations` found). While it is registered (from its construction to
  * its destruction), a job's end keeps what it points to, as it keeps what a
- * promoted value reaches.
+ * promoted value reaches, but for what a seen set only compares by address
+ * (`Hold::identity`).
  */
 class UnforceHolder
 {
@@ -74,6 +77,12 @@ public:
         virtual ~Hold();
         /** Keep `p`, a `Value *` or a `Bindings *`. */
         virtual void operator()(const void * p, Kind kind) = 0;
+        /**
+         * `p`, a `Bindings *` that `set` only compares by address: kept, or
+         * forgotten by `set` until a re-force builds what stands for it
+         * (unforce.cc, Promotion).
+         */
+        virtual void identity(const void * p, UnforceSeen & set) = 0;
     };
 
     UnforceHolder();
@@ -104,22 +113,35 @@ public:
     {
         return false;
     }
+
+    /** `cell`, which a job's end reverted, was just forced again. */
+    virtual void rebuilt(const Value & cell) {}
 };
 
 /**
  * A set of the containers a traversal has seen, by address (to print
  * «repeated», or to drop duplicates), that stays exact across jobs: its
- * entries in the open job's memory are held.
+ * entries in the open job's memory are held, but for a set that is the
+ * value of a cell a job's end reverts, which it forgets until the cell's
+ * re-force puts the set it builds in its place.
  */
 class UnforceSeen : public std::set<const void *>, public UnforceHolder
 {
     std::vector<std::pair<const void *, Kind>> young;
+    /* The reverted cells whose re-force gives an entry back. */
+    std::set<const Value *> owners;
 
 public:
+    /** A record of `owners`, made before a job's end writes anything. */
+    using Owner = std::set<const Value *>::node_type;
+
     /** Add `p`, of `kind`; returns whether it was not there yet. */
     bool see(const void * p, Kind kind);
     void held(Hold & hold) override;
     void ended() override;
+    void rebuilt(const Value & cell) override;
+    /** Forget `p` until the re-force of `owner`'s cell. Allocates nothing. */
+    void forget(const void * p, Owner owner);
 };
 
 /**
