@@ -7,6 +7,7 @@
 #include "nix/expr/unforce.hh"
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/value-to-xml.hh"
+#include "nix/util/file-system.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
@@ -430,6 +431,30 @@ TEST_F(UnforceTest, lookupPathHookKeepsJob)
     EXPECT_EQ(unforceStats.stepEnds, ends);
     state.endUnforceScope();
     EXPECT_FALSE(v->isThunk());
+}
+
+/* A file is read once, as without jobs: a reverted import evaluates the
+   file's first parse again, and a failed parse stays failed. */
+TEST_F(UnforceTest, importParsedOnce)
+{
+    auto dir = createTempDir();
+    AutoDelete del(dir, true);
+    auto importOf = [&](auto name) { return oldThunk("import " + (dir / name).string()); };
+    auto v = importOf("f.nix"), w = importOf("g.nix");
+    writeFile(dir / "f.nix", "{ a = [ 1 ]; }");
+    writeFile(dir / "g.nix", "{");
+    auto reverted = unforceStats.cellsReverted;
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    EXPECT_THROW(state.forceValue(*w, noPos), ParseError);
+    state.endUnforceScope();
+    ASSERT_GE(unforceStats.cellsReverted, reverted + 2); // v and the file's cache cell
+    writeFile(dir / "f.nix", "{ a = [ 2 ]; }");
+    writeFile(dir / "g.nix", "{ }");
+    state.beginUnforceScope();
+    EXPECT_EQ(deep(*v), "{ a = [ 1 ]; }");
+    EXPECT_THROW(state.forceValue(*importOf("g.nix"), noPos), ParseError);
+    state.endUnforceScope();
 }
 
 /* A root made in a job (as the evaluation cache's cursors make them) keeps

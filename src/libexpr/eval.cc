@@ -1144,6 +1144,8 @@ struct ExprParseFile : Expr, gc
     // FIXME: make this a reference (see below).
     SourcePath path;
     bool mustBeTrivial;
+    /** The first parse: a job end may revert the cache cell, and its next force evaluates this again. */
+    Expr * parsed = nullptr;
 
     ExprParseFile(SourcePath & path, bool mustBeTrivial)
         : path(path)
@@ -1155,7 +1157,9 @@ struct ExprParseFile : Expr, gc
     {
         printTalkative("evaluating file '%s'", path);
 
-        auto e = state.parseExprFromFile(path);
+        if (!parsed)
+            parsed = state.parseExprFromFile(path);
+        auto e = parsed;
 
         try {
             auto dts = state.debugRepl ? debugTraceStacker(state, *e) : nullptr;
