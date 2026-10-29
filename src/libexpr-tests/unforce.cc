@@ -226,17 +226,20 @@ TEST_F(UnforceTest, depthFailureRetried)
 }
 
 /* A cell that an earlier job reverted keeps the value a later job gives
-   it. */
+   it; with unforce-always-revert, that job reverts it again. */
 TEST_F(UnforceTest, promotesRevertedCell)
 {
-    auto v = oldThunk("{ a = 1; }");
-    for (int i = 0; i < 2; ++i) {
-        state.beginUnforceScope();
-        state.forceValue(*v, noPos);
-        state.endUnforceScope();
+    for (bool always : {false, true}) {
+        evalSettings.unforceAlwaysRevert = always;
+        auto v = oldThunk("{ a = 1; }");
+        for (int i = 0; i < 2; ++i) {
+            state.beginUnforceScope();
+            state.forceValue(*v, noPos);
+            state.endUnforceScope();
+        }
+        EXPECT_EQ(v->isThunk(), always);
+        EXPECT_EQ(deep(*v), "{ a = 1; }");
     }
-    ASSERT_EQ(v->type(), nAttrs);
-    EXPECT_EQ(deep(*v), "{ a = 1; }");
 }
 
 /* A cell that a promoted value reaches is the cell its owner holds: the
@@ -272,27 +275,31 @@ TEST_F(UnforceTest, revertsConsumedOwner)
 }
 
 /* A seen set keeps the containers it holds, where they are (nothing moves),
-   so that one seen again in a later job is found. */
+   so that one seen again in a later job is found; also with
+   unforce-always-revert. */
 TEST_F(UnforceTest, seenHoldsContainers)
 {
-    auto v = oldThunk("let s = { x = 1; }; in { a = s; b = s; }");
-    auto junk = oldThunk("builtins.genList (x: { inherit x; }) 100");
-    state.forceValue(*v, noPos);
-    auto a = v->attrs()->get(createSymbol("a"))->value;
-    auto b = v->attrs()->get(createSymbol("b"))->value;
-    UnforceSeen seen;
-    state.beginUnforceScope();
-    state.forceValue(*junk, noPos);
-    state.forceValue(*a, noPos);
-    auto first = a->attrs();
-    EXPECT_TRUE(seen.see(first, UnforceHolder::Kind::bindings));
-    state.endUnforceScope();
-    state.beginUnforceScope();
-    state.forceValue(*b, noPos);
-    EXPECT_EQ(b->attrs(), first);
-    EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
-    state.endUnforceScope();
-    EXPECT_EQ(deep(*b), "{ x = 1; }");
+    for (bool always : {false, true}) {
+        evalSettings.unforceAlwaysRevert = always;
+        auto v = oldThunk("let s = { x = 1; }; in { a = s; b = s; }");
+        auto junk = oldThunk("builtins.genList (x: { inherit x; }) 100");
+        state.forceValue(*v, noPos);
+        auto a = v->attrs()->get(createSymbol("a"))->value;
+        auto b = v->attrs()->get(createSymbol("b"))->value;
+        UnforceSeen seen;
+        state.beginUnforceScope();
+        state.forceValue(*junk, noPos);
+        state.forceValue(*a, noPos);
+        auto first = a->attrs();
+        EXPECT_TRUE(seen.see(first, UnforceHolder::Kind::bindings));
+        state.endUnforceScope();
+        state.beginUnforceScope();
+        state.forceValue(*b, noPos);
+        EXPECT_EQ(b->attrs(), first);
+        EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
+        state.endUnforceScope();
+        EXPECT_EQ(deep(*b), "{ x = 1; }");
+    }
 }
 
 /* A traversal runs each element of its root in a job of its own: a

@@ -334,6 +334,17 @@ public:
     Setting<unsigned int> maxCallDepth{
         this, 10000, "max-call-depth", "The maximum function call depth to allow before erroring."};
 
+    Setting<bool> unforceAlwaysRevert{
+        this,
+        false,
+        "unforce-always-revert",
+        R"(
+          In a build without Boehm GC, a value that an earlier unforce job
+          reverted is kept by default when a later job computes it again. If
+          set to true, it is reverted again at every job's end and computed
+          anew wherever it is read next: less memory, possibly more time.
+        )"};
+
     Setting<bool> builtinsTraceDebugger{
         this,
         false,

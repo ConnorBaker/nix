@@ -38,10 +38,26 @@ expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 5
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 3
 [[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
+# unforce-always-revert keeps what the traversal walked, as without it (s's
+# value, a string, is in the job's memory).
+[[ $(nix-instantiate --eval --strict --option unforce-always-revert true -E '{ s = "a" + "b"; }') == '{ s = "ab"; }' ]]
 # Only on 64-bit Linux, without Boehm GC, do jobs have a region, from which
 # they free.
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
+fi
+
+# A cell an element's job reverted (s in a's) is kept by the next element's
+# job that forces it (b's); with unforce-always-revert, every job reverts it
+# again (b's and c's). The output is the same.
+rexpr='let s = { x = 1; }; in { a = s.x; b = s.x; c = s.x; }'
+expectJobs "$(jobsOf nix eval --expr "$rexpr")" 3
+[[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
+reverted=$(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json")
+expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$rexpr")" 3
+[[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
+if ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json") -gt $reverted ]]
 fi
 
 # Without --strict, no element runs in a job of its own: an element's job end
@@ -73,6 +89,9 @@ nix eval --impure --expr "$(copy src2) { a = builtins.seq p 1; }" 2> "$TEST_ROOT
 jobsOf nix eval --impure --expr "$(copy src) { a = builtins.seq p 1; b = builtins.seq p 2; q = { x = 1; }; }" 2> "$TEST_ROOT/err" > /dev/null
 [[ $(grep -c '^trace: f$' "$TEST_ROOT/err") == $(grep -c '^trace: f$' "$TEST_ROOT/err1") ]]
 grepQuiet '^trace: f$' "$TEST_ROOT/err"
+# unforce-always-revert keeps the effect's cell too: the copy runs once.
+nix eval --impure --option unforce-always-revert true --expr "$(copy src) { a = builtins.seq p 1; b = builtins.seq p 2; }" 2> "$TEST_ROOT/err" > /dev/null
+[[ $(grep -c '^trace: f$' "$TEST_ROOT/err") == $(grep -c '^trace: f$' "$TEST_ROOT/err1") ]]
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 0 ]]
 fi

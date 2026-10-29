@@ -703,7 +703,9 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    region, so one whose value holds no pointer into it (no young recovery
    value, `youngFree`) keeps its value, as the evaluation without unforcing
    does: later reads throw the first force's error again, with its frames.
-   A failed young cell inside a reverted owner is still built again.
+   A failed young cell inside a reverted owner is still built again. With
+   `unforce-always-revert`, a target an earlier job reverted is not
+   nominated: every job reverts it again.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
@@ -852,11 +854,12 @@ struct OwnerHold : UnforceHolder::Hold
 /* Which targets the job promotes (see above), and the top of the memory it
    keeps; null to keep it whole. No object is visited. */
 static char *
-keepPrefix(const std::vector<UnforceUndoEntry> & log, const Targets & targets, std::vector<bool> & promote)
+keepPrefix(
+    const std::vector<UnforceUndoEntry> & log, const Targets & targets, std::vector<bool> & promote, bool alwaysRevert)
 {
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
-        if (log[i].keep || (p.isThunk() && unforceIsReverted(p.thunk().expr))
+        if (log[i].keep || (!alwaysRevert && p.isThunk() && unforceIsReverted(p.thunk().expr))
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             promote[targets.ofEntry[i]] = true;
     }
@@ -1555,7 +1558,7 @@ void EvalState::endUnforceJob(const char * ender)
         try {
             Targets targets(undoLog);
             std::vector<bool> promote(targets.cells.size());
-            keptTo = keepPrefix(undoLog, targets, promote);
+            keptTo = keepPrefix(undoLog, targets, promote, settings.unforceAlwaysRevert);
             /* Null: a holder holds what the driver allocated in the job. */
             if (!keptTo)
                 keep = true;
