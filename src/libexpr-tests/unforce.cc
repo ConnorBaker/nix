@@ -16,14 +16,7 @@
    a garbage collector, on 64-bit Linux. Elsewhere these tests are left out. */
 #if !NIX_USE_BOEHMGC && defined(__linux__) && SIZE_MAX > UINT32_MAX
 
-#  include <pthread.h>
-
 namespace nix {
-
-/* Defined in unforce.cc for these tests: the most native stack that
-   re-forces on this thread held as one entered a segment, and the thread's
-   stack size. */
-std::pair<size_t, size_t> unforceTestReforceStack();
 
 /* Defined in unforce.cc for these tests: forget that C API client code,
    which other tests in this process create, may run. */
@@ -114,69 +107,6 @@ TEST_F(UnforceTest, revertsApplication)
     EXPECT_EQ(deep(*w), "{ x = 1; }");
 }
 
-/* A cell is re-forced at the call depth of its first force, however deep
-   the force that finds it reverted. */
-TEST_F(UnforceTest, reforceAtFirstDepth)
-{
-    evalSettings.maxCallDepth = 100;
-    auto v = oldThunk("let f = n: if n == 0 then { inherit n; } else f (n - 1); in f 60");
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.endUnforceScope();
-    ASSERT_TRUE(v->isThunk());
-    /* 60 calls deep: 120 in all without the rebase. */
-    Value r;
-    state.callFunction(*oldThunk("v: let g = n: if n == 0 then v else g (n - 1); in g 60"), *v, r, noPos);
-    state.forceValue(r, noPos);
-    EXPECT_EQ(r.type(), nAttrs);
-}
-
-/* Re-forces nested in re-forces hold no more native stack together than
-   the thread's: here, a chain of 100 cells, each first forced alone and
-   re-forced 100 calls deep in the next, on a thread with a stack of 1 MiB,
-   which the chain would hold several times over. */
-TEST_F(UnforceTest, reforceChainBound)
-{
-    auto v = oldThunk(
-        "let step = n: x: if n == 0 then builtins.seq x { inherit x; } else step (n - 1) x; "
-        "c = builtins.genList (i: step 100 (if i == 0 then null else builtins.elemAt c (i - 1))) 100; in c");
-    state.forceValue(*v, noPos);
-    auto & last = *v->listView()[99];
-    bool reverted = false;
-    std::pair<size_t, size_t> held;
-    auto body = [&] {
-        try {
-            state.beginUnforceScope();
-            for (auto e : v->listView())
-                state.forceValue(*e, noPos);
-            state.endUnforceScope();
-            reverted = last.isThunk();
-            state.beginUnforceScope();
-            state.forceValue(last, noPos);
-            state.endUnforceScope();
-            held = unforceTestReforceStack();
-        } catch (std::exception & e) {
-            ADD_FAILURE() << e.what();
-        }
-    };
-    using Body = decltype(body);
-    pthread_attr_t attr;
-    pthread_t thread;
-    ASSERT_EQ(pthread_attr_init(&attr), 0);
-    ASSERT_EQ(pthread_attr_setstacksize(&attr, 1 << 20), 0);
-    auto run = [](void * body) -> void * {
-        (*static_cast<Body *>(body))();
-        return nullptr;
-    };
-    ASSERT_EQ(pthread_create(&thread, &attr, run, &body), 0);
-    pthread_join(thread, nullptr);
-    pthread_attr_destroy(&attr);
-    ASSERT_TRUE(reverted);
-    /* Some re-force ran on a segment. */
-    EXPECT_GT(held.first, 0);
-    EXPECT_LE(held.first, held.second);
-}
-
 /* A reverted cell has the position of the value it held, and is trivial,
    as a cell that holds a value is. */
 TEST_F(UnforceTest, revertedPosition)
@@ -194,6 +124,14 @@ TEST_F(UnforceTest, revertedPosition)
     EXPECT_NE(w->determinePos(noPos), noPos);
     EXPECT_EQ(v->determinePos(noPos), w->determinePos(noPos));
     EXPECT_TRUE(v->isTrivial());
+    /* A function's position is its lambda's. */
+    auto f = oldThunk("let x = 1; in y: x");
+    state.beginUnforceScope();
+    state.forceValue(*f, noPos);
+    auto lambda = f->determinePos(noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(f->isThunk());
+    EXPECT_EQ(f->determinePos(noPos), lambda);
 }
 
 /* Only the outermost scope is a job. */

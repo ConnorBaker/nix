@@ -401,13 +401,9 @@ extern EvalRegion evalRegion;
 struct UnforceUndoEntry
 {
     Value * target;
-    /* The call depth, position and native stack room (in 16-byte units;
-       0: unknown) of the force: a reverted target is re-forced at this
-       depth, with at least this room, and a reverted application called
-       again at this position. */
-    uint32_t depth;
+    /* The position of the force: a reverted application is called again at
+       this position. */
     PosIdx pos;
-    uint32_t room;
     /* Whether the target keeps its value: an effect ran while the force was
        the current owner. */
     bool keep;
@@ -1091,8 +1087,6 @@ private:
      */
     size_t callDepth = 0;
 
-    /* Reads and rebases `callDepth` for a re-force (unforce.cc). */
-    friend struct UnforceDepth;
     friend void unforceNoteEffect(EvalState & state);
 
     std::vector<UnforceUndoEntry> undoLog;

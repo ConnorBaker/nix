@@ -1,8 +1,7 @@
 # A young cell that fails within its owner's force: q's force evaluates r.b,
 # whose `tryEval` catches r.a's failure, with a message that shows x while x.a
-# is a thunk. q keeps its value, failed cell and all: re-forced, it would fail
-# again after the second element forced x.a, and the third would raise a
-# failure that shows x.a's value.
+# is a thunk. q is reverted, failed cell and all: re-forced after the second
+# element forced x.a, the third raises a failure that shows x.a's value.
 let
   x = {
     a = 1 + 1;
