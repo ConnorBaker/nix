@@ -1022,7 +1022,9 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
 
     actLock.reset();
 
-    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, true);
+    /* An external builder gets the build's timeouts in build.json and
+       enforces them itself, as a remote builder does. */
+    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, !localBuildCap.externalBuilder);
 
     started();
 
