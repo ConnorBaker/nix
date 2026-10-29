@@ -64,6 +64,8 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         json.emplace("storeDir", store->storeDir);
         json.emplace("realStoreDir", store->getRealStoreDir().native());
         json.emplace("system", drv.platform);
+        json.emplace("timeout", settings.getWorkerSettings().buildTimeout.get());
+        json.emplace("maxSilentTime", settings.getWorkerSettings().maxSilentTime.get());
         {
             auto l = nlohmann::json::array();
             for (auto & i : inputPaths)
