@@ -286,6 +286,87 @@ struct UnforceStats
 
 extern UnforceStats unforceStats;
 
+/* Boolean frames (unforce.cc). `unforceFrame`: the innermost open frame's
+   start, and the lowest cell older than it written with a pointer at or
+   above it. `unforceFrames`: each open frame's start, and the lowest index
+   of the open frames a write marked. `unforceFrameSpan`: what a frame must
+   span to give anything back. `unforceFailures` ticks at every failed force
+   and every frame an exception leaves. */
+struct UnforceFrameRecord
+{
+    const char * lowC;
+    const char * s;
+};
+
+struct UnforceFrameMark
+{
+    const char * s;
+    int64_t markLo;
+};
+
+extern UnforceFrameRecord unforceFrame;
+extern std::vector<UnforceFrameMark> unforceFrames;
+extern size_t unforceFrameSpan;
+extern uint64_t unforceFailures;
+
+[[gnu::noinline, gnu::cold]] void unforceBoolFrameEnd(EvalState & state, uint64_t job, uint64_t fails);
+
+/**
+ * An in-place boolean evaluation (`EvalState::evalBool`: `if`, `assert`,
+ * `&&`, `||`, `->`, `!`) in a job: a frame, whose end may give back what the
+ * current owner allocated in it.
+ */
+class UnforceBoolFrame
+{
+    bool on;
+    uint64_t job = 0, fails = 0;
+    UnforceFrameRecord saved;
+
+    /* Back to the enclosing frame's record, with this one's merged in. */
+    [[gnu::always_inline]] void close()
+    {
+        unforceFrame = {std::min(saved.lowC, unforceFrame.lowC), saved.s};
+        auto m = unforceFrames.back().markLo;
+        unforceFrames.pop_back();
+        if (m < int64_t(unforceFrames.size()))
+            unforceFrames.back().markLo = std::min(unforceFrames.back().markLo, m);
+    }
+
+public:
+    [[gnu::always_inline]] UnforceBoolFrame(bool on, const char * cur)
+        : on(on)
+    {
+        if (on) {
+            unforceFrames.push_back({cur, INT64_MAX});
+            job = unforceStats.jobs;
+            fails = unforceFailures;
+            saved = std::exchange(unforceFrame, {(const char *) UINTPTR_MAX, cur});
+        }
+    }
+
+    /** The evaluation in `state` gave a Boolean, the bump cursor at `cur`. */
+    [[gnu::always_inline]] void done(EvalState & state, const char * cur)
+    {
+        if (on) {
+            on = false;
+            if (size_t(cur - unforceFrame.s) >= unforceFrameSpan)
+                unforceBoolFrameEnd(state, job, fails);
+            close();
+        }
+    }
+
+    [[gnu::always_inline]] ~UnforceBoolFrame()
+    {
+        if (on) {
+            unforceFailures++;
+            close();
+        }
+    }
+
+    UnforceBoolFrame(const UnforceBoolFrame &) = delete;
+    UnforceBoolFrame & operator=(const UnforceBoolFrame &) = delete;
+};
+
 /**
  * Whether front ends open unforce jobs in `state`: not with Boehm GC, nor
  * with the debugger, nor where native code may run (`unforceNativeCode`).

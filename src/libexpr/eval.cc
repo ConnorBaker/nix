@@ -1275,10 +1275,12 @@ inline bool EvalState::evalBool(Env & env, Expr * e, std::string_view errorCtx)
 {
     PosIdx pos = e->getPos();
     try {
+        UnforceBoolFrame frame(!NIX_USE_BOEHMGC && isolationDepth, evalRegion.cur);
         Value v;
         e->eval(*this, env, v);
         if (v.type() != nBool)
             throwEvalBoolTypeError(*this, env, *e, v, pos);
+        frame.done(*this, evalRegion.cur);
         return v.boolean();
     } catch (Error & e) {
         addTraceAt(*this, e, pos, errorCtx);

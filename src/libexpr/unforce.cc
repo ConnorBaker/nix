@@ -9,9 +9,10 @@
    region (see "Promotion" below). A cell whose value holds no pointer into
    the region (`youngFree`) keeps it as it is. The job keeps its memory below
    a cut decided from records made as forces ended, and frees the rest by
-   lowering the bump cursor: nothing is marked, walked or moved. A job in
-   which an effect ran outside any cell's force is kept whole instead:
-   nothing is reverted, and its memory stays. */
+   lowering the bump cursor: nothing is marked, walked or moved. Below the
+   cut, the whole pages of what no kept value reaches go back to the system.
+   A job in which an effect ran outside any cell's force is kept whole
+   instead: nothing is reverted, and its memory stays. */
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/unforce.hh"
@@ -58,6 +59,22 @@ static size_t pageSize()
 static char * pageUp(char * p)
 {
     return (char *) (((uintptr_t) p + pageSize() - 1) & ~(uintptr_t) (pageSize() - 1));
+}
+
+/* Give [lo, hi), memory of the open job that nothing will read, back to the
+   system: its whole pages, which read as zeros if touched again. Under
+   AddressSanitizer all of it is poisoned instead, so that a read of any of
+   it fails. */
+static void giveBack(char * lo, char * hi)
+{
+#if NIX_ASAN_ENABLED
+    if (lo < hi)
+        ASAN_POISON_MEMORY_REGION(lo, hi - lo);
+#elif defined(__linux__)
+    auto a = pageUp(lo), b = (char *) ((uintptr_t) hi & ~(uintptr_t) (pageSize() - 1));
+    if (a < b)
+        madvise(a, b - a, MADV_DONTNEED);
+#endif
 }
 
 /* The highest the open job's region reached: a loop's step lowers `cur`
@@ -133,6 +150,8 @@ static void openRegion()
         regionBytes = bytes / 2;
     }
     evalRegion.base = evalRegion.cur = jobTop = keptTop;
+    /* Under AddressSanitizer every frame that allocates poisons what it may. */
+    unforceFrameSpan = NIX_ASAN_ENABLED ? 1 : pageSize();
     roomEnd = keptTop + regionBytes;
     evalRegion.end = dirtyTop > keptTop ? keptTop : roomEnd;
 #endif
@@ -594,6 +613,11 @@ static void forgetYoungCell(const Value::Failed & f)
 
 static constexpr uint32_t noOwner = UINT32_MAX;
 
+/* For the unit tests: the length at which a job's undo log is full, which
+   otherwise owner names bound. Never set by evaluation. */
+extern uint32_t unforceTestLogLimit;
+uint32_t unforceTestLogLimit = noOwner;
+
 struct OwnerSeg
 {
     /* Its start, in granules from the region's base. */
@@ -734,9 +758,21 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    that shares its value is decided on its own, and a young cell that does
    was written while that cell's owner was current, below that owner's
    `at`: under the cut if the owner is in S, unreachable if not. The parts
-   of its value above the cut (its bytes, its context array with the
-   array's elements) are copied out of the region (`copyStringOut`), and the
-   cell, at its own address, keeps its value.
+   of its value that the job's end frees (its bytes, its context array with
+   the array's elements; see below) are copied out of the region
+   (`copyStringOut`), and the cell, at its own address, keeps its value.
+
+   Below the cut, a target neither in S nor kept by copy owns memory that
+   nothing kept reaches: the argument above holds for objects of every kind,
+   not only for those that bear identity, as a value reaches another owner's
+   objects (its strings and their contexts, its environments too) only
+   through that owner's cells, written once its force has ended. So the
+   job's end gives the whole pages of such targets' runs back to the system
+   (`releaseDead`), never to be reused: the next job starts at the cut. The
+   driver's runs stay, as a holder may reach them. A string kept by copy is
+   outside S, and may hold another target's bytes (its value taken from that
+   target's, whose force enclosed a promoted one and allocated them before
+   it): it is copied out of those runs too.
 
    A seen set's entry for a set (`UnforceSeen`) stands only for its
    address, which the set compares. One that is the value of the target
@@ -955,14 +991,13 @@ struct OwnerHold : UnforceHolder::Hold
 } // namespace
 
 /* Copy string `v`'s bytes and context out of the job's region, the parts
-   that lie in it at or above `keep`, the top of the memory the job keeps, to
-   memory allocated as outside any job (the caller pauses the region).
-   `fromBuilder` allocates a context array's elements right after it, with
-   no force between, so the cut never separates them. */
-static void copyStringOut(EvalState & state, Value & v, const char * keep)
+   that the job's end frees (`freed`), to memory allocated as outside any job
+   (the caller pauses the region). `fromBuilder` allocates a context array's
+   elements right after it, with no force between, so neither the cut nor an
+   owner's run separates them. */
+static void copyStringOut(EvalState & state, Value & v, auto && freed)
 {
     using Context = Value::StringWithContext::Context;
-    auto freed = [&](const void * p) { return evalRegion.contains(p) && (const char *) p >= keep; };
     auto s = v.stringData();
     auto c = v.context();
     if (freed(s))
@@ -1046,12 +1081,47 @@ static char * keepPrefix(
     }
     /* Nothing live lies above the cursor. */
     auto keep = std::min(top, evalRegion.cur);
+    /* What the job's end frees: what lies above the cut, and the runs below
+       it of the targets that keep nothing (`releaseDead`). */
+    auto freed = [&](const void * p) {
+        if (!evalRegion.contains(p))
+            return false;
+        if ((const char *) p >= keep)
+            return true;
+        auto o = ownerOf(p);
+        return o != noOwner && !promote[targets.ofEntry[o]] && !copy[targets.ofEntry[o]];
+    };
     for (size_t t = 0; t < promote.size(); ++t)
         if (copy[t] && !promote[t]) {
-            copyStringOut(state, *targets.cells[t], keep);
+            copyStringOut(state, *targets.cells[t], freed);
             promote[t] = true;
         }
     return keep;
+}
+
+/* Give back the runs below the cut `keptTo` of the targets that keep nothing
+   (see Promotion): adjacent ones as one run, so that a page they share goes
+   too. */
+static void releaseDead(const Targets & targets, const std::vector<bool> & promote, char * keptTo)
+{
+    char *lo = nullptr, *hi = nullptr;
+    auto run = [&](char * s, char * e, uint32_t o) {
+        e = std::min(e, keptTo);
+        if (s < e && o != noOwner && !promote[targets.ofEntry[o]]) {
+            if (hi != s) {
+                giveBack(lo, hi);
+                lo = s;
+            }
+            hi = e;
+        } else {
+            giveBack(lo, hi);
+            lo = hi = nullptr;
+        }
+    };
+    for (size_t k = 0; k < segments.size() && segStart(segments[k]) < keptTo; ++k)
+        run(segStart(segments[k]), k + 1 < segments.size() ? segStart(segments[k + 1]) : openSeg, segments[k].owner);
+    run(openSeg, evalRegion.cur, curOwner);
+    giveBack(lo, hi);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1226,6 +1296,10 @@ void UnforceSteps::stepSlow(Value * v)
     if (!kept && top > f.start) {
         /* Free the step's memory. */
         jobTop = std::max(jobTop, top);
+#if NIX_ASAN_ENABLED
+        /* Frames' ends may have poisoned some of it (`giveBack`). */
+        ASAN_UNPOISON_MEMORY_REGION(f.start, top - f.start);
+#endif
         memset(f.start, 0, top - f.start);
 #if NIX_ASAN_ENABLED
         ASAN_POISON_MEMORY_REGION(f.start, top - f.start);
@@ -1255,6 +1329,112 @@ void UnforceSteps::end()
 {
     dropStepWrites(stepFrames.back());
     stepFrames.pop_back();
+}
+
+/* ---------------------------------------------------------------------------
+   Boolean frames.
+
+   An in-place boolean evaluation in a job (`UnforceBoolFrame`) is a frame:
+   it starts with the bump cursor at `s` under owner O, and ends with a
+   Boolean, which points to nothing. What O allocated in it, O's runs in
+   [s, cur), is then dead unless a pointer into it was stored outside it,
+   and its whole pages go back to the system. Pointers are stored as an
+   object is made, as a force writes its cell, and in C++ state that a
+   holder covers. A force in the frame writes a young cell or a slot of the
+   job's stack, whose value is looked at as the force ends (`frameWrite`),
+   whoever owns it; or an old cell, which is logged, so forced as its own
+   owner from its pre-image (a thunk or an application), which reaches O's
+   memory in the frame only through a cell that a force wrote first, or
+   through a pointer of its own, which blocks the frame. So the frame gives
+   nothing back if a young cell older than it or a slot was written with a
+   pointer at or above its start, or a pre-image logged in it points into
+   the region; if a force in it failed (a failed cell gets its recovery
+   value under O after its force's end, and the job's end reads failed
+   young cells); if a holder may hold its memory; or if its job is gone, the
+   region paused, native code possible, the job kept whole (as when its log
+   is full, and cells are forced unlogged, under O) or its steps unsafe. The
+   owner at its end is O: forces push and pop owners in pairs, and only a
+   failed force's end pops one out of turn.
+
+   The records are the innermost frame's, merged into the enclosing one's as
+   it ends. A young write blocks the frames that start above the cell and at
+   or below its highest pointer, found among the open frames' starts, which
+   grow along the stack. Neither depends on who owns what at the write,
+   which a dropped entry may change later.
+   --------------------------------------------------------------------------- */
+
+UnforceFrameRecord unforceFrame = {(const char *) UINTPTR_MAX, nullptr};
+std::vector<UnforceFrameMark> unforceFrames;
+size_t unforceFrameSpan = SIZE_MAX;
+uint64_t unforceFailures = 0;
+
+/* The highest pointer of `v` into the job's region, or null. */
+static const char * maxYoung(const Value & v)
+{
+    const char * p = nullptr;
+    valueEdges(v, [&](const void * q) {
+        if (evalRegion.contains(q))
+            p = std::max(p, (const char *) q);
+    });
+    return p;
+}
+
+/* Cell `v` was written in a frame, at its force's end, or is logged with `v`
+   its pre-image (`preImage`). Out of line, as `valueEdges`'s locals would
+   cost the force path a stack frame. */
+[[gnu::noinline, gnu::cold]] static void frameWrite(const Value & v, bool preImage)
+{
+    auto & r = unforceFrame;
+    auto c = (const char *) &v;
+    bool young = evalRegion.contains(c);
+    if (young ? c >= r.s : !preImage && (c < jobStackLow || c >= jobStackMark))
+        return;
+    auto p = maxYoung(v);
+    if (!p)
+        return;
+    if (!young)
+        /* Every open frame. */
+        r.lowC = (const char *) 1;
+    else if (p >= r.s)
+        r.lowC = std::min(r.lowC, c);
+    else {
+        auto & st = unforceFrames;
+        auto byS = [](const char * x, const UnforceFrameMark & f) { return x < f.s; };
+        int64_t hi = std::upper_bound(st.begin(), st.end(), p, byS) - st.begin() - 1;
+        int64_t lo = std::upper_bound(st.begin(), st.begin() + (hi + 1), c, byS) - st.begin();
+        if (lo <= hi)
+            st[hi].markLo = std::min(st[hi].markLo, lo);
+    }
+}
+
+/* A force ended in a frame, or failed. */
+[[gnu::noinline, gnu::cold]] static void frameForceEnd(const Value & v, bool completed)
+{
+    if (!completed)
+        unforceFailures++;
+    else if (unforceFrame.s)
+        frameWrite(v, false);
+}
+
+/* The innermost frame ended with its Boolean, spanning `unforceFrameSpan`. */
+void unforceBoolFrameEnd(EvalState & state, uint64_t job, uint64_t fails)
+{
+    auto s = (char *) unforceFrame.s;
+    if (job != unforceStats.jobs || jobOwner.load() != &state || evalRegion.paused || keepWhole || stepsUnsafe
+        || fails != unforceFailures || unforceFrame.lowC < s
+        || unforceFrames.back().markLo < int64_t(unforceFrames.size())
+        || std::ranges::any_of(
+            *jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, s); })
+        || unforceNativeCode(state))
+        return;
+    giveBack(std::max(openSeg, s), evalRegion.cur);
+    for (auto k = segments.size(); k-- > 0;) {
+        auto end = k + 1 < segments.size() ? segStart(segments[k + 1]) : openSeg;
+        if (end <= s)
+            break;
+        if (segments[k].owner == curOwner)
+            giveBack(std::max(segStart(segments[k]), s), end);
+    }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1657,6 +1837,9 @@ void EvalState::beginUnforceScope(const void * stackMark)
     jobStackLow = stack.low;
     jobHolders = &holders;
     keepWhole = stepsUnsafe = !(jobStackMark > stack.low && size_t(jobStackMark - stack.low) <= stack.size);
+    /* Opened in a boolean frame (never, by the level rule): searches for the
+       frames a write marks would mix two jobs' starts. */
+    stepsUnsafe = stepsUnsafe || unforceFrame.s;
     try {
         openRegion();
         openSeg = evalRegion.base;
@@ -1741,6 +1924,9 @@ void EvalState::endUnforceJob(const char * ender)
                         e.preImage = reforcePreImage(*this, e.preImage, e.pos, *e.target);
                 }
                 promoted = std::ranges::count(promote, true);
+                /* Last: the reads of young objects above are done, and nothing
+                   after it keeps the job whole. */
+                releaseDead(targets, promote, keptTo);
             }
         } catch (std::bad_alloc &) {
             keep = true;
@@ -1800,9 +1986,11 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
     }
     if (isJobStackSlot(p))
         return;
-    /* A log as long as owner names allow keeps the job whole. */
-    if (undoLog.size() >= noOwner) [[unlikely]] {
-        keepWhole = true;
+    /* A log as long as owner names allow keeps the job whole, and no step or
+       frame of it frees: the cells it forces from then on are not logged,
+       and are forced under the current owner. */
+    if (undoLog.size() >= unforceTestLogLimit) [[unlikely]] {
+        keepWhole = stepsUnsafe = true;
         return;
     }
     roomFor(undoLog, 1);
@@ -1810,45 +1998,55 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
     roomFor(segments, opens.size() + 2);
     roomFor(opens, 1);
     auto entry = uint32_t(undoLog.size());
+    if (unforceFrame.s) [[unlikely]]
+        frameWrite(v, true);
     undoLog.push_back({&v, pos, false, v});
     ends.emplace_back();
     openForce(v, entry, entry);
 }
 
+/* Only tail calls: the end of a force that changed no owner needs no stack
+   frame. */
 void EvalState::endLoggedForceSlow(Value & v, bool completed)
 {
-    if (!opens.empty() && opens.back().cell == &v) {
-        auto f = opens.back();
-        opens.pop_back();
-        /* A logged force that completed with a young-free value drops its
-           entry, if it is still the last one and no closed segment has its
-           label: the job's end would keep the cell as it is anyway, so the
-           log and the timeline do not grow with such forces, however many a
-           job makes. What the force allocated in its segment is garbage (its
-           value reaches none of it, and a cell older than the force that
-           reaches it would have a later entry), and becomes the restored
-           owner's. */
-        if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs
-            && youngFree(v)) {
-            undoLog.pop_back();
-            ends.pop_back();
-            curOwner = f.saved;
-            if (!segments.empty() && segments.back().owner == f.saved) {
-                openSeg = segStart(segments.back());
-                segments.pop_back();
-            }
-        } else {
-            /* The clock of these ends, and what each target owned last. */
-            auto t = ++forceClock;
-            if (curOwner != noOwner) {
-                ends[curOwner].last = t;
-                ends[curOwner].at = std::max(ends[curOwner].at, evalRegion.cur);
-            }
-            if (f.entry != noOwner)
-                ends[f.entry].own = t;
-            setOwner(f.saved);
+    if (!opens.empty() && opens.back().cell == &v)
+        return endOwnerForce(v, completed);
+    if (!completed || unforceFrame.s) [[unlikely]]
+        return frameForceEnd(v, completed);
+}
+
+void EvalState::endOwnerForce(Value & v, bool completed)
+{
+    auto f = opens.back();
+    opens.pop_back();
+    /* A logged force that completed with a young-free value drops its
+       entry, if it is still the last one and no closed segment has its
+       label: the job's end would keep the cell as it is anyway, so the
+       log and the timeline do not grow with such forces, however many a
+       job makes. What the force allocated in its segment is garbage (its
+       value reaches none of it, and a cell older than the force that
+       reaches it would have a later entry), and becomes the restored
+       owner's. */
+    if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs && youngFree(v)) {
+        undoLog.pop_back();
+        ends.pop_back();
+        curOwner = f.saved;
+        if (!segments.empty() && segments.back().owner == f.saved) {
+            openSeg = segStart(segments.back());
+            segments.pop_back();
         }
+    } else {
+        /* The clock of these ends, and what each target owned last. */
+        auto t = ++forceClock;
+        if (curOwner != noOwner) {
+            ends[curOwner].last = t;
+            ends[curOwner].at = std::max(ends[curOwner].at, evalRegion.cur);
+        }
+        if (f.entry != noOwner)
+            ends[f.entry].own = t;
+        setOwner(f.saved);
     }
+    frameForceEnd(v, completed);
 }
 
 } // namespace nix

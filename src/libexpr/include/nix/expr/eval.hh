@@ -1148,6 +1148,7 @@ private:
 
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, PosIdx pos);
     [[gnu::noinline, gnu::cold]] void endLoggedForceSlow(Value & v, bool completed);
+    [[gnu::noinline]] void endOwnerForce(Value & v, bool completed);
     [[gnu::noinline]] void endUnforceJob(const char * ender);
 
 public:

@@ -19,6 +19,9 @@
    a garbage collector, on 64-bit Linux. Elsewhere these tests are left out. */
 #if !NIX_USE_BOEHMGC && defined(__linux__) && SIZE_MAX > UINT32_MAX
 
+#  include <sys/mman.h>
+#  include <unistd.h>
+
 namespace nix {
 
 /* Defined in unforce.cc for these tests: forget that C API client code,
@@ -28,6 +31,10 @@ void unforceTestResetNativeCode();
 /* Defined in unforce.cc for these tests: while set, every mapping a job asks
    for fails. */
 extern bool unforceTestFailMapping;
+
+/* Defined in unforce.cc for these tests: the length at which a job's undo
+   log is full. */
+extern uint32_t unforceTestLogLimit;
 
 /* While alive, a job's region cannot be mapped (`unforceTestFailMapping`). */
 struct FailMapping
@@ -668,6 +675,61 @@ TEST_F(UnforceTest, stringKeptByCopy)
     }
 }
 
+/* Whether the page holding `p` went back to the system: under
+   AddressSanitizer, whether `p` is poisoned instead. */
+static bool givenBack(const void * p)
+{
+#  if NIX_ASAN_ENABLED
+    return __asan_address_is_poisoned(p);
+#  else
+    auto page = sysconf(_SC_PAGESIZE);
+    unsigned char resident = 1;
+    mincore((void *) (uintptr_t(p) & ~uintptr_t(page - 1)), page, &resident);
+    return !(resident & 1);
+#  endif
+}
+
+/* A holder that keeps `cells` at a job's end. */
+struct KeepCells : UnforceHolder
+{
+    std::vector<const Value *> cells;
+
+    void held(Hold &) override {}
+
+    void ended() override {}
+
+    bool keeps(const Value * c) const override
+    {
+        return std::ranges::contains(cells, c);
+    }
+};
+
+/* A job's end gives back the whole pages, below its cut, of the targets that
+   keep nothing: `u`'s, whose force encloses that of `p`, which a holder
+   keeps. `t`, a string target the holder keeps too, took `u`'s value, whose
+   bytes lie in `u`'s run: it is kept by a copy of all of them. `p`'s list
+   stays as it was. */
+TEST_F(UnforceTest, deadRunsGivenBack)
+{
+    auto v = oldThunk(
+        "rec { p = builtins.genList (i: i) 4096; t = u; u = let s = builtins.concatStringsSep \"\" "
+        "(builtins.genList (i: \"abcdefgh\") 8192); in builtins.seq s (builtins.seq p s); }");
+    state.forceValue(*v, noPos);
+    auto cell = [&](const char * name) { return v->attrs()->get(createSymbol(name))->value; };
+    KeepCells holder;
+    holder.cells = {cell("p"), cell("t")};
+    state.beginUnforceScope();
+    state.forceValue(*cell("t"), noPos);
+    auto bytes = cell("t")->c_str() + sysconf(_SC_PAGESIZE);
+    state.endUnforceScope();
+    EXPECT_TRUE(cell("u")->isThunk());
+    EXPECT_TRUE(givenBack(bytes));
+    EXPECT_EQ(cell("t")->string_view().size(), 65536u);
+    EXPECT_EQ(cell("t")->string_view().find_first_not_of("abcdefgh"), std::string_view::npos);
+    state.forceValue(*cell("p")->listView()[4095], noPos);
+    EXPECT_THAT(*cell("p")->listView()[4095], IsIntEq(4095));
+}
+
 /* A value the driver allocated in the job, which a holder holds, is no
    target's: the job is kept whole, and a seen set forgets nothing. */
 TEST_F(UnforceTest, driverHoldKeepsJob)
@@ -1028,6 +1090,60 @@ TEST_F(UnforceTest, stepsEscapeEdgeKinds)
         EXPECT_THAT(u, IsIntEq(want)) << step;
         state.endUnforceScope();
     }
+}
+
+/* A condition gives back the whole pages of the list it built as it ends:
+   nothing outside it points there. But once the job's undo log is full
+   (`unforceTestLogLimit`, here at one entry), `t` is forced unlogged, under
+   the current owner: its value lies in the condition's memory, or in
+   `foldl'`'s step's, and neither frees it. */
+TEST_F(UnforceTest, boolFrameGivesBack)
+{
+    auto limit = unforceTestLogLimit;
+    Finally restore([&] { unforceTestLogLimit = limit; });
+    auto cond = "if builtins.length t.l + builtins.length (builtins.genList (i: i) 10000) > 0 then 1 else 0";
+    for (auto [full, a] : std::initializer_list<std::pair<bool, const char *>>{
+             {false, cond}, {true, cond}, {true, "builtins.foldl' (n: x: builtins.length t.l) 0 [ 1 ]"}}) {
+        unforceTestLogLimit = full ? 1 : limit;
+        auto v = oldThunk(fmt("rec { t = { l = builtins.genList (i: i * 2) 10000; }; a = %s; }", a));
+        state.forceValue(*v, noPos);
+        auto cell = [&](Value & s, const char * name) -> Value & { return *s.attrs()->get(createSymbol(name))->value; };
+        state.beginUnforceScope();
+        state.forceValue(cell(*v, "a"), noPos);
+        if (a == cond)
+            EXPECT_EQ(givenBack(evalRegion.cur - 2 * sysconf(_SC_PAGESIZE)), !full);
+        state.endUnforceScope();
+        auto & t = cell(*v, "t");
+        state.forceValue(t, noPos);
+        auto & l = cell(t, "l");
+        state.forceValue(l, noPos);
+        state.forceValue(*l.listView()[9999], noPos);
+        EXPECT_THAT(*l.listView()[9999], IsIntEq(19998)) << a;
+    }
+}
+
+/* A frame entered in the job holds a thunk `slot`, which `f`'s condition
+   forces: the slot's value lies in the condition's memory, which it keeps. */
+[[gnu::noinline]] static void conditionForcesSlot(EvalState & state, Value & f)
+{
+    Value slot;
+    slot.mkThunk(
+        &state.baseEnv,
+        state.parseExprFromString("builtins.genList (i: i * 2) 10000", state.rootPath(CanonPath::root)));
+    auto w = state.allocValue();
+    w->mkApp(&f, &slot);
+    state.forceValue(*w, noPos);
+    state.forceValue(*slot.listView()[9999], noPos);
+    EXPECT_THAT(*slot.listView()[9999], IsIntEq(19998));
+}
+
+TEST_F(UnforceTest, boolFrameKeepsSlot)
+{
+    auto f = oldThunk("x: if builtins.length x > 0 then 1 else 0");
+    state.forceValue(*f, noPos);
+    state.beginUnforceScope();
+    conditionForcesSlot(state, *f);
+    state.endUnforceScope();
 }
 
 /* Strict JSON printing: an element of a nested level runs in a job of its own,
