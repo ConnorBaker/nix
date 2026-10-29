@@ -2608,6 +2608,8 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         recovery->mkThunk(env, expr);
     }
     v.mkFailed(e, recovery);
+    if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+        unforceNoteFailure(v);
 }
 
 [[gnu::noinline]]
@@ -2628,6 +2630,8 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
         *recovery = savedApp;
     }
     v.mkFailed(e, recovery);
+    if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
+        unforceNoteFailure(v);
 }
 
 [[gnu::noinline]]
@@ -3660,6 +3664,8 @@ void EvalState::printStatistics()
         {"cellsPromoted", unforceStats.cellsPromoted},
         {"bytesKept", unforceStats.bytesKept},
         {"bytesFreed", unforceStats.bytesFreed},
+        {"stepEnds", unforceStats.stepEnds},
+        {"stepBytesFreed", unforceStats.stepBytesFreed},
     };
     if (auto reason = unforceNativeCode(*this))
         topObj["unforce"]["off"] = reason;

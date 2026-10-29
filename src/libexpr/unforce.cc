@@ -7,10 +7,10 @@
    At the job's end each logged cell is reverted to its pre-image, or
    promoted: it keeps its value, and with it what the value reaches in the
    region (see "Promotion" below). A cell whose value holds no pointer into
-   the region (`youngFree`) keeps it as it is. What the promoted values
-   reach is compacted to the region's bottom and kept, and the rest freed:
-   no old cell points into it any more. A job in which an effect other than
-   a trace or a warning ran (those promote a cell) is kept whole instead:
+   the region (`youngFree`) keeps it as it is. The job keeps its memory below
+   a cut decided from records made as forces ended, and frees the rest by
+   lowering the bump cursor: nothing is marked, walked or moved. A job in
+   which an effect ran outside any cell's force is kept whole instead:
    nothing is reverted, and its memory stays. */
 
 #include "nix/expr/eval.hh"
@@ -25,9 +25,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 
 #if defined(__linux__)
 #  include <sys/mman.h>
@@ -66,7 +66,8 @@ static char * pageUp(char * p)
     return (char *) (((uintptr_t) p + pageSize() - 1) & ~(uintptr_t) (pageSize() - 1));
 }
 
-/* The highest the open job's region reached. */
+/* The highest the open job's region reached: a loop's step lowers `cur`
+   when it frees its memory (see "Steps"). */
 static char * jobTop = nullptr;
 
 #if defined(__linux__)
@@ -86,22 +87,9 @@ static char * dirtyTop = nullptr;
 
 #endif
 
-/* The sizes of the Envs in the open job's region, which nothing else
-   records: a byte per granule, where an Env starts, or 255 for one of 255
-   values or more, whose size is in `bigEnvSizes`. Only the pages that
-   jobs' Envs touched are memory. */
-static uint8_t * envSizes = nullptr;
-static boost::unordered_flat_map<const void *, size_t> bigEnvSizes;
-
 static size_t granuleOf(const void * p)
 {
     return size_t((const char *) p - evalRegion.base) >> 4;
-}
-
-static size_t envSizeOf(const Env * e)
-{
-    auto s = envSizes[granuleOf(e)];
-    return s < 255 ? s : bigEnvSizes.at(e);
 }
 
 /* For the unit tests: while set, a job maps its region afresh, and every
@@ -129,14 +117,8 @@ static void openRegion()
 {
 #if defined(__linux__)
     auto mappingBytes = 2 * regionBytes;
-    if (!envSizes) {
-        if (!regionBytes)
-            return;
-        auto p = mapAnonymous(regionBytes >> 4);
-        if (p == MAP_FAILED)
-            throw std::bad_alloc();
-        envSizes = (uint8_t *) p;
-    }
+    if (!regionBytes)
+        return;
     if (!mapping || unforceTestFailMapping || size_t(mapping + mappingBytes - keptTop) < regionBytes) {
         auto p = mapAnonymous(mappingBytes);
         if (p == MAP_FAILED)
@@ -178,9 +160,7 @@ void * EvalRegion::more(size_t n)
 
 /* End the job's region: its memory below `keepTo` stays, for the rest of
    the process; above it, the next job's region reuses it. What earlier jobs
-   wrote above where this one reached goes back to the system. Its Env sizes
-   are not needed any more: one is written where an Env is allocated, and
-   read only there. */
+   wrote above where this one reached goes back to the system. */
 static void closeRegion(char * keepTo)
 {
 #if defined(__linux__)
@@ -192,7 +172,6 @@ static void closeRegion(char * keepTo)
     if (top > keepTo)
         ASAN_POISON_MEMORY_REGION(keepTo, top - keepTo);
 #  endif
-    decltype(bigEnvSizes)().swap(bigEnvSizes);
     dirtyTop = std::max(dirtyTop, top);
     if (pageUp(top) < dirtyTop && madvise(pageUp(top), pageUp(dirtyTop) - pageUp(top), MADV_DONTNEED) == 0)
         dirtyTop = pageUp(top);
@@ -389,24 +368,6 @@ void * evalCalloc(size_t n)
         return evalRegion.bump(n);
     return calloc(n, 1);
 }
-
-void * evalCallocEnv(size_t size)
-{
-    size_t n;
-    if (__builtin_mul_overflow(size, sizeof(Value *), &n) || __builtin_add_overflow(n, sizeof(Env), &n))
-        throw std::bad_alloc();
-    if (!evalRegion.active()) [[likely]] {
-        auto p = calloc(n, 1);
-        if (!p)
-            throw std::bad_alloc();
-        return p;
-    }
-    auto p = evalRegion.bump(n);
-    if (size >= 255)
-        bigEnvSizes.emplace(p, size);
-    envSizes[granuleOf(p)] = std::min<size_t>(size, 255);
-    return p;
-}
 #endif
 
 void unforcePauseBegin()
@@ -428,19 +389,42 @@ static std::atomic<const EvalState *> jobOwner = nullptr;
 /* Whether the open job is kept whole (see the top of this file). */
 static bool keepWhole = false;
 
-/* This thread's stack: its lowest address and size, or null if unknown. */
-static thread_local const std::pair<const char *, size_t> threadStack = [] {
-    void * addr = nullptr;
+/* Whether no step of the open job may free (see "Steps"): it forced a cell
+   whose frame cannot be told (a fake stack's), or ran a plugin's lookup
+   path hook. */
+static bool stepsUnsafe = false;
+
+/* This thread's stack: its lowest address and size, or null if unknown.
+   Constant-initialized and filled on first use, so that no access runs a
+   dynamic initializer; read once per job, at its opening. */
+struct ThreadStack
+{
+    const char * low = nullptr;
     size_t size = 0;
+    bool known = false;
+};
+
+static thread_local ThreadStack threadStackCache;
+
+static const ThreadStack & threadStack()
+{
+    auto & t = threadStackCache;
+    if (!t.known) {
 #if defined(__linux__)
-    pthread_attr_t attr;
-    if (pthread_getattr_np(pthread_self(), &attr) == 0) {
-        pthread_attr_getstack(&attr, &addr, &size);
-        pthread_attr_destroy(&attr);
-    }
+        pthread_attr_t attr;
+        void * addr = nullptr;
+        size_t size = 0;
+        if (pthread_getattr_np(pthread_self(), &attr) == 0) {
+            pthread_attr_getstack(&attr, &addr, &size);
+            pthread_attr_destroy(&attr);
+        }
+        t.low = (const char *) addr;
+        t.size = addr ? size : 0;
 #endif
-    return std::pair{(const char *) addr, addr ? size : 0};
-}();
+        t.known = true;
+    }
+    return t;
+}
 
 #if defined(__linux__) && NIX_ASAN_ENABLED
 /* Whether `p` is a slot of a running frame that AddressSanitizer placed on
@@ -453,8 +437,11 @@ static bool onFakeStack(const void * p)
 #endif
 
 /* The stack pointer of the open job's opener: the frames entered during the
-   job are below it, down to the bottom of the thread's stack. */
+   job are below it, down to the bottom of the thread's stack (`jobStackLow`,
+   the opener's thread's, read at the opening: the force path reads no
+   thread-local). */
 static const char * jobStackMark = nullptr;
+static const char * jobStackLow = nullptr;
 
 /* Whether `p` is a slot of a stack frame entered during the open job, which
    will have returned when it ends: such a cell is never logged, as the end
@@ -467,126 +454,52 @@ static bool isJobStackSlot(const void * p)
        of where its frame is: keep the job whole, so that its end writes no
        slot of a frame still running, nor of one that returned. */
     if (onFakeStack(p)) {
-        keepWhole = true;
+        keepWhole = stepsUnsafe = true;
         return true;
     }
 #  endif
 #endif
-    return (const char *) p >= threadStack.first && (const char *) p < jobStackMark;
+    return (const char *) p >= jobStackLow && (const char *) p < jobStackMark;
 }
 
-/* ---------------------------------------------------------------------------
-   The objects in a job's region.
-
-   A pointer into the region says what its object is: a value, an `Env`, a
-   `Bindings` layer, a list's element array, a string's context, or its
-   `StringData`, which holds no pointers. Bump allocations are 16-byte
-   aligned and never share a granule.
-   --------------------------------------------------------------------------- */
-
-enum class Obj : uint8_t { value, env, bindings, elems, context, string };
-
-using Context = Value::StringWithContext::Context;
-
-/* The bytes `p`, an object of `kind`, takes (`n`: an element array's
-   length). A Bindings layer's room beyond its attributes is not counted:
-   nothing adds to a layer once it is published. */
-static size_t objectBytes(const void * p, Obj kind, size_t n)
+/* The pointers of `v` to the objects it is made of: `edge(p)` for each. */
+template<typename E>
+static void valueEdges(const Value & v, E && edge)
 {
-    switch (kind) {
-    case Obj::value:
-        return sizeof(Value);
-    case Obj::env:
-        return sizeof(Env) + envSizeOf((const Env *) p) * sizeof(Value *);
-    case Obj::bindings:
-        return sizeof(Bindings) + ((const Bindings *) p)->layerSize() * sizeof(Attr);
-    case Obj::elems:
-        return n * sizeof(Value *);
-    case Obj::context:
-        return sizeof(Context) + ((const Context *) p)->size() * sizeof(Context::value_type);
-    case Obj::string:
-        return sizeof(StringData) + ((const StringData *) p)->size() + 1;
-    }
-    unreachable();
-}
-
-/* The pointers of `v` to the objects it is made of: `edge(p, kind, n)` for
-   each (`n`: an element array's length), storing what it returns unless
-   `V` is const. The one enumeration of a value's pointers, which marking
-   and forwarding share (`Walk`), so that they cannot differ. A failure's
-   recovery value is forwarded apart (`Mark::failures`): cells may share
-   the failure. */
-template<typename V, typename E>
-static void valueEdges(V & v, E && edge)
-{
-    constexpr bool write = !std::is_const_v<V>;
     switch (v.internalType()) {
-    case tString: {
-        auto s = (const StringData *) edge(v.stringData(), Obj::string, 0);
-        auto c = (const Context *) edge(v.context(), Obj::context, 0);
-        if constexpr (write)
-            v.mkStringNoCopy(*s, c);
+    case tString:
+        edge(v.stringData());
+        edge(v.context());
         break;
-    }
-    case tPath: {
-        auto s = (const StringData *) edge(v.pathData(), Obj::string, 0);
-        if constexpr (write)
-            v.mkPath(v.pathAccessor(), *s);
+    case tPath:
+        edge(v.pathData());
         break;
-    }
-    case tAttrs: {
-        auto b = (const Bindings *) edge(v.attrs(), Obj::bindings, 0);
-        if constexpr (write)
-            v.mkAttrs(b);
+    case tAttrs:
+        edge(v.attrs());
         break;
-    }
-    case tListSmall: {
-        auto l = v.rawSmallList();
-        auto a = (Value *) edge(l[0], Obj::value, 0);
-        auto b = (Value *) edge(l[1], Obj::value, 0);
-        if constexpr (write)
-            v.setRawSmallList({a, b});
+    case tListSmall:
+        edge(v.rawSmallList()[0]);
+        edge(v.rawSmallList()[1]);
         break;
-    }
-    case tListN: {
-        auto l = v.rawList();
-        auto elems = (Value * const *) edge(l.elems, Obj::elems, l.size);
-        if constexpr (write)
-            v.setRawList({.size = l.size, .elems = elems});
+    case tListN:
+        edge(v.rawList().elems);
         break;
-    }
-    case tThunk: {
-        auto t = v.thunk();
-        auto env = (Env *) edge(t.env, Obj::env, 0);
-        if constexpr (write)
-            v.mkThunk(env, t.expr);
+    case tThunk:
+        edge(v.thunk().env);
         break;
-    }
-    case tApp: {
-        auto a = v.app();
-        auto left = (Value *) edge(a.left, Obj::value, 0);
-        auto right = (Value *) edge(a.right, Obj::value, 0);
-        if constexpr (write)
-            v.mkApp(left, right);
+    case tApp:
+        edge(v.app().left);
+        edge(v.app().right);
         break;
-    }
-    case tPrimOpApp: {
-        auto a = v.primOpApp();
-        auto left = (Value *) edge(a.left, Obj::value, 0);
-        auto right = (Value *) edge(a.right, Obj::value, 0);
-        if constexpr (write)
-            v.mkPrimOpApp(left, right);
+    case tPrimOpApp:
+        edge(v.primOpApp().left);
+        edge(v.primOpApp().right);
         break;
-    }
-    case tLambda: {
-        auto l = v.lambda();
-        auto env = (Env *) edge(l.env, Obj::env, 0);
-        if constexpr (write)
-            v.mkLambda(env, l.fun);
+    case tLambda:
+        edge(v.lambda().env);
         break;
-    }
     case tFailed:
-        edge(v.failed().recoveryValue, Obj::value, 0);
+        edge(v.failed().recoveryValue);
         break;
     case tUninitialized:
     case tInt:
@@ -596,78 +509,6 @@ static void valueEdges(V & v, E && edge)
     case tExternal:
     case tPrimOp:
     case tNumberOfInternalTypes:
-        break;
-    }
-}
-
-/* How many pointers `p`, an object of `kind` other than a value, holds
-   (`n`: an element array's length). */
-static size_t wideEdges(const void * p, Obj kind, size_t n)
-{
-    switch (kind) {
-    case Obj::env:
-        return 1 + envSizeOf((const Env *) p);
-    case Obj::bindings:
-        return 1 + ((const Bindings *) p)->layerSize();
-    case Obj::elems:
-        return n;
-    case Obj::context:
-        return ((const Context *) p)->size();
-    case Obj::value:
-    case Obj::string:
-        return 0;
-    }
-    unreachable();
-}
-
-/* Pointer `i` of `p` (see `wideEdges`), passed to `edge` as `valueEdges`
-   passes a value's, storing what it returns if `write`. */
-template<bool write, typename E>
-static void wideEdge(void * p, Obj kind, size_t i, E && edge)
-{
-    switch (kind) {
-    case Obj::env: {
-        auto e = (Env *) p;
-        if (i == 0) {
-            auto up = (Env *) edge(e->up, Obj::env, 0);
-            if constexpr (write)
-                e->up = up;
-        } else {
-            auto v = (Value *) edge(e->values[i - 1], Obj::value, 0);
-            if constexpr (write)
-                e->values[i - 1] = v;
-        }
-        break;
-    }
-    case Obj::bindings: {
-        auto b = (Bindings *) p;
-        if (i == 0) {
-            auto base = (const Bindings *) edge(b->layerBase(), Obj::bindings, 0);
-            if constexpr (write)
-                b->setLayerBase(base);
-        } else {
-            auto v = (Value *) edge(b->layerValue(i - 1), Obj::value, 0);
-            if constexpr (write)
-                b->setLayerValue(i - 1, v);
-        }
-        break;
-    }
-    case Obj::elems: {
-        auto elems = (Value **) p;
-        auto v = (Value *) edge(elems[i], Obj::value, 0);
-        if constexpr (write)
-            elems[i] = v;
-        break;
-    }
-    case Obj::context: {
-        auto elems = const_cast<Context::value_type *>(((const Context *) p)->begin());
-        auto s = (const StringData *) edge(elems[i], Obj::string, 0);
-        if constexpr (write)
-            elems[i] = s;
-        break;
-    }
-    case Obj::value:
-    case Obj::string:
         break;
     }
 }
@@ -682,233 +523,9 @@ static bool youngFree(const Value & v)
     if (v.isThunk() || v.isApp() || v.isFailed() || v.internalType() == tUninitialized)
         return false;
     bool young = false;
-    valueEdges(v, [&](const void * p, Obj, size_t) {
-        young = young || evalRegion.contains(p);
-        return p;
-    });
+    valueEdges(v, [&](const void * p) { young = young || evalRegion.contains(p); });
     return !young;
 }
-
-/* A bit per granule of [base, cur). */
-struct GranuleBits
-{
-    const char * base;
-    size_t words;
-    uint64_t * w;
-
-    GranuleBits(const char * base, const char * cur)
-        : base(base)
-        , words(size_t(cur - base + 1023) >> 10)
-        , w((uint64_t *) std::calloc(std::max<size_t>(words, 1), sizeof(uint64_t)))
-    {
-        if (!w)
-            throw std::bad_alloc();
-    }
-
-    ~GranuleBits()
-    {
-        std::free(w);
-    }
-
-    GranuleBits(const GranuleBits &) = delete;
-    GranuleBits & operator=(const GranuleBits &) = delete;
-
-    size_t granule(const void * p) const
-    {
-        return size_t((const char *) p - base) >> 4;
-    }
-
-    bool test(const void * p) const
-    {
-        auto g = granule(p);
-        return (w[g >> 6] >> (g & 63)) & 1;
-    }
-
-    /* Set `p`'s bit; returns whether it was set already. */
-    bool testAndSet(const void * p)
-    {
-        auto g = granule(p);
-        auto bit = uint64_t(1) << (g & 63);
-        auto old = w[g >> 6];
-        w[g >> 6] = old | bit;
-        return old & bit;
-    }
-
-    /* Set the bits of the granules that [p, p + n) touches; n > 0. */
-    void set(const void * p, size_t n)
-    {
-        auto g0 = granule(p), g1 = granule((const char *) p + n - 1);
-        for (auto i = g0 >> 6; i <= g1 >> 6; ++i) {
-            auto lo = i == g0 >> 6 ? g0 & 63 : 0, hi = i == g1 >> 6 ? g1 & 63 : 63;
-            w[i] |= ((uint64_t(2) << hi) - 1) & ~((uint64_t(1) << lo) - 1);
-        }
-    }
-};
-
-/* A depth-first walk of the young objects reachable from root values, each
-   entered once (`Visit::enter`), each pointer to one replaced by
-   `Visit::to`'s when `Visit::write`. Values are scanned whole, wide objects
-   (`wideEdges`) a pointer at a time, once the values found so far are done,
-   so that the worklists hold about one path's worth of entries, however
-   wide the objects on it.
-
-   A path can be as long as the job's memory allows, so the worklists hold
-   at most as many bytes as a bit map of the job's memory (`room`). An
-   object entered while they are full is deferred instead: a bit at its
-   first granule, in a bit map of its kind. Only values, Envs and Bindings
-   layers are ever deferred (a value is scanned only while its pointers
-   fit). Once the worklists are empty, the deferred objects are walked from
-   the maps in address order, each map swept on from where its last sweep
-   stopped; a map that holds nothing is not swept. The order changes
-   nothing: no pointer is rewritten twice, and nothing moves until every one
-   is. A walk made with `reserved` allocates nothing once made. */
-template<typename Visit>
-struct Walk
-{
-    Visit & visit;
-    std::vector<Value *> values;
-
-    struct Wide
-    {
-        void * p;
-        size_t next, end;
-        Obj kind;
-    };
-
-    std::vector<Wide> wides;
-    size_t room;
-
-    struct Deferred
-    {
-        std::optional<GranuleBits> bits;
-        size_t count = 0;
-        size_t next = 0;
-    };
-
-    /* Values, Envs, Bindings layers. */
-    Deferred deferred[3];
-
-    Walk(Visit & visit, bool reserved = false)
-        : visit(visit)
-        , room(std::max<size_t>(2, (size_t(evalRegion.cur - evalRegion.base) >> 10) * sizeof(uint64_t) / sizeof(Wide)))
-    {
-        if (reserved) {
-            values.reserve(room);
-            wides.reserve(room);
-            for (auto & d : deferred)
-                d.bits.emplace(evalRegion.base, evalRegion.cur);
-        }
-    }
-
-    bool full(size_t more = 1) const
-    {
-        return values.size() + wides.size() + more > room;
-    }
-
-    void defer(const void * p, Obj kind)
-    {
-        auto & d = deferred[kind == Obj::value ? 0 : kind == Obj::env ? 1 : 2];
-        assert(kind == Obj::value || kind == Obj::env || kind == Obj::bindings);
-        if (!d.bits)
-            d.bits.emplace(evalRegion.base, evalRegion.cur);
-        if (!d.bits->testAndSet(p))
-            d.count++;
-    }
-
-    /* Push the next deferred object; false if none. */
-    bool undefer()
-    {
-        for (size_t k = 0; k < 3; ++k) {
-            auto & d = deferred[k];
-            if (!d.count)
-                continue;
-            auto & b = *d.bits;
-            for (;; d.next = (d.next + 1) % b.words)
-                if (auto w = b.w[d.next]) {
-                    b.w[d.next] = w & (w - 1);
-                    d.count--;
-                    auto p = (char *) b.base + (((d.next << 6) + std::countr_zero(w)) << 4);
-                    if (k == 0)
-                        values.push_back((Value *) p);
-                    else {
-                        auto kind = k == 1 ? Obj::env : Obj::bindings;
-                        wides.push_back({p, 0, wideEdges(p, kind, 0), kind});
-                    }
-                    return true;
-                }
-        }
-        return false;
-    }
-
-    const void * edge(const void * p, Obj kind, size_t n)
-    {
-        if (!p || !evalRegion.contains(p))
-            return p;
-        if (visit.enter(p, kind, n)) {
-            if (kind == Obj::value) {
-                if (full())
-                    defer(p, kind);
-                else
-                    values.push_back((Value *) p);
-            } else if (auto end = wideEdges(p, kind, n)) {
-                if (full())
-                    defer(p, kind);
-                else
-                    wides.push_back({const_cast<void *>(p), 0, end, kind});
-            }
-        }
-        return visit.to(p);
-    }
-
-    void scan(Value & v)
-    {
-        visit.value(v);
-        auto e = [&](const void * p, Obj kind, size_t n) { return edge(p, kind, n); };
-        if constexpr (Visit::write)
-            valueEdges(v, e);
-        else
-            valueEdges(std::as_const(v), e);
-    }
-
-    /* Walk what `v`, a target's value, reaches. */
-    void root(Value & v)
-    {
-        scan(v);
-        drain();
-    }
-
-    /* Walk what `p`, a held object of `kind`, reaches; returns where it goes. */
-    const void * from(const void * p, Obj kind)
-    {
-        auto to = edge(p, kind, 0);
-        drain();
-        return to;
-    }
-
-    void drain()
-    {
-        for (;;) {
-            if (!values.empty()) {
-                auto next = values.back();
-                values.pop_back();
-                if (full(2))
-                    defer(next, Obj::value);
-                else
-                    scan(*next);
-            } else if (!wides.empty()) {
-                auto & w = wides.back();
-                auto p = w.p;
-                auto kind = w.kind;
-                auto i = w.next++;
-                if (w.next == w.end)
-                    wides.pop_back();
-                wideEdge<Visit::write>(
-                    p, kind, i, [&](const void * p, Obj kind, size_t n) { return edge(p, kind, n); });
-            } else if (!undefer())
-                break;
-        }
-    }
-};
 
 /* A failure that outlives its job may name one of the job's cells: an
    `InfiniteRecursionError` names the cell whose force found it blackholed,
@@ -927,143 +544,6 @@ static void forgetYoungCell(const Value::Failed & f)
     } catch (...) {
     }
 }
-
-/* Marking, for `Walk`: each object's granules into `marked`, and each
-   identity-bearing one (a value, a Bindings layer, an element array) to
-   `onMark`. A failure that it keeps forgets its young cell, and is
-   recorded if its recovery value is young. */
-template<typename F>
-struct Mark
-{
-    static constexpr bool write = false;
-    GranuleBits & marked;
-    F onMark;
-    size_t count = 0;
-    boost::unordered_flat_set<Value::Failed *> failures = {};
-
-    bool enter(const void * p, Obj kind, size_t n)
-    {
-        /* An object's first granule is marked exactly when the object is:
-           no other object has a byte in it. */
-        if (marked.test(p))
-            return false;
-        marked.set(p, objectBytes(p, kind, n));
-        count++;
-        if (kind == Obj::value || kind == Obj::bindings || kind == Obj::elems)
-            onMark(p);
-        return true;
-    }
-
-    const void * to(const void * p) const
-    {
-        return p;
-    }
-
-    void value(const Value & v)
-    {
-        if (v.isFailed()) {
-            forgetYoungCell(v.failed());
-            if (evalRegion.contains(v.failed().recoveryValue))
-                failures.insert(&v.failed());
-        }
-    }
-};
-
-/* Where compaction puts each byte of Evac(S), as marking found it
-   (`marked`, each object's granules): the region's base plus the bytes of
-   Evac(S) below it. When sliding would free no page (Evac(S) is a prefix of
-   the job's memory, or its holes are too small), nothing moves: the job
-   keeps the prefix, holes and all. */
-struct LiveMap
-{
-    const GranuleBits & marked;
-    /* Per word of `marked`, the live granules below it, if anything moves. */
-    std::vector<uint32_t> below;
-    bool prefix;
-    /* The granules the job keeps from its base. */
-    size_t kept;
-
-    LiveMap(const GranuleBits & marked)
-        : marked(marked)
-    {
-        size_t live = 0, end = 0;
-        for (size_t i = 0; i < marked.words; ++i)
-            if (auto w = marked.w[i]) {
-                live += std::popcount(w);
-                end = (i << 6) + std::bit_width(w);
-            }
-        auto floorPage = [&](size_t g) { return pageUp((char *) marked.base + (g << 4)); };
-        prefix = floorPage(live) == floorPage(end);
-        kept = prefix ? end : live;
-        if (prefix)
-            return;
-        below.resize(marked.words);
-        uint32_t m = 0;
-        for (size_t i = 0; i < marked.words; ++i) {
-            below[i] = m;
-            m += std::popcount(marked.w[i]);
-        }
-    }
-
-    /* Where the live byte at `p` goes. By the closure, a young pointer that
-       something kept holds names a byte of Evac(S); anything else is a bug
-       in the enumeration, fatal here, before any byte has moved. */
-    char * to(const void * p) const
-    {
-        auto g = marked.granule(p);
-        auto word = marked.w[g >> 6];
-        auto bit = uint64_t(1) << (g & 63);
-        if (!(word & bit)) [[unlikely]]
-            panic(fmt("unforce: compaction would forward %p, which is not in Evac(S)", p));
-        return (char *) marked.base + ((size_t(below[g >> 6]) + std::popcount(word & (bit - 1))) << 4)
-               + (uintptr_t(p) & 15);
-    }
-
-    /* Slide each run of live granules down to where `to` puts it, in
-       address order: each destination is at or below its source and above
-       every run moved already. Returns the top of what the job keeps. */
-    char * slide() const
-    {
-        auto base = (char *) marked.base;
-        if (!prefix)
-            for (size_t i = 0; i < marked.words; ++i)
-                for (auto w = marked.w[i]; w;) {
-                    unsigned s = std::countr_zero(w);
-                    unsigned len = std::countr_one(w >> s);
-                    auto from = base + (((i << 6) + s) << 4);
-                    memmove(to(from), from, size_t(len) << 4);
-                    w = s + len >= 64 ? 0 : w & ~(((uint64_t(1) << len) - 1) << s);
-                }
-        return base + (kept << 4);
-    }
-};
-
-/* Forwarding, for `Walk`: each object's pointers once (`visited`), each to
-   where `live` puts its object. */
-struct Forward
-{
-    static constexpr bool write = true;
-    const LiveMap & live;
-    GranuleBits visited;
-
-    Forward(const LiveMap & live)
-        : live(live)
-        , visited(evalRegion.base, evalRegion.cur)
-    {
-    }
-
-    bool enter(const void * p, Obj kind, size_t n)
-    {
-        return kind != Obj::string && !visited.testAndSet(p);
-    }
-
-    const void * to(const void * p) const
-    {
-        return live.to(p);
-    }
-
-    void value(Value & v) {}
-};
 
 /* ---------------------------------------------------------------------------
    The owner timeline.
@@ -1117,6 +597,19 @@ struct OpenForce
 };
 
 static std::vector<OpenForce> opens;
+
+/* Per log entry, when its force ended (`own`; the clock counts the ends of
+   forces that changed the owner), and when and where (the bump cursor) the
+   last force it owned ended (`last`, `at`). */
+struct EntryEnds
+{
+    uint64_t own = UINT64_MAX;
+    uint64_t last = 0;
+    char * at = nullptr;
+};
+
+static std::vector<EntryEnds> ends;
+static uint64_t forceClock = 0;
 
 /* Room for `more` pushes on `v`, growing it geometrically. */
 template<typename T>
@@ -1177,35 +670,32 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    keeps a young cell that re-forcing t builds again: two cells then stand
    for one of the evaluation without unforcing. So the promoted set S is
    closed under ownership: every young identity-bearing object (a cell, a
-   Bindings layer, an element array) that a promoted value reaches, Evac(S),
-   has its owner in S, or none. Then a reverted target, re-forced later,
-   rebuilds only cells that nothing kept.
+   Bindings layer, an element array) that a promoted value reaches has its
+   owner in S, or none. Then a reverted target, re-forced later, rebuilds
+   only cells that nothing kept.
 
-   Two lemmas make that exact. While t is being forced, the young cells it
-   owns are visible only to its own evaluation and to the forces of those
-   cells (no other cell's evaluation can reach them but through a cell's
-   value, and t has none yet). So if a promoted value reaches an object t
-   owns, t's value reaches it too: promoting t keeps nothing that its value
-   does not keep. The closure is computed by marking Evac(S) from the
-   promoted values and adding the owner of each object marked, until no
-   owner is added.
+   S is decided from records alone. While t is being forced, the young
+   cells it owns are visible only to its own evaluation and to the forces of
+   those cells (no other cell's evaluation can reach them but through a
+   cell's value, and t has none yet). So a value reaches t's young objects
+   only once t's force has ended, and what the forces a promoted target owns
+   (its own, and those of its young cells) leave reachable was allocated
+   before the last of them ended, below the bump cursor then, and reaches
+   only targets whose forces ended before then. Promoting those too, until
+   none is added, closes S under ownership without visiting anything. The
+   job keeps its memory below the highest cursor at the end of a force that
+   S owns, and frees the rest.
 
-   A job promotes the targets that an earlier job reverted, which are
-   evidently shared between jobs: reverting them again would only make each
-   job evaluate them anew. A failed target is reverted like any other: its
-   re-force throws the same error again, later and under other frames, so
-   that its trace may differ and its message may show more of what is
-   evaluated by then, which the exactness contract allows. What holders hold
-   (see unforce.hh) is marked as the promoted values are.
-
-   Evac(S) is then compacted in place (Lisp-2 sliding, as by the Compressor
-   or GHC's compacting collector): each of its objects moves down by the
-   bytes below it that are not in Evac(S), so that it ends up packed from
-   the region's base in allocation order, and the rest is freed. Before
-   anything moves, every pointer into Evac(S) is forwarded: the promoted
-   values' and those of Evac(S) itself, by a second walk from the same roots
-   through the same enumeration of pointers (`valueEdges`, `wideEdge`), each
-   object's once.
+   S starts from the nominated targets: those under whose force an effect
+   ran (`keep`); those an earlier job reverted, which are evidently shared
+   between jobs (reverting them again would only make each job evaluate
+   them anew); those a holder keeps; and the owners of the young objects
+   holders hold (see unforce.hh). A young object a holder holds that the
+   driver owns keeps the job whole. A failed target is not nominated: it is
+   reverted like any other, and its re-force throws the same error again,
+   later and under other frames, so that its trace may differ and its
+   message may show more of what is evaluated by then, which the exactness
+   contract allows.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
@@ -1230,8 +720,10 @@ struct Targets
 
 /* The holders alive (see unforce.hh), roots of a job's end besides the
    promoted values. Per thread: a holder's thread is the one that runs the
-   jobs it sees. */
+   jobs it sees. `jobHolders`: the open job's thread's, set at its opening,
+   so that a step's end reads no thread-local. */
 static thread_local std::vector<UnforceHolder *> holders;
+static std::vector<UnforceHolder *> * jobHolders = nullptr;
 
 UnforceHolder::UnforceHolder()
 {
@@ -1256,15 +748,19 @@ struct HeldRoot : UnforceHolder
     explicit HeldRoot(Value * v)
         : v(v)
     {
+        youngTop = v;
     }
 
     void held(Hold & hold) override
     {
         if (evalRegion.contains(v))
-            v = (Value *) hold(v, Kind::value);
+            hold(v, Kind::value);
     }
 
-    void ended() override {}
+    void ended() override
+    {
+        youngTop = nullptr;
+    }
 };
 
 } // namespace
@@ -1279,93 +775,324 @@ bool UnforceSeen::see(const void * p, Kind kind)
 {
     if (!insert(p).second)
         return false;
-    if (evalRegion.contains(p))
+    if (evalRegion.contains(p)) {
         young.emplace_back(p, kind);
+        youngTop = std::max(youngTop, (const void *) p, std::less<>());
+    }
     return true;
 }
 
 void UnforceSeen::held(Hold & hold)
 {
-    /* In address order: compaction keeps it, so no entry is rewritten to
-       the address of one not rewritten yet. */
-    std::ranges::sort(young);
     for (auto & [p, kind] : young)
-        if (auto to = hold(p, kind); to != p) {
-            auto node = extract(p);
-            node.value() = to;
-            insert(std::move(node));
-            p = to;
-        }
+        hold(p, kind);
 }
 
 void UnforceSeen::ended()
 {
     young.clear();
+    youngTop = nullptr;
 }
 
-/* A holder's pointers as roots of `walk`. */
-template<typename W>
-struct WalkHold : UnforceHolder::Hold
-{
-    W & walk;
+/* The young cells whose force failed in the open job, and whether one could
+   not be recorded (then the job is kept whole). Not nominations: a job's
+   end makes each failure it made forget the job's cells (`forgetYoungCell`),
+   as no walk tells which failures outlive it. */
+static std::vector<const Value *> youngFailures;
+static bool youngFailuresLost = false;
 
-    explicit WalkHold(W & walk)
-        : walk(walk)
+void unforceNoteFailure(const Value & v) noexcept
+{
+    if (!evalRegion.contains(&v))
+        return;
+    try {
+        youngFailures.push_back(&v);
+    } catch (std::bad_alloc &) {
+        youngFailuresLost = true;
+    }
+}
+
+namespace {
+
+/* A holder's young pointers, each nominating its owner's target, or, for
+   one that the driver owns, keeping the job whole. */
+struct OwnerHold : UnforceHolder::Hold
+{
+    const Targets & targets;
+    std::vector<bool> & promote;
+    bool driver = false;
+
+    OwnerHold(const Targets & targets, std::vector<bool> & promote)
+        : targets(targets)
+        , promote(promote)
     {
     }
 
-    const void * operator()(const void * p, UnforceHolder::Kind kind) override
+    void operator()(const void * p, UnforceHolder::Kind) override
     {
-        return walk.from(p, kind == UnforceHolder::Kind::value ? Obj::value : Obj::bindings);
+        if (!evalRegion.contains(p))
+            return;
+        if (auto o = ownerOf(p); o == noOwner)
+            driver = true;
+        else
+            promote[targets.ofEntry[o]] = true;
     }
 };
 
-/* Which targets the job promotes (see above), marking what their values
-   and the holders reach, Evac(S), into `evac`; `failures`: the failures in Evac(S) whose
-   recovery values are young. Returns whether Evac(S) holds anything. */
-static bool decide(
-    const std::vector<UnforceUndoEntry> & log,
-    const Targets & targets,
-    std::vector<bool> & promote,
-    GranuleBits & evac,
-    boost::unordered_flat_set<Value::Failed *> & failures)
+} // namespace
+
+/* Which targets the job promotes (see above), and the top of the memory it
+   keeps; null to keep it whole. No object is visited. */
+static char *
+keepPrefix(const std::vector<UnforceUndoEntry> & log, const Targets & targets, std::vector<bool> & promote)
 {
-    std::vector<uint32_t> pending;
-    /* An owner names a log entry: an entry is dropped only when no segment
-       has its label. */
-    auto targetOf = [&](uint32_t o) {
-        assert(o < log.size());
-        return targets.ofEntry[o];
-    };
-    auto nominate = [&](uint32_t t) {
-        if (!promote[t]) {
-            promote[t] = true;
-            pending.push_back(t);
-        }
-    };
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
         if (log[i].keep || (p.isThunk() && unforceIsReverted(p.thunk().expr))
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
-            nominate(targets.ofEntry[i]);
+            promote[targets.ofEntry[i]] = true;
     }
-
-    /* The closure, from what the holders hold too. */
-    auto mark = Mark{evac, [&](const void * p) {
-                         if (auto o = ownerOf(p); o != noOwner)
-                             nominate(targetOf(o));
-                     }};
-    Walk walk{mark};
-    WalkHold hold{walk};
+    OwnerHold hold{targets, promote};
     for (auto h : holders)
         h->held(hold);
-    while (!pending.empty()) {
-        auto t = pending.back();
-        pending.pop_back();
-        walk.root(*targets.cells[t]);
+    if (hold.driver)
+        return nullptr;
+
+    std::vector<EntryEnds> per(targets.cells.size(), EntryEnds{0, 0, nullptr});
+    for (size_t i = 0; i < log.size(); ++i) {
+        auto & e = per[targets.ofEntry[i]];
+        e.own = std::max(e.own, ends[i].own);
+        e.last = std::max(e.last, ends[i].last);
+        e.at = std::max(e.at, ends[i].at);
     }
-    failures = std::move(mark.failures);
-    return mark.count;
+    uint64_t horizon = 0;
+    char * top = evalRegion.base;
+    auto add = [&](size_t t) {
+        if (per[t].own == UINT64_MAX)
+            top = evalRegion.cur;
+        horizon = std::max({horizon, per[t].own == UINT64_MAX ? 0 : per[t].own, per[t].last});
+        top = std::max(top, per[t].at);
+    };
+    for (size_t t = 0; t < promote.size(); ++t)
+        if (promote[t])
+            add(t);
+    /* The time closure, in the order the targets' forces ended. */
+    std::vector<uint32_t> order(per.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::ranges::sort(order, {}, [&](auto t) { return per[t].own; });
+    for (auto t : order) {
+        if (per[t].own > horizon)
+            break;
+        if (!promote[t]) {
+            promote[t] = true;
+            add(t);
+        }
+    }
+    /* Nothing live lies above the cursor. */
+    return std::min(top, evalRegion.cur);
+}
+
+/* ---------------------------------------------------------------------------
+   Steps.
+
+   A loop's steps (`UnforceSteps`) free their memory inside a job, by
+   records, without a walk or a move. A step's memory is what the bump
+   cursor passed during it, [start, cur). Nothing allocated before the step
+   points into it unless the step wrote it, and the step writes a cell
+   outside its memory only by forcing it, or as the cell its value goes to.
+   So once the step's call has returned, a pointer into its memory can only
+   be in:
+   - the step's value, in a cell outside its memory (`UnforceSteps::cell`);
+   - a cell logged during the step (an old cell): its value or pre-image;
+   - a young cell below `start`, or a slot of a frame outside the step (the
+     loop's and its callers'), forced during the step (`stepWrites`);
+   - a holder (`youngTop`), a young failure recorded during the step, or
+     what native code holds.
+   The step's end looks at the own pointers of each (`valueEdges`), not
+   further: what they point to outside the step's memory was allocated
+   before it, and points into it only if the step wrote it, which is a
+   record above. A failed value is taken to point into it. If none does,
+   the cursor goes back to `start`, the memory is zeroed, and the owner
+   timeline is cut back to `start`.
+
+   This rests on the step writing its own value's cell once, at its end, by
+   copy: no evaluation keeps the address of the cell its result goes to
+   (`callFunction` evaluates into a local and copies).
+
+   The cell the next step writes lies outside that step's memory: a cell
+   allocated before it starts, or the cell that an earlier step read
+   (`spare`) once that step's memory was freed, or was empty at its end,
+   and no record points to the cell, so that nothing reads it any more. A
+   step's memory is empty at its end if it allocated nothing, or if inner
+   steps freed all it allocated. Such a step goes through the same checks:
+   none can find a pointer into its memory, but each looks for one to that
+   cell, which its value may hold (`[ a ]` in an inner `foldl'`).
+   --------------------------------------------------------------------------- */
+
+namespace {
+
+struct StepFrame
+{
+    char * start = nullptr;
+    /* The loop's frame: slots at or above it are outside the steps. */
+    const char * sp = nullptr;
+    /* At the step's start: the sizes of `stepWrites`, the log, the young
+       failures and `opens`; the owner; the job. */
+    size_t writes = 0, log = 0, failures = 0, opens = 0;
+    uint32_t owner = noOwner;
+    uint64_t job = 0;
+    /* The cell the step writes, the one the step before wrote (this step's
+       argument), whether each is the loop's own (`cell` allocated it), and
+       a cell of the loop's that nothing reads. */
+    Value * cur = nullptr;
+    Value * prev = nullptr;
+    bool curOwn = false, prevOwn = false;
+    Value * spare = nullptr;
+};
+
+} // namespace
+
+/* Plain statics, like `segments` and `opens`: steps open only in a job
+   (`begin`), and only its owner's thread forces in it (`logPreImageSlow` runs
+   while `isolationDepth` is set, which only the job's owner has), so no other
+   thread touches them; a thread-local here cost a `__tls_get_addr` call per
+   access from libnixexpr.so, several per step and per force. */
+static std::vector<StepFrame> stepFrames;
+static std::vector<Value *> stepWrites;
+
+/* Whether `p` lies outside the memory and the frames of step frame `f`. */
+static bool outsideStep(const void * p, const StepFrame & f)
+{
+    return evalRegion.contains(p) ? (const char *) p < f.start : (const char *) p >= f.sp;
+}
+
+/* A force of `v` starts while a step runs: record it if `v` lies outside
+   the step's memory and frames, and is no old cell (which is logged). */
+static void noteStepWrite(Value & v)
+{
+    auto & f = stepFrames.back();
+    auto p = (const char *) &v;
+    if (evalRegion.contains(p) ? p < f.start : p >= f.sp && p >= jobStackLow && p < jobStackMark) {
+        roomFor(stepWrites, 1);
+        stepWrites.push_back(&v);
+    }
+}
+
+/* Drop the writes recorded since `f`'s step started that lie inside the
+   frame around it, or all of them if none. */
+static void dropStepWrites(const StepFrame & f)
+{
+    auto up = stepFrames.size() > 1 ? &stepFrames.end()[-2] : nullptr;
+    stepWrites.erase(
+        std::remove_if(
+            stepWrites.begin() + f.writes, stepWrites.end(), [&](auto w) { return !up || !outsideStep(w, *up); }),
+        stepWrites.end());
+}
+
+bool UnforceSteps::begin()
+{
+    if (jobOwner.load() != &state || evalRegion.paused)
+        return false;
+    roomFor(stepFrames, 1);
+    StepFrame f;
+    f.sp = (const char *) __builtin_dwarf_cfa();
+    f.start = evalRegion.cur;
+    f.writes = stepWrites.size();
+    f.job = unforceStats.jobs;
+    stepFrames.push_back(f);
+    return true;
+}
+
+Value * UnforceSteps::cellSlow(Value * given)
+{
+    auto & f = stepFrames.back();
+    if (f.job != unforceStats.jobs)
+        f.spare = nullptr;
+    auto c = given;
+    if (!c) {
+        if (f.spare) {
+            c = f.spare;
+            f.spare = nullptr;
+        } else
+            c = state.allocValue();
+    }
+    f.cur = c;
+    f.curOwn = !given;
+    /* The step starts here. */
+    f.start = evalRegion.cur;
+    f.writes = stepWrites.size();
+    f.log = state.undoLog.size();
+    f.failures = youngFailures.size();
+    f.opens = opens.size();
+    f.owner = curOwner;
+    f.job = unforceStats.jobs;
+    return c;
+}
+
+void UnforceSteps::stepSlow(Value * v)
+{
+    auto & f = stepFrames.back();
+    auto top = evalRegion.cur;
+    /* Whether the step's argument, the loop's own cell, may be written by
+       a later step: nothing it leaves points to it. `escapes` clears it as
+       it looks; it is read only when no check below stopped the step, so
+       that every check has run in full. */
+    bool spare = f.prevOwn;
+    auto escapes = [&](const Value & x) {
+        if (x.isFailed())
+            return true;
+        bool into = false;
+        valueEdges(x, [&](const void * p) {
+            into = into || ((const char *) p >= f.start && (const char *) p < top);
+            spare = spare && p != f.prev;
+        });
+        return into;
+    };
+    /* An empty step (the cursor is back at its start: it allocated nothing,
+       or inner steps freed all it allocated) goes through the same checks:
+       only whether its argument's cell may be reused depends on them. */
+    bool kept = f.job != unforceStats.jobs || jobOwner.load() != &state || evalRegion.paused || youngFailuresLost
+                || youngFailures.size() != f.failures || opens.size() != f.opens || curOwner != f.owner || stepsUnsafe
+                || unforceNativeCode(state)
+                || std::ranges::any_of(*jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, f.start); })
+                || escapes(*v)
+                || std::any_of(
+                    state.undoLog.begin() + f.log,
+                    state.undoLog.end(),
+                    [&](auto & e) { return escapes(*e.target) || escapes(e.preImage); })
+                || std::any_of(stepWrites.begin() + f.writes, stepWrites.end(), [&](auto w) { return escapes(*w); });
+    if (!kept && top > f.start) {
+        /* Free the step's memory. */
+        jobTop = std::max(jobTop, top);
+        memset(f.start, 0, top - f.start);
+#if NIX_ASAN_ENABLED
+        ASAN_POISON_MEMORY_REGION(f.start, top - f.start);
+#endif
+        evalRegion.cur = f.start;
+        if (openSeg > f.start) {
+            while (!segments.empty() && segStart(segments.back()) >= f.start)
+                segments.pop_back();
+            openSeg = f.start;
+            if (!segments.empty() && segments.back().owner == curOwner) {
+                openSeg = segStart(segments.back());
+                segments.pop_back();
+            }
+        }
+        unforceStats.stepEnds++;
+        unforceStats.stepBytesFreed += top - f.start;
+    }
+    if (!kept && spare
+        && std::ranges::none_of(*jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, f.prev); }))
+        f.spare = f.prev;
+    f.prev = f.cur;
+    f.prevOwn = f.curOwn;
+    dropStepWrites(f);
+}
+
+void UnforceSteps::end()
+{
+    dropStepWrites(stepFrames.back());
+    stepFrames.pop_back();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1490,7 +1217,7 @@ bool unforceNoteLookupPathHook(const EvalSettings & settings, const std::string 
     /* What the hook allocates, or keeps of what it reaches in the job, would
        be freed with the job's region. */
     if (jobOwner.load())
-        keepWhole = true;
+        keepWhole = stepsUnsafe = true;
     return true;
 }
 
@@ -1616,7 +1343,10 @@ void EvalState::beginUnforceScope(const void * stackMark)
     jobStackMark = (const char *) (stackMark ? stackMark : __builtin_dwarf_cfa());
     /* On a stack other than the thread's (a coroutine's), or one that is
        not known, the frames entered during the job cannot be told apart. */
-    keepWhole = !(jobStackMark > threadStack.first && size_t(jobStackMark - threadStack.first) <= threadStack.second);
+    auto & stack = threadStack();
+    jobStackLow = stack.low;
+    jobHolders = &holders;
+    keepWhole = stepsUnsafe = !(jobStackMark > stack.low && size_t(jobStackMark - stack.low) <= stack.size);
     try {
         openRegion();
         openSeg = evalRegion.base;
@@ -1624,7 +1354,7 @@ void EvalState::beginUnforceScope(const void * stackMark)
         /* Memory for the job could not be mapped: no job is open. */
         if (evalRegion.base)
             closeRegion(evalRegion.base);
-        keepWhole = false;
+        keepWhole = stepsUnsafe = false;
         isolationDepth = 0;
         jobOwner = nullptr;
         throw;
@@ -1643,45 +1373,51 @@ void EvalState::endUnforceJob(const char * ender)
     /* A job during which native code came to be able to run is kept whole,
        and so is one that logged a slot of a frame that has returned since
        (between the job's opener and `ender`), which must be neither read
-       nor written. */
-    bool keep = keepWhole || !evalRegion.base || unforceNativeCode(*this)
+       nor written, and one that could not record a young failure. */
+    bool keep = keepWhole || youngFailuresLost || !evalRegion.base || unforceNativeCode(*this)
                 || std::any_of(undoLog.begin(), undoLog.end(), [&](auto & e) {
                        return (const char *) e.target >= jobStackMark && (const char *) e.target < ender;
                    });
+    /* No walk tells which of the failures the job made outlive it: one whose
+       recovery value (only an interrupted or a recoverable failure has one)
+       is young keeps the job whole. */
+    auto youngRecovery = [](const Value * v) {
+        return v->isFailed() && evalRegion.contains(v->failed().recoveryValue);
+    };
+    keep = keep || std::ranges::any_of(undoLog, [&](auto & e) { return youngRecovery(e.target); })
+           || std::ranges::any_of(youngFailures, youngRecovery);
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is
        written, or keeps its value (no `target`). Everything that may fail to
        allocate is done before anything is written. */
-    std::vector<Value *> promoted;
-    std::optional<GranuleBits> evac;
-    boost::unordered_flat_set<Value::Failed *> failures;
-    std::optional<LiveMap> live;
-    std::optional<Forward> forward;
-    std::optional<Walk<Forward>> walk;
+    size_t promoted = 0;
+    /* The top of what the job keeps. */
+    char * keptTo = nullptr;
     if (!keep) {
         PauseRegion pause;
         try {
             Targets targets(undoLog);
             std::vector<bool> promote(targets.cells.size());
-            evac.emplace(evalRegion.base, evalRegion.cur);
-            if (!decide(undoLog, targets, promote, *evac, failures))
-                evac.reset();
-            for (size_t i = 0; i < undoLog.size(); ++i) {
-                auto & e = undoLog[i];
-                if (youngFree(*e.target) || promote[targets.ofEntry[i]])
-                    e.target = nullptr;
-                else
-                    e.preImage = reforcePreImage(*this, e.preImage, e.pos, *e.target);
-            }
-            if (evac) {
-                for (size_t t = 0; t < targets.cells.size(); ++t)
-                    if (promote[t])
-                        promoted.push_back(targets.cells[t]);
-                live.emplace(*evac);
-                if (!live->prefix) {
-                    forward.emplace(*live);
-                    walk.emplace(*forward, true);
+            keptTo = keepPrefix(undoLog, targets, promote);
+            /* Null: a holder holds what the driver allocated in the job. */
+            if (!keptTo)
+                keep = true;
+            else {
+                /* Each failure the job made forgets the job's cells. */
+                for (auto & e : undoLog)
+                    if (e.target->isFailed())
+                        forgetYoungCell(e.target->failed());
+                for (auto x : youngFailures)
+                    if (x->isFailed())
+                        forgetYoungCell(x->failed());
+                for (size_t i = 0; i < undoLog.size(); ++i) {
+                    auto & e = undoLog[i];
+                    if (youngFree(*e.target) || promote[targets.ofEntry[i]])
+                        e.target = nullptr;
+                    else
+                        e.preImage = reforcePreImage(*this, e.preImage, e.pos, *e.target);
                 }
+                promoted = std::ranges::count(promote, true);
             }
         } catch (std::bad_alloc &) {
             keep = true;
@@ -1698,37 +1434,32 @@ void EvalState::endUnforceJob(const char * ender)
                 *i->target = i->preImage;
                 unforceStats.cellsReverted++;
             }
-        unforceStats.cellsPromoted += promoted.size();
-        /* Forward every pointer into Evac(S); nothing has moved yet. */
-        if (walk) {
-            for (auto t : promoted)
-                walk->root(*t);
-            WalkHold hold{*walk};
-            for (auto h : holders)
-                h->held(hold);
-            for (auto f : failures)
-                f->recoveryValue = (Value *) live->to(f->recoveryValue);
-        }
+        unforceStats.cellsPromoted += promoted;
     }
     for (auto h : holders)
         h->ended();
     undoLog.clear();
     undoLog.shrink_to_fit();
+    decltype(ends)().swap(ends);
     decltype(segments)().swap(segments);
     decltype(opens)().swap(opens);
+    decltype(youngFailures)().swap(youngFailures);
+    youngFailuresLost = false;
     curOwner = noOwner;
     if (evalRegion.base) {
-        auto top = keep ? evalRegion.cur : live ? live->slide() : evalRegion.base;
+        auto top = keep ? evalRegion.cur : keptTo;
         unforceStats.bytesKept += top - evalRegion.base;
         unforceStats.bytesFreed += evalRegion.cur - top;
         closeRegion(top);
     }
-    keepWhole = false;
+    keepWhole = stepsUnsafe = false;
     jobOwner = nullptr;
 }
 
 void EvalState::logPreImageSlow(Value & v, PosIdx pos)
 {
+    if (!stepFrames.empty()) [[unlikely]]
+        noteStepWrite(v);
     auto p = (const char *) &v;
     /* A young cell is freed with the region, or kept with it, and is its
        owner's while it is forced. */
@@ -1746,10 +1477,12 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
         return;
     assert(undoLog.size() < noOwner);
     roomFor(undoLog, 1);
+    roomFor(ends, 1);
     roomFor(segments, opens.size() + 2);
     roomFor(opens, 1);
     auto entry = uint32_t(undoLog.size());
     undoLog.push_back({&v, pos, false, v});
+    ends.emplace_back();
     openForce(v, entry, entry);
 }
 
@@ -1769,13 +1502,23 @@ void EvalState::endLoggedForceSlow(Value & v, bool completed)
         if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs
             && youngFree(v)) {
             undoLog.pop_back();
+            ends.pop_back();
             curOwner = f.saved;
             if (!segments.empty() && segments.back().owner == f.saved) {
                 openSeg = segStart(segments.back());
                 segments.pop_back();
             }
-        } else
+        } else {
+            /* The clock of these ends, and what each target owned last. */
+            auto t = ++forceClock;
+            if (curOwner != noOwner) {
+                ends[curOwner].last = t;
+                ends[curOwner].at = std::max(ends[curOwner].at, evalRegion.cur);
+            }
+            if (f.entry != noOwner)
+                ends[f.entry].own = t;
             setOwner(f.saved);
+        }
     }
 }
 

@@ -126,33 +126,6 @@ public:
         return numAttrsInChain;
     }
 
-    /* This layer's own attributes and the layer below it, for unforcing,
-       which tells what a Bindings points to and moves it. */
-    size_type layerSize() const
-    {
-        return numAttrs;
-    }
-
-    const Bindings * layerBase() const
-    {
-        return baseLayer;
-    }
-
-    Value * layerValue(size_type i) const
-    {
-        return attrs[i].value;
-    }
-
-    void setLayerBase(const Bindings * b)
-    {
-        baseLayer = b;
-    }
-
-    void setLayerValue(size_type i, Value * v)
-    {
-        attrs[i].value = v;
-    }
-
     bool empty() const
     {
         return size() == 0;

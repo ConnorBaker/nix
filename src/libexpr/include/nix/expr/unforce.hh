@@ -36,6 +36,12 @@ struct PauseRegion
 };
 
 /**
+ * `v`'s force just failed in an open scope: recorded, so that the job's end
+ * makes the failure forget the job's cells.
+ */
+[[gnu::noinline, gnu::cold]] void unforceNoteFailure(const Value & v) noexcept;
+
+/**
  * An effect that running again could give another result (a download, a
  * copy that nothing remembers, a build) is about to run: the open job, if
  * any, keeps the value of the cell whose re-force would run it again.
@@ -47,8 +53,7 @@ void unforceKeepJob();
 
 /**
  * `allocRootValue` of `v`, in the open job's memory: while the root lives,
- * the job's end keeps what it points to (an `UnforceHolder`), and it points
- * to where that moves.
+ * the job's end keeps what it points to (an `UnforceHolder`).
  */
 RootValue unforceHeldRoot(Value * v);
 
@@ -57,7 +62,7 @@ RootValue unforceHeldRoot(Value * v);
  * printer's set of the containers it has printed, the derivations that
  * `getDerivations` found). While it is registered (from its construction to
  * its destruction), a job's end keeps what it points to, as it keeps what a
- * promoted value reaches, and rewrites its pointers to where that moves.
+ * promoted value reaches.
  */
 class UnforceHolder
 {
@@ -67,8 +72,8 @@ public:
     struct Hold
     {
         virtual ~Hold();
-        /** Keep `p`, a `Value *` or a `Bindings *`; returns where it is from now on. */
-        virtual const void * operator()(const void * p, Kind kind) = 0;
+        /** Keep `p`, a `Value *` or a `Bindings *`. */
+        virtual void operator()(const void * p, Kind kind) = 0;
     };
 
     UnforceHolder();
@@ -78,13 +83,18 @@ public:
 
     /**
      * At a job's end: pass each pointer into the job's memory that this
-     * holds to `hold`, and store what it returns. Called once, and once more
-     * if anything moves; then `ended`. Allocates nothing.
+     * holds to `hold`; then `ended`. Allocates nothing.
      */
     virtual void held(Hold & hold) = 0;
 
     /** A job ended: nothing this holds is in a job's memory any more. */
     virtual void ended() = 0;
+
+    /**
+     * The highest address in the open job's memory that this holds, or
+     * null: a loop's step does not free memory at or below it.
+     */
+    const void * youngTop = nullptr;
 
     /**
      * At a job's end: whether `cell`, older than the job, which forced it,
@@ -158,6 +168,56 @@ public:
         unforceElementStart();
 }
 
+/**
+ * The steps of a primop's loop that hands a value on from step to step
+ * (`foldl'`'s accumulator). Between steps the loop holds nothing that its
+ * steps allocated but the cell it hands on, which it takes from `cell`,
+ * outside the step's memory. In a job, a step's end frees the step's memory
+ * when no record shows a pointer into it (see unforce.cc).
+ */
+class UnforceSteps
+{
+    EvalState & state;
+    bool open;
+
+    [[gnu::noinline]] bool begin();
+    [[gnu::noinline]] Value * cellSlow(Value * given);
+    [[gnu::noinline]] void stepSlow(Value * v);
+    [[gnu::noinline]] void end();
+
+public:
+    [[gnu::always_inline]] explicit UnforceSteps(EvalState & state)
+        : state(state)
+        , open(!NIX_USE_BOEHMGC && evalRegion.base && begin())
+    {
+    }
+
+    [[gnu::always_inline]] ~UnforceSteps()
+    {
+        if (open) [[unlikely]]
+            end();
+    }
+
+    UnforceSteps(const UnforceSteps &) = delete;
+    UnforceSteps & operator=(const UnforceSteps &) = delete;
+
+    /**
+     * The cell a step writes its value to: `given`, or else a new one. The
+     * step starts once it is returned.
+     */
+    [[gnu::always_inline]] Value * cell(Value * given)
+    {
+        return open ? cellSlow(given) : given ? given : state.allocValue();
+    }
+
+    /** A step ended, its value in `v`, the cell `cell` returned. */
+    [[gnu::always_inline]] void step(Value * v)
+    {
+        if (open) [[unlikely]]
+            stepSlow(v);
+    }
+};
+
 /** Whether a thunk of `expr` is a cell that unforcing reverted. */
 bool unforceIsReverted(const Expr * expr);
 
@@ -171,6 +231,7 @@ extern bool unforceAnyReverted;
 struct UnforceStats
 {
     uint64_t jobs = 0, jobsKeptWhole = 0, cellsReverted = 0, cellsPromoted = 0, bytesKept = 0, bytesFreed = 0;
+    uint64_t stepEnds = 0, stepBytesFreed = 0;
 };
 
 extern UnforceStats unforceStats;

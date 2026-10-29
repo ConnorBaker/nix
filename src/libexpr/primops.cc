@@ -4164,10 +4164,12 @@ static void prim_foldlStrict(EvalState & state, CallSite callSite, Value * const
         Value * vCur = args[1];
 
         auto listView = args[2]->listView();
+        UnforceSteps steps(state);
         for (auto [n, elem] : enumerate(listView)) {
             auto vs = std::to_array({vCur, elem});
-            vCur = n == args[2]->listSize() - 1 ? &v : state.allocValue();
+            vCur = steps.cell(n == args[2]->listSize() - 1 ? &v : nullptr);
             state.callFunction(*args[0], vs, *vCur, noPos);
+            steps.step(vCur);
         }
         state.forceValue(v, noPos);
     } else {

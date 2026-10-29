@@ -48,10 +48,20 @@ nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2>
 [[ $(grep '^trace: ' "$TEST_ROOT/err" | sort -u) == 'trace: s' ]]
 
 # An effect, here a filtered copy, which nothing remembers, keeps the cell
-# whose evaluation ran it: the job is not kept whole.
-mkdir -p "$TEST_ROOT/src"
-echo a > "$TEST_ROOT/src/a"
-jobsOf nix eval --expr "{ p = builtins.path { path = $TEST_ROOT/src; filter = _: _: true; }; q = { x = 1; }; }" > /dev/null
+# whose evaluation ran it: a later element that reads the cell does not run
+# it again (the filter traces once per file, as when one element reads it),
+# and the job is not kept whole.
+for d in src src2; do
+    mkdir -p "$TEST_ROOT/$d"
+    for f in a b c d e; do echo "$d $f" > "$TEST_ROOT/$d/$f"; done
+done
+copy() {
+    echo "let p = builtins.path { path = $TEST_ROOT/$1; filter = _: _: builtins.trace \"f\" true; }; in"
+}
+nix eval --impure --expr "$(copy src2) { a = builtins.seq p 1; }" 2> "$TEST_ROOT/err1" > /dev/null
+jobsOf nix eval --impure --expr "$(copy src) { a = builtins.seq p 1; b = builtins.seq p 2; q = { x = 1; }; }" 2> "$TEST_ROOT/err" > /dev/null
+[[ $(grep -c '^trace: f$' "$TEST_ROOT/err") == $(grep -c '^trace: f$' "$TEST_ROOT/err1") ]]
+grepQuiet '^trace: f$' "$TEST_ROOT/err"
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 0 ]]
 fi

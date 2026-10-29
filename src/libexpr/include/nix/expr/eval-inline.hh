@@ -99,10 +99,8 @@ Env & EvalMemory::allocEnv(size_t size)
         GC_NEXT(p) = nullptr;
         env = (Env *) p;
     } else
-        env = (Env *) allocBytes<Value *, sizeof(Env)>(size);
-#else
-    env = (Env *) evalCallocEnv(size);
 #endif
+        env = (Env *) allocBytes<Value *, sizeof(Env)>(size);
 
     /* We assume that env->values has been cleared by the allocator; maybeThunk() and lookupVar fromWith expect this. */
 

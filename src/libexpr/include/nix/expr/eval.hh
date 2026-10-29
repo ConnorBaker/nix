@@ -399,12 +399,6 @@ extern EvalRegion evalRegion;
  * inlined, have the frames they have without unforcing.
  */
 [[gnu::noinline]] void * evalCalloc(size_t n);
-
-/**
- * A zeroed `Env` of `size` values, in the open job's region (its size
- * recorded) while there is one. Out of line, as `evalCalloc`.
- */
-[[gnu::noinline]] void * evalCallocEnv(size_t size);
 #endif
 
 /**
@@ -1101,6 +1095,7 @@ private:
     size_t callDepth = 0;
 
     friend void unforceNoteEffect(EvalState & state);
+    friend class UnforceSteps;
 
     std::vector<UnforceUndoEntry> undoLog;
     /** The open unforce scopes; the outermost is a job. */

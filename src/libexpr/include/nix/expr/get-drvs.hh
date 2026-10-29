@@ -34,7 +34,7 @@ private:
 
     const Bindings *attrs = nullptr, *meta = nullptr;
 
-    /* Rewrites `attrs` where an unforce job's end moves it. */
+    /* Holds `attrs` across an unforce job's end. */
     friend struct DerivationsSeen;
 
     const Bindings * getMeta();

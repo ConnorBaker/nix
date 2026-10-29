@@ -349,8 +349,10 @@ struct DerivationsSeen : UnforceSeen
        it. Out of line, out of the walk's frames. */
     [[gnu::noinline]] void noteFound(PackageInfos & drvs)
     {
-        if (evalRegion.contains(drvs.back().attrs))
+        if (evalRegion.contains(drvs.back().attrs)) {
             found.push_back(&drvs.back());
+            youngTop = std::max(youngTop, (const void *) drvs.back().attrs, std::less<>());
+        }
     }
 };
 
@@ -358,7 +360,7 @@ void DerivationsSeen::held(Hold & hold)
 {
     UnforceSeen::held(hold);
     for (auto drv : found)
-        drv->attrs = (const Bindings *) hold(drv->attrs, Kind::bindings);
+        hold(drv->attrs, Kind::bindings);
 }
 
 typedef DerivationsSeen Done;

@@ -7,6 +7,7 @@
 #include "nix/expr/unforce.hh"
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/value-to-xml.hh"
+#include "nix/util/signals.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
 
@@ -221,29 +222,6 @@ TEST_F(UnforceTest, promotesOwner)
     EXPECT_EQ(*root, b->listView()[1]);
 }
 
-/* A promoted value keeps what it reaches, moved down over what the job
-   freed (`junk`), and later jobs reuse the memory freed. */
-TEST_F(UnforceTest, compactsPromoted)
-{
-    auto v = oldThunk(
-        "let junk = builtins.genList (x: { inherit x; }) 100; in { a = builtins.length (builtins.deepSeq junk junk); b = [ 1 2 3 ]; }");
-    for (int i = 0; i < 2; ++i) {
-        state.beginUnforceScope();
-        state.forceValue(*v, noPos);
-        state.forceValue(*v->attrs()->get(createSymbol("a"))->value, noPos);
-        state.forceValueDeep(*v->attrs()->get(createSymbol("b"))->value);
-        state.endUnforceScope();
-    }
-    ASSERT_EQ(v->type(), nAttrs);
-    for (int i = 0; i < 3; ++i) {
-        auto w = oldThunk("builtins.genList (x: { y = x; }) 200");
-        state.beginUnforceScope();
-        state.forceValueDeep(*w);
-        state.endUnforceScope();
-    }
-    EXPECT_EQ(deep(*v), "{ a = 100; b = [ 1 2 3 ]; }");
-}
-
 /* A cell whose value's young cell is forced after its force ended is
    reverted like any other: its re-force builds that cell again, unforced. */
 TEST_F(UnforceTest, revertsConsumedOwner)
@@ -257,24 +235,25 @@ TEST_F(UnforceTest, revertsConsumedOwner)
     EXPECT_EQ(deep(*v), "{ a = 2; }");
 }
 
-/* A seen set keeps the containers it holds, moved by the job's end, so
-   that one seen again in a later job is found. */
+/* A seen set keeps the containers it holds, where they are (nothing moves),
+   so that one seen again in a later job is found. */
 TEST_F(UnforceTest, seenHoldsContainers)
 {
-    auto v = oldThunk(
-        "let s = builtins.seq (builtins.length (builtins.genList (x: { inherit x; }) 100)) { x = 1; }; in { a = s; b = s; }");
+    auto v = oldThunk("let s = { x = 1; }; in { a = s; b = s; }");
+    auto junk = oldThunk("builtins.genList (x: { inherit x; }) 100");
     state.forceValue(*v, noPos);
     auto a = v->attrs()->get(createSymbol("a"))->value;
     auto b = v->attrs()->get(createSymbol("b"))->value;
     UnforceSeen seen;
     state.beginUnforceScope();
+    state.forceValue(*junk, noPos);
     state.forceValue(*a, noPos);
     auto first = a->attrs();
     EXPECT_TRUE(seen.see(first, UnforceHolder::Kind::bindings));
     state.endUnforceScope();
     state.beginUnforceScope();
     state.forceValue(*b, noPos);
-    EXPECT_NE(b->attrs(), first);
+    EXPECT_EQ(b->attrs(), first);
     EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
     state.endUnforceScope();
     EXPECT_EQ(deep(*b), "{ x = 1; }");
@@ -406,9 +385,14 @@ TEST_F(UnforceTest, lookupPathHookKeepsJob)
     evalSettings.lookupPathHooks.insert_or_assign(
         "unforce-test", [](EvalState &, std::string_view) -> std::optional<SourcePath> { return std::nullopt; });
     auto v = oldThunk("{ a = 1; }");
+    auto r = oldThunk("builtins.foldl' (acc: i: acc + builtins.length (builtins.genList (j: j) 20)) 0 [ 1 2 3 ]");
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
     EXPECT_TRUE(unforceNoteLookupPathHook(evalSettings, "unforce-test"));
+    /* Nor does a loop's step free anything from then on. */
+    auto ends = unforceStats.stepEnds;
+    state.forceValue(*r, noPos);
+    EXPECT_EQ(unforceStats.stepEnds, ends);
     state.endUnforceScope();
     EXPECT_FALSE(v->isThunk());
 }
@@ -480,13 +464,10 @@ TEST_F(UnforceTest, poisonsFreed)
 #  endif
 
 /* A job does not run without its region: where none can be mapped, opening
-   the job runs out of memory, and leaves no job open. A job first maps all
-   it needs but the region, which the next job maps again. */
+   the job runs out of memory, and leaves no job open. */
 TEST_F(UnforceTest, unmappableRegionThrows)
 {
     auto v = oldThunk("{ a = 1; }");
-    state.beginUnforceScope();
-    state.endUnforceScope();
     {
         FailMapping fail;
         EXPECT_THROW(state.beginUnforceScope(), std::bad_alloc);
@@ -502,13 +483,339 @@ TEST_F(UnforceTest, unmappableRegionThrows)
 TEST_F(UnforceTest, unmappableRegionNotSwallowed)
 {
     auto v = oldThunk("{ a = 1; }");
-    state.beginUnforceScope();
-    state.endUnforceScope();
     state.forceValue(*v, noPos);
     FailMapping fail;
     std::ostringstream out;
     UnforceJobs jobs(state, v);
     EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
+}
+
+/* The cut is where the last force a promoted target owns ended. `before`
+   ended earlier, so the time closure promotes it; `after` ended later, so
+   it is reverted and its memory freed, which a later job allocates again
+   zeroed, as all memory is. */
+TEST_F(UnforceTest, timeClosure)
+{
+    auto before = oldThunk("{ x = 1; }");
+    auto held = oldThunk("{ y = 2; }");
+    auto after = oldThunk("builtins.genList (i: { inherit i; }) 100");
+    UnforceSeen seen;
+    auto freed = unforceStats.bytesFreed;
+    state.beginUnforceScope();
+    state.forceValue(*before, noPos);
+    state.forceValue(*held, noPos);
+    EXPECT_TRUE(seen.see(held->attrs(), UnforceHolder::Kind::bindings));
+    state.forceValue(*after, noPos);
+    state.endUnforceScope();
+    EXPECT_FALSE(before->isThunk());
+    EXPECT_FALSE(held->isThunk());
+    EXPECT_TRUE(after->isThunk());
+    freed = unforceStats.bytesFreed - freed;
+    ASSERT_GT(freed, 0u);
+    state.beginUnforceScope();
+    auto p = (const char *) state.mem.allocBytes(freed);
+    EXPECT_TRUE(std::all_of(p, p + freed, [](char c) { return c == 0; }));
+    state.endUnforceScope();
+    EXPECT_EQ(deep(*before), "{ x = 1; }");
+    state.forceValue(*after, noPos);
+    EXPECT_EQ(after->listSize(), 100u);
+}
+
+/* A value the driver allocated in the job, which a holder holds, is no
+   target's: the job is kept whole. */
+TEST_F(UnforceTest, driverHoldKeepsJob)
+{
+    auto v = oldThunk("{ a = 1; }");
+    UnforceSeen seen;
+    auto whole = unforceStats.jobsKeptWhole;
+    state.beginUnforceScope();
+    state.forceValue(*v, noPos);
+    auto w = state.allocValue();
+    w->mkInt(1);
+    EXPECT_TRUE(seen.see(w, UnforceHolder::Kind::value));
+    state.endUnforceScope();
+    EXPECT_EQ(unforceStats.jobsKeptWhole, whole + 1);
+    EXPECT_FALSE(v->isThunk());
+    EXPECT_THAT(*w, IsIntEq(1));
+}
+
+/* An interrupted force leaves its cell failed with a recovery value the job
+   allocated after the force ended. Nothing tells whether the failure
+   outlives the job, so the job is kept whole, and a later read recovers:
+   for an old cell, and for a young cell whose owner a holder keeps, after
+   another job reused the memory a job freed. */
+TEST_F(UnforceTest, interruptedKeepsJob)
+{
+    auto v = oldThunk("builtins.toJSON [ 1 2 3 ]");
+    state.beginUnforceScope();
+    setInterrupted(true);
+    EXPECT_THROW(state.forceValue(*v, noPos), Interrupted);
+    setInterrupted(false);
+    state.endUnforceScope();
+    ASSERT_TRUE(v->isFailed());
+    state.forceValue(*v, noPos);
+    EXPECT_THAT(*v, IsStringEq("[1,2,3]"));
+
+    auto u = oldThunk("{ a = { b = builtins.toJSON [ 1 2 3 ]; }; }");
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    state.forceValue(*u, noPos);
+    auto & a = *u->attrs()->get(createSymbol("a"))->value;
+    state.forceValue(a, noPos);
+    EXPECT_TRUE(seen.see(a.attrs(), UnforceHolder::Kind::bindings));
+    auto & b = *a.attrs()->get(createSymbol("b"))->value;
+    setInterrupted(true);
+    EXPECT_THROW(state.forceValue(b, noPos), Interrupted);
+    setInterrupted(false);
+    state.endUnforceScope();
+    state.beginUnforceScope();
+    state.forceValue(*oldThunk("builtins.length (builtins.genList (i: { inherit i; }) 10000)"), noPos);
+    state.endUnforceScope();
+    ASSERT_TRUE(b.isFailed());
+    state.forceValue(b, noPos);
+    EXPECT_THAT(b, IsStringEq("[1,2,3]"));
+}
+
+/* Every failure a job made forgets the job's cells: here an infinite
+   recursion found in a young cell, by a young cell that survives the job
+   with its owner. */
+TEST_F(UnforceTest, keptFailureForgetsYoungCell)
+{
+    auto u = oldThunk("{ s = { r = let x = { a = x.a; }; in x.a; }; }");
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    state.forceValue(*u, noPos);
+    auto & s = *u->attrs()->get(createSymbol("s"))->value;
+    state.forceValue(s, noPos);
+    EXPECT_TRUE(seen.see(s.attrs(), UnforceHolder::Kind::bindings));
+    auto & r = *s.attrs()->get(createSymbol("r"))->value;
+    EXPECT_THROW(state.forceValue(r, noPos), InfiniteRecursionError);
+    state.endUnforceScope();
+    ASSERT_TRUE(r.isFailed());
+    try {
+        std::rethrow_exception(r.failed().exRef->ex);
+    } catch (InfiniteRecursionError & e) {
+        EXPECT_EQ(e.v, nullptr);
+    }
+}
+
+/* `foldl'`'s steps, in one force in a job. Each case's `r` is forced after
+   its list `xs`, made in the job, or before it (`old`). Then, once the job
+   has allocated over what the steps freed, as zeroed memory, `c` prints as
+   without jobs. Where the steps free all they allocate (`frees`), the region
+   grows by no more for a list twice as long but by the two cells the steps
+   take turns writing. */
+TEST_F(UnforceTest, steps)
+{
+    struct Case
+    {
+        const char *xs, *r, *c;
+        bool old, frees;
+    };
+
+    auto ints = "builtins.genList (i: i) n", sets = "builtins.genList (i: { a = i; }) n";
+    auto forcedInts = "let l = builtins.genList (i: i) n; in builtins.deepSeq l l",
+         forcedLists = "let l = builtins.genList (i: [ i ]) n; in builtins.deepSeq l l";
+    auto run = [&](const Case & k, int n) {
+        auto program =
+            fmt("let n = %d; s = { z = 1; }; xs = %s; r = %s; in { inherit xs r; c = %s; }", n, k.xs, k.r, k.c);
+        auto want = deep(*oldThunk(fmt("(%s).c", program)));
+        auto v = oldThunk(program);
+        state.forceValue(*v, noPos);
+        auto attr = [&](const char * name) -> Value & { return *v->attrs()->get(createSymbol(name))->value; };
+        if (k.old)
+            state.forceValue(attr("xs"), noPos);
+        state.beginUnforceScope();
+        state.forceValue(attr("xs"), noPos);
+        auto cur = evalRegion.cur;
+        state.forceValue(attr("r"), noPos);
+        size_t grew = evalRegion.cur - cur;
+        auto p = (const char *) state.mem.allocBytes(4096);
+        EXPECT_TRUE(std::all_of(p, p + 4096, [](char c) { return c == 0; })) << k.r;
+        EXPECT_EQ(deep(attr("c")), want) << k.r;
+        state.endUnforceScope();
+        return grew;
+    };
+    const Case cases[] = {
+        /* Each step's list is freed. */
+        {ints, "builtins.foldl' (acc: x: acc + builtins.length (builtins.genList (j: j) 20)) 0 xs", "r", false, true},
+        /* Each step's value points into its memory. */
+        {ints,
+         "builtins.foldl' (acc: x: { n = acc.n + x; prev = acc; }) { n = 0; prev = null; } xs",
+         "let count = p: if p == null then 0 else 1 + count p.prev; in [ r.n (count r) ]",
+         false,
+         false},
+        /* Each step's value holds the cell it read: no later step writes it. */
+        {ints, "builtins.foldl' (acc: x: [ acc ]) null xs", "r", false, false},
+        /* Each step's value holds no cell of the loop's. */
+        {ints, "builtins.foldl' (acc: x: [ x ]) null xs", "r", false, true},
+        /* A step forces a young cell made before the loop (a write), or an old one (logged). */
+        {sets, "builtins.foldl' (acc: x: acc + x.a) 0 xs", "[ r xs ]", false, false},
+        {sets, "builtins.foldl' (acc: x: acc + x.a) 0 xs", "[ r xs ]", true, false},
+        /* Loops in a loop's steps: the inner steps free, and an inner step's write is the outer step's. */
+        {ints,
+         "builtins.foldl' (acc: x: acc + builtins.foldl' (a: j: a + builtins.length (builtins.genList (k: k) j)) 0 [ 1 2 3 ]) 0 xs",
+         "r",
+         false,
+         true},
+        {sets,
+         "builtins.foldl' (acc: x: acc + builtins.foldl' (a: j: a + x.a) 0 [ 1 2 ]) 0 xs",
+         "[ r xs ]",
+         false,
+         false},
+        /* A failure caught in a step keeps that step; the others free. */
+        {ints,
+         "builtins.foldl' (acc: x: acc + (if (builtins.tryEval (if x == 3 then throw \"x\" else x)).success then 1 else 0)) 0 xs",
+         "r",
+         false,
+         true},
+        {ints,
+         "builtins.foldl' (acc: x: acc + (if (builtins.tryEval (builtins.foldl' (a: j: if j == 2 then throw \"x\" else a + j) 0 [ 1 2 3 ])).success then 1 else 0)) 0 xs",
+         "r",
+         false,
+         false},
+        /* A step's value is a cell shared outside the loop. */
+        {ints, "builtins.foldl' (acc: x: if x == 5 then s else acc) null xs", "[ r s ]", false, true},
+        /* Steps that allocate nothing take turns writing two cells. */
+        {forcedInts, "builtins.foldl' builtins.add 0 xs", "r", false, true},
+        /* Steps whose inner steps free all they allocate: the value holds
+           the cell the step read, which is not written again, or not. */
+        {forcedLists, "builtins.foldl' (builtins.foldl' (a: x: [ a ])) null xs", "r", false, false},
+        {forcedLists, "builtins.foldl' (builtins.foldl' (a: x: a + x)) 0 xs", "r", false, true},
+    };
+    for (auto & k : cases) {
+        auto grew = run(k, 100);
+        if (k.frees)
+            EXPECT_LE(run(k, 200), grew + 2 * sizeof(Value)) << k.r;
+    }
+}
+
+/* A value promoted at a job's end, built after steps freed memory, stays as
+   it was while a later job reuses the region. */
+TEST_F(UnforceTest, stepsThenPromote)
+{
+    auto v = oldThunk(
+        "{ r = let n = builtins.foldl' (acc: i: acc + builtins.length (builtins.genList (j: j) 20)) 0 "
+        "(builtins.genList (i: i) 50); in { inherit n; l = builtins.genList (k: { x = k + n; }) 50; }; }");
+    state.forceValue(*v, noPos);
+    auto & r = *v->attrs()->get(createSymbol("r"))->value;
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    auto ends = unforceStats.stepEnds;
+    state.forceValueDeep(r);
+    EXPECT_GT(unforceStats.stepEnds, ends);
+    EXPECT_TRUE(seen.see(r.attrs(), UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    EXPECT_FALSE(r.isThunk());
+    auto big = oldThunk("builtins.length (builtins.genList (i: { inherit i; }) 10000)");
+    state.beginUnforceScope();
+    state.forceValue(*big, noPos);
+    state.endUnforceScope();
+    std::string expected = "{ l = [ ";
+    for (int k = 0; k < 50; ++k)
+        expected += "{ x = " + std::to_string(k + 1000) + "; } ";
+    expected += "]; n = 1000; }";
+    EXPECT_EQ(printValue(state, r), expected);
+}
+
+/* A step in which a failure was caught is kept: the job's end reads the
+   failure's cell. */
+TEST_F(UnforceTest, failedStepKept)
+{
+    auto v =
+        oldThunk("builtins.foldl' (acc: x: acc + (if (builtins.tryEval (throw \"x\")).success then 1 else 0)) 0 [ 1 ]");
+    state.beginUnforceScope();
+    auto ends = unforceStats.stepEnds;
+    state.forceValue(*v, noPos);
+    EXPECT_EQ(unforceStats.stepEnds, ends);
+    state.endUnforceScope();
+    state.forceValue(*v, noPos);
+    EXPECT_THAT(*v, IsIntEq(0));
+}
+
+/* A step frees what an old cell's force allocated in it (x's value is k's
+   list, made before the step, so that x stays a target), and the owner
+   timeline forgets that force: what y builds there after the loop is y's,
+   so that a holder of it promotes y. */
+TEST_F(UnforceTest, stepsCutOwners)
+{
+    auto v = oldThunk(
+        "rec { k = builtins.genList (i: i) 3; x = builtins.seq (builtins.genList (j: j) 20) k; "
+        "y = let n = builtins.seq k (builtins.foldl' builtins.seq null [ x ]); r = { s = { z = n; }; }; "
+        "in builtins.seq n (builtins.seq r.s r); }");
+    state.forceValue(*v, noPos);
+    auto & y = *v->attrs()->get(createSymbol("y"))->value;
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    auto ends = unforceStats.stepEnds;
+    state.forceValue(y, noPos);
+    EXPECT_GT(unforceStats.stepEnds, ends);
+    auto & s = *y.attrs()->get(createSymbol("s"))->value;
+    EXPECT_TRUE(seen.see(s.attrs(), UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    EXPECT_FALSE(y.isThunk());
+}
+
+/* A holder that may hold a step's memory (`youngTop`) keeps every step's. */
+TEST_F(UnforceTest, holderBlocksSteps)
+{
+    auto r = oldThunk("builtins.foldl' (acc: i: acc + builtins.length (builtins.genList (j: j) 20)) 0 [ 1 2 3 ]");
+    UnforceSeen seen;
+    state.beginUnforceScope();
+    seen.youngTop = (const void *) UINTPTR_MAX;
+    auto ends = unforceStats.stepEnds;
+    state.forceValue(*r, noPos);
+    EXPECT_EQ(unforceStats.stepEnds, ends);
+    EXPECT_THAT(*r, IsIntEq(60));
+    state.endUnforceScope();
+}
+
+/* A frame entered in the job holds a thunk `slot`, which the first step of
+   `f`'s loop forces: the slot's value lies in that step's memory, which the
+   step keeps, however much is allocated after it. */
+[[gnu::noinline]] static void forceThroughSlot(EvalState & state, Value & f)
+{
+    Value slot;
+    slot.mkThunk(&state.baseEnv, state.parseExprFromString("{ y = 1; }", state.rootPath(CanonPath::root)));
+    auto w = state.allocValue();
+    w->mkApp(&f, &slot);
+    auto cur = evalRegion.cur;
+    state.forceValue(*w, noPos);
+    ASSERT_EQ(slot.type(), nAttrs);
+    EXPECT_GT(evalRegion.cur, (const char *) slot.attrs());
+    state.mem.allocBytes(evalRegion.cur - cur);
+    EXPECT_EQ(printValue(state, slot), "{ y = 1; }");
+}
+
+TEST_F(UnforceTest, stepsKeepSlot)
+{
+    auto f = oldThunk("x: builtins.foldl' (a: i: builtins.seq x (a + i)) 0 [ 1 2 3 ]");
+    state.forceValue(*f, noPos);
+    state.beginUnforceScope();
+    forceThroughSlot(state, *f);
+    state.endUnforceScope();
+}
+
+/* A step's value that reaches the step's memory through one pointer of one
+   kind: a partly applied primop's operand, a curried function's
+   environment, a two-element list's second element. The steps keep it. */
+TEST_F(UnforceTest, stepsEscapeEdgeKinds)
+{
+    for (auto [step, use, want] : std::initializer_list<std::tuple<const char *, const char *, int>>{
+             {"acc: i: builtins.add (builtins.length (builtins.genList (j: j) (i * 10)))", "r 1", 31},
+             {"acc: i: let big = builtins.genList (j: j) (i * 10); in y: builtins.length big + y", "r 1", 31},
+             {"acc: i: [ 0 (builtins.genList (j: j) (i * 10)) ]", "builtins.length (builtins.elemAt r 1)", 30},
+         }) {
+        auto v = oldThunk(fmt("rec { r = builtins.foldl' (%s) null [ 1 2 3 ]; u = %s; }", step, use));
+        state.beginUnforceScope();
+        state.forceValue(*v, noPos);
+        state.forceValue(*v->attrs()->get(createSymbol("r"))->value, noPos);
+        state.mem.allocBytes(4096);
+        auto & u = *v->attrs()->get(createSymbol("u"))->value;
+        state.forceValue(u, noPos);
+        EXPECT_THAT(u, IsIntEq(want)) << step;
+        state.endUnforceScope();
+    }
 }
 
 /* The front ends' traversals, as the commands run them. */
