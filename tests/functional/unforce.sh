@@ -22,7 +22,9 @@ expectJobs() {
 expr='let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }'
 expectJobs "$(jobsOf nix eval --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
-expectJobs "$(jobsOf nix eval --json --expr "$expr")" 3
+# Strict JSON printing nests: an element of a printed set or list is a job of
+# its own too, once its parent's job is not empty (a's x, c's first element).
+expectJobs "$(jobsOf nix eval --json --expr "$expr")" 5
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
 # nix-instantiate evaluates its root, and then each attribute path, in a job
 # of its own first.
@@ -84,12 +86,15 @@ cat > "$flakeDir/flake.nix" <<EOF
   outputs = { self }: with import ./config.nix; {
     packages.$system.x = mkDerivation { name = "x"; builder = "/b"; };
     overlays.default = final: prev: { };
+    hydraJobs.j = { y = mkDerivation { name = "y"; builder = "/b"; }; z = mkDerivation { name = "z"; builder = "/b"; }; };
   };
 }
 EOF
-expectJobs "$(jobsOf nix flake check "$flakeDir")" 2
-# flake show shows each package in one.
-expectJobs "$(jobsOf nix flake show "$flakeDir")" 1
+# A jobset's jobs run in its job: its loop iterates the jobset's set, which
+# jobs of their own would free.
+expectJobs "$(jobsOf nix flake check "$flakeDir")" 3
+# flake show shows each package, and each jobset, in one.
+expectJobs "$(jobsOf nix flake show "$flakeDir")" 2
 
 # A derivation found in an earlier job is dropped in a later one; one job
 # per attribute, then one per derivation found (its name, its drvPath).

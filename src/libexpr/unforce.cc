@@ -1299,6 +1299,147 @@ struct Traversal
 
 static thread_local std::vector<Traversal> traversals;
 
+/* ---------------------------------------------------------------------------
+   Nested levels (`unforceLevelElement`). In a traversal's job, an element of
+   a level nested in its element (a set the front end recurses into) starts
+   a job of its own, ending the one before it (a *switch*). That end keeps
+   what the levels still open read across it: their containers, which
+   `UnforceNest` holds (their loops hold copies of `Attr *`s or elements). A
+   declared loop (`UnforceJobs::element`) reads through held roots, and
+   forces again what a switch reverted. A loop that names no container and
+   declares nothing may read anything the job allocated: no switch.
+
+   A level is told by its frame, its loop's kind (that of the loop whose
+   element opened the job) and its call depth: one step past its parent's
+   for printers and `getDerivations`, equal for declared loops. A printer
+   that an element's evaluation reaches (`builtins.toJSON`) is at least three
+   steps past the innermost level (the element's own, a call, its own), so
+   it is no level; a primop calling a printer without a call would be. A
+   level whose loop returned is dropped when an element starts in a frame
+   above it, at its depth or less (a sibling's, for loops that step the
+   depth), or when a job ends above it. A job's end settles the levels open:
+   what they hold then lies below every later job's memory, so later ends
+   skip them.
+   --------------------------------------------------------------------------- */
+
+struct UnforceNest : UnforceHolder
+{
+    struct Level
+    {
+        const char * frame;
+        const Value * container;
+        size_t depth;
+        bool settled = false;
+    };
+
+    /* Settled levels first. */
+    std::vector<Level> levels;
+    /* The loop whose element opened the job. */
+    UnforceLoop base = UnforceLoop::other;
+
+    void held(Hold & hold) override;
+
+    void ended() override
+    {
+        for (auto l = levels.rbegin(); l != levels.rend() && !l->settled; ++l)
+            l->settled = true;
+    }
+
+    /* The levels whose frames lie below `frame` have returned. */
+    void prune(const char * frame)
+    {
+        while (!levels.empty() && levels.back().frame < frame)
+            levels.pop_back();
+    }
+
+    void open(EvalState & state, const char * frame, UnforceLoop loop)
+    {
+        base = loop;
+        levels.clear();
+        levels.push_back({frame, nullptr, state.callDepth});
+    }
+
+    void start(EvalState & state, const char * frame, const Value * container, UnforceLoop loop);
+};
+
+void UnforceNest::held(Hold & hold)
+{
+    for (auto l = levels.rbegin(); l != levels.rend() && !l->settled; ++l)
+        if (auto v = l->container) {
+            hold(v, Kind::value);
+            if (v->type() == nAttrs)
+                hold(v->attrs(), Kind::bindings);
+            else if (v->internalType() == tListN)
+                hold(v->rawList().elems, Kind::value);
+            else if (v->internalType() == tListSmall)
+                for (auto e : v->rawSmallList())
+                    if (e)
+                        hold(e, Kind::value);
+        }
+}
+
+/* A holder is the thread's that makes it. */
+static thread_local UnforceNest nest;
+
+/* An element of the level of `loop` at `frame`, which iterates `container`,
+   starts in a job. */
+void UnforceNest::start(EvalState & state, const char * frame, const Value * container, UnforceLoop loop)
+{
+    if (loop != base)
+        return;
+    size_t step = loop != UnforceLoop::nests;
+    prune(frame);
+    /* Another level's frame, at an address that a returned one had. */
+    if (!levels.empty() && levels.back().frame == frame
+        && (levels.back().container != container || levels.back().depth != state.callDepth))
+        levels.pop_back();
+    if (step)
+        while (levels.size() > 1 && levels.back().frame != frame && levels.back().depth >= state.callDepth)
+            levels.pop_back();
+    if (levels.empty())
+        return;
+    if (levels.back().frame != frame) {
+        /* The level of a function or a functor iterates what a call
+           returned, which nothing holds. */
+        if (state.callDepth != levels.back().depth + step
+            || (container
+                && (container->type() == nAttrs ? container->attrs()->get(state.s.functor) != nullptr
+                                                : container->type() != nList)))
+            return;
+        levels.push_back({frame, container, state.callDepth});
+    }
+    /* Only the levels' loops run (no force is open): the level rule above
+       implies it, but does not need it, as an evaluation reaching a missed
+       level may well have no force open. */
+    assert(jobOwner.load() == &state && opens.empty() && stepFrames.empty() && !evalRegion.paused);
+    if (keepWhole || (evalRegion.cur == evalRegion.base && state.undoLog.empty()))
+        return;
+    /* A slot logged in a frame between the job's opener and the outermost
+       level's, of a level still running or of a frame that returned and
+       whose address another reuses, which the end can tell apart from
+       neither: the job is kept whole. */
+    if (std::ranges::any_of(state.undoLog, [&](auto & e) {
+            return (const char *) e.target >= jobStackMark && (const char *) e.target < levels.front().frame;
+        }))
+        keepWhole = true;
+    state.endUnforceScope(frame);
+    try {
+        state.beginUnforceScope(frame);
+    } catch (...) {
+        /* No job is open, for the traversal that opened the one that ended
+           to end. */
+        for (auto & t : traversals)
+            t.opener = nullptr;
+        levels.clear();
+        throw;
+    }
+}
+
+void unforceNestedElementStart(EvalState & state, const Value * v, UnforceLoop loop)
+{
+    nest.start(state, (const char *) __builtin_dwarf_cfa(), v, loop);
+}
+
 void unforceJobsBegin(EvalState & state, const Value * root)
 {
     auto unforce = unforceEnabled(state);
@@ -1311,11 +1452,13 @@ void unforceJobsEnd()
     auto t = traversals.back();
     traversals.pop_back();
     t.state.unforceRoot = t.savedRoot;
-    if (t.opener)
+    if (t.opener) {
+        nest.levels.clear();
         t.state.endUnforceScope(__builtin_dwarf_cfa());
+    }
 }
 
-void unforceElementStart()
+void unforceElementStart(UnforceLoop loop)
 {
     auto & t = traversals.back();
     /* The level's stack pointer, below which its element's frames lie. */
@@ -1326,11 +1469,16 @@ void unforceElementStart()
         t.opener = nullptr;
         t.state.endUnforceScope(level);
     }
-    /* In a job, of which the traversal is part. */
-    if (jobOwner.load())
+    /* In a job, of which the traversal is part: a nested level of the
+       traversal whose element opened it, if its loop declared it nests. */
+    if (jobOwner.load()) {
+        if (loop == UnforceLoop::nests)
+            nest.start(t.state, level, nullptr, loop);
         return;
+    }
     t.state.beginUnforceScope(level);
     t.opener = level;
+    nest.open(t.state, level, loop);
 }
 
 void unforceKeepJob()
@@ -1378,6 +1526,7 @@ void EvalState::endUnforceScope(const void * ender)
 
 void EvalState::endUnforceJob(const char * ender)
 {
+    nest.prune(ender);
     /* A job during which native code came to be able to run is kept whole,
        and so is one that logged a slot of a frame that has returned since
        (between the job's opener and `ender`), which must be neither read

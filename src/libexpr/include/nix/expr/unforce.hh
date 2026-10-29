@@ -122,9 +122,19 @@ public:
     void ended() override;
 };
 
+/**
+ * The loop whose element starts: an `UnforceJobs` loop or a printer's
+ * (`other`), an `UnforceJobs` loop that declared it nests, the strict JSON
+ * printer's, or `getDerivations`'. A level nested in a traversal's job is
+ * one of its levels only if its loop is of the kind of the one whose element
+ * opened the job (see `unforceLevelElement`).
+ */
+enum class UnforceLoop : unsigned char { other, nests, json, drvs };
+
 [[gnu::noinline]] void unforceJobsBegin(EvalState & state, const Value * root);
 [[gnu::noinline]] void unforceJobsEnd();
-[[gnu::noinline]] void unforceElementStart();
+[[gnu::noinline]] void unforceElementStart(UnforceLoop loop = UnforceLoop::other);
+[[gnu::noinline]] void unforceNestedElementStart(EvalState & state, const Value * v, UnforceLoop loop);
 
 /**
  * Unforce jobs for a traversal of independent elements (the derivations of
@@ -154,10 +164,14 @@ public:
     UnforceJobs(const UnforceJobs &) = delete;
     UnforceJobs & operator=(const UnforceJobs &) = delete;
 
-    /** An element of the caller's loop starts. */
-    [[gnu::always_inline]] void element()
+    /**
+     * An element of the caller's loop starts. `nests`: the loop reads nothing
+     * a job allocated across its elements but through held roots, cells it
+     * forces again, and copies, so that it may be a nested level.
+     */
+    [[gnu::always_inline]] void element(bool nests = false)
     {
-        unforceElementStart();
+        unforceElementStart(nests ? UnforceLoop::nests : UnforceLoop::other);
     }
 };
 
@@ -166,6 +180,20 @@ public:
 {
     if (state.unforceRoot == &v) [[unlikely]]
         unforceElementStart();
+}
+
+/**
+ * `unforceElement` for a `loop` whose levels may nest (unforce.cc, "Nested
+ * levels"): a level iterates `v`'s attributes or list (or a copy's), reads
+ * nothing else across its elements but copies, and never `v` after its
+ * first element, which a switch may have reverted.
+ */
+[[gnu::always_inline]] inline void unforceLevelElement(EvalState & state, const Value & v, UnforceLoop loop)
+{
+    if (state.unforceRoot == &v) [[unlikely]]
+        unforceElementStart(loop);
+    else if (loop != UnforceLoop::other && evalRegion.cur) [[unlikely]]
+        unforceNestedElementStart(state, &v, loop);
 }
 
 /**

@@ -1096,6 +1096,7 @@ private:
 
     friend void unforceNoteEffect(EvalState & state);
     friend class UnforceSteps;
+    friend struct UnforceNest;
 
     std::vector<UnforceUndoEntry> undoLog;
     /** The open unforce scopes; the outermost is a job. */

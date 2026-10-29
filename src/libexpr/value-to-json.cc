@@ -86,7 +86,7 @@ json printValueAsJSON(
                 // All that remains is to return a JSON object.
                 json obj = json::object();
                 for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
-                    unforceElement(state, *peeled);
+                    unforceLevelElement(state, *peeled, strict ? UnforceLoop::json : UnforceLoop::other);
                     try {
                         obj.emplace(
                             state.symbols[a->name],
@@ -105,7 +105,7 @@ json printValueAsJSON(
         out = json::array();
         int i = 0;
         for (auto elem : v.listView()) {
-            unforceElement(state, v);
+            unforceLevelElement(state, v, strict ? UnforceLoop::json : UnforceLoop::other);
             try {
                 out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore));
             } catch (Error & e) {

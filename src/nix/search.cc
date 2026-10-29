@@ -100,10 +100,12 @@ struct CmdSearch : InstallableValueCommand, MixJSON
             try {
                 auto recurse = [&]() {
                     /* A job per attribute of the outermost level that
-                       recurses (that of the packages). */
+                       recurses (that of the packages), and of each level
+                       nested in its elements: the loop reads through cursors
+                       and copies. */
                     UnforceJobs jobs(*state);
                     for (const auto & attr : cursor.getAttrs()) {
-                        jobs.element();
+                        jobs.element(true);
                         auto cursor2 = cursor.getAttr(state->symbols[attr]);
                         auto attrPath2(attrPath);
                         attrPath2.push_back(attr);

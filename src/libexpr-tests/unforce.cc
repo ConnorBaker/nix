@@ -947,6 +947,145 @@ TEST_F(UnforceTest, stepsEscapeEdgeKinds)
     }
 }
 
+/* Strict JSON printing: an element of a nested level runs in a job of its own,
+   while the levels open keep their sets and lists (a, y, q a list, l a small
+   list in an old cell), and prints as without jobs. `c` leaves its job empty,
+   which x then continues. The printer that b's `__toString` calls
+   (`builtins.toJSON`, on `g`, forced before) is no level of the traversal. */
+TEST_F(UnforceTest, nestedLevelJobs)
+{
+    auto expr =
+        "let big = n: builtins.length (builtins.genList (i: { inherit i; }) n); "
+        "g = { u = big 6; v = { w = big 7; }; }; in builtins.seq g "
+        "{ a = { c = 1; x = big 1000; y = { p = big 2000; q = [ (big 3) (big 4) (big 5) ]; }; z = big 5; }; "
+        "b = { __toString = self: builtins.toJSON g; }; l = [ { x = big 1; } { y = big 2; } ]; }";
+    auto json = [&](Value & v, bool jobs) {
+        state.forceValue(v, noPos);
+        NixStringContext context;
+        std::optional<UnforceJobs> traversal;
+        if (jobs)
+            traversal.emplace(state, &v);
+        return printValueAsJSON(state, true, v, noPos, context, false).dump();
+    };
+    auto jobs = unforceStats.jobs;
+    auto whole = unforceStats.jobsKeptWhole;
+    auto freed = unforceStats.bytesFreed;
+    EXPECT_EQ(json(*oldThunk(expr), true), json(*oldThunk(expr), false));
+    /* Ended at c, y, p, q, q's three elements, z, b, l, l's two elements and
+       their attributes, and the traversal's end. */
+    EXPECT_EQ(unforceStats.jobs - jobs, 15u);
+    EXPECT_EQ(unforceStats.jobsKeptWhole - whole, 0u);
+    EXPECT_GT(unforceStats.bytesFreed - freed, 0u);
+}
+
+/* Non-strict printing has no nested levels: a value that an outPath's peel
+   forced in one element is read as it is in another. */
+TEST_F(UnforceTest, nestedJsonNonStrict)
+{
+    auto v = oldThunk(
+        "let t = \"x\" + \"y\"; a = { outPath = t; }; top = { inherit a; b = t; }; in "
+        "builtins.seq a (builtins.seq top { inherit top; })");
+    state.forceValue(*v, noPos);
+    NixStringContext context;
+    UnforceJobs traversal(state, v);
+    EXPECT_EQ(
+        printValueAsJSON(state, false, *v, noPos, context, false).dump(), "{\"top\":{\"a\":\"xy\",\"b\":\"xy\"}}");
+}
+
+/* `getDerivations` finds the derivations of the sets it recurses into in
+   jobs of their own; an element that leaves its job empty (a
+   `recurseForDerivations`) does not end it, nor does one of what a functor
+   (f) or a function (the list's first element) returned, which nothing
+   holds. What it found outlives them. */
+TEST_F(UnforceTest, getDerivationsNestedJobs)
+{
+    auto found = [&](std::string expr, uint64_t wantJobs) {
+        auto v = oldThunk("let d = n: derivation { name = n; system = \"s\"; builder = \"b\"; }; in " + expr);
+        state.forceValue(*v, noPos);
+        auto jobs = unforceStats.jobs;
+        PackageInfos drvs;
+        getDerivations(state, *v, "", Bindings::emptyBindings, drvs, false);
+        EXPECT_EQ(unforceStats.jobs - jobs, wantJobs) << expr;
+        std::set<std::string> names;
+        for (auto & drv : drvs) {
+            names.insert(drv.queryName());
+            EXPECT_EQ(drv.queryOutputName(), "out");
+        }
+        return names;
+    };
+    /* Ended at a's recurseForDerivations, x, y, y's recurseForDerivations, b, f, and the traversal's end. */
+    EXPECT_EQ(
+        found(
+            "{ a = { recurseForDerivations = true; x = d \"x\"; y = { recurseForDerivations = true; z = d \"z\"; }; "
+            "w = d \"w\"; }; b = d \"b\"; "
+            "f = { recurseForDerivations = true; __functor = self: { u = d \"u\"; v = d \"v\"; }; }; }",
+            7),
+        (std::set<std::string>{"b", "u", "v", "w", "x", "z"}));
+    /* Ended at r and the traversal's end. */
+    EXPECT_EQ(
+        found("[ ({ ... }: { p = d \"p\"; q = d \"q\"; }) (d \"r\") ]", 2), (std::set<std::string>{"p", "q", "r"}));
+}
+
+/* An `UnforceJobs` loop in another's job, at one frame address in each call:
+   its element forces a local cell, before or after the element starts. */
+[[gnu::noinline]] static bool sibling(EvalState & state, Expr * e, bool nests, bool forceFirst)
+{
+    Value local;
+    local.mkThunk(&state.baseEnv, e);
+    UnforceJobs inner(state);
+    if (!forceFirst)
+        state.forceValue(local, noPos);
+    inner.element(nests);
+    if (forceFirst)
+        state.forceValue(local, noPos);
+    return !local.isThunk();
+}
+
+/* An inner loop's element is a job of its own only if both loops declared
+   they nest. A slot that a sibling's frame logged after a switch, at an
+   address the next sibling's frame reuses, keeps the job whole: reverting it
+   would write into the running frame. */
+TEST_F(UnforceTest, nestedLoops)
+{
+    auto e = state.parseExprFromString("{ a = [ 1 2 ]; }", state.rootPath(CanonPath::root));
+    for (auto outerNests : {false, true}) {
+        auto jobs = unforceStats.jobs;
+        {
+            UnforceJobs outer(state);
+            outer.element(outerNests);
+            state.forceValue(*oldThunk("[ 1 ]"), noPos);
+            sibling(state, e, true, true);
+            if (outerNests) {
+                EXPECT_EQ(unforceStats.jobs - jobs, 1u);
+                EXPECT_TRUE(sibling(state, e, true, false));
+            }
+        }
+        if (!outerNests)
+            EXPECT_EQ(unforceStats.jobs - jobs, 1u);
+    }
+}
+
+/* A switch whose next job cannot open (no region) leaves no job open: the
+   next traversal's elements run in jobs. */
+TEST_F(UnforceTest, nestedOpenFails)
+{
+    {
+        UnforceJobs outer(state);
+        outer.element(true);
+        state.forceValue(*oldThunk("[ 1 ]"), noPos);
+        FailMapping fail;
+        EXPECT_THROW(
+            sibling(state, state.parseExprFromString("{ }", state.rootPath(CanonPath::root)), true, true),
+            std::bad_alloc);
+    }
+    auto jobs = unforceStats.jobs;
+    auto freed = unforceStats.bytesFreed;
+    auto expr = "{ a = builtins.genList (i: i) 10; }";
+    EXPECT_EQ(printed(*oldThunk(expr), true), printed(*oldThunk(expr), false));
+    EXPECT_EQ(unforceStats.jobs - jobs, 1u);
+    EXPECT_GT(unforceStats.bytesFreed - freed, 0u);
+}
+
 /* The front ends' traversals, as the commands run them. */
 static const std::vector<std::pair<std::string, std::function<std::string(EvalState &, Value &)>>> frontEnds = {
     {"nix-instantiate --eval --strict",

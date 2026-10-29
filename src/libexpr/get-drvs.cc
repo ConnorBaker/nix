@@ -515,7 +515,7 @@ static void getDerivations(
                 if (!isAttrPathComponent(symbol))
                     continue;
                 if (!combineChannels)
-                    unforceElement(state, vIn);
+                    unforceLevelElement(state, vIn, UnforceLoop::drvs);
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
                     getChannelDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -542,7 +542,7 @@ static void getDerivations(
     else if (v.type() == nList) {
         auto listView = v.listView();
         for (auto [n, elem] : enumerate(listView)) {
-            unforceElement(state, vIn);
+            unforceLevelElement(state, vIn, UnforceLoop::drvs);
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *elem, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
