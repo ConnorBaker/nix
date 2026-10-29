@@ -44,12 +44,6 @@ namespace nix {
 
 EvalRegion evalRegion;
 
-/* A job's room: 64 GiB of address space, 2^32 of the bump allocator's
-   16-byte granules (so that a 32-bit offset addresses one), of which only
-   the pages it touches are memory. None on 32-bit systems. */
-constexpr uint64_t regionWanted = uint64_t(1) << 36;
-constexpr size_t regionBytes = SIZE_MAX / 2 < regionWanted ? 0 : size_t(regionWanted);
-
 static size_t pageSize()
 {
 #if defined(__linux__)
@@ -77,6 +71,10 @@ static char * jobTop = nullptr;
    at `keptTop` while the mapping has a region's room above it. */
 static char * mapping = nullptr;
 static char * keptTop = nullptr;
+
+/* A job's room: half the mapping, of which only the pages it touches are
+   memory. */
+static size_t regionBytes = 0;
 
 /* The end of the open job's room, and the top of the mapping's memory that
    jobs wrote: above it, the system's zero-filled pages. The evaluator
@@ -109,24 +107,30 @@ static void * mapAnonymous(size_t bytes)
 #endif
 
 /* Open the job's region. Only Linux on a 64-bit system has one: elsewhere,
-   the job allocates as outside any job, and its end reverts nothing. Failing
-   to map one is running out of memory (`std::bad_alloc`): the job does not
-   run without one. Not an `Error`, which traversals take for an element's
-   failure and print or skip. */
+   the job allocates as outside any job, and its end reverts nothing. The
+   mapping is as large as the system gives: the largest power of two a
+   `size_t` holds, halved until `mmap` accepts it, so that no size or
+   address layout is assumed. Failing to map a page is running out of
+   memory (`std::bad_alloc`): the job does not run without a region. Not an
+   `Error`, which traversals take for an element's failure and print or
+   skip. */
 static void openRegion()
 {
 #if defined(__linux__)
-    auto mappingBytes = 2 * regionBytes;
-    if (!regionBytes)
+    if (sizeof(void *) < 8)
         return;
-    if (!mapping || unforceTestFailMapping || size_t(mapping + mappingBytes - keptTop) < regionBytes) {
-        auto p = mapAnonymous(mappingBytes);
+    if (!mapping || unforceTestFailMapping || size_t(mapping + 2 * regionBytes - keptTop) < regionBytes) {
+        auto bytes = ~(SIZE_MAX >> 1);
+        auto p = MAP_FAILED;
+        while (bytes >= pageSize() && (p = mapAnonymous(bytes)) == MAP_FAILED)
+            bytes >>= 1;
         if (p == MAP_FAILED)
             throw std::bad_alloc();
         /* The old mapping keeps the pages of what its jobs kept. */
         if (mapping)
-            munmap(pageUp(keptTop), mapping + mappingBytes - pageUp(keptTop));
+            munmap(pageUp(keptTop), mapping + 2 * regionBytes - pageUp(keptTop));
         mapping = keptTop = dirtyTop = (char *) p;
+        regionBytes = bytes / 2;
     }
     evalRegion.base = evalRegion.cur = jobTop = keptTop;
     roomEnd = keptTop + regionBytes;
@@ -580,7 +584,7 @@ static constexpr uint32_t noOwner = UINT32_MAX;
 struct OwnerSeg
 {
     /* Its start, in granules from the region's base. */
-    uint32_t off;
+    uint64_t off;
     uint32_t owner;
 };
 
@@ -640,7 +644,7 @@ static void setOwner(uint32_t o)
             segments.pop_back();
         }
     } else {
-        segments.push_back({uint32_t(granuleOf(openSeg)), curOwner});
+        segments.push_back({granuleOf(openSeg), curOwner});
         openSeg = evalRegion.cur;
     }
     curOwner = o;
@@ -652,7 +656,7 @@ static uint32_t ownerOf(const void * p)
     if ((const char *) p >= openSeg)
         return curOwner;
     auto i = std::upper_bound(
-        segments.begin(), segments.end(), uint32_t(granuleOf(p)), [](uint32_t off, auto & s) { return off < s.off; });
+        segments.begin(), segments.end(), uint64_t(granuleOf(p)), [](uint64_t off, auto & s) { return off < s.off; });
     assert(i != segments.begin());
     return i[-1].owner;
 }
@@ -1479,7 +1483,11 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
     }
     if (isJobStackSlot(p))
         return;
-    assert(undoLog.size() < noOwner);
+    /* A log as long as owner names allow keeps the job whole. */
+    if (undoLog.size() >= noOwner) [[unlikely]] {
+        keepWhole = true;
+        return;
+    }
     roomFor(undoLog, 1);
     roomFor(ends, 1);
     roomFor(segments, opens.size() + 2);

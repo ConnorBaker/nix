@@ -525,6 +525,32 @@ TEST_F(UnforceTest, unmappableRegionNotSwallowed)
     EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
 }
 
+/* A job's memory 64 GiB and more above its start: v's set, which a holder
+   holds, lies there, below the start of the segment that u's force opened
+   once a 32-bit offset wraps. The set names v, which is promoted, and u
+   with it by time. Only where the system maps a region that large. */
+TEST_F(UnforceTest, regionBeyond64GiB)
+{
+    auto u = oldThunk("builtins.genList (i: i) 1000");
+    auto v = oldThunk("{ b = 2; }");
+    UnforceSeen seen;
+    auto whole = unforceStats.jobsKeptWhole;
+    state.beginUnforceScope();
+    state.forceValue(*u, noPos);
+    try {
+        state.mem.allocBytes((size_t(1) << 36) - 4096);
+    } catch (std::bad_alloc &) {
+        state.endUnforceScope();
+        GTEST_SKIP() << "no region of 64 GiB";
+    }
+    state.forceValue(*v, noPos);
+    EXPECT_TRUE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
+    state.endUnforceScope();
+    EXPECT_EQ(unforceStats.jobsKeptWhole, whole);
+    EXPECT_FALSE(u->isThunk());
+    EXPECT_FALSE(v->isThunk());
+}
+
 /* The cut is where the last force a promoted target owns ended. `before`
    ended earlier, so the time closure promotes it; `after` ended later, so
    it is reverted and its memory freed, which a later job allocates again
