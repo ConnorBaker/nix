@@ -1596,9 +1596,12 @@ static bool printsAsOrMoreEvaluated(std::string want, std::string got)
    under other frames), but that a failure's message may show more of what
    is evaluated
    (`printsAsOrMoreEvaluated`). In an evaluator of its own each time, so
-   that nothing is forced before. */
+   that nothing is forced before. The store is a dummy one: derivations'
+   paths are computed, not written. */
 TEST_F(UnforceTest, corpus)
 {
+    auto readOnly = std::exchange(nix::settings.readOnlyMode, true);
+    Finally restore([&] { nix::settings.readOnlyMode = readOnly; });
     std::vector<std::filesystem::path> programs;
     for (auto & entry : std::filesystem::directory_iterator(getUnitTestData() / "unforce"))
         if (entry.path().extension() == ".nix")
