@@ -93,6 +93,7 @@ static void prim_forceLazyFetcherAttr(EvalState & state, CallSite callSite, Valu
     auto * ext = dynamic_cast<LazyFetcherAttr *>(args[0]->external());
     assert(ext);
 
+    UnforceImpure impure(state);
     resolvedAttrToValue(state, v, ext->force());
 }
 
@@ -301,6 +302,7 @@ static void fetchTree(
         }
     }
 
+    UnforceImpure impure(state);
     if (!state.settings.pureEval && !input.isDirect() && experimentalFeatureSettings.isEnabled(Xp::Flakes))
         input = lookupInRegistries(state.fetchSettings, *state.store, input, fetchers::UseRegistries::Limited).first;
 
@@ -518,6 +520,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
     if (who == "fetchTarball")
         url = state.settings.resolvePseudoUrl(*url);
 
+    UnforceImpure impure(state);
     state.checkURI(*url);
 
     if (name == "")
@@ -564,6 +567,7 @@ fetch(EvalState & state, Value * const * args, Value & v, const std::string & wh
                 .references = {}});
 
         // Try to get the path from the local store or substituters
+        unforceNoteRead(state, state.storePath(expectedPath));
         try {
             state.store->getBuilder()->ensurePath(expectedPath);
             debug("using substituted/cached path '%s' for '%s'", state.store->printStorePath(expectedPath), *url);

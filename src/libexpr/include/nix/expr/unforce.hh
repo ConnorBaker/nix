@@ -45,8 +45,122 @@ struct PauseRegion
  * An effect that running again could give another result (a download, a
  * copy that nothing remembers, a build) is about to run: the open job, if
  * any, keeps the value of the cell whose re-force would run it again.
+ * Nothing runs the driver's evaluation (no cell's force) again.
  */
 void unforceNoteEffect(EvalState & state);
+
+/** How a read can change in an evaluation (`unforceReadChange`); ordered, as `std::max` combines two. */
+enum class UnforceChange { none, byEdit, byEvaluation };
+
+/**
+ * How reading `path` (its symlinks resolved as the reader does) in a job's cell can change (else `none`): not at all
+ * if the allow list lets it be read and it lies in a store path that is valid (then held by a temporary root) or
+ * mounted from a snapshot or a store object; by the evaluation's own builds, copies and allowances if it is not
+ * allowed yet or lies elsewhere in the store, unless the host has it where the store keeps its objects elsewhere;
+ * else (outside the store, in a work tree mounted there, or on the host) by an edit.
+ */
+UnforceChange unforceReadChange(EvalState & state, const SourcePath & path);
+
+/** An operation whose result is not checked keeps its cell if it reads what may change. */
+inline void unforceNoteRead(EvalState & state, const SourcePath & path)
+{
+    if (unforceReadChange(state, path) != UnforceChange::none)
+        unforceNoteEffect(state);
+}
+
+/* A file read in this evaluation changed before it was read again. Not an
+   `Error`, which printers and front ends may report and go on from. */
+MakeError(UnforceFileChanged, BaseError);
+
+/**
+ * A read whose result is checked (`readFile`, `hashFile`, `readDir`, `pathExists`, the bytes `scopedImport` parses, a
+ * copy without a filter). In a job of a one-shot evaluation, the first result of a read that only an edit can change
+ * is recorded with where the path led and keeps no cell: every later read by the operation of the path as given
+ * (before its symlinks are resolved) must lead there and give it again, or the evaluation stops with
+ * `UnforceFileChanged` (exit status 102). So a re-force reads what the first force read. A read that the evaluation
+ * itself may change keeps its cell, as does any in the REPL.
+ */
+struct UnforceRead
+{
+    EvalState & state;
+    std::string_view op;
+    /** The path as given, once known: the key. */
+    std::optional<SourcePath> given;
+    /** Where it led (`at`), recorded with the result. */
+    std::string resolved;
+    /** Whether where it leads may change: a link led it there, or its accessor caches no `lstat` (only `rootFS` does). */
+    bool linked = false;
+    UnforceChange change = UnforceChange::none;
+
+    UnforceRead(EvalState & state, std::string_view op, std::optional<SourcePath> given = std::nullopt)
+        : state(state)
+        , op(op)
+        , given(std::move(given))
+    {
+    }
+
+    /** The path as given led to `path`: the read changes as the more restricted of the two. */
+    SourcePath at(SourcePath path);
+
+    /** A step of the read (its resolution too): one that fails where a result was recorded changed. */
+    auto operator()(auto && read)
+    {
+        try {
+            return read();
+        } catch (Error &) {
+            if (key(false))
+                changed();
+            throw;
+        }
+    }
+
+    /** `v` realised (`EvalState::realisePath`), its symlinks resolved as `mode` says. */
+    SourcePath realise(Value & v, std::optional<SymlinkResolution> mode = SymlinkResolution::Full)
+    {
+        return at((*this)([&] {
+            return state.realisePath(noPos, v, mode, EvalState::CopyLazyPaths::PreserveLazy, &given);
+        }));
+    }
+
+    /** `feed` writes what the read gave; `changes`: whether that can change. */
+    void check(fun<void(Sink &)> feed, bool changes = true);
+
+private:
+    std::optional<std::string> key(bool changes);
+    [[noreturn]] void changed();
+};
+
+/**
+ * `path` resolved as `mode` says, for an operation (`op`) remembered by where the path led (a copy without a filter,
+ * `storePath`): an `UnforceRead` of the resolution, recorded only where that may change (`UnforceRead::linked`).
+ */
+SourcePath unforceResolve(EvalState & state, std::string_view op, const SourcePath & path, SymlinkResolution mode);
+
+/**
+ * Lives around an operation that reads the file system, the store or the
+ * network: the cell keeps its value if it fails (its error might not repeat),
+ * or where the file caches are reset (`EvalState::fileCachesReset`). What the
+ * evaluator caches once it succeeds (imports, copies without a filter, lookup
+ * paths, fetched inputs, `lstat`) keeps nothing more.
+ */
+struct UnforceImpure
+{
+    EvalState & state;
+    int failing = std::uncaught_exceptions();
+
+    explicit UnforceImpure(EvalState & state)
+        : state(state)
+    {
+        if (state.fileCachesReset)
+            unforceNoteEffect(state);
+    }
+
+    ~UnforceImpure()
+    {
+        if (std::uncaught_exceptions() > failing)
+            unforceNoteEffect(state);
+    }
+};
 
 /** The caller keeps something it built in the open job outside any cell: the job, if any, keeps all its memory. */
 void unforceKeepJob();

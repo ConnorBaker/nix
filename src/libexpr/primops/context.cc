@@ -1,5 +1,6 @@
 #include "nix/expr/primops.hh"
 #include "nix/expr/eval-inline.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/derivations.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/build.hh"
@@ -272,8 +273,11 @@ static void prim_appendContext(EvalState & state, CallSite callSite, Value * con
         if (!state.store->isStorePath(name))
             state.error<EvalError>("context key '%s' is not a store path", name).atPos(i.pos).debugThrow();
         auto namePath = state.store->parseStorePath(name);
-        if (!settings.readOnlyMode)
+        if (!settings.readOnlyMode) {
+            UnforceImpure impure(state);
+            unforceNoteRead(state, state.storePath(namePath));
             state.store->getBuilder()->ensurePath(namePath);
+        }
         state.forceAttrs(*i.value, i.pos, "while evaluating the value of a string context");
 
         if (auto attr = i.value->attrs()->get(sPath)) {

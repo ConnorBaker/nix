@@ -171,12 +171,17 @@ StringMap EvalState::realiseContext(const NixStringContext & context, StorePathS
 }
 
 SourcePath EvalState::realisePath(
-    const PosIdx pos, Value & v, std::optional<SymlinkResolution> resolveSymlinks, CopyLazyPaths copyLazyPaths)
+    const PosIdx pos,
+    Value & v,
+    std::optional<SymlinkResolution> resolveSymlinks,
+    CopyLazyPaths copyLazyPaths,
+    std::optional<SourcePath> * given)
 {
     NixStringContext context;
 
     auto path = coerceToPath(noPos, v, context, "while realising the context of a path");
 
+    UnforceImpure impure(*this);
     try {
         if (!context.empty() && path.accessor == rootFS) {
             auto rewrites = realiseContext(context);
@@ -184,6 +189,8 @@ SourcePath EvalState::realisePath(
                 ensureLazyPathsCopied(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
         }
+        if (given)
+            *given = path;
         return resolveSymlinks ? path.resolveSymlinks(*resolveSymlinks) : path;
     } catch (Error & e) {
         e.addTrace(nullptr, "while realising the context of path '%s'", path);
@@ -288,7 +295,14 @@ static void scopedImport(EvalState & state, SourcePath & path, Value * vScope, V
     // args[0]->attrs is already sorted.
 
     printTalkative("evaluating file '%1%'", path);
-    Expr * e = state.parseExprFromFile(resolveExprPath(path), staticEnv);
+    Expr * e = [&] {
+        UnforceImpure impure(state);
+        UnforceRead read(state, "scopedImport", path);
+        auto file = read([&] { return resolveExprPath(path); });
+        auto text = read([&] { return read.at(file.resolveSymlinks()).readFile(); });
+        read.check([&](Sink & sink) { sink << text; });
+        return state.parseExprFromFile(file, staticEnv, std::move(text));
+    }();
 
     e->eval(state, *env, v);
 }
@@ -302,6 +316,7 @@ static void import(EvalState & state, Value & vPath, Value * vScope, Value & v)
 
     // FIXME
     auto isValidDerivationInStore = [&]() -> std::optional<StorePath> {
+        UnforceImpure impure(state);
         if (!state.store->isStorePath(path2))
             return std::nullopt;
         auto storePath = state.store->parseStorePath(path2);
@@ -311,6 +326,7 @@ static void import(EvalState & state, Value & vPath, Value * vScope, Value & v)
     };
 
     if (auto storePath = isValidDerivationInStore()) {
+        unforceNoteRead(state, path);
         derivationToValue(state, path, *storePath, v);
     } else if (vScope) {
         scopedImport(state, path, vScope, v);
@@ -1846,6 +1862,7 @@ warnStructuredAttrsIneffective(EvalState & state, const Attr & i, std::string_vi
 [[gnu::noinline]] static void
 finishDerivationStrict(EvalState & state, std::string_view drvName, DerivationStrictState & st, Value & v)
 {
+    UnforceImpure impure(state);
     auto & drv = st.drv;
     auto & outputs = st.outputs;
     auto & outputHash = st.outputHash;
@@ -2140,17 +2157,20 @@ static void prim_storePath(EvalState & state, CallSite callSite, Value * const *
     NixStringContext context;
     SourcePath sourcePath = state.coerceToPath(
         noPos, *args[0], context, "while evaluating the first argument passed to 'builtins.storePath'");
+    UnforceImpure impure(state);
 
     /* Resolve symlinks in ‘path’, unless ‘path’ itself is a symlink
        directly in the store.  The latter condition is necessary so
        e.g. nix-push does the right thing. */
     if (!state.store->isStorePath(sourcePath.path.abs()))
-        sourcePath = sourcePath.resolveSymlinks(SymlinkResolution::Full);
+        sourcePath = unforceResolve(state, "storePath", sourcePath, SymlinkResolution::Full);
     if (!state.store->isInStore(sourcePath.path.abs()))
         state.error<EvalError>("path '%1%' is not in the Nix store", sourcePath).atPos(noPos).debugThrow();
     auto storePath = state.store->toStorePath(sourcePath.path.abs()).first;
-    if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))) && !settings.readOnlyMode)
+    if (!state.storeFS->getMount(CanonPath(state.store->printStorePath(storePath))) && !settings.readOnlyMode) {
+        unforceNoteRead(state, sourcePath);
         state.store->getBuilder()->ensurePath(storePath);
+    }
     context.insert(NixStringContextElem::Opaque{.path = storePath});
     v.mkString(sourcePath.path.abs(), context, state.mem);
 }
@@ -2186,10 +2206,13 @@ static void prim_pathExists(EvalState & state, CallSite callSite, Value * const 
             arg.type() == nString && (arg.string_view().ends_with("/") || arg.string_view().ends_with("/."));
 
         auto symlinkResolution = mustBeDir ? SymlinkResolution::Full : SymlinkResolution::Ancestors;
-        auto path = state.realisePath(noPos, arg, symlinkResolution);
+        UnforceRead read(state, mustBeDir ? "pathExists/" : "pathExists");
+        auto path = read.realise(arg, symlinkResolution);
 
-        auto st = path.maybeLstat();
+        UnforceImpure impure(state);
+        auto st = read([&] { return path.maybeLstat(); });
         auto exists = st && (!mustBeDir || st->type == SourceAccessor::tDirectory);
+        read.check([&](Sink & sink) { sink << uint64_t(exists); }, !st || read.linked);
         v.mkBool(exists);
     } catch (RestrictedPathError & e) {
         v.mkBool(false);
@@ -2298,12 +2321,10 @@ static RegisterPrimOp primop_dirOf({
 /* Return the contents of a file as a string. */
 static void prim_readFile(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    auto path = state.realisePath(noPos, *args[0]);
-    auto s = path.readFile();
-    if (s.find((char) 0) != std::string::npos)
-        state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
-            .atPos(noPos)
-            .debugThrow();
+    UnforceRead read(state, "readFile");
+    auto path = read.realise(*args[0]);
+    UnforceImpure impure(state);
+    auto s = read([&] { return path.readFile(); });
     StorePathSet refs;
     if (state.store->isInStore(path.path.abs())) {
         try {
@@ -2315,6 +2336,15 @@ static void prim_readFile(EvalState & state, CallSite callSite, Value * const * 
         refsSink << s;
         refs = refsSink.getResultPaths();
     }
+    read.check([&](Sink & sink) {
+        sink << s;
+        for (auto & p : refs)
+            sink << state.store->printStorePath(p);
+    });
+    if (s.find((char) 0) != std::string::npos)
+        state.error<EvalError>("the contents of the file '%1%' cannot be represented as a Nix string", path)
+            .atPos(noPos)
+            .debugThrow();
     NixStringContext context;
     for (auto && p : std::move(refs)) {
         context.insert(
@@ -2368,6 +2398,7 @@ static void prim_findFile(EvalState & state, CallSite callSite, Value * const * 
                 .toOwned();
 
         try {
+            UnforceImpure impure(state);
             auto rewrites = state.realiseContext(context);
             path = rewriteStrings(std::move(path), rewrites);
         } catch (InvalidPathError & e) {
@@ -2386,6 +2417,7 @@ static void prim_findFile(EvalState & state, CallSite callSite, Value * const * 
     auto path =
         state.forceStringNoCtx(*args[1], noPos, "while evaluating the second argument passed to builtins.findFile");
 
+    UnforceImpure impure(state);
     v.mkPath(state.findFile(lookupPath, path, noPos), state.mem);
 }
 
@@ -2533,9 +2565,13 @@ static void prim_hashFile(EvalState & state, CallSite callSite, Value * const * 
     if (!ha)
         state.error<EvalError>("unknown hash algorithm '%1%'", algo).atPos(noPos).debugThrow();
 
-    auto path = state.realisePath(noPos, *args[1]);
+    UnforceRead read(state, "hashFile");
+    auto path = read.realise(*args[1]);
+    UnforceImpure impure(state);
+    auto s = read([&] { return path.readFile(); });
+    read.check([&](Sink & sink) { sink << s; });
 
-    v.mkString(hashString(*ha, path.readFile()).to_string(HashFormat::Base16, false), state.mem);
+    v.mkString(hashString(*ha, s).to_string(HashFormat::Base16, false), state.mem);
 }
 
 static RegisterPrimOp primop_hashFile({
@@ -2586,6 +2622,7 @@ static const Value & fileTypeToString(EvalState & state, SourceAccessor::Type ty
 static void prim_readFileType(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     auto path = state.realisePath(noPos, *args[0], std::nullopt);
+    UnforceImpure impure(state);
     /* Retrieve the directory entry type and stringize it. */
     v = fileTypeToString(state, path.lstat().type);
 }
@@ -2603,12 +2640,21 @@ static RegisterPrimOp primop_readFileType({
 /* Read a directory (without . or ..) */
 static void prim_readDir(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
-    auto path = state.realisePath(noPos, *args[0]);
+    UnforceRead read(state, "readDir");
+    auto path = read.realise(*args[0]);
+    UnforceImpure impure(state);
 
     // Retrieve directory entries for all nodes in a directory.
     // This is similar to `getFileType` but is optimized to reduce system calls
     // on many systems.
-    auto entries = path.readDirectory();
+    auto entries = read([&] { return path.readDirectory(); });
+    read.check([&](Sink & sink) {
+        for (auto & [name, type] : entries) {
+            /* A type not known here may be at the next read. */
+            auto st = type ? std::nullopt : (path / name).maybeLstat();
+            sink << name << uint64_t(type ? *type : st ? st->type : SourceAccessor::tUnknown);
+        }
+    });
     auto attrs = state.buildBindings(entries.size());
 
     // If we hit unknown directory entry types we may need to fallback to
@@ -2879,6 +2925,7 @@ static void prim_toFile(EvalState & state, CallSite callSite, Value * const * ar
         state.forceStringNoCtx(*args[0], noPos, "while evaluating the first argument passed to builtins.toFile");
     auto contents =
         state.forceString(*args[1], context, noPos, "while evaluating the second argument passed to builtins.toFile");
+    UnforceImpure impure(state);
 
     StorePathSet refs;
 
@@ -3026,6 +3073,7 @@ static void addPath(
     Value & v,
     const NixStringContext & context)
 {
+    UnforceImpure impure(state);
     try {
         StorePathSet refs;
 
@@ -3035,6 +3083,7 @@ static void addPath(
             auto rewrites = state.realiseContext(context);
             path = {path.accessor, CanonPath(rewriteStrings(path.path.abs(), rewrites))};
             auto [storePath, subPath] = state.store->toStorePath(path.path.abs());
+            unforceNoteRead(state, path);
             try {
                 refs = state.store->queryPathInfo(storePath)->references;
             } catch (Error &) { // FIXME: should be InvalidPathError
@@ -3054,15 +3103,21 @@ static void addPath(
                 name, ContentAddressWithReferences::fromParts(method, *expectedHash, {refs}));
 
         if (!expectedHash || !state.store->isValidPath(*expectedStorePath)) {
-            /* A filtered copy, or one with references, is remembered nowhere
-               in this process, and without a hash it is made again. */
-            if ((filterFun || !refs.empty()) && !expectedHash)
-                unforceNoteEffect(state);
+            /* A copy without a filter is remembered by where the path led
+               (`fetchToStore`); a filtered copy, or one with references,
+               nowhere in this process: it is made again unless a hash made
+               the first valid (not in read-only mode). */
+            bool copied = !filterFun && refs.empty();
+            auto resolved = copied ? unforceResolve(state, "path", path, SymlinkResolution::Full) : path.resolveSymlinks();
+            if (!copied && (!expectedHash || settings.readOnlyMode)) {
+                unforceNoteRead(state, path);
+                unforceNoteRead(state, resolved);
+            }
             // FIXME: support refs in fetchToStore()?
             auto dstPath = refs.empty() ? fetchToStore(
                                               state.fetchSettings,
                                               *state.store,
-                                              path.resolveSymlinks(),
+                                              resolved,
                                               settings.readOnlyMode ? FetchMode::DryRun : FetchMode::Copy,
                                               name,
                                               method,
@@ -3070,7 +3125,7 @@ static void addPath(
                                               state.repair)
                                         : state.store->addToStore(
                                               name,
-                                              path.resolveSymlinks(),
+                                              resolved,
                                               method,
                                               HashAlgorithm::SHA256,
                                               refs,

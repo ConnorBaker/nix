@@ -10,15 +10,17 @@
    the region (`youngFree`) keeps it as it is. The job keeps its memory below
    a cut decided from records made as forces ended, and frees the rest by
    lowering the bump cursor: nothing is marked, walked or moved. Below the
-   cut, the whole pages of what no kept value reaches go back to the system.
-   A job in which an effect ran outside any cell's force is kept whole
-   instead: nothing is reverted, and its memory stays. */
+   cut, the whole pages of what no kept value reaches go back to the system. */
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/primops.hh"
+#include "nix/fetchers/filtering-source-accessor.hh"
+#include "nix/store/local-fs-store.hh"
+#include "nix/store/store-api.hh"
 #include "nix/util/config.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/util/std-hash.hh"
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -1044,7 +1046,8 @@ static char * keepPrefix(
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
         auto t = targets.ofEntry[i];
-        if (log[i].keep || (!alwaysRevert && p.isThunk() && unforceIsReverted(p.thunk().expr))
+        if ((log[i].keep && !log[i].target->isFailed())
+            || (!alwaysRevert && p.isThunk() && unforceIsReverted(p.thunk().expr))
             || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
             (byCopy(t) ? copy : promote)[t] = true;
     }
@@ -1606,15 +1609,115 @@ UnforceBuiltinsCheck::~UnforceBuiltinsCheck()
 void unforceNoteEffect(EvalState & state)
 {
     /* Running in the current owner's force, or in that of a young cell it
-       owns, which only its re-force runs again. Outside any (the driver's),
-       or in another evaluator than the job's: the job is kept whole. */
+       owns, which only its re-force runs again. In another evaluator than
+       the job's, the job is kept whole. */
     auto job = jobOwner.load();
-    if (!job)
-        return;
-    if (job == &state && curOwner != noOwner)
-        state.undoLog[curOwner].keep = true;
-    else
+    if (job && job != &state)
         keepWhole = true;
+    else if (job && curOwner != noOwner)
+        state.undoLog[curOwner].keep = true;
+}
+
+/* `path` is read as it is: outside the REPL, the evaluator's caches keep the
+   resolution of its symlinks (`lstat`, `readlink`), and accessors follow none. */
+UnforceChange unforceReadChange(EvalState & state, const SourcePath & path)
+{
+    auto job = jobOwner.load();
+    if (!job || (job == &state && curOwner == noOwner))
+        return UnforceChange::none;
+    auto & store = *state.store;
+    auto s = path.path.abs();
+    auto allow = state.rootFS.dynamic_pointer_cast<AllowListSourceAccessor>();
+    if (path.accessor == state.rootFS && allow && !allow->isAllowed(path.path))
+        return UnforceChange::byEvaluation;
+    /* The store directory's listing too: the evaluation adds to it. */
+    if (path.accessor != state.rootFS || !(store.isInStore(s) || s == store.storeDir))
+        return UnforceChange::byEdit;
+    auto p = store.maybeParseStorePath(s.substr(0, s.find('/', store.storeDir.size() + 1)));
+    if (!p)
+        return UnforceChange::byEvaluation;
+    if (auto mount = state.storeFS->getMount(CanonPath(store.printStorePath(*p)))) {
+        auto dir = mount->getPhysicalPath(CanonPath::root);
+        return !dir || store.isInStore(dir->string()) ? UnforceChange::none : UnforceChange::byEdit;
+    }
+    /* What the store cannot answer is as if not valid yet. */
+    try {
+        auto held = state.heldStorePaths.find(*p);
+        if (held == state.heldStorePaths.end()) {
+            store.addTempRoot(*p);
+            held = state.heldStorePaths.emplace(*p, false).first;
+        }
+        if ((held->second = held->second || store.isValidPath(*p)))
+            return UnforceChange::none;
+    } catch (Error &) {
+    }
+    /* Impure, `rootFS` reads the host's file system first. A store that
+       keeps its objects elsewhere (a dummy, chroot or remote store) never
+       writes there: what the host has there changes only by an edit. */
+    auto local = dynamic_cast<LocalFSStore *>(&store);
+    if (!state.settings.pureEval && !(local && local->getRealStoreDir().string() == store.storeDir)
+        && getFSSourceAccessor()->pathExists(CanonPath(store.printStorePath(*p))))
+        return UnforceChange::byEdit;
+    return UnforceChange::byEvaluation;
+}
+
+void UnforceFileChanged::anchor() {}
+
+SourcePath UnforceRead::at(SourcePath path)
+{
+    resolved = path.path.abs();
+    linked = path != *given || path.accessor != state.rootFS;
+    change = unforceReadChange(state, *given);
+    if (linked)
+        change = std::max(change, unforceReadChange(state, path));
+    return path;
+}
+
+std::optional<std::string> UnforceRead::key(bool changes)
+{
+    /* Recorded in this evaluator's job, outside the REPL (which keeps every
+       impure operation's cell). */
+    bool record = changes && change == UnforceChange::byEdit && jobOwner.load() == &state && !state.fileCachesReset;
+    if (changes && change != UnforceChange::none && !record)
+        unforceNoteEffect(state);
+    if (!given || (!record && state.readDigests.empty()))
+        return std::nullopt;
+    auto key = std::string(op) + ' ' + std::to_string(given->accessor->number) + ' ' + given->path.abs();
+    if (!record && !state.readDigests.contains(key))
+        return std::nullopt;
+    return key;
+}
+
+void UnforceRead::check(fun<void(Sink &)> feed, bool changes)
+{
+    if (auto k = key(changes)) {
+        HashSink sink(HashAlgorithm::SHA256);
+        sink << resolved;
+        feed(sink);
+        auto digest = sink.finish().hash;
+        if (state.readDigests.emplace(std::move(*k), digest).first->second != digest)
+            changed();
+    }
+}
+
+SourcePath unforceResolve(EvalState & state, std::string_view op, const SourcePath & path, SymlinkResolution mode)
+{
+    /* A resolution through `rootFS` that followed no link follows none
+       later either (its cache keeps what `lstat` found), so no read of the
+       path was recorded or will be: it needs none (copies run at every
+       coercion of a path). */
+    if (path.accessor == state.rootFS)
+        if (auto resolved = path.resolveSymlinks(mode); resolved == path)
+            return resolved;
+    UnforceRead read(state, op, path);
+    auto resolved = read.at(read([&] { return path.resolveSymlinks(mode); }));
+    read.check([](Sink &) {}, read.linked);
+    return resolved;
+}
+
+void UnforceRead::changed()
+{
+    throw UnforceFileChanged((unsigned int) 102, "file '%s' changed during evaluation (%s)", given->to_string(), op);
 }
 
 /* ---------------------------------------------------------------------------

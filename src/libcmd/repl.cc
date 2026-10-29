@@ -142,6 +142,7 @@ NixRepl::NixRepl(
     , runNixPtr{runNix}
     , interacter(std::make_unique<ReadlineLikeInteracter>(getDataDir() / "repl-history"))
 {
+    state->fileCachesReset = true;
 }
 
 static std::ostream & showDebugTrace(std::ostream & out, const PosTable & positions, const DebugTrace & dt)

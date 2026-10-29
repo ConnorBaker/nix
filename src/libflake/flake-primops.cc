@@ -14,6 +14,7 @@
 #include "nix/expr/eval-inline.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/expr/symbol-table.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/expr/value.hh"
 #include "nix/fetchers/attrs.hh"
 #include "nix/fetchers/fetchers.hh"
@@ -31,6 +32,8 @@ namespace nix::flake::primops {
 PrimOp getFlake(const Settings & settings)
 {
     auto prim_getFlake = [&settings](EvalState & state, CallSite callSite, Value * const * args, Value & v) {
+        /* It reads the lock file each time. */
+        unforceNoteEffect(state);
         state.forceValue(*args[0], noPos);
 
         LockFlags lockFlags{

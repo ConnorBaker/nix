@@ -9,6 +9,8 @@
 #include "nix/expr/value-to-xml.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/finally.hh"
+#include "nix/util/memory-source-accessor.hh"
+#include "nix/util/mounted-source-accessor.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
@@ -56,6 +58,34 @@ struct FailMapping
 class UnforceTest : public LibExprTest
 {
 protected:
+    /* A store that paths can be added to; `restricted`: restrict-eval. */
+    UnforceTest(bool restricted = false)
+        : LibExprTest(openStore("dummy://", {{"read-only", "false"}}), [&](bool & readOnlyMode) {
+            EvalSettings settings{readOnlyMode};
+            settings.nixPath = {};
+            settings.restrictEval = restricted;
+            return settings;
+        })
+    {
+    }
+
+    /* A valid store path, a file holding `contents`. */
+    std::string storeFile(std::string contents)
+    {
+        StringSource s{contents};
+        return state.store->printStorePath(state.store->addToStoreFromDump(
+            s, "w12", FileSerialisationMethod::Flat, ContentAddressMethod::Raw::Text, HashAlgorithm::SHA256));
+    }
+
+    /* `v` printed deep in a job. */
+    std::string afterJob(Value & v)
+    {
+        state.beginUnforceScope();
+        auto first = deep(v);
+        state.endUnforceScope();
+        return first;
+    }
+
     void SetUp() override
     {
         unforceTestResetNativeCode();
@@ -407,16 +437,16 @@ TEST_F(UnforceTest, builtinsChangeTurnsOff)
     EXPECT_FALSE(unforceEnabled(state));
 }
 
-/* A job in which an effect ran outside any cell's force is kept whole. */
-TEST_F(UnforceTest, effectKeepsJob)
+/* An effect in the driver's evaluation (no cell's force), which nothing runs
+   again, keeps nothing. */
+TEST_F(UnforceTest, driverEffectKeepsNothing)
 {
     auto v = oldThunk("{ a = 1; }");
     state.beginUnforceScope();
     state.forceValue(*v, noPos);
     unforceNoteEffect(state);
     state.endUnforceScope();
-    EXPECT_FALSE(v->isThunk());
-    EXPECT_EQ(deep(*v), "{ a = 1; }");
+    EXPECT_TRUE(v->isThunk());
 }
 
 /* A trace keeps nothing: the cell whose evaluation showed it, here in the
@@ -478,6 +508,153 @@ TEST_F(UnforceTest, importParsedOnce)
     EXPECT_EQ(deep(*v), "{ a = [ 1 ]; }");
     EXPECT_THROW(state.forceValue(*importOf("g.nix"), noPos), ParseError);
     state.endUnforceScope();
+}
+
+/* An impure operation keeps its cell where running it again could differ: a
+   copy that nothing remembers (with a filter), unless its source cannot change
+   (a valid store path, or one mounted from a snapshot), and one that fails,
+   also where the evaluator caches it once it succeeds, until it does, but not
+   for a failure of its argument or of the file it imports. Where the file
+   caches are reset while values stay (the REPL), every one keeps, an import
+   too. */
+TEST_F(UnforceTest, impureKeeps)
+{
+    auto dir = createTempDir();
+    AutoDelete del(dir, true);
+    auto d = dir.string();
+    writeFile(dir / "f", "1");
+    writeFile(dir / "t", "throw \"t\"");
+    auto snapshot = make_ref<MemorySourceAccessor>();
+    snapshot->addFile(CanonPath("/f"), "2");
+    auto snap = state.store->printStorePath(StorePath::random("s")),
+         work = state.store->printStorePath(StorePath::random("w"));
+    state.storeFS->mount(CanonPath(snap), snapshot);
+    state.storeFS->mount(CanonPath(work), makeFSSourceAccessor(dir));
+    auto copy = [](std::string p) { return "\"${builtins.path { path = " + p + "; filter = _: _: true; }}\""; };
+    for (auto & [op, keeps] : std::vector<std::pair<std::string, bool>>{
+             {copy(d + "/f"), true},
+             {copy(work + "/f"), true},
+             {copy(storeFile("1")), false},
+             {copy(snap + "/f"), false},
+             {"import " + d + "/f", false},
+             {"builtins.tryEval (import " + d + "/t) == builtins.tryEval (builtins.readFile (throw \"x\"))", false},
+             {"builtins.readDir " + state.store->storeDir, true}, // the evaluation adds to it
+         }) {
+        for (bool reset : {false, true}) {
+            state.fileCachesReset = reset;
+            auto v = oldThunk("{ a = " + op + "; }");
+            afterJob(*v);
+            EXPECT_EQ(v->isThunk(), !keeps && !reset) << op;
+        }
+    }
+    state.fileCachesReset = false;
+    for (std::string op : {"import " + d + "/m", "builtins.readFileType " + d + "/m", "\"${" + d + "/m}\""}) {
+        std::filesystem::remove(dir / "m");
+        auto v = oldThunk("{ a = { b = " + op + "; }; }");
+        state.beginUnforceScope();
+        EXPECT_THROW(deep(*v), Error) << op;
+        state.endUnforceScope();
+        writeFile(dir / "m", "1");
+        EXPECT_THROW(deep(*v), Error) << op;
+    }
+}
+
+/* A read that only an edit can change keeps no cell, whether it ran in the
+   cell's own force or after it: read again, in a job or not, it must lead
+   where it led and give what it first gave, or the evaluation stops, also
+   where it now fails or a link made since leads elsewhere (k and j, links
+   to m/../t and m/../u, once m is a link; u leads into the store). So must
+   a copy. A new read is checked the same. The REPL keeps the cell instead,
+   and a new read there sees the edit. */
+TEST_F(UnforceTest, readChecked)
+{
+    auto dir = createTempDir();
+    AutoDelete del(dir, true);
+    using Edit = std::function<void(const std::filesystem::path &)>;
+    Edit write = [](auto & d) { writeFile(d / "f", "2"); };
+    Edit relink = [](auto & d) { std::filesystem::create_symlink(d / "t" / "x", d / "m"); }; // to t/t, t/u
+    int n = 0;
+    for (auto & [op, edit] : std::vector<std::pair<std::string, Edit>>{
+             {"builtins.readFile @/f", write},
+             {"builtins.readFile @/f", [](auto & d) { std::filesystem::remove(d / "f"); }},
+             {"builtins.readFile @/f", [](auto & d) { writeFile(d / "f", std::string("1\0", 2)); }},
+             {"builtins.hashFile \"sha256\" @/f", write},
+             {"builtins.scopedImport { } @/f", [](auto & d) { writeFile(d / "f", "{"); }},
+             {"builtins.readDir @", [](auto & d) { writeFile(d / "g", ""); }},
+             {"builtins.pathExists @/l/x",
+              [](auto & d) { std::filesystem::create_directory_symlink(d / "t", d / "l"); }},
+             {"builtins.pathExists @/k/x", relink},
+             {"\"${@/k/x}\"", relink},
+             {"builtins.path { path = @/k/x; }", relink},
+             {"builtins.readFile @/k/x", [](auto & d) { std::filesystem::create_symlink(d / "m", d / "m"); }},
+             {"builtins.readFile @/j", relink},
+             {"builtins.storePath @/j", relink},
+         })
+        for (bool own : {true, false}) {
+            auto d = dir / std::to_string(n++);
+            std::filesystem::create_directories(d / "t");
+            writeFile(d / "t" / "x", "");
+            writeFile(d / "f", "1");
+            std::filesystem::create_symlink("m/../t", d / "k");
+            std::filesystem::create_symlink("m/../u", d / "j");
+            std::filesystem::create_symlink(storeFile("1"), d / "u");
+            auto read = replaceStrings(op, "@", d.string());
+            auto v = oldThunk(own ? "let a = " + read + "; in builtins.seq a { inherit a; }" : "{ a = " + read + "; }");
+            afterJob(*v);
+            EXPECT_TRUE(v->isThunk()) << read;
+            edit(d);
+            state.beginUnforceScope();
+            EXPECT_THROW(deep(*v), UnforceFileChanged) << read;
+            state.endUnforceScope();
+            EXPECT_THROW(deep(*oldThunk(read)), UnforceFileChanged) << read;
+        }
+    auto f = (dir / "r").string();
+    writeFile(f, "1");
+    state.fileCachesReset = true;
+    auto v = oldThunk("{ a = builtins.readFile " + f + "; }");
+    afterJob(*v);
+    writeFile(f, "2");
+    EXPECT_EQ(deep(*v), "{ a = \"1\"; }");
+    EXPECT_EQ(afterJob(*oldThunk("builtins.readFile " + f)), "\"2\"");
+    state.fileCachesReset = false;
+}
+
+/* A store path that the store does not have but the host does, where the
+   store keeps its objects elsewhere (the dummy store, as a chroot or a
+   remote store), changes only by an edit: its read is recorded and keeps no
+   cell. Here, the tests' data in the host's store. */
+TEST_F(UnforceTest, hostStorePathRecorded)
+{
+    auto data = getUnitTestData().string();
+    if (!state.store->isInStore(data))
+        GTEST_SKIP() << "the test data is not in the store";
+    auto records = state.readDigests.size();
+    auto v = oldThunk("{ a = builtins.readDir " + data + "; }");
+    afterJob(*v);
+    EXPECT_TRUE(v->isThunk());
+    EXPECT_EQ(state.readDigests.size(), records + 1);
+}
+
+class UnforceRestrictedTest : public UnforceTest
+{
+protected:
+    UnforceRestrictedTest()
+        : UnforceTest(true)
+    {
+    }
+};
+
+/* A path that restrict-eval does not allow yet may be allowed by the
+   evaluation itself: the cell that found it missing keeps its value, and a
+   new read, once it is allowed, finds it. */
+TEST_F(UnforceRestrictedTest, notAllowedKeeps)
+{
+    auto p = storeFile("1");
+    auto v = oldThunk("{ a = builtins.pathExists " + p + "; }");
+    EXPECT_EQ(afterJob(*v), "{ a = false; }");
+    state.allowPath(state.store->parseStorePath(p));
+    EXPECT_EQ(deep(*v), "{ a = false; }");
+    EXPECT_EQ(afterJob(*oldThunk("builtins.pathExists " + p)), "true");
 }
 
 /* A root made in a job (as the evaluation cache's cursors make them) keeps

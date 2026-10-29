@@ -145,3 +145,68 @@ expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 7
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
 # search visits each attribute in a job.
 expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 3
+
+if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    # A store path that a reverted cell read or took cannot be deleted while the evaluator lives: a temporary root
+    # holds it. The evaluation opens the fifo once the earlier elements' jobs ended, and reads it until it is closed.
+    p=$(nix-store --add "$TEST_ROOT/src/a")
+    q=$(nix-store --add "$TEST_ROOT/src/b")
+    mkfifo "$TEST_ROOT/fifo"
+    nix eval --impure --expr "[ \"\${builtins.path { path = $p; filter = _: _: true; }}\" (builtins.storePath $q) (builtins.fetchurl file://$TEST_ROOT/fifo) ]" > /dev/null &
+    (exec 3> "$TEST_ROOT/fifo"; for x in "$p" "$q"; do if nix-store --delete "$x"; then fail "deleted $x while it was read"; fi; done)
+    wait $!
+
+    # A file that a job read must read the same until the evaluation ends, or it stops with exit status 102 in every
+    # front end, through tryEval and nix eval's printer too; unchanged, the output is as before. q.a reads ./f in
+    # vg1's job; vg2's blocks on a fifo while EDIT runs; vg3's re-forces q, whose a reads ./f again. The edit also
+    # makes m a link to u/e, so that k, a link to m/../t, leads to u/t.
+    vg=$TEST_ROOT/vg
+    mkdir -p "$vg/t" "$vg/u/e"
+    printf A > "$vg/t/x"
+    ln -s m/../t "$vg/k"
+    vgN=0
+    vgRun() { # vgRun PROGRAM EDIT CMD...: CMD's exit status in vgRc, its output in $vg/out
+        local fifo=$vg/fifo$((++vgN))
+        mkfifo "$fifo"
+        printf A > "$vg/f"
+        rm -f "$vg/m"
+        echo "with import $config_nix; let q = { a = builtins.readFile ./f; }; wait = builtins.fetchurl \"file://$fifo\";
+          d = name: mkDerivation { inherit name; builder = \"/b\"; }; in $1" > "$vg/p.nix"
+        "${@:3}" "$vg/p.nix" > "$vg/out" 2> "$vg/err" &
+        (exec 3> "$fifo"; eval "$2")
+        vgRc=0
+        wait $! || vgRc=$?
+    }
+    vgCheck() { # vgCheck PROGRAM EXPECTED CMD...
+        vgRun "$1" : "${@:3}"
+        [[ $vgRc == 0 && $(< "$vg/out") == "$2" ]] || fail "unchanged: $vgRc $(< "$vg/out") $(< "$vg/err")"
+        vgRun "$1" "printf B > $vg/f; ln -s $vg/u/e $vg/m" "${@:3}"
+        [[ $vgRc == 102 && ! -s $vg/out ]] || fail "edited: $vgRc $(< "$vg/out") $(< "$vg/err")"
+        grepQuiet "changed during evaluation" "$vg/err"
+    }
+    s='{ vg1 = q.a; vg2 = builtins.seq wait null; vg3 = (builtins.tryEval q.a).value; }'
+    vgCheck "$s" '{ vg1 = "A"; vg2 = null; vg3 = "A"; }' nix eval --impure -f
+    vgCheck "$s" '{"vg1":"A","vg2":null,"vg3":"A"}' nix eval --impure --json -f
+    vgCheck "$s" '{ vg1 = "A"; vg2 = null; vg3 = "A"; }' nix-instantiate --eval --strict
+    # nix-env holds the derivations it found, so q is not reverted here: vg3 reads ./f afresh.
+    vgCheck '{ vg1 = builtins.seq q.a (d "vg1"); vg2 = builtins.seq wait (d "vg2"); vg3 = builtins.seq (builtins.readFile ./f) (d "vg3"); }' \
+        $'vg1\nvg2\nvg3' nix-env -qa -f
+    # So is a file that a store path's link leads to.
+    mkdir "$vg/s"
+    ln -s "$vg/f" "$vg/s/l"
+    sp=$(nix-store --add "$vg/s")
+    vgCheck "let r = { a = builtins.readFile $sp/l; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }" \
+        '{"vg1":"A","vg2":null,"vg3":"A"}' nix eval --impure --json -f
+    # And where a link leads, for a copy and a found path.
+    xp=$(nix-store --add "$vg/t/x")
+    vgCheck 'let r = { a = "${./k/x}"; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }' \
+        "{\"vg1\":\"$xp\",\"vg2\":null,\"vg3\":\"$xp\"}" nix eval --impure --json -f
+    vgCheck 'let r = { a = builtins.pathExists ./k/x; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }' \
+        '{"vg1":true,"vg2":null,"vg3":true}' nix eval --impure --json -f
+
+    # A store path that the evaluation itself builds is no changed file: the cell that found it missing keeps its
+    # value, and a new read finds it.
+    o=$(nix eval --impure --raw --expr "(import $PWD/simple.nix).outPath")
+    [[ $(nix eval --impure --json --expr "let c = { x = builtins.pathExists \"$o\"; }; in
+      [ c.x (builtins.seq (builtins.readDir (import $PWD/simple.nix)) c.x) (builtins.pathExists \"$o\") ]") == '[false,false,true]' ]]
+fi

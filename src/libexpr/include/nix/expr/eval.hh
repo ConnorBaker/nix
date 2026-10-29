@@ -714,6 +714,8 @@ public:
      */
     Expr * parseExprFromFile(const SourcePath & path);
     Expr * parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv);
+    /** The same, from `buffer`, which the caller read from `path`. */
+    Expr * parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv, std::string buffer);
 
     /**
      * Parse a Nix expression from the specified string.
@@ -1110,6 +1112,13 @@ public:
     /** The root of the traversal whose elements run in unforce jobs (`UnforceJobs`), or null. */
     const Value * unforceRoot = nullptr;
 
+    /** Whether a front end clears the file caches while the values it forced stay (the REPL; `UnforceImpure`). */
+    bool fileCachesReset = false;
+    /** The store paths that a temporary root holds, and whether each was found valid (`unforceReadChange`). */
+    std::map<StorePath, bool> heldStorePaths;
+    /** The SHA-256 of each recorded read's first result (`UnforceRead`). */
+    std::map<std::string, Hash> readDigests;
+
     /**
      * Open an unforce scope. The outermost is a job: it allocates in a region
      * of its own, and the thunks older than it that are forced until its
@@ -1319,12 +1328,14 @@ public:
      * Coerce `v` to a path and realise it, i.e. build anything in the value's string context using `realiseContext()`.
      * @param copyLazyPaths When encountering a lazy path (i.e. a string with Opaque context that's also "mounted" on
      * the storeFS), fetch the store path to the store.
+     * @param given If not null, set to the path before its symlinks are resolved.
      */
     SourcePath realisePath(
         const PosIdx pos,
         Value & v,
         std::optional<SymlinkResolution> resolveSymlinks = SymlinkResolution::Full,
-        CopyLazyPaths copyLazyPaths = CopyLazyPaths::PreserveLazy);
+        CopyLazyPaths copyLazyPaths = CopyLazyPaths::PreserveLazy,
+        std::optional<SourcePath> * given = nullptr);
 
     /**
      * Realise the given string with context, and return the string with outputs instead of downstream output

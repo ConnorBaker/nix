@@ -1197,6 +1197,7 @@ struct ExprParseFile : Expr, gc
 
 Value * EvalState::fileEvalCell(const SourcePath & path, bool mustBeTrivial)
 {
+    UnforceImpure impure(*this);
     auto resolvedPath = getConcurrent(*importResolutionCache, path);
 
     if (!resolvedPath) {
@@ -3125,13 +3126,16 @@ BackedStringView EvalState::coerceToString(
 
 StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePath & path)
 {
+    UnforceImpure impure(*this);
     if (nix::isDerivation(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
+    /* Remembered by where the path led (`fetchToStore`). */
+    auto resolved = unforceResolve(*this, "copy", path, SymlinkResolution::Ancestors);
     auto dstPath = fetchToStore(
         fetchSettings,
         *store,
-        path.resolveSymlinks(SymlinkResolution::Ancestors),
+        resolved,
         settings.isReadOnly() ? FetchMode::DryRun : FetchMode::Copy,
         path.baseName(),
         ContentAddressMethod::Raw::NixArchive,
@@ -3770,7 +3774,12 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
-    auto buffer = path.resolveSymlinks().readFile();
+    return parseExprFromFile(path, staticEnv, path.resolveSymlinks().readFile());
+}
+
+Expr *
+EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv, std::string buffer)
+{
     // readFile hopefully have left some extra space for terminators
     buffer.append("\0\0", 2);
     return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);

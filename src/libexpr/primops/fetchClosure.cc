@@ -1,4 +1,5 @@
 #include "nix/expr/primops.hh"
+#include "nix/expr/unforce.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/realisation.hh"
 #include "nix/store/make-content-addressed.hh"
@@ -125,6 +126,7 @@ typedef std::optional<StorePath> StorePathOrGap;
 
 static void prim_fetchClosure(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
+    unforceNoteEffect(state);
     state.forceAttrs(*args[0], noPos, "while evaluating the argument passed to builtins.fetchClosure");
 
     std::optional<std::string> fromStoreUrl;
