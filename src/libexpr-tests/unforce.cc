@@ -8,6 +8,7 @@
 #include "nix/expr/value-to-json.hh"
 #include "nix/expr/value-to-xml.hh"
 #include "nix/util/file-system.hh"
+#include "nix/util/finally.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
@@ -612,6 +613,50 @@ TEST_F(UnforceTest, timeClosure)
     EXPECT_EQ(deep(*before), "{ x = 1; }");
     state.forceValue(*after, noPos);
     EXPECT_EQ(after->listSize(), 100u);
+}
+
+/* A string target keeps its value by a copy, outside S: forced again after
+   a job reverted it, it is nominated, keeps its value, and the job keeps
+   none of its memory, which a later job allocates again zeroed. Its bytes,
+   its context array (shared by `substring 0 0`) and the array's elements
+   are intact. */
+TEST_F(UnforceTest, stringKeptByCopy)
+{
+    /* The store is a dummy one: derivations' paths are computed, not written. */
+    auto readOnly = std::exchange(nix::settings.readOnlyMode, true);
+    Finally restore([&] { nix::settings.readOnlyMode = readOnly; });
+    std::string drv = "\"${derivation { name = \"d\"; system = \"s\"; builder = \"b\"; }}-y\"";
+    auto context = [](const Value & s) {
+        std::vector<std::string> r;
+        if (s.context())
+            for (auto e : *s.context())
+                r.emplace_back(e->view());
+        return r;
+    };
+    for (auto & [expr, elements] : std::vector<std::pair<std::string, size_t>>{
+             {"builtins.concatStringsSep \"\" (builtins.genList (i: \"abcdefgh\") 64)", 0},
+             {drv, 1},
+             {"builtins.substring 0 0 " + drv, 1}}) {
+        /* Forced outside any job first, so that the jobs force no cell
+           outside them but `v` (`derivation` is one). */
+        auto fresh = oldThunk(expr);
+        state.forceValue(*fresh, noPos);
+        auto v = oldThunk(expr);
+        for (bool again : {false, true}) {
+            auto kept = unforceStats.bytesKept;
+            state.beginUnforceScope();
+            state.forceValue(*v, noPos);
+            state.endUnforceScope();
+            EXPECT_EQ(unforceStats.bytesKept, kept);
+            EXPECT_EQ(v->isThunk(), !again);
+        }
+        state.beginUnforceScope();
+        state.mem.allocBytes(1 << 20);
+        state.endUnforceScope();
+        EXPECT_EQ(v->string_view(), fresh->string_view());
+        EXPECT_EQ(context(*v), context(*fresh));
+        EXPECT_EQ(context(*v).size(), elements);
+    }
 }
 
 /* A value the driver allocated in the job, which a holder holds, is no

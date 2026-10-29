@@ -46,6 +46,15 @@ expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
 fi
+# Each element here is a string, a name read from a set its job built, which
+# the job keeps by a copy: it frees the set and its list, and the later
+# elements' jobs, which reuse that memory, leave the names intact.
+nexpr='builtins.mapAttrs (_: p: builtins.seq (builtins.length p.big) p.name) (builtins.listToAttrs (builtins.genList (i: { name = "p${toString i}"; value = { name = "n-" + toString i; big = builtins.genList (x: x) 1000; }; }) 3))'
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$nexpr")" 5
+[[ $(< "$TEST_ROOT/out") == '{ p0 = "n-0"; p1 = "n-1"; p2 = "n-2"; }' ]]
+if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(jq -r '.unforce.bytesFreed > .unforce.bytesKept' "$TEST_ROOT/stats.json") == true ]]
+fi
 
 # A cell an element's job reverted (s in a's) is kept by the next element's
 # job that forces it (b's); with unforce-always-revert, every job reverts it

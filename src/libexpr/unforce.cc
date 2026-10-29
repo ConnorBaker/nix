@@ -706,6 +706,24 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
    A failed young cell inside a reverted owner is still built again. With
    `unforce-always-revert`, a target an earlier job reverted is not
    nominated: every job reverts it again.
+
+   A target whose value is a string keeps it outside S, by a copy: neither
+   the first three nominations nor the time closure put it in S, so it
+   raises neither the horizon nor the cut. A string reaches no cell,
+   Bindings or list, and strings are compared by content, so no identity
+   rests on where its bytes are. Its young objects leave its force only
+   through its value, through a holder (whose young pointers name it as
+   their owner, which keeps it in S as before), or through a table that
+   keeps values across forces, of which there is none (the import cache
+   gives each file a cell of its own). So once its force has ended nothing
+   reaches them; a force of one of them after its own, which would show
+   otherwise (its `last` past its `own`), keeps it in S. Another target
+   that shares its value is decided on its own, and a young cell that does
+   was written while that cell's owner was current, below that owner's
+   `at`: under the cut if the owner is in S, unreachable if not. The parts
+   of its value above the cut (its bytes, its context array with the
+   array's elements) are copied out of the region (`copyStringOut`), and the
+   cell, at its own address, keeps its value.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
@@ -851,24 +869,39 @@ struct OwnerHold : UnforceHolder::Hold
 
 } // namespace
 
-/* Which targets the job promotes (see above), and the top of the memory it
-   keeps; null to keep it whole. No object is visited. */
-static char *
-keepPrefix(
-    const std::vector<UnforceUndoEntry> & log, const Targets & targets, std::vector<bool> & promote, bool alwaysRevert)
+/* Copy string `v`'s bytes and context out of the job's region, the parts
+   that lie in it at or above `keep`, the top of the memory the job keeps, to
+   memory allocated as outside any job (the caller pauses the region).
+   `fromBuilder` allocates a context array's elements right after it, with
+   no force between, so the cut never separates them. */
+static void copyStringOut(EvalState & state, Value & v, const char * keep)
 {
-    for (size_t i = 0; i < log.size(); ++i) {
-        auto & p = log[i].preImage;
-        if (log[i].keep || (!alwaysRevert && p.isThunk() && unforceIsReverted(p.thunk().expr))
-            || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
-            promote[targets.ofEntry[i]] = true;
+    using Context = Value::StringWithContext::Context;
+    auto freed = [&](const void * p) { return evalRegion.contains(p) && (const char *) p >= keep; };
+    auto s = v.stringData();
+    auto c = v.context();
+    if (freed(s))
+        s = &StringData::make(state.mem, s->view());
+    if (freed(c)) {
+        auto c2 = new (state.mem.allocBytes<const StringData *, sizeof(Context)>(c->size())) Context(c->size());
+        std::ranges::transform(*c, const_cast<const StringData **>(c2->begin()), [&](auto e) {
+            return &StringData::make(state.mem, e->view());
+        });
+        c = c2;
     }
-    OwnerHold hold{targets, promote};
-    for (auto h : holders)
-        h->held(hold);
-    if (hold.driver)
-        return nullptr;
+    v.mkStringNoCopy(*s, c);
+}
 
+/* Which targets keep their values (`promote`: S, and the strings kept by
+   copy; see above), and the top of the memory the job keeps; null to keep
+   it whole. No object is visited. */
+static char * keepPrefix(
+    EvalState & state,
+    const std::vector<UnforceUndoEntry> & log,
+    const Targets & targets,
+    std::vector<bool> & promote,
+    bool alwaysRevert)
+{
     std::vector<EntryEnds> per(targets.cells.size(), EntryEnds{0, 0, nullptr});
     for (size_t i = 0; i < log.size(); ++i) {
         auto & e = per[targets.ofEntry[i]];
@@ -876,6 +909,29 @@ keepPrefix(
         e.last = std::max(e.last, ends[i].last);
         e.at = std::max(e.at, ends[i].at);
     }
+    /* Whether target `t` keeps its value by copy instead of in S. */
+    auto byCopy = [&](size_t t) {
+        if (targets.cells[t]->internalType() != tString)
+            return false;
+        /* Never so, by the argument above; kept as a guard. */
+        if (per[t].last != per[t].own) [[unlikely]]
+            return false;
+        return true;
+    };
+    std::vector<bool> copy(promote.size());
+    for (size_t i = 0; i < log.size(); ++i) {
+        auto & p = log[i].preImage;
+        auto t = targets.ofEntry[i];
+        if (log[i].keep || (!alwaysRevert && p.isThunk() && unforceIsReverted(p.thunk().expr))
+            || std::ranges::any_of(holders, [&](auto h) { return h->keeps(log[i].target); }))
+            (byCopy(t) ? copy : promote)[t] = true;
+    }
+    OwnerHold hold{targets, promote};
+    for (auto h : holders)
+        h->held(hold);
+    if (hold.driver)
+        return nullptr;
+
     uint64_t horizon = 0;
     char * top = evalRegion.base;
     auto add = [&](size_t t) {
@@ -894,13 +950,21 @@ keepPrefix(
     for (auto t : order) {
         if (per[t].own > horizon)
             break;
-        if (!promote[t]) {
+        if (!promote[t] && byCopy(t))
+            copy[t] = true;
+        else if (!promote[t]) {
             promote[t] = true;
             add(t);
         }
     }
     /* Nothing live lies above the cursor. */
-    return std::min(top, evalRegion.cur);
+    auto keep = std::min(top, evalRegion.cur);
+    for (size_t t = 0; t < promote.size(); ++t)
+        if (copy[t] && !promote[t]) {
+            copyStringOut(state, *targets.cells[t], keep);
+            promote[t] = true;
+        }
+    return keep;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1549,7 +1613,9 @@ void EvalState::endUnforceJob(const char * ender)
     /* Each entry's cell is reverted (`target` stays) to what its entry
        says, decided from the cell's value at the job's end before any is
        written, or keeps its value (no `target`). Everything that may fail to
-       allocate is done before anything is written. */
+       allocate is done before anything is written, but for a string kept by
+       copy (`copyStringOut`), whose cell then holds the same content outside
+       the region: harmless if the job is kept whole after all. */
     size_t promoted = 0;
     /* The top of what the job keeps. */
     char * keptTo = nullptr;
@@ -1558,7 +1624,7 @@ void EvalState::endUnforceJob(const char * ender)
         try {
             Targets targets(undoLog);
             std::vector<bool> promote(targets.cells.size());
-            keptTo = keepPrefix(undoLog, targets, promote, settings.unforceAlwaysRevert);
+            keptTo = keepPrefix(*this, undoLog, targets, promote, settings.unforceAlwaysRevert);
             /* Null: a holder holds what the driver allocated in the job. */
             if (!keptTo)
                 keep = true;
