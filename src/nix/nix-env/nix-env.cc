@@ -1088,10 +1088,13 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
        walk's job that found it, so that nothing holds what the job built;
        not where --system-filter, --status or --prebuilt-only read the
        elements after the walk. queryJSON throws what a query threw. Only
-       with unforcing, which frees what the jobs built. */
+       with unforcing, which frees what the jobs built. The table, with or
+       without unforcing, reads only their names after the walk unless it
+       prints more than names, attribute paths and versions: the walk lists
+       them by name only. */
     JSONQuery jsonQuery{globals, printOutPath, printDrvPath, printMeta};
-    jsonQuery.walked = jsonOutput && source == sAvailable && globals.instSource.systemFilter == "*" && !printStatus
-                       && !globals.prebuiltOnly && unforceEnabled(*globals.state);
+    bool readAfter = globals.instSource.systemFilter != "*" || printStatus || globals.prebuiltOnly;
+    jsonQuery.walked = jsonOutput && source == sAvailable && !readAfter && unforceEnabled(*globals.state);
     DrvNames selectors = drvNamesFromArgs(opArgs);
     std::function<void(PackageInfo &)> walk;
     if (jsonQuery.walked)
@@ -1106,6 +1109,9 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
                 /* filterBySelector throws it after the walk. */
             }
         };
+    else if (
+        !readAfter && !jsonOutput && !xmlOutput && !printSystem && !printDrvPath && !printOutPath && !printDescription)
+        walk = [](PackageInfo &) {};
 
     if (source == sAvailable || compareVersions)
         loadDerivations(

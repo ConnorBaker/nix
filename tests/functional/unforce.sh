@@ -173,7 +173,8 @@ expectJobs "$(jobsOf nix flake check "$flakeDir")" 3
 expectJobs "$(jobsOf nix flake show "$flakeDir")" 2
 
 # A derivation found in an earlier job is dropped in a later one; one job
-# per attribute, then one per derivation found (its name, its drvPath).
+# per attribute, then one per derivation found (its name, its drvPath); -qa
+# keeps none of them, so one more element joins an open job.
 cat > "$TEST_ROOT/drvs.nix" <<EOF
 with import "${config_nix}";
 rec {
@@ -182,7 +183,7 @@ rec {
   z = mkDerivation { name = "z"; builder = "/b"; };
 }
 EOF
-expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 4
+expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 3
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
 # Derivations of merged elements that share their meta show it whole.
 cat > "$TEST_ROOT/mdrvs.nix" <<EOF
@@ -206,7 +207,7 @@ fi
 # So in each of nix-env's channels (a directory of expressions).
 mkdir -p "$TEST_ROOT/channels"
 cp "$TEST_ROOT/drvs.nix" "$TEST_ROOT/channels/"
-expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 4
+expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 3
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
 expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 6
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
@@ -214,12 +215,14 @@ expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 6
 expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 2
 
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
-    # -qa --json queries each derivation in the job that found it, which then holds nothing: it keeps less than
-    # -qa, whose derivations hold the jobs that found them.
-    jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa > /dev/null
+    # -qa --json queries each derivation in the job that found it, and -qaP reads only names and attribute paths
+    # after the walk: neither holds the walk's jobs, so both keep less than -qa --system, which reads more.
+    jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa --system > /dev/null
     kept=$(jq .unforce.bytesKept "$TEST_ROOT/stats.json")
-    jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa --json > /dev/null
-    [[ $(jq .unforce.bytesKept "$TEST_ROOT/stats.json") -lt $kept ]]
+    for a in --json -P; do
+        jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa "$a" > /dev/null
+        [[ $(jq .unforce.bytesKept "$TEST_ROOT/stats.json") -lt $kept ]]
+    done
 
     # A store path that a reverted cell read or took cannot be deleted while the evaluator lives: a temporary root
     # holds it. The evaluation opens the fifo once the earlier elements' jobs ended, and reads it until it is closed.
@@ -262,7 +265,7 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     vgCheck "$s" '{ vg1 = "A"; vg2 = null; vg3 = "A"; }' nix eval --impure -f
     vgCheck "$s" '{"vg1":"A","vg2":null,"vg3":"A"}' nix eval --impure --json -f
     vgCheck "$s" '{ vg1 = "A"; vg2 = null; vg3 = "A"; }' nix-instantiate --eval --strict
-    # nix-env holds the derivations it found, so q is not reverted here: vg3 reads ./f afresh.
+    # vg3 reads ./f afresh itself.
     vgCheck '{ vg1 = builtins.seq q.a (d "vg1"); vg2 = builtins.seq wait (d "vg2"); vg3 = builtins.seq (builtins.readFile ./f) (d "vg3"); }' \
         $'vg1\nvg2\nvg3' nix-env -qa -f
     # So is a file that a store path's link leads to.
