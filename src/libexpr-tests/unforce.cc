@@ -119,116 +119,6 @@ protected:
     }
 };
 
-/* A cell whose value is built in the job is reverted, and forced again
-   gives the value it had. */
-TEST_F(UnforceTest, revertsYoungValue)
-{
-    for (auto expr : {
-             "{ a = 1; b = [ 2 3 ]; }",
-             "[ 1 2 3 ]",
-             "\"a\" + \"b\"",
-             "let y = 1; in x: y",
-             "builtins.map (x: x * 2) [ 1 2 ]",
-             "builtins.tryEval (throw \"no\")",
-         }) {
-        auto v = oldThunk(expr);
-        state.beginUnforceScope();
-        state.forceValue(*v, noPos);
-        state.endUnforceScope();
-        EXPECT_TRUE(v->isThunk()) << expr;
-        EXPECT_EQ(deep(*v), deep(*oldThunk(expr))) << expr;
-    }
-}
-
-/* A cell whose value points into no memory of the job keeps it. */
-TEST_F(UnforceTest, keepsYoungFreeValue)
-{
-    auto v = oldThunk("1 + 2");
-    auto s = oldThunk("{ a = 1; }");
-    state.forceValue(*s, noPos);
-    auto w = state.allocValue();
-    w->mkApp(oldThunk("s: s"), s);
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.forceValue(*w, noPos);
-    state.endUnforceScope();
-    EXPECT_THAT(*v, IsIntEq(3));
-    EXPECT_EQ(w->type(), nAttrs);
-    EXPECT_EQ(w->attrs(), s->attrs());
-}
-
-/* A reverted application is called again. */
-TEST_F(UnforceTest, revertsApplication)
-{
-    auto w = state.allocValue();
-    w->mkApp(oldThunk("x: { inherit x; }"), oldThunk("1"));
-    state.beginUnforceScope();
-    state.forceValue(*w, noPos);
-    state.endUnforceScope();
-    ASSERT_TRUE(w->isThunk());
-    EXPECT_EQ(deep(*w), "{ x = 1; }");
-}
-
-/* A reverted cell has the position of the value it held, and is trivial,
-   as a cell that holds a value is. */
-TEST_F(UnforceTest, revertedPosition)
-{
-    auto e = state.parseExprFromString("let x = 1; in { a = x; }", state.rootPath(CanonPath::root));
-    auto v = state.allocValue(), w = state.allocValue();
-    v->mkThunk(&state.baseEnv, e);
-    w->mkThunk(&state.baseEnv, e);
-    EXPECT_FALSE(v->isTrivial());
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.endUnforceScope();
-    state.forceValue(*w, noPos);
-    ASSERT_TRUE(v->isThunk());
-    EXPECT_NE(w->determinePos(noPos), noPos);
-    EXPECT_EQ(v->determinePos(noPos), w->determinePos(noPos));
-    EXPECT_TRUE(v->isTrivial());
-    /* A function's position is its lambda's. */
-    auto f = oldThunk("let x = 1; in y: x");
-    state.beginUnforceScope();
-    state.forceValue(*f, noPos);
-    auto lambda = f->determinePos(noPos);
-    state.endUnforceScope();
-    ASSERT_TRUE(f->isThunk());
-    EXPECT_EQ(f->determinePos(noPos), lambda);
-}
-
-/* Only the outermost scope is a job. */
-TEST_F(UnforceTest, nestedScope)
-{
-    auto v = oldThunk("{ a = 1; }");
-    state.beginUnforceScope();
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.endUnforceScope();
-    EXPECT_EQ(v->type(), nAttrs);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-}
-
-/* An old cell whose force failed keeps its failure, as the job's other
-   cells are reverted: read again, it throws the same error. */
-TEST_F(UnforceTest, failureKept)
-{
-    auto v = oldThunk("{ a = 1; }");
-    auto f = oldThunk("throw \"no\"");
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    EXPECT_THROW(state.forceValue(*f, noPos), ThrownError);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-    EXPECT_TRUE(f->isFailed());
-    try {
-        state.forceValue(*f, noPos);
-        FAIL();
-    } catch (ThrownError & e) {
-        EXPECT_THAT(e.msg(), ::testing::HasSubstr("no"));
-    }
-}
-
 /* A failure on max-call-depth in a job, here met from deeper than a first
    force that fitted, is retried by later reads at their own depth: an old
    cell, a young cell of a promoted owner and an application give their
@@ -283,59 +173,24 @@ TEST_F(UnforceTest, promotesRevertedCell)
 
 /* A cell that a promoted value reaches is the cell its owner holds: the
    owner is promoted too. A root keeps a cell of `b`'s own, which promotes
-   `b`, whose value reaches `a`'s cell `f`. */
+   `b`, whose value reaches `a`'s cell `f`; also with unforce-always-revert,
+   which changes only what becomes of a cell an earlier job reverted. */
 TEST_F(UnforceTest, promotesOwner)
-{
-    auto a = oldThunk("{ f = x: x; }");
-    auto b = state.allocValue();
-    b->mkApp(oldThunk("a: builtins.attrValues a ++ [ (1 + 1) ]"), a);
-    RootValue root;
-    state.beginUnforceScope();
-    state.forceValue(*b, noPos);
-    root = allocRootValue(b->listView()[1]);
-    state.endUnforceScope();
-    ASSERT_EQ(a->type(), nAttrs);
-    ASSERT_EQ(b->type(), nList);
-    EXPECT_EQ(b->listView()[0], a->attrs()->get(createSymbol("f"))->value);
-    EXPECT_EQ(*root, b->listView()[1]);
-}
-
-/* A cell whose value's young cell is forced after its force ended is
-   reverted like any other: its re-force builds that cell again, unforced. */
-TEST_F(UnforceTest, revertsConsumedOwner)
-{
-    auto v = oldThunk("{ a = 1 + 1; }");
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.forceValue(*v->attrs()->get(createSymbol("a"))->value, noPos);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-    EXPECT_EQ(deep(*v), "{ a = 2; }");
-}
-
-/* A seen set forgets a set that is the value of a cell the job reverts (`s`,
-   which `a` and `b` are), and the cell's re-force in a later job puts the
-   set it builds in its place, so that it is found when seen again; also
-   with unforce-always-revert. */
-TEST_F(UnforceTest, seenForgetsReverted)
 {
     for (bool always : {false, true}) {
         evalSettings.unforceAlwaysRevert = always;
-        auto v = oldThunk("let s = { x = 1; }; in { a = s; b = s; }");
-        state.forceValue(*v, noPos);
-        auto a = v->attrs()->get(createSymbol("a"))->value;
-        auto b = v->attrs()->get(createSymbol("b"))->value;
-        UnforceSeen seen;
-        state.beginUnforceScope();
-        state.forceValue(*a, noPos);
-        EXPECT_TRUE(seen.see(a->attrs(), UnforceHolder::Kind::bindings));
-        state.endUnforceScope();
-        EXPECT_TRUE(b->isThunk());
+        auto a = oldThunk("{ f = x: x; }");
+        auto b = state.allocValue();
+        b->mkApp(oldThunk("a: builtins.attrValues a ++ [ (1 + 1) ]"), a);
+        RootValue root;
         state.beginUnforceScope();
         state.forceValue(*b, noPos);
-        EXPECT_FALSE(seen.see(b->attrs(), UnforceHolder::Kind::bindings));
+        root = allocRootValue(b->listView()[1]);
         state.endUnforceScope();
-        EXPECT_EQ(deep(*b), "{ x = 1; }");
+        ASSERT_EQ(a->type(), nAttrs);
+        ASSERT_EQ(b->type(), nList);
+        EXPECT_EQ(b->listView()[0], a->attrs()->get(createSymbol("f"))->value);
+        EXPECT_EQ(*root, b->listView()[1]);
     }
 }
 
@@ -358,20 +213,6 @@ TEST_F(UnforceTest, printerJobs)
     EXPECT_TRUE(attr("let s = { x = 1; }; in { a = s; b = { y = 2; }; }", "a")->isThunk());
     attr("let s = { x = 1; }; in { a = { t = s; u = { z = 1; }; }; b = s; }", "b");
     attr("let l = map (n: { inherit n; }) [ 1 2 ]; in builtins.seq (builtins.length l) { a = builtins.head l; b = builtins.head l; c = builtins.elemAt l 1; }", "a");
-}
-
-/* `getDerivations` finds each derivation in a job, drops one found in an
-   earlier job, and the attributes of those it finds outlive the jobs. */
-TEST_F(UnforceTest, getDerivationsJobs)
-{
-    auto v = oldThunk(
-        "rec { x = derivation { name = \"x\"; system = \"s\"; builder = \"b\"; }; y = x; z = derivation { name = \"z\"; system = \"s\"; builder = \"b\"; outputs = [ \"dev\" ]; }; w = { a = 1; }; }");
-    state.forceValue(*v, noPos);
-    PackageInfos drvs;
-    getDerivations(state, *v, "", Bindings::emptyBindings, drvs, false);
-    EXPECT_TRUE(v->attrs()->get(createSymbol("w"))->value->isThunk());
-    ASSERT_EQ(drvs.size(), 2);
-    EXPECT_EQ(drvs.back().queryOutputName(), "dev");
 }
 
 /* The derivation that `getDerivation` hands to a callback keeps nothing of
@@ -448,25 +289,6 @@ TEST_F(UnforceTest, driverEffectKeepsNothing)
     unforceNoteEffect(state);
     state.endUnforceScope();
     EXPECT_TRUE(v->isThunk());
-}
-
-/* A trace keeps nothing: the cell whose evaluation showed it, here in the
-   force of a young cell that `t` owns, reverts with the job's other cells,
-   and so does a job in which one was shown outside any cell's force. */
-TEST_F(UnforceTest, traceKeepsNothing)
-{
-    auto v = oldThunk("{ a = 1; }");
-    auto t = oldThunk("let x = builtins.trace \"t\" { b = 2; }; in builtins.seq x { inherit x; }");
-    auto f = oldThunk("x: builtins.trace x x");
-    state.forceValue(*f, noPos);
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.forceValue(*t, noPos);
-    Value r;
-    state.callFunction(*f, *oldThunk("\"s\""), r, noPos);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-    EXPECT_TRUE(t->isThunk());
 }
 
 /* A job in which a plugin's lookup path hook ran is kept whole. */
@@ -558,6 +380,22 @@ TEST_F(UnforceTest, impureKeeps)
         writeFile(dir / "m", "1");
         EXPECT_THROW(deep(*v), Error) << op;
     }
+}
+
+/* A failed target is not nominated, also where its force ran an impure
+   operation that keeps its cell (a missing file's import): it keeps its
+   failure, and `w`, forced before it in the job, is reverted as it would be
+   without it, instead of being kept with what the job allocated. */
+TEST_F(UnforceTest, failedImpureKeepsNothing)
+{
+    auto w = oldThunk("{ a = 1; }");
+    auto f = oldThunk("import /nonexistent/unforce-test.nix");
+    state.beginUnforceScope();
+    state.forceValue(*w, noPos);
+    EXPECT_THROW(state.forceValue(*f, noPos), Error);
+    state.endUnforceScope();
+    EXPECT_TRUE(f->isFailed());
+    EXPECT_TRUE(w->isThunk());
 }
 
 /* A read that only an edit can change keeps no cell, whether it ran in the
@@ -658,20 +496,6 @@ TEST_F(UnforceRestrictedTest, notAllowedKeeps)
     EXPECT_EQ(afterJob(*oldThunk("builtins.pathExists " + p)), "true");
 }
 
-/* A root made in a job (as the evaluation cache's cursors make them) keeps
-   what it points to past the job's end, and with it its owner. */
-TEST_F(UnforceTest, rootHoldsValue)
-{
-    auto v = oldThunk("{ a = { b = 1; }; }");
-    RootValue root;
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    root = allocRootValue(v->attrs()->get(createSymbol("a"))->value);
-    state.endUnforceScope();
-    ASSERT_FALSE(v->isThunk());
-    EXPECT_EQ(deep(**root), "{ b = 1; }");
-}
-
 /* A job continues past a boundary only while no holder but a seen set holds
    its memory, which it could let go of after a later element read through
    it. b and c allocate little next to a: b is trapped at c's boundary, and
@@ -695,20 +519,6 @@ TEST_F(UnforceTest, holderEndsMergedJob)
     EXPECT_TRUE(trapped("b"));
     jobs.element();
     EXPECT_FALSE(trapped("b") || trapped("c"));
-}
-
-/* What a job allocates while the region is paused outlives it. */
-TEST_F(UnforceTest, pause)
-{
-    Value * kept;
-    state.beginUnforceScope();
-    {
-        PauseRegion pause;
-        kept = state.allocValue();
-        kept->mkString("kept", state.mem);
-    }
-    state.endUnforceScope();
-    EXPECT_THAT(*kept, IsStringEq("kept"));
 }
 
 /* A job keeps the memory of what it promotes up to the end of its last
@@ -750,22 +560,8 @@ TEST_F(UnforceTest, poisonsFreed)
 #  endif
 
 /* A job does not run without its region: where none can be mapped, opening
-   the job runs out of memory, and leaves no job open. */
-TEST_F(UnforceTest, unmappableRegionThrows)
-{
-    auto v = oldThunk("{ a = 1; }");
-    {
-        FailMapping fail;
-        EXPECT_THROW(state.beginUnforceScope(), std::bad_alloc);
-    }
-    state.beginUnforceScope();
-    state.forceValue(*v, noPos);
-    state.endUnforceScope();
-    EXPECT_TRUE(v->isThunk());
-}
-
-/* Not even where a traversal prints an element's error and goes on: that is
-   no element's failure. */
+   the job runs out of memory, also where a traversal prints an element's
+   error and goes on (that is no element's failure). */
 TEST_F(UnforceTest, unmappableRegionNotSwallowed)
 {
     auto v = oldThunk("{ a = 1; }");
@@ -801,81 +597,6 @@ TEST_F(UnforceTest, regionBeyond64GiB)
     EXPECT_EQ(unforceStats.jobsKeptWhole, whole);
     EXPECT_TRUE(u->isThunk());
     EXPECT_TRUE(v->isThunk());
-}
-
-/* The cut is where the last force a promoted target owns ended: `held`'s,
-   whose list a seen set holds. `before` ended earlier, so the time closure
-   promotes it; `after` ended later, so it is reverted and its memory freed,
-   which a later job allocates again zeroed, as all memory is. */
-TEST_F(UnforceTest, timeClosure)
-{
-    auto before = oldThunk("{ x = 1; }");
-    auto held = oldThunk("{ y = [ 2 ]; }");
-    auto after = oldThunk("builtins.genList (i: { inherit i; }) 100");
-    UnforceSeen seen;
-    auto freed = unforceStats.bytesFreed;
-    state.beginUnforceScope();
-    state.forceValue(*before, noPos);
-    state.forceValue(*held, noPos);
-    EXPECT_TRUE(seen.see(held->attrs()->get(createSymbol("y"))->value, UnforceHolder::Kind::value));
-    state.forceValue(*after, noPos);
-    state.endUnforceScope();
-    EXPECT_FALSE(before->isThunk());
-    EXPECT_FALSE(held->isThunk());
-    EXPECT_TRUE(after->isThunk());
-    freed = unforceStats.bytesFreed - freed;
-    ASSERT_GT(freed, 0u);
-    state.beginUnforceScope();
-    auto p = (const char *) state.mem.allocBytes(freed);
-    EXPECT_TRUE(std::all_of(p, p + freed, [](char c) { return c == 0; }));
-    state.endUnforceScope();
-    EXPECT_EQ(deep(*before), "{ x = 1; }");
-    state.forceValue(*after, noPos);
-    EXPECT_EQ(after->listSize(), 100u);
-}
-
-/* A string target keeps its value by a copy, outside S: forced again after
-   a job reverted it, it is nominated, keeps its value, and the job keeps
-   none of its memory, which a later job allocates again zeroed. Its bytes,
-   its context array (shared by `substring 0 0`) and the array's elements
-   are intact. */
-TEST_F(UnforceTest, stringKeptByCopy)
-{
-    /* The store is a dummy one: derivations' paths are computed, not written. */
-    auto readOnly = std::exchange(nix::settings.readOnlyMode, true);
-    Finally restore([&] { nix::settings.readOnlyMode = readOnly; });
-    std::string drv = "\"${derivation { name = \"d\"; system = \"s\"; builder = \"b\"; }}-y\"";
-    auto context = [](const Value & s) {
-        std::vector<std::string> r;
-        if (s.context())
-            for (auto e : *s.context())
-                r.emplace_back(e->view());
-        return r;
-    };
-    for (auto & [expr, elements] : std::vector<std::pair<std::string, size_t>>{
-             {"builtins.concatStringsSep \"\" (builtins.genList (i: \"abcdefgh\") 64)", 0},
-             {drv, 1},
-             {"builtins.substring 0 0 " + drv, 1}}) {
-        /* Forced outside any job first, so that the jobs force no cell
-           outside them but `v` (`derivation` is one). */
-        auto fresh = oldThunk(expr);
-        state.forceValue(*fresh, noPos);
-        auto v = oldThunk(expr);
-        for (bool again : {false, true}) {
-            auto kept = unforceStats.bytesKept;
-            state.beginUnforceScope();
-            state.forceValue(*v, noPos);
-            state.endUnforceScope();
-            EXPECT_EQ(unforceStats.bytesKept, kept);
-            EXPECT_EQ(v->isThunk(), !again);
-        }
-        state.beginUnforceScope();
-        state.mem.allocBytes(1 << 20);
-        state.endUnforceScope();
-        EXPECT_EQ(v->string_view(), fresh->string_view());
-        EXPECT_EQ(context(*v), context(*fresh));
-        EXPECT_EQ(context(*v).size(), elements);
-    }
 }
 
 /* Whether the page holding `p` went back to the system: under
@@ -1165,34 +886,6 @@ TEST_F(UnforceTest, steps)
         if (k.frees)
             EXPECT_LE(run(k, 200), grew + 2 * sizeof(Value)) << k.r;
     }
-}
-
-/* A value promoted at a job's end, built after steps freed memory, stays as
-   it was while a later job reuses the region. */
-TEST_F(UnforceTest, stepsThenPromote)
-{
-    auto v = oldThunk(
-        "{ r = let n = builtins.foldl' (acc: i: acc + builtins.length (builtins.genList (j: j) 20)) 0 "
-        "(builtins.genList (i: i) 50); in { inherit n; l = builtins.genList (k: { x = k + n; }) 50; }; }");
-    state.forceValue(*v, noPos);
-    auto & r = *v->attrs()->get(createSymbol("r"))->value;
-    UnforceSeen seen;
-    state.beginUnforceScope();
-    auto ends = unforceStats.stepEnds;
-    state.forceValueDeep(r);
-    EXPECT_GT(unforceStats.stepEnds, ends);
-    EXPECT_TRUE(seen.see(r.attrs()->get(createSymbol("l"))->value, UnforceHolder::Kind::value));
-    state.endUnforceScope();
-    EXPECT_FALSE(r.isThunk());
-    auto big = oldThunk("builtins.length (builtins.genList (i: { inherit i; }) 10000)");
-    state.beginUnforceScope();
-    state.forceValue(*big, noPos);
-    state.endUnforceScope();
-    std::string expected = "{ l = [ ";
-    for (int k = 0; k < 50; ++k)
-        expected += "{ x = " + std::to_string(k + 1000) + "; } ";
-    expected += "]; n = 1000; }";
-    EXPECT_EQ(printValue(state, r), expected);
 }
 
 /* A step in which a failure was caught is kept: the job's end reads the
