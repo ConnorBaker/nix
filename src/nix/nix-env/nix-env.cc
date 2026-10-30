@@ -28,6 +28,7 @@
 #include <ctime>
 #include <algorithm>
 #include <iostream>
+#include <regex>
 #include <sstream>
 
 #include <sys/types.h>
@@ -211,14 +212,15 @@ static void loadDerivations(
     std::string systemFilter,
     const Bindings & autoArgs,
     const std::string & pathPrefix,
-    PackageInfos & elems)
+    PackageInfos & elems,
+    std::function<void(PackageInfo &)> use = {})
 {
     Value vRoot;
     loadSourceExpr(state, nixExprPath, vRoot);
 
     Value & v(*findAlongAttrPath(state, pathPrefix, autoArgs, vRoot).first);
 
-    getDerivations(state, v, pathPrefix, autoArgs, elems, true);
+    getDerivations(state, v, pathPrefix, autoArgs, elems, true, use);
 
     /* Filter out all derivations not applicable to the current
        system. */
@@ -900,25 +902,32 @@ static VersionDiff compareVersionAgainstSet(const PackageInfo & elem, const Pack
     return diff;
 }
 
-static void
-queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath, bool printDrvPath, bool printMeta)
+using nlohmann::json;
+
+/* What `--json` prints, made element by element. */
+struct JSONQuery
 {
-    using nlohmann::json;
+    Globals & globals;
+    bool printOutPath, printDrvPath, printMeta;
     /* The members of the object printed, by attribute path (nlohmann's
        order for an object's members): each as `dump(2)` prints it in the
        object less the object's indentation, or the error that printing it
        threw, raised where the object's `dump` would raise it. So no document
        of every element is built. */
     std::map<std::string, std::variant<std::string, std::exception_ptr>> members;
-    UnforceJobs jobs(*globals.state);
-    for (auto & i : elems) {
-        jobs.element();
+    /* Set if the elements were queried in the walk's jobs that found them,
+       with what their queries threw, by attribute path. */
+    bool walked = false;
+    std::map<std::string, std::exception_ptr> failed;
+
+    void query(PackageInfo & i)
+    {
         /* Made before its fields are queried: an element whose query fails
            an assertion is printed as far as it got (null at first). */
         std::optional<json> member;
         try {
             if (i.hasFailed())
-                continue;
+                return;
 
             auto drvName = DrvName(i.queryName());
             json & pkgObj = member.emplace();
@@ -980,6 +989,20 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
             } catch (json::exception &) {
                 members[i.attrPath] = std::current_exception();
             }
+    }
+};
+
+static void queryJSON(JSONQuery & q, std::vector<PackageInfo> & elems)
+{
+    auto & members = q.members;
+    UnforceJobs jobs(*q.globals.state);
+    for (auto & i : elems) {
+        if (!q.walked) {
+            jobs.element();
+            q.query(i);
+        } else if (auto f = q.failed.find(i.attrPath); f != q.failed.end())
+            /* What its query threw, in name order, as if queried here. */
+            std::rethrow_exception(f->second);
     }
     for (auto & [_, m] : members)
         if (auto e = std::get_if<std::exception_ptr>(&m))
@@ -1061,6 +1084,29 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     if (source == sInstalled || compareVersions || printStatus)
         installedElems = queryInstalled(*globals.state, globals.profile);
 
+    /* `--json` queries each available element that a selector picks in the
+       walk's job that found it, so that nothing holds what the job built;
+       not where --system-filter, --status or --prebuilt-only read the
+       elements after the walk. queryJSON throws what a query threw. Only
+       with unforcing, which frees what the jobs built. */
+    JSONQuery jsonQuery{globals, printOutPath, printDrvPath, printMeta};
+    jsonQuery.walked = jsonOutput && source == sAvailable && globals.instSource.systemFilter == "*" && !printStatus
+                       && !globals.prebuiltOnly && unforceEnabled(*globals.state);
+    DrvNames selectors = drvNamesFromArgs(opArgs);
+    std::function<void(PackageInfo &)> walk;
+    if (jsonQuery.walked)
+        walk = [&](PackageInfo & i) {
+            try {
+                DrvName name(i.queryName());
+                if (selectors.empty() || std::ranges::any_of(selectors, [&](auto & s) { return s.matches(name); }))
+                    jsonQuery.query(i);
+            } catch (Error &) {
+                jsonQuery.failed[i.attrPath] = std::current_exception();
+            } catch (std::regex_error &) {
+                /* filterBySelector throws it after the walk. */
+            }
+        };
+
     if (source == sAvailable || compareVersions)
         loadDerivations(
             *globals.state,
@@ -1068,7 +1114,8 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
             globals.instSource.systemFilter,
             *globals.instSource.autoArgs,
             attrPath,
-            availElems);
+            availElems,
+            walk);
 
     PackageInfos elems_ =
         filterBySelector(*globals.state, source == sInstalled ? installedElems : availElems, opArgs, false);
@@ -1111,7 +1158,7 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
 
     /* Print the desired columns, or XML output. */
     if (jsonOutput) {
-        queryJSON(globals, elems, printOutPath, printDrvPath, printMeta);
+        queryJSON(jsonQuery, elems);
         std::cout << '\n';
         return;
     }

@@ -328,6 +328,8 @@ void PackageInfo::setMeta(const std::string & name, Value * v)
 struct DerivationsSeen : UnforceSeen
 {
     std::vector<PackageInfo *> found;
+    /* Given each derivation found, which is then listed by name only. */
+    std::function<void(PackageInfo &)> use;
 
     ~DerivationsSeen()
     {
@@ -391,8 +393,13 @@ static bool getDerivation(
 
         drv.queryName();
 
-        drvs.push_back(drv);
-        done.noteFound(drvs);
+        if (done.use) {
+            done.use(drv);
+            drvs.emplace_back(state, attrPath, nullptr).setName(drv.queryName());
+        } else {
+            drvs.push_back(drv);
+            done.noteFound(drvs);
+        }
 
         return false;
 
@@ -559,10 +566,12 @@ void getDerivations(
     const std::string & pathPrefix,
     const Bindings & autoArgs,
     PackageInfos & drvs,
-    bool ignoreAssertionFailures)
+    bool ignoreAssertionFailures,
+    std::function<void(PackageInfo &)> use)
 {
     /* On the heap: this frame is below the walk. */
     auto done = std::make_unique<Done>();
+    done->use = std::move(use);
     /* Each attribute (or element) of `v` is found in a job of its own, the
        last one ending while `done` holds what it found. */
     UnforceJobs jobs(state, &v);

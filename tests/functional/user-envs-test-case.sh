@@ -46,6 +46,12 @@ test "$(nix-env -q '*' | wc -l)" -eq 1
 nix-env -q '*' | grepQuiet foo-1.0
 test "$("$profiles"/test/bin/foo)" = "foo-1.0"
 
+# --json prints the same where it queries the elements after the walk (installed, or with -s or -b) as where
+# the walk queries them.
+[[ $(nix-env -q --json | jq -r '.[].name') == foo-1.0 ]]
+j=$(nix-env -qa --json)
+[[ $(nix-env -qas --json) == "$j" && $(nix-env -qab --json) == "$j" ]]
+
 # Test nix-env -qc to compare installed against available packages, and vice versa.
 nix-env -qc '*' | grepQuiet '< 2.0'
 nix-env -qac '*' | grepQuiet '> 1.0'

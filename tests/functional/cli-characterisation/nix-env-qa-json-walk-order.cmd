@@ -1,0 +1,1 @@
+1 nix-env -f ./cli-characterisation/json-walk.nix -qa --json --out-path

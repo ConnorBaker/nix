@@ -197,6 +197,12 @@ let m = { description = "d" + "x"; tags = [ ("t" + "1") ]; }; in rec {
 EOF
 nix-env -f "$TEST_ROOT/mdrvs.nix" -qa --json --meta | jq -c '[keys, .a1.meta, .a2.meta, .a4.meta]' > "$TEST_ROOT/out"
 [[ $(< "$TEST_ROOT/out") == '[["a1","a2","a4"],{"description":"dx","tags":["t1"]},{"description":"dx","tags":["t1"]},{"description":"dx","more":"y","tags":["t1"]}]' ]]
+# Without unforcing (Boehm GC), --json queries after the walk: a's meta traces after b's walk.
+echo "with import $config_nix; { a = mkDerivation { name = \"a\"; builder = \"/b\"; meta.m = builtins.trace \"q\" 1; }; b = builtins.trace \"w\" (mkDerivation { name = \"b\"; builder = \"/b\"; }); }" > "$TEST_ROOT/t.nix"
+nix-env -f "$TEST_ROOT/t.nix" -qa --json --meta > /dev/null 2> "$TEST_ROOT/err"
+if jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(< "$TEST_ROOT/err") == $'trace: w\ntrace: q' ]]
+fi
 # So in each of nix-env's channels (a directory of expressions).
 mkdir -p "$TEST_ROOT/channels"
 cp "$TEST_ROOT/drvs.nix" "$TEST_ROOT/channels/"
@@ -208,6 +214,13 @@ expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 6
 expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 2
 
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    # -qa --json queries each derivation in the job that found it, which then holds nothing: it keeps less than
+    # -qa, whose derivations hold the jobs that found them.
+    jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa > /dev/null
+    kept=$(jq .unforce.bytesKept "$TEST_ROOT/stats.json")
+    jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa --json > /dev/null
+    [[ $(jq .unforce.bytesKept "$TEST_ROOT/stats.json") -lt $kept ]]
+
     # A store path that a reverted cell read or took cannot be deleted while the evaluator lives: a temporary root
     # holds it. The evaluation opens the fifo once the earlier elements' jobs ended, and reads it until it is closed.
     p=$(nix-store --add "$TEST_ROOT/src/a")

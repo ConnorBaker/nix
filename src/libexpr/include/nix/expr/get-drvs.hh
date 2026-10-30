@@ -118,12 +118,17 @@ std::optional<PackageInfo> getDerivation(EvalState & state, Value & v, bool igno
  */
 bool getDerivation(EvalState & state, Value & v, bool ignoreAssertionFailures, fun<void(PackageInfo &)> use);
 
+/**
+ * With `use`, each derivation found is handed to it in the unforce job that
+ * found it, which `use` must not hold, and listed by name only.
+ */
 void getDerivations(
     EvalState & state,
     Value & v,
     const std::string & pathPrefix,
     const Bindings & autoArgs,
     PackageInfos & drvs,
-    bool ignoreAssertionFailures);
+    bool ignoreAssertionFailures,
+    std::function<void(PackageInfo &)> use = {});
 
 } // namespace nix

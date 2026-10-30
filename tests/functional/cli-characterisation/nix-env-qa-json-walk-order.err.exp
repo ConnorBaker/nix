@@ -1,0 +1,5 @@
+trace: walk b
+error:
+       … while querying the derivation named 'x-1.0'
+
+       error: derivation does not have attribute 'outPath'

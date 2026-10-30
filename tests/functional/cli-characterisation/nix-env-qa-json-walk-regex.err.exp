@@ -1,0 +1,2 @@
+trace: walk b
+error: Mismatched '(' and ')' in regular expression
