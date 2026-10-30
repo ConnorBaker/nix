@@ -1,0 +1,1 @@
+1 nix-env -f ./cli-characterisation/json-members.nix -qa --json --meta c

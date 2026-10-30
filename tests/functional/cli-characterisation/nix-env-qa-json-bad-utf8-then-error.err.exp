@@ -1,0 +1,11 @@
+error:
+       … while querying the derivation named 'd-1.0'
+
+       … while calling the 'abort' builtin
+         at /pwd/cli-characterisation/json-members.nix:12:39:
+           11|   utf8 = drv "c-1.0" system { bad = builtins.substring 0 1 "é"; };
+           12|   aborts = drv "d-1.0" system { bad = abort "d"; };
+             |                                       ^
+           13| }
+
+       error: evaluation aborted with the following error message: 'd'

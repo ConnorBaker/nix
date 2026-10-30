@@ -904,16 +904,24 @@ static void
 queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath, bool printDrvPath, bool printMeta)
 {
     using nlohmann::json;
-    json topObj = json::object();
+    /* The members of the object printed, by attribute path (nlohmann's
+       order for an object's members): each as `dump(2)` prints it in the
+       object less the object's indentation, or the error that printing it
+       threw, raised where the object's `dump` would raise it. So no document
+       of every element is built. */
+    std::map<std::string, std::variant<std::string, std::exception_ptr>> members;
     UnforceJobs jobs(*globals.state);
     for (auto & i : elems) {
         jobs.element();
+        /* Made before its fields are queried: an element whose query fails
+           an assertion is printed as far as it got (null at first). */
+        std::optional<json> member;
         try {
             if (i.hasFailed())
                 continue;
 
             auto drvName = DrvName(i.queryName());
-            json & pkgObj = topObj[i.attrPath];
+            json & pkgObj = member.emplace();
             pkgObj = {
                 {"name", drvName.fullName},
                 {"pname", drvName.name},
@@ -961,8 +969,30 @@ queryJSON(Globals & globals, std::vector<PackageInfo> & elems, bool printOutPath
             e.addTrace(nullptr, "while querying the derivation named '%1%'", i.queryName());
             throw;
         }
+        if (member)
+            try {
+                /* The key before the value, as the object's `dump` prints
+                   them, so the key's error is kept if both are not UTF-8. */
+                auto text = json(i.attrPath).dump() + ": ";
+                text += member->dump(2);
+                text.shrink_to_fit();
+                members[i.attrPath] = std::move(text);
+            } catch (json::exception &) {
+                members[i.attrPath] = std::current_exception();
+            }
     }
-    std::cout << topObj.dump(2);
+    for (auto & [_, m] : members)
+        if (auto e = std::get_if<std::exception_ptr>(&m))
+            std::rethrow_exception(*e);
+    std::cout << (members.empty() ? "{}" : "{\n");
+    for (auto m = members.begin(); m != members.end(); ++m) {
+        /* Each line at the object's indentation: `dump` breaks lines only
+           between tokens, as strings escape their newlines. */
+        std::string_view text = std::get<std::string>(m->second);
+        for (size_t n; (n = text.find('\n')) != text.npos; text.remove_prefix(n + 1))
+            std::cout << "  " << text.substr(0, n + 1);
+        std::cout << "  " << text << (std::next(m) == members.end() ? "\n}" : ",\n");
+    }
 }
 
 static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
