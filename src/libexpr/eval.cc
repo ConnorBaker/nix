@@ -210,9 +210,12 @@ PosIdx Value::determinePos(const PosIdx pos) const
     case tApp:
         return app().left->determinePos(pos);
     case tThunk:
-        /* A cell that unforcing reverted has its value's position. */
-        if (unforceAnyReverted) [[unlikely]]
+        /* A cell that unforcing reverted or trapped has its value's position. */
+        if (unforceAnyReverted) [[unlikely]] {
+            if (auto t = unforceTrapped(thunk().expr, thunk().env))
+                return t->determinePos(pos);
             return unforceRevertedPos(thunk().expr, pos);
+        }
         return pos;
     default:
         return pos;
@@ -222,7 +225,9 @@ PosIdx Value::determinePos(const PosIdx pos) const
 
 bool Value::isTrivial() const
 {
-    /* A cell that unforcing reverted holds a value without unforcing. */
+    /* A cell that unforcing reverted or trapped holds a value without unforcing. */
+    if (auto t = isa<tThunk>() ? unforceTrapped(thunk().expr, thunk().env) : nullptr)
+        return t->isTrivial();
     return !isa<tApp, tPrimOpApp>()
            && (!isa<tThunk>()
                || (dynamic_cast<ExprAttrs *>(thunk().expr) && ((ExprAttrs *) thunk().expr)->dynamicAttrs->empty())

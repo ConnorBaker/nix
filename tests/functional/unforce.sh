@@ -2,8 +2,13 @@
 
 source common.sh
 
-# Traversals evaluate each element of their root in an unforce job of its
-# own (builds without Boehm GC), and print what they print without.
+# Traversals evaluate the elements of their root in unforce jobs (builds
+# without Boehm GC), and print what they print without. An element runs in
+# the job of the one before unless memory in use (what ended jobs keep, and
+# the open job's top) rose past its most at any earlier boundary, or the
+# open job holds more than any one element took: so the first element's job
+# ends, and a later element that allocates no more than that joins the open
+# job (one job fewer than elements below).
 
 clearStoreIfPossible
 
@@ -18,23 +23,24 @@ expectJobs() {
     [[ $1 == - || $1 == "$2" ]] || fail "expected $2 unforce jobs, got $1"
 }
 
-# A set printed in an earlier element's job is «repeated» in a later one's.
+# A set printed in an earlier element's job is «repeated» in a later one's;
+# b builds s again, no more than a did, so c runs in b's job.
 expr='let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }'
-expectJobs "$(jobsOf nix eval --expr "$expr")" 3
+expectJobs "$(jobsOf nix eval --expr "$expr")" 2
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 # Strict JSON printing nests: an element of a printed set or list is a job of
 # its own too, once its parent's job is not empty (a's x, c's first element).
-expectJobs "$(jobsOf nix eval --json --expr "$expr")" 5
+expectJobs "$(jobsOf nix eval --json --expr "$expr")" 4
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
 # nix-instantiate evaluates its root, and then each attribute path, in a job
 # of its own first.
-expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 5
-expectJobs "$(jobsOf nix repl <<< ":p $expr")" 3
+expectJobs "$(jobsOf nix-instantiate --eval --strict --xml -E "$expr")" 4
+expectJobs "$(jobsOf nix repl <<< ":p $expr")" 2
 
 # --strict forces each element in a job before anything is printed: what
 # it forced stays forced (a reverted cell prints as `<CODE>`), and what an
 # element built besides is freed.
-expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 5
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 4
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 3
 [[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
@@ -50,23 +56,34 @@ fi
 # the job keeps by a copy: it frees the set and its list, and the later
 # elements' jobs, which reuse that memory, leave the names intact.
 nexpr='builtins.mapAttrs (_: p: builtins.seq (builtins.length p.big) p.name) (builtins.listToAttrs (builtins.genList (i: { name = "p${toString i}"; value = { name = "n-" + toString i; big = builtins.genList (x: x) 1000; }; }) 3))'
-expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$nexpr")" 5
+expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$nexpr")" 4
 [[ $(< "$TEST_ROOT/out") == '{ p0 = "n-0"; p1 = "n-1"; p2 = "n-2"; }' ]]
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.bytesFreed > .unforce.bytesKept' "$TEST_ROOT/stats.json") == true ]]
 fi
 
-# A cell an element's job reverted (s in a's) is kept by the next element's
-# job that forces it (b's); with unforce-always-revert, every job reverts it
-# again (b's and c's). The output is the same.
+# A cell an element's job reverted (s in a's) is kept by the next job that
+# forces it (b's and c's); with unforce-always-revert, every job reverts it
+# again. The output is the same.
 rexpr='let s = { x = 1; }; in { a = s.x; b = s.x; c = s.x; }'
-expectJobs "$(jobsOf nix eval --expr "$rexpr")" 3
+expectJobs "$(jobsOf nix eval --expr "$rexpr")" 2
 [[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
 reverted=$(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json")
-expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$rexpr")" 3
+expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$rexpr")" 2
 [[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
 if ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json") -gt $reverted ]]
+fi
+# e2, in e1's job, forces an element of x, which e1 forced: the job keeps x,
+# which e3 reads; with unforce-always-revert, it reverts x, and e3 forces x
+# again.
+xexpr='let x = builtins.trace "x" (builtins.genList (i: i * 2) 3); in { e0 = builtins.length (builtins.genList (i: i) 1000); e1 = builtins.length x; e2 = builtins.seq (builtins.elemAt x 1) (builtins.length (builtins.genList (i: i) 2000)); e3 = builtins.length x; }'
+expectJobs "$(jobsOf nix eval --expr "$xexpr" 2> "$TEST_ROOT/err")" 3
+[[ $(grep -c '^trace: x$' "$TEST_ROOT/err") == 1 ]]
+expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$xexpr" 2> "$TEST_ROOT/err")" 3
+[[ $(< "$TEST_ROOT/out") == '{ e0 = 1000; e1 = 3; e2 = 2000; e3 = 3; }' ]]
+if ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
+    [[ $(grep -c '^trace: x$' "$TEST_ROOT/err") == 2 ]]
 fi
 
 # Without --strict, no element runs in a job of its own: an element's job end
@@ -105,6 +122,37 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 0 ]]
 fi
 
+# An element reads what an earlier element of its job forced through a trap,
+# which records the read. c, kept for its filtered copy, holds q's list (both
+# forced in e1) and, from e3, g's (forced in e2): the job's end keeps both,
+# whose functions the next job's e5 compares.
+hexpr="let big = n: builtins.length (builtins.genList (x: x) n); q = { k = [ (x: x) ]; }; g = { z = [ (x: x) ]; };
+  c = let k = q.k; in builtins.seq (builtins.path { path = $TEST_ROOT/src; filter = _: _: true; }) (builtins.seq k { y = g.z; w = k; });
+  in { e0 = big 300000; e1 = builtins.seq c 1; e2 = builtins.length g.z; e3 = builtins.length c.y; e4 = big 400000;
+  e5 = [ (c.y == g.z) (c.w == q.k) ]; }"
+[[ $(nix eval --impure --expr "$hexpr") == '{ e0 = 300000; e1 = 1; e2 = 1; e3 = 1; e4 = 400000; e5 = [ true true ]; }' ]]
+# Sets and lists printed through traps are «repeated» as before, and the REPL
+# prints an element's error and goes on.
+sexpr='let big = n: builtins.length (builtins.genList (x: x) n); s = { x = [ (1 + 0) ]; }; l = [ s ];
+  in { e0 = big 300000; e1 = s; e2 = s; e3 = l; e4 = l; e5 = { y = s; }; }'
+[[ $(nix eval --expr "$sexpr") == '{ e0 = 300000; e1 = { x = [ 1 ]; }; e2 = «repeated»; e3 = [ «repeated» ]; e4 = «repeated»; e5 = { y = «repeated»; }; }' ]]
+nix repl <<< ":p ${sexpr/e2 = s/e2 = throw \"boom\"}" | sed -e 's/\x1b\[[0-9;]*m//g' | tr -s ' \n' ' ' > "$TEST_ROOT/out"
+[[ $(< "$TEST_ROOT/out") == '{ e0 = 300000; e1 = { x = [ 1 ]; }; e2 = «error: boom»; e3 = [ «repeated» ]; e4 = «repeated»; e5 = { y = «repeated»; }; } ' ]]
+# Memory a job gave back is not in use: e1's job keeps p (forced again) above
+# t's list, which it gives back, so e2 and e3 run in one job.
+gexpr='let p = { y = builtins.genList (x: x) 10; z = 1; }; t = builtins.seq (builtins.genList (x: x) 300000) (builtins.length p.y);
+  in { e0 = p.z; e1 = builtins.seq p.z t; e2 = builtins.length (builtins.genList (x: x) 1000); e3 = 1; }'
+expectJobs "$(jobsOf nix eval --expr "$gexpr")" 3
+[[ $(< "$TEST_ROOT/out") == '{ e0 = 1; e1 = 10; e2 = 1000; e3 = 1; }' ]]
+
+# A job holds at most what the largest element took, and the element that
+# crossed it: elements that allocate alike and keep nothing run in jobs of
+# two after the first (counting what a job of several left as in use, each
+# such job would let the next take one element more: 1, 2, 3, 4).
+cexpr='let f = i: builtins.length (builtins.genList (x: x + i) 1000); in builtins.listToAttrs (builtins.genList (i: { name = "e${toString i}"; value = f i; }) 10)'
+expectJobs "$(jobsOf nix eval --expr "$cexpr")" 6
+[[ $(< "$TEST_ROOT/out") == '{ e0 = 1000; e1 = 1000; e2 = 1000; e3 = 1000; e4 = 1000; e5 = 1000; e6 = 1000; e7 = 1000; e8 = 1000; e9 = 1000; }' ]]
+
 # flake check checks each output in a job of its own.
 flakeDir=$TEST_ROOT/flake
 mkdir -p "$flakeDir"
@@ -134,17 +182,30 @@ rec {
   z = mkDerivation { name = "z"; builder = "/b"; };
 }
 EOF
-expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 5
+expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/drvs.nix" -qa)" 4
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
+# Derivations of merged elements that share their meta show it whole.
+cat > "$TEST_ROOT/mdrvs.nix" <<EOF
+with import "${config_nix}";
+let m = { description = "d" + "x"; tags = [ ("t" + "1") ]; }; in rec {
+  a = builtins.length (builtins.genList (x: x) 300000);
+  a1 = mkDerivation { name = "a1"; builder = "/b"; meta = m; };
+  a2 = mkDerivation { name = "a2"; builder = "/b"; meta = m; };
+  a3 = a2;
+  a4 = mkDerivation { name = "a4"; builder = "/b"; meta = m // { more = "y"; }; };
+}
+EOF
+nix-env -f "$TEST_ROOT/mdrvs.nix" -qa --json --meta | jq -c '[keys, .a1.meta, .a2.meta, .a4.meta]' > "$TEST_ROOT/out"
+[[ $(< "$TEST_ROOT/out") == '[["a1","a2","a4"],{"description":"dx","tags":["t1"]},{"description":"dx","tags":["t1"]},{"description":"dx","more":"y","tags":["t1"]}]' ]]
 # So in each of nix-env's channels (a directory of expressions).
 mkdir -p "$TEST_ROOT/channels"
 cp "$TEST_ROOT/drvs.nix" "$TEST_ROOT/channels/"
-expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 5
+expectJobs "$(jobsOf nix-env -f "$TEST_ROOT/channels" -qa)" 4
 [[ $(< "$TEST_ROOT/out") == $'x\nz' ]]
-expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 7
+expectJobs "$(jobsOf nix-instantiate "$TEST_ROOT/drvs.nix")" 6
 [[ $(wc -l < "$TEST_ROOT/out") == 2 ]]
 # search visits each attribute in a job.
-expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 3
+expectJobs "$(jobsOf nix search -f "$TEST_ROOT/drvs.nix" '' ^)" 2
 
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     # A store path that a reverted cell read or took cannot be deleted while the evaluator lives: a temporary root

@@ -13,6 +13,7 @@
    cut, the whole pages of what no kept value reaches go back to the system. */
 
 #include "nix/expr/eval.hh"
+#include "nix/expr/eval-inline.hh"
 #include "nix/expr/unforce.hh"
 #include "nix/expr/attr-set.hh"
 #include "nix/expr/primops.hh"
@@ -64,18 +65,23 @@ static char * pageUp(char * p)
 }
 
 /* Give [lo, hi), memory of the open job that nothing will read, back to the
-   system: its whole pages, which read as zeros if touched again. Under
-   AddressSanitizer all of it is poisoned instead, so that a read of any of
-   it fails. */
-static void giveBack(char * lo, char * hi)
+   system: its whole pages, which read as zeros if touched again, whose size
+   it returns. Under AddressSanitizer all of it is poisoned instead, so that a
+   read of any of it fails. */
+static size_t giveBack(char * lo, char * hi)
 {
-#if NIX_ASAN_ENABLED
+#if defined(__linux__)
+    auto a = pageUp(lo), b = (char *) ((uintptr_t) hi & ~(uintptr_t) (pageSize() - 1));
+#  if NIX_ASAN_ENABLED
     if (lo < hi)
         ASAN_POISON_MEMORY_REGION(lo, hi - lo);
-#elif defined(__linux__)
-    auto a = pageUp(lo), b = (char *) ((uintptr_t) hi & ~(uintptr_t) (pageSize() - 1));
+#  else
     if (a < b)
         madvise(a, b - a, MADV_DONTNEED);
+#  endif
+    return a < b ? b - a : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -657,6 +663,12 @@ struct EntryEnds
 static std::vector<EntryEnds> ends;
 static uint64_t forceClock = 0;
 
+/* The clock at each boundary the open job continued past, and the ends (an
+   entry, the clock) of the forces of an entry's young cells in a later
+   element than its own force's, which `last` leaves out (see "Elements"). */
+static std::vector<uint64_t> joinClocks;
+static std::vector<std::pair<uint32_t, uint64_t>> crossForces;
+
 /* Room for `more` pushes on `v`, growing it geometrically. */
 template<typename T>
 static void roomFor(std::vector<T> & v, size_t more)
@@ -734,17 +746,19 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
 
    S starts from the nominated targets: those under whose force an effect
    ran (`keep`); those an earlier job reverted, which are evidently shared
-   between jobs (reverting them again would only make each job evaluate
-   them anew); those a holder keeps; and the owners of the young objects
-   holders hold (see unforce.hh). A young object a holder holds that the
-   driver owns keeps the job whole. A failed target is not nominated. Its
-   failure (`Value::Failed` and its exception) is allocated outside the
-   region, so one whose value holds no pointer into it (no young recovery
-   value, `youngFree`) keeps its value, as the evaluation without unforcing
-   does: later reads throw the first force's error again, with its frames.
-   A failed young cell inside a reverted owner is still built again. With
-   `unforce-always-revert`, a target an earlier job reverted is not
-   nominated: every job reverts it again.
+   between jobs (reverting them again would only make each job evaluate them
+   anew); those a holder keeps; the owners of the young objects holders hold
+   (see unforce.hh); and those whose young cells a later element of the job
+   forced (see "Elements"). A young object a holder holds that the driver
+   owns keeps the job whole. A failed target is not nominated. Its failure
+   (`Value::Failed` and its exception) is allocated outside the region, so
+   one whose value holds no pointer into it (no young recovery value,
+   `youngFree`) keeps its value, as the evaluation without unforcing does:
+   later reads throw the first force's error again, with its frames. A
+   failed young cell inside a reverted owner is still built again. With
+   `unforce-always-revert`, a target an earlier job reverted, or one whose
+   young cells a later element forced, is not nominated: every job reverts
+   it again.
 
    A target whose value is a string keeps it outside S, by a copy: neither
    the first three nominations nor the time closure put it in S, so it
@@ -1014,6 +1028,81 @@ static void copyStringOut(EvalState & state, Value & v, auto && freed)
     v.mkStringNoCopy(*s, c);
 }
 
+/* ---------------------------------------------------------------------------
+   Elements. A job that a traversal continues past an element's boundary
+   (`unforceElementStart`) runs several elements. Taken as one stretch of
+   time, its latest promoted value could reach anything an earlier element
+   allocated, as a read of a cell already forced leaves no record. So at
+   each such boundary every cell logged since the one before whose value
+   points into the region is trapped: it holds a thunk of `trapExpr`, whose
+   environment is the cell, and its value waits in `traps`. Forcing the cell
+   gives the value back, the same bits, and is logged as a *read* of it
+   that ends in the reading element; forcing a copy of the trap forces the
+   cell and copies its value, which is what a copy of the value would hold.
+   A holder that holds the job's memory at the boundary could let go of it
+   before the job's end, after a later element read through it: the job
+   ends there instead. A seen set does not: it lets go of nothing before the
+   job's end (only `ended` clears it) and is read only by address, so the
+   end sees what it holds if it still lives, and nothing reads it if it does
+   not. So an element reaches what an earlier one allocated only through a
+   read, a holder that the end asks, or a value the end keeps, and
+   the argument above holds in each element on its own: the time closure
+   gives each element its own horizon. A promoted target raises the horizon
+   of the element its force ended in to its forces' last end there, and that
+   of each later element where a force of one of its young cells ended to
+   that end; every entry, a read too, that ended in an element by its
+   horizon promotes its target. A read allocates nothing: it raises no
+   horizon and no cut. The job's end puts every trapped value back before it
+   decides anything; a read's entry is never written back (the cell ends
+   with its first entry's pre-image). A boundary where this cannot be done
+   ends the job instead (see `UnforceNest::trap`).
+   --------------------------------------------------------------------------- */
+
+struct ExprTrap : Expr
+{
+    void eval(EvalState & state, Env & env, Value & v) override;
+
+    void show(const SymbolTable & symbols, std::ostream & str) const override {}
+
+    void bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env) override {}
+};
+
+static ExprTrap trapExpr;
+static boost::unordered_flat_map<const Value *, Value> traps;
+
+/* The undo log's length at the last boundary. */
+static size_t trapFrom = 0;
+
+void ExprTrap::eval(EvalState & state, Env & env, Value & v)
+{
+    auto cell = reinterpret_cast<Value *>(&env);
+    if (&v == cell) {
+        auto i = traps.find(cell);
+        assert(i != traps.end());
+        v = i->second;
+        traps.erase(i);
+    } else {
+        state.forceValue(*cell, noPos);
+        v = *cell;
+    }
+}
+
+const Value * unforceTrapped(const Expr * expr, const Env * env)
+{
+    if (expr != &trapExpr)
+        return nullptr;
+    auto cell = reinterpret_cast<const Value *>(env);
+    auto i = traps.find(cell);
+    return i != traps.end() ? &i->second : cell;
+}
+
+/* Whether `e` logged a read of its cell's trap (a copy's force is a force). */
+static bool isRead(const UnforceUndoEntry & e)
+{
+    return e.preImage.isThunk() && e.preImage.thunk().expr == &trapExpr
+           && e.preImage.thunk().env == reinterpret_cast<Env *>(e.target);
+}
+
 /* Which targets keep their values (`promote`: S, and the strings kept by
    copy; see above), and the top of the memory the job keeps; null to keep
    it whole. No object is visited. `forget`: the seen sets' entries whose
@@ -1043,6 +1132,12 @@ static char * keepPrefix(
         return true;
     };
     std::vector<bool> copy(promote.size());
+    /* A target whose young cells a later element of the job forced is
+       needed there: an end at the boundary between would have reverted it,
+       and that element forced it again (see "Elements"). */
+    for (auto & f : crossForces)
+        if (auto t = targets.ofEntry[f.first]; !alwaysRevert && !targets.cells[t]->isFailed())
+            promote[t] = true;
     for (size_t i = 0; i < log.size(); ++i) {
         auto & p = log[i].preImage;
         auto t = targets.ofEntry[i];
@@ -1057,30 +1152,58 @@ static char * keepPrefix(
     if (hold.driver)
         return nullptr;
 
-    uint64_t horizon = 0;
+    /* The time closure, each element on its own (see "Elements"): `h[e]`
+       is element e's horizon; its entries, by their ends, are byEnd[first[e],
+       first[e + 1]), of which those before next[e] are closed in. */
+    auto elemOf = [&](uint64_t c) { return size_t(std::ranges::lower_bound(joinClocks, c) - joinClocks.begin()); };
+    auto m = joinClocks.size();
+    std::vector<uint32_t> byEnd(log.size());
+    std::iota(byEnd.begin(), byEnd.end(), 0);
+    std::ranges::sort(byEnd, {}, [&](auto i) { return ends[i].own; });
+    std::vector<size_t> first(m + 2, byEnd.size());
+    first[0] = 0;
+    for (size_t e = 1; e <= m; ++e)
+        first[e] = std::ranges::upper_bound(byEnd, joinClocks[e - 1], {}, [&](auto i) { return ends[i].own; })
+                   - byEnd.begin();
+    auto next = first;
+    std::vector<uint64_t> h(m + 1);
+    std::vector<size_t> raised;
+    auto raise = [&](uint64_t c) {
+        if (auto e = elemOf(c); c > h[e]) {
+            h[e] = c;
+            raised.push_back(e);
+        }
+    };
+    /* Each target's entries, from its first. */
+    std::vector<uint32_t> head(promote.size(), noOwner), link(log.size(), noOwner);
+    for (auto i = log.size(); i-- > 0;) {
+        link[i] = head[targets.ofEntry[i]];
+        head[targets.ofEntry[i]] = i;
+    }
+    std::ranges::sort(crossForces);
     char * top = evalRegion.base;
     auto add = [&](size_t t) {
-        if (per[t].own == UINT64_MAX)
-            top = evalRegion.cur;
-        horizon = std::max({horizon, per[t].own == UINT64_MAX ? 0 : per[t].own, per[t].last});
-        top = std::max(top, per[t].at);
+        for (auto i = head[t]; i != noOwner; i = link[i])
+            if (!isRead(log[i])) {
+                raise(std::max(ends[i].own, ends[i].last));
+                top = ends[i].own == UINT64_MAX ? evalRegion.cur : std::max(top, ends[i].at);
+                for (auto & f : std::ranges::equal_range(crossForces, i, {}, &std::pair<uint32_t, uint64_t>::first))
+                    raise(f.second);
+            }
     };
     for (size_t t = 0; t < promote.size(); ++t)
         if (promote[t])
             add(t);
-    /* The time closure, in the order the targets' forces ended. */
-    std::vector<uint32_t> order(per.size());
-    std::iota(order.begin(), order.end(), 0);
-    std::ranges::sort(order, {}, [&](auto t) { return per[t].own; });
-    for (auto t : order) {
-        if (per[t].own > horizon)
-            break;
-        if (!promote[t] && byCopy(t))
-            copy[t] = true;
-        else if (!promote[t]) {
-            promote[t] = true;
-            add(t);
-        }
+    while (!raised.empty()) {
+        auto e = raised.back();
+        raised.pop_back();
+        for (; next[e] < first[e + 1] && ends[byEnd[next[e]]].own <= h[e]; ++next[e])
+            if (auto t = targets.ofEntry[byEnd[next[e]]]; !promote[t] && byCopy(t))
+                copy[t] = true;
+            else if (!promote[t]) {
+                promote[t] = true;
+                add(t);
+            }
     }
     /* Nothing live lies above the cursor. */
     auto keep = std::min(top, evalRegion.cur);
@@ -1104,27 +1227,28 @@ static char * keepPrefix(
 
 /* Give back the runs below the cut `keptTo` of the targets that keep nothing
    (see Promotion): adjacent ones as one run, so that a page they share goes
-   too. */
-static void releaseDead(const Targets & targets, const std::vector<bool> & promote, char * keptTo)
+   too. Returns how much memory went back. */
+static size_t releaseDead(const Targets & targets, const std::vector<bool> & promote, char * keptTo)
 {
     char *lo = nullptr, *hi = nullptr;
+    size_t given = 0;
     auto run = [&](char * s, char * e, uint32_t o) {
         e = std::min(e, keptTo);
         if (s < e && o != noOwner && !promote[targets.ofEntry[o]]) {
             if (hi != s) {
-                giveBack(lo, hi);
+                given += giveBack(lo, hi);
                 lo = s;
             }
             hi = e;
         } else {
-            giveBack(lo, hi);
+            given += giveBack(lo, hi);
             lo = hi = nullptr;
         }
     };
     for (size_t k = 0; k < segments.size() && segStart(segments[k]) < keptTo; ++k)
         run(segStart(segments[k]), k + 1 < segments.size() ? segStart(segments[k + 1]) : openSeg, segments[k].owner);
     run(openSeg, evalRegion.cur, curOwner);
-    giveBack(lo, hi);
+    return given + giveBack(lo, hi);
 }
 
 /* ---------------------------------------------------------------------------
@@ -1503,12 +1627,21 @@ void unforceNoteCApiCode()
     cApiCode = true;
 }
 
-/* For the unit tests, which share their process with the C API's. */
-void unforceTestResetNativeCode();
+/* The memory that ended jobs keep (less what they gave back), the most
+   memory in use at a traversal's boundary so far, and the most that one
+   element took in its job: from `elementStart`, where it started, to the
+   job's top. */
+static uint64_t keptMemory = 0, highWater = 0, mostOne = 0;
+static char * elementStart = nullptr;
 
-void unforceTestResetNativeCode()
+/* For the unit tests, which share their process with the C API's and with
+   each other. */
+void unforceTestReset();
+
+void unforceTestReset()
 {
     cApiCode = false;
+    keptMemory = highWater = mostOne = 0;
 }
 
 void unforceNoteCApiState(EvalState & state)
@@ -1797,6 +1930,8 @@ struct UnforceNest : UnforceHolder
     }
 
     void start(EvalState & state, const char * frame, const Value * container, UnforceLoop loop);
+
+    bool trap(EvalState & state);
 };
 
 void UnforceNest::held(Hold & hold)
@@ -1872,6 +2007,48 @@ void UnforceNest::start(EvalState & state, const char * frame, const Value * con
     }
 }
 
+/* The open job continues past a boundary: trap the cells logged since the
+   last one (see "Elements"). False, having trapped nothing, if a force, a
+   step or a frame is open, the region is paused, native code may run (it
+   could read a trap unforced), a cell to trap is a slot on the stack (a copy
+   of its trap could outlive the frame), a holder other than a seen set holds
+   the job's memory, or memory runs out: the job ends here then. */
+bool UnforceNest::trap(EvalState & state)
+{
+    auto & log = state.undoLog;
+    auto & stack = threadStack();
+    auto onStack = [&](auto & e) {
+        auto p = (const char *) e.target;
+        return p >= stack.low && p < stack.low + stack.size;
+    };
+    /* Seen sets are exempt (see "Elements"). `DerivationsSeen::found` is read
+       through (its derivations' attrs, young memory of earlier elements), but
+       only by `getDerivations`' callers once the traversal's jobs have ended:
+       a read of them across elements would need to be logged as a read. */
+    auto holds = [](auto h) { return !dynamic_cast<UnforceSeen *>(h) && evalRegion.contains(h->youngTop); };
+    if (!opens.empty() || !stepFrames.empty() || unforceFrame.s || evalRegion.paused || unforceNativeCode(state)
+        || std::any_of(log.begin() + trapFrom, log.end(), onStack) || std::ranges::any_of(*jobHolders, holds))
+        return false;
+    try {
+        traps.reserve(traps.size() + log.size() - trapFrom);
+        roomFor(joinClocks, 1);
+    } catch (std::bad_alloc &) {
+        return false;
+    }
+    /* An emplace may still allocate (erasures lower a flat map's load
+       limit): a throw leaves every trapped cell's value in `traps`, which the
+       job's end, as the throw unwinds the traversal, puts back. */
+    for (auto i = log.begin() + trapFrom; i != log.end(); ++i)
+        if (auto c = i->target; !c->isThunk() && !c->isApp() && !c->isFailed() && !youngFree(*c)) {
+            traps.emplace(c, *c);
+            c->mkThunk(reinterpret_cast<Env *>(c), &trapExpr);
+        }
+    trapFrom = log.size();
+    joinClocks.push_back(forceClock);
+    unforceAnyReverted = true;
+    return true;
+}
+
 void unforceNestedElementStart(EvalState & state, const Value * v, UnforceLoop loop)
 {
     nest.start(state, (const char *) __builtin_dwarf_cfa(), v, loop);
@@ -1903,6 +2080,28 @@ void unforceElementStart(UnforceLoop loop)
     if (!t.unforce || (t.opener && t.opener != level))
         return;
     if (t.opener) {
+        /* The next element runs in the open job too, unless memory in use
+           (what ended jobs keep, and the open job's top) rose past the most
+           there was at any earlier boundary, or the open job holds more than
+           any one element took: the job's end then frees what its elements
+           left for later ones to reuse. The first mark counts what the
+           elements of a job left at the boundary that ends it, so each such
+           job raises it by an element; the second counts each element on its
+           own, so that a job holds at most what the largest element took,
+           and the element that crossed it. Such a job is a job of several
+           elements, decided at its end as any job (the levels of the element
+           before have returned). A job kept whole, or one a nested level's
+           switch opened, ends here. */
+        auto top = std::max(jobTop, evalRegion.cur);
+        auto inUse = keptMemory + uint64_t(top - evalRegion.base);
+        bool rose = inUse > highWater || uint64_t(top - evalRegion.base) > mostOne;
+        highWater = std::max(highWater, inUse);
+        mostOne = std::max(mostOne, uint64_t(top - elementStart));
+        if (!rose && !keepWhole && jobStackMark == level && nest.trap(t.state)) {
+            elementStart = evalRegion.cur;
+            nest.open(t.state, level, loop);
+            return;
+        }
         t.opener = nullptr;
         t.state.endUnforceScope(level);
     }
@@ -1945,7 +2144,7 @@ void EvalState::beginUnforceScope(const void * stackMark)
     stepsUnsafe = stepsUnsafe || unforceFrame.s;
     try {
         openRegion();
-        openSeg = evalRegion.base;
+        openSeg = elementStart = evalRegion.base;
     } catch (...) {
         /* Memory for the job could not be mapped: no job is open. */
         if (evalRegion.base)
@@ -1966,6 +2165,10 @@ void EvalState::endUnforceScope(const void * ender)
 
 void EvalState::endUnforceJob(const char * ender)
 {
+    /* Trapped values first: the end decides from values (see "Elements"). */
+    for (auto & [cell, v] : traps)
+        *const_cast<Value *>(cell) = v;
+    traps.clear();
     nest.prune(ender);
     /* A job during which native code came to be able to run is kept whole,
        and so is one that logged a slot of a frame that has returned since
@@ -1991,7 +2194,7 @@ void EvalState::endUnforceJob(const char * ender)
        string kept by copy (`copyStringOut`), whose cell then holds the same
        content outside the region: harmless if the job is kept whole after
        all. */
-    size_t promoted = 0;
+    size_t promoted = 0, given = 0;
     /* The top of what the job keeps. */
     char * keptTo = nullptr;
     std::vector<SeenEntry> forget;
@@ -2021,7 +2224,7 @@ void EvalState::endUnforceJob(const char * ender)
                         forgetYoungCell(x->failed());
                 for (size_t i = 0; i < undoLog.size(); ++i) {
                     auto & e = undoLog[i];
-                    if (youngFree(*e.target) || promote[targets.ofEntry[i]])
+                    if (youngFree(*e.target) || promote[targets.ofEntry[i]] || isRead(e))
                         e.target = nullptr;
                     else
                         e.preImage = reforcePreImage(*this, e.preImage, e.pos, *e.target);
@@ -2029,7 +2232,7 @@ void EvalState::endUnforceJob(const char * ender)
                 promoted = std::ranges::count(promote, true);
                 /* Last: the reads of young objects above are done, and nothing
                    after it keeps the job whole. */
-                releaseDead(targets, promote, keptTo);
+                given = releaseDead(targets, promote, keptTo);
             }
         } catch (std::bad_alloc &) {
             keep = true;
@@ -2058,12 +2261,16 @@ void EvalState::endUnforceJob(const char * ender)
     decltype(segments)().swap(segments);
     decltype(opens)().swap(opens);
     decltype(youngFailures)().swap(youngFailures);
+    joinClocks.clear();
+    crossForces.clear();
+    trapFrom = 0;
     youngFailuresLost = false;
     curOwner = noOwner;
     if (evalRegion.base) {
         auto top = keep ? evalRegion.cur : keptTo;
         unforceStats.bytesKept += top - evalRegion.base;
         unforceStats.bytesFreed += evalRegion.cur - top;
+        keptMemory += top - evalRegion.base - given;
         closeRegion(top);
     }
     keepWhole = stepsUnsafe = false;
@@ -2085,6 +2292,7 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
             return;
         roomFor(segments, opens.size() + 2);
         roomFor(opens, 1);
+        roomFor(crossForces, opens.size() + 1);
         return openForce(v, noOwner, o);
     }
     if (isJobStackSlot(p))
@@ -2142,8 +2350,12 @@ void EvalState::endOwnerForce(Value & v, bool completed)
         /* The clock of these ends, and what each target owned last. */
         auto t = ++forceClock;
         if (curOwner != noOwner) {
-            ends[curOwner].last = t;
-            ends[curOwner].at = std::max(ends[curOwner].at, evalRegion.cur);
+            auto & r = ends[curOwner];
+            if (!joinClocks.empty() && r.own <= joinClocks.back())
+                crossForces.push_back({curOwner, t});
+            else
+                r.last = t;
+            r.at = std::max(r.at, evalRegion.cur);
         }
         if (f.entry != noOwner)
             ends[f.entry].own = t;

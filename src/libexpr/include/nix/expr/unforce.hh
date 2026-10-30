@@ -275,8 +275,10 @@ enum class UnforceLoop : unsigned char { other, nests, json, drvs };
 /**
  * Unforce jobs for a traversal of independent elements (the derivations of
  * a package set, the attributes that a printer prints): each element runs
- * in a job of its own, which ends when the next element starts or when this
- * ends, unless the traversal itself runs in a job. The traversal is a loop
+ * in a job, which ends when the next element starts if memory in use rose
+ * or the job holds more than any one element took (else that element runs
+ * in it too) or when this ends, unless the traversal itself runs in a job.
+ * The traversal is a loop
  * in the caller's frame that calls `element` before each element, or a
  * recursive walk of `root` whose levels call `unforceElement`: only the
  * outermost level's elements are jobs. Nothing a job allocated may outlive
@@ -381,6 +383,9 @@ public:
             stepSlow(v);
     }
 };
+
+/** The value that a thunk of `expr` and `env` stands for if it is a trapped cell (unforce.cc, "Elements"), else null. */
+const Value * unforceTrapped(const Expr * expr, const Env * env);
 
 /** Whether a thunk of `expr` is a cell that unforcing reverted. */
 bool unforceIsReverted(const Expr * expr);

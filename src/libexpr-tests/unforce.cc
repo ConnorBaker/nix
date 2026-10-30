@@ -27,8 +27,9 @@
 namespace nix {
 
 /* Defined in unforce.cc for these tests: forget that C API client code,
-   which other tests in this process create, may run. */
-void unforceTestResetNativeCode();
+   which other tests in this process create, may run, and the memory in use
+   they left, so that each test's traversals start as a process's would. */
+void unforceTestReset();
 
 /* Defined in unforce.cc for these tests: while set, every mapping a job asks
    for fails. */
@@ -88,7 +89,7 @@ protected:
 
     void SetUp() override
     {
-        unforceTestResetNativeCode();
+        unforceTestReset();
     }
 
     /* A cell allocated outside any job: a thunk of `expr`. */
@@ -669,6 +670,31 @@ TEST_F(UnforceTest, rootHoldsValue)
     state.endUnforceScope();
     ASSERT_FALSE(v->isThunk());
     EXPECT_EQ(deep(**root), "{ b = 1; }");
+}
+
+/* A job continues past a boundary only while no holder but a seen set holds
+   its memory, which it could let go of after a later element read through
+   it. b and c allocate little next to a: b is trapped at c's boundary, and
+   the job ends at the next one, where a root holds c's memory. */
+TEST_F(UnforceTest, holderEndsMergedJob)
+{
+    auto v = oldThunk("{ a = builtins.length (builtins.genList (x: x) 300000); b = { x = 1; }; c = { y = 2; }; }");
+    state.forceValue(*v, noPos);
+    auto cell = [&](const char * name) { return v->attrs()->get(createSymbol(name))->value; };
+    auto trapped = [&](const char * name) {
+        return cell(name)->isThunk() && unforceTrapped(cell(name)->thunk().expr, cell(name)->thunk().env);
+    };
+    RootValue root;
+    UnforceJobs jobs(state);
+    for (auto name : {"a", "b", "c"}) {
+        jobs.element();
+        state.forceValue(*cell(name), noPos);
+    }
+    root = allocRootValue(state.allocValue());
+    (*root)->mkInt(1);
+    EXPECT_TRUE(trapped("b"));
+    jobs.element();
+    EXPECT_FALSE(trapped("b") || trapped("c"));
 }
 
 /* What a job allocates while the region is paused outlives it. */
