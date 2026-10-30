@@ -4224,7 +4224,7 @@ static void prim_foldlStrict(EvalState & state, CallSite callSite, Value * const
             auto vs = std::to_array({vCur, elem});
             vCur = steps.cell(n == args[2]->listSize() - 1 ? &v : nullptr);
             state.callFunction(*args[0], vs, *vCur, noPos);
-            steps.step(vCur);
+            vCur = steps.step(vCur);
         }
         state.forceValue(v, noPos);
     } else {

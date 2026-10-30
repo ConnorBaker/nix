@@ -801,8 +801,8 @@ TEST_F(UnforceTest, failureKeepsFirstTrace)
    its list `xs`, made in the job, or before it (`old`). Then, once the job
    has allocated over what the steps freed, as zeroed memory, `c` prints as
    without jobs. Where the steps free all they allocate (`frees`), the region
-   grows by no more for a list twice as long but by the two cells the steps
-   take turns writing. */
+   grows by no more for a list twice as long but by the two cells the loop
+   takes turns handing on. */
 TEST_F(UnforceTest, steps)
 {
     struct Case
@@ -845,11 +845,29 @@ TEST_F(UnforceTest, steps)
          false},
         /* Each step's value holds the cell it read: no later step writes it. */
         {ints, "builtins.foldl' (acc: x: [ acc ]) null xs", "r", false, false},
+        /* The same, each step a batch (it allocates a page), whose value moves to a new cell. */
+        {ints,
+         "builtins.foldl' (acc: x: builtins.seq (builtins.genList (j: j) 300) [ acc ]) null xs",
+         "r",
+         false,
+         false},
+        /* The batch's last value holds its first cell, which holds what the first step built. */
+        {ints,
+         "builtins.foldl' (acc: x: if x == 0 then { a = 1; } else if x == 1 then [ acc ] else acc) null xs",
+         "r",
+         false,
+         false},
         /* Each step's value holds no cell of the loop's. */
         {ints, "builtins.foldl' (acc: x: [ x ]) null xs", "r", false, true},
         /* A step forces a young cell made before the loop (a write), or an old one (logged). */
         {sets, "builtins.foldl' (acc: x: acc + x.a) 0 xs", "[ r xs ]", false, false},
         {sets, "builtins.foldl' (acc: x: acc + x.a) 0 xs", "[ r xs ]", true, false},
+        /* The same, the cell made in the loop's force (its owner's open segment). */
+        {ints,
+         "let ys = builtins.genList (i: { a = i; }) n; in [ (builtins.foldl' (a: y: a + y.a) 0 ys) ys ]",
+         "r",
+         false,
+         false},
         /* Loops in a loop's steps: the inner steps free, and an inner step's write is the outer step's. */
         {ints,
          "builtins.foldl' (acc: x: acc + builtins.foldl' (a: j: a + builtins.length (builtins.genList (k: k) j)) 0 [ 1 2 3 ]) 0 xs",
@@ -888,6 +906,17 @@ TEST_F(UnforceTest, steps)
     }
 }
 
+/* Steps that hold less than a page in all end together, with the last. */
+TEST_F(UnforceTest, stepsBatch)
+{
+    auto v = oldThunk("builtins.foldl' builtins.add 0 (builtins.genList (i: i) 100)");
+    state.beginUnforceScope();
+    auto ends = unforceStats.stepEnds;
+    state.forceValue(*v, noPos);
+    EXPECT_EQ(unforceStats.stepEnds, ends + 1);
+    state.endUnforceScope();
+}
+
 /* A step in which a failure was caught is kept: the job's end reads the
    failure's cell. */
 TEST_F(UnforceTest, failedStepKept)
@@ -924,6 +953,42 @@ TEST_F(UnforceTest, stepsCutOwners)
     EXPECT_TRUE(seen.see(s.attrs(), UnforceHolder::Kind::bindings));
     state.endUnforceScope();
     EXPECT_FALSE(y.isThunk());
+}
+
+/* `s`'s force forces a cell of `t`'s, after `t`'s force, and a holder keeps
+   `t` (or `q`, whose force ends after `t`'s and before `s`'s). What that
+   force built stays `t`'s, and so is kept with it, where `t`'s cell reaches
+   it (`v`), or a cell of `t`'s that it forced does (`w`, by `u`); and a
+   force that reopened `t`'s segment (`s` allocated nothing first) leaves the
+   segment `t`'s (`l`, which `t` built, spans pages). In the last case the
+   force leaves no trace. A later job allocates over what the end freed. */
+TEST_F(UnforceTest, youngForceKeepsOwner)
+{
+    auto t0 =
+        "let l = builtins.genList (i: i) 1000; in builtins.seq l (rec { inherit l; v = builtins.genList (i: i * 2) "
+        "1000; w = { z = 2; }; u = builtins.seq w 1; x = 0; y = x + 0; })";
+    auto want = deep(*oldThunk(t0));
+    for (auto [e, holder, held] : std::initializer_list<std::tuple<const char *, const char *, const char *>>{
+             {"builtins.seq t.v { a = 1; }", "t", "v"},
+             {"builtins.seq t.u { a = 1; }", "t", "w"},
+             {"t.y + q.n", "q", "z"},
+             {"builtins.seq t.y { a = 1; }", "t", "y"}}) {
+        auto r = oldThunk(fmt("rec { t = %s; q = { n = 1; z = { }; }; s = %s; }", t0, e));
+        state.forceValue(*r, noPos);
+        auto get = [&](Value & a, const char * n) -> Value & { return *a.attrs()->get(createSymbol(n))->value; };
+        auto & t = get(*r, "t");
+        UnforceSeen seen;
+        state.beginUnforceScope();
+        state.forceValue(t, noPos);
+        state.forceValue(get(*r, "s"), noPos);
+        EXPECT_TRUE(seen.see(&get(get(*r, holder), held), UnforceHolder::Kind::value));
+        state.endUnforceScope();
+        EXPECT_FALSE(t.isThunk()) << e;
+        state.beginUnforceScope();
+        state.mem.allocBytes(1 << 20);
+        EXPECT_EQ(deep(t), want) << e;
+        state.endUnforceScope();
+    }
 }
 
 /* A holder that may hold a step's memory (`youngTop`) keeps every step's. */

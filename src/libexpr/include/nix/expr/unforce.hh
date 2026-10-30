@@ -337,9 +337,9 @@ public:
 /**
  * The steps of a primop's loop that hands a value on from step to step
  * (`foldl'`'s accumulator). Between steps the loop holds nothing that its
- * steps allocated but the cell it hands on, which it takes from `cell`,
- * outside the step's memory. In a job, a step's end frees the step's memory
- * when no record shows a pointer into it (see unforce.cc).
+ * steps allocated but the cell it hands on: the one `cell` gave, or the one
+ * `step` returns. In a job, the steps end in batches, and a batch's end
+ * frees its memory when no record shows a pointer into it (see unforce.cc).
  */
 class UnforceSteps
 {
@@ -348,7 +348,7 @@ class UnforceSteps
 
     [[gnu::noinline]] bool begin();
     [[gnu::noinline]] Value * cellSlow(Value * given);
-    [[gnu::noinline]] void stepSlow(Value * v);
+    [[gnu::noinline]] Value * stepSlow(Value * v);
     [[gnu::noinline]] void end();
 
 public:
@@ -376,11 +376,13 @@ public:
         return open ? cellSlow(given) : given ? given : state.allocValue();
     }
 
-    /** A step ended, its value in `v`, the cell `cell` returned. */
-    [[gnu::always_inline]] void step(Value * v)
+    /**
+     * A step ended, its value in `v`, the cell `cell` returned. Returns the
+     * cell that holds the value from now on.
+     */
+    [[gnu::always_inline]] Value * step(Value * v)
     {
-        if (open) [[unlikely]]
-            stepSlow(v);
+        return open ? stepSlow(v) : v;
     }
 };
 
@@ -411,19 +413,12 @@ extern UnforceStats unforceStats;
    of the open frames a write marked. `unforceFrameSpan`: what a frame must
    span to give anything back. `unforceFailures` ticks at every failed force
    and every frame an exception leaves. */
-struct UnforceFrameRecord
-{
-    const char * lowC;
-    const char * s;
-};
-
 struct UnforceFrameMark
 {
     const char * s;
     int64_t markLo;
 };
 
-extern UnforceFrameRecord unforceFrame;
 extern std::vector<UnforceFrameMark> unforceFrames;
 extern size_t unforceFrameSpan;
 extern uint64_t unforceFailures;

@@ -634,21 +634,32 @@ struct OwnerSeg
 };
 
 static std::vector<OwnerSeg> segments;
-static char * openSeg = nullptr;
+char * unforceOpenSeg = nullptr;
+static char *& openSeg = unforceOpenSeg;
 static uint32_t curOwner = noOwner;
+const Value * unforceTopOpen = nullptr;
 
 /* A force that changed the owner: a logged one (`entry`, its log index) or
    a young one (`noOwner`). `saved` is the owner to restore at its end;
-   `segs`, how many closed segments there were once its own opened. */
+   `segs`, how many closed segments there were once its own opened; `at`,
+   the cursor at its start; `events`, `ownerEvents` once it opened. */
 struct OpenForce
 {
     const Value * cell;
     uint32_t entry;
     uint32_t saved;
     size_t segs;
+    char * at;
+    uint64_t events;
 };
 
 static std::vector<OpenForce> opens;
+
+/* Ticks at every force that changes the owner, and at every force of a
+   young cell of the current owner's below its open segment or of a slot on
+   the job's stack: the writes outside the open segment that no record
+   shows. */
+static uint64_t ownerEvents = 0;
 
 /* Per log entry, when its force ended (`own`; the clock counts the ends of
    forces that changed the owner), and when and where (the bump cursor) the
@@ -701,21 +712,29 @@ static void setOwner(uint32_t o)
     curOwner = o;
 }
 
+/* The closed segment the last lookup found, tried first. */
+static size_t ownerHint = 0;
+
 /* The owner of the young object at `p`. */
 static uint32_t ownerOf(const void * p)
 {
     if ((const char *) p >= openSeg)
         return curOwner;
-    auto i = std::upper_bound(
-        segments.begin(), segments.end(), uint64_t(granuleOf(p)), [](uint64_t off, auto & s) { return off < s.off; });
+    uint64_t g = granuleOf(p);
+    auto & h = ownerHint;
+    if (h < segments.size() && segments[h].off <= g && (h + 1 == segments.size() || g < segments[h + 1].off))
+        return segments[h].owner;
+    auto i = std::upper_bound(segments.begin(), segments.end(), g, [](uint64_t off, auto & s) { return off < s.off; });
     assert(i != segments.begin());
+    h = i - segments.begin() - 1;
     return i[-1].owner;
 }
 
 /* Push a force that changes the owner to `o` (`entry`, for a logged one). */
 static void openForce(const Value & v, uint32_t entry, uint32_t o)
 {
-    opens.push_back({&v, entry, curOwner, 0});
+    opens.push_back({&v, entry, curOwner, 0, evalRegion.cur, ++ownerEvents});
+    unforceTopOpen = &v;
     setOwner(o);
     opens.back().segs = segments.size();
 }
@@ -1255,37 +1274,42 @@ static size_t releaseDead(const Targets & targets, const std::vector<bool> & pro
    Steps.
 
    A loop's steps (`UnforceSteps`) free their memory inside a job, by
-   records, without a walk or a move. A step's memory is what the bump
-   cursor passed during it, [start, cur). Nothing allocated before the step
-   points into it unless the step wrote it, and the step writes a cell
-   outside its memory only by forcing it, or as the cell its value goes to.
-   So once the step's call has returned, a pointer into its memory can only
-   be in:
-   - the step's value, in a cell outside its memory (`UnforceSteps::cell`);
-   - a cell logged during the step (an old cell): its value or pre-image;
-   - a young cell below `start`, or a slot of a frame outside the step (the
-     loop's and its callers'), forced during the step (`stepWrites`);
-   - a holder (`youngTop`), a young failure recorded during the step, or
+   records, without a walk or a move. They end in batches: a batch's steps
+   run on until what it holds (its memory, its writes and its log entries)
+   spans a page, as a boolean frame must to give anything back, or a step's
+   cell was given (the loop's last), or the job is gone. A batch's memory is
+   what the bump cursor passed during it, [start, cur). It starts before its
+   first step's cell, so every cell its steps write a value to lies in it,
+   but a given one. Nothing allocated before the batch points into it unless
+   the batch wrote it, and its steps write a cell outside it only by forcing
+   it, or as the given cell. So once its last step's call has returned, a
+   pointer into its memory can only be in:
+   - the last step's value;
+   - a cell logged during the batch (an old cell): its value or pre-image;
+   - a young cell below `start`, or a slot of a frame outside the steps (the
+     loop's and its callers'), forced during the batch (`stepWrites`);
+   - a holder (`youngTop`), a young failure recorded during the batch, or
      what native code holds.
-   The step's end looks at the own pointers of each (`valueEdges`), not
-   further: what they point to outside the step's memory was allocated
-   before it, and points into it only if the step wrote it, which is a
-   record above. A failed value is taken to point into it. If none does,
-   the cursor goes back to `start`, the memory is zeroed, and the owner
-   timeline is cut back to `start`.
+   The records accumulate over the batch: writes are dropped only at its
+   end, and a log entry only by its force's end with a young-free value
+   (`endOwnerForce`), whose cell then points to nothing young. The batch's
+   end looks at the own pointers of each (`valueEdges`), not further: what
+   they point to outside its memory was allocated before it, and points
+   into it only if the batch wrote it, which is a record above. A failed
+   value is taken to point into it. If none does, the cursor goes back to
+   `start`, the memory is zeroed, and the owner timeline is cut back to
+   `start`.
 
-   This rests on the step writing its own value's cell once, at its end, by
+   This rests on each step writing its own value's cell once, at its end, by
    copy: no evaluation keeps the address of the cell its result goes to
-   (`callFunction` evaluates into a local and copies).
+   (`callFunction` evaluates into a local and copies). Between steps the
+   loop reads only that cell; a step's memory may hold the cells earlier
+   steps of its batch wrote, which only the step after each reads.
 
-   The cell the next step writes lies outside that step's memory: a cell
-   allocated before it starts, or the cell that an earlier step read
-   (`spare`) once that step's memory was freed, or was empty at its end,
-   and no record points to the cell, so that nothing reads it any more. A
-   step's memory is empty at its end if it allocated nothing, or if inner
-   steps freed all it allocated. Such a step goes through the same checks:
-   none can find a pointer into its memory, but each looks for one to that
-   cell, which its value may hold (`[ a ]` in an inner `foldl'`).
+   A freed batch's last value, in a cell of the batch's, moves out of it:
+   to the cell the batch's first step read (`prev`) if that is the loop's
+   own and nothing reads it any more (no record and no holder points to it),
+   else to a new cell at `start`. So a loop's cells do not pile up.
    --------------------------------------------------------------------------- */
 
 namespace {
@@ -1295,18 +1319,17 @@ struct StepFrame
     char * start = nullptr;
     /* The loop's frame: slots at or above it are outside the steps. */
     const char * sp = nullptr;
-    /* At the step's start: the sizes of `stepWrites`, the log, the young
+    /* At the batch's start: the sizes of `stepWrites`, the log, the young
        failures and `opens`; the owner; the job. */
     size_t writes = 0, log = 0, failures = 0, opens = 0;
     uint32_t owner = noOwner;
     uint64_t job = 0;
-    /* The cell the step writes, the one the step before wrote (this step's
-       argument), whether each is the loop's own (`cell` allocated it), and
-       a cell of the loop's that nothing reads. */
-    Value * cur = nullptr;
+    /* Whether a batch is open; whether the step's cell is the loop's own
+       (`cell` allocated it); the cell the batch's first step read, and
+       whether it is the loop's own (a batch's end put the value there). */
+    bool batch = false, own = false;
     Value * prev = nullptr;
-    bool curOwn = false, prevOwn = false;
-    Value * spare = nullptr;
+    bool prevOwn = false;
 };
 
 } // namespace
@@ -1318,6 +1341,7 @@ struct StepFrame
    access from libnixexpr.so, several per step and per force. */
 static std::vector<StepFrame> stepFrames;
 static std::vector<Value *> stepWrites;
+unsigned unforceStepsOpen = 0;
 
 /* Whether `p` lies outside the memory and the frames of step frame `f`. */
 static bool outsideStep(const void * p, const StepFrame & f)
@@ -1359,43 +1383,47 @@ bool UnforceSteps::begin()
     f.writes = stepWrites.size();
     f.job = unforceStats.jobs;
     stepFrames.push_back(f);
+    unforceStepsOpen++;
     return true;
 }
 
 Value * UnforceSteps::cellSlow(Value * given)
 {
     auto & f = stepFrames.back();
-    if (f.job != unforceStats.jobs)
-        f.spare = nullptr;
-    auto c = given;
-    if (!c) {
-        if (f.spare) {
-            c = f.spare;
-            f.spare = nullptr;
-        } else
-            c = state.allocValue();
+    if (!f.batch || f.job != unforceStats.jobs) {
+        /* A batch starts here, before its first cell. A batch of another
+           job's ends unchecked, and a cell of another job's is not the
+           loop's to write. */
+        if (f.batch)
+            dropStepWrites(f);
+        f.prevOwn = f.prevOwn && f.job == unforceStats.jobs;
+        f.start = evalRegion.cur;
+        f.writes = stepWrites.size();
+        f.log = state.undoLog.size();
+        f.failures = youngFailures.size();
+        f.opens = opens.size();
+        f.owner = curOwner;
+        f.job = unforceStats.jobs;
+        f.batch = true;
     }
-    f.cur = c;
-    f.curOwn = !given;
-    /* The step starts here. */
-    f.start = evalRegion.cur;
-    f.writes = stepWrites.size();
-    f.log = state.undoLog.size();
-    f.failures = youngFailures.size();
-    f.opens = opens.size();
-    f.owner = curOwner;
-    f.job = unforceStats.jobs;
-    return c;
+    f.own = !given;
+    return given ? given : state.allocValue();
 }
 
-void UnforceSteps::stepSlow(Value * v)
+Value * UnforceSteps::stepSlow(Value * v)
 {
     auto & f = stepFrames.back();
     auto top = evalRegion.cur;
-    /* Whether the step's argument, the loop's own cell, may be written by
-       a later step: nothing it leaves points to it. `escapes` clears it as
-       it looks; it is read only when no check below stopped the step, so
-       that every check has run in full. */
+    if (f.own && f.job == unforceStats.jobs
+        && size_t(top - f.start) + (stepWrites.size() - f.writes) * sizeof(Value *)
+                   + (state.undoLog.size() - f.log) * sizeof(UnforceUndoEntry)
+               < pageSize())
+        return v;
+    f.batch = false;
+    /* Whether the batch's argument, the loop's own cell, may take its
+       value: nothing it leaves points to it. `escapes` clears it as it
+       looks; it is read only when no check below stopped the batch, so that
+       every check has run in full. */
     bool spare = f.prevOwn;
     auto escapes = [&](const Value & x) {
         if (x.isFailed())
@@ -1407,9 +1435,6 @@ void UnforceSteps::stepSlow(Value * v)
         });
         return into;
     };
-    /* An empty step (the cursor is back at its start: it allocated nothing,
-       or inner steps freed all it allocated) goes through the same checks:
-       only whether its argument's cell may be reused depends on them. */
     bool kept = f.job != unforceStats.jobs || jobOwner.load() != &state || evalRegion.paused || youngFailuresLost
                 || youngFailures.size() != f.failures || opens.size() != f.opens || curOwner != f.owner || stepsUnsafe
                 || unforceNativeCode(state)
@@ -1421,7 +1446,8 @@ void UnforceSteps::stepSlow(Value * v)
                     [&](auto & e) { return escapes(*e.target) || escapes(e.preImage); })
                 || std::any_of(stepWrites.begin() + f.writes, stepWrites.end(), [&](auto w) { return escapes(*w); });
     if (!kept && top > f.start) {
-        /* Free the step's memory. */
+        /* Free the batch's memory. */
+        auto value = *v;
         jobTop = std::max(jobTop, top);
 #if NIX_ASAN_ENABLED
         /* Frames' ends may have poisoned some of it (`giveBack`). */
@@ -1443,19 +1469,25 @@ void UnforceSteps::stepSlow(Value * v)
         }
         unforceStats.stepEnds++;
         unforceStats.stepBytesFreed += top - f.start;
+        if (f.own) {
+            assert((char *) v >= f.start && (char *) v < top);
+            v = spare && std::ranges::none_of(*jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, f.prev); })
+                    ? f.prev
+                    : state.allocValue();
+            *v = value;
+        }
     }
-    if (!kept && spare
-        && std::ranges::none_of(*jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, f.prev); }))
-        f.spare = f.prev;
-    f.prev = f.cur;
-    f.prevOwn = f.curOwn;
+    f.prev = v;
+    f.prevOwn = f.own;
     dropStepWrites(f);
+    return v;
 }
 
 void UnforceSteps::end()
 {
     dropStepWrites(stepFrames.back());
     stepFrames.pop_back();
+    unforceStepsOpen--;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2260,6 +2292,7 @@ void EvalState::endUnforceJob(const char * ender)
     decltype(ends)().swap(ends);
     decltype(segments)().swap(segments);
     decltype(opens)().swap(opens);
+    unforceTopOpen = nullptr;
     decltype(youngFailures)().swap(youngFailures);
     joinClocks.clear();
     crossForces.clear();
@@ -2288,15 +2321,19 @@ void EvalState::logPreImageSlow(Value & v, PosIdx pos)
         if (p >= openSeg)
             return;
         auto o = ownerOf(p);
-        if (o == curOwner)
+        if (o == curOwner) {
+            ownerEvents++;
             return;
+        }
         roomFor(segments, opens.size() + 2);
         roomFor(opens, 1);
         roomFor(crossForces, opens.size() + 1);
         return openForce(v, noOwner, o);
     }
-    if (isJobStackSlot(p))
+    if (isJobStackSlot(p)) {
+        ownerEvents++;
         return;
+    }
     /* A log as long as owner names allow keeps the job whole, and no step or
        frame of it frees: the cells it forces from then on are not logged,
        and are forced under the current owner. */
@@ -2326,10 +2363,21 @@ void EvalState::endLoggedForceSlow(Value & v, bool completed)
         return frameForceEnd(v, completed);
 }
 
+/* Whether a holder holds memory in [at, cur): the drops in `endOwnerForce`
+   rest on none keeping a pointer into a force's memory past its end. */
+[[maybe_unused]] static bool heldFrom(const char * at)
+{
+    return std::ranges::any_of(*jobHolders, [&](auto h) {
+        auto p = (const char *) h->youngTop;
+        return !std::less<>()(p, at) && std::less<>()(p, evalRegion.cur);
+    });
+}
+
 void EvalState::endOwnerForce(Value & v, bool completed)
 {
     auto f = opens.back();
     opens.pop_back();
+    unforceTopOpen = opens.empty() ? nullptr : opens.back().cell;
     /* A logged force that completed with a young-free value drops its
        entry, if it is still the last one and no closed segment has its
        label: the job's end would keep the cell as it is anyway, so the
@@ -2339,8 +2387,22 @@ void EvalState::endOwnerForce(Value & v, bool completed)
        reaches it would have a later entry), and becomes the restored
        owner's. */
     if (f.entry != noOwner && completed && f.entry + 1 == undoLog.size() && segments.size() == f.segs && youngFree(v)) {
+        assert(!heldFrom(f.at));
         undoLog.pop_back();
         ends.pop_back();
+        curOwner = f.saved;
+        if (!segments.empty() && segments.back().owner == f.saved) {
+            openSeg = segStart(segments.back());
+            segments.pop_back();
+        }
+    } else if (
+        f.entry == noOwner && completed && f.events == ownerEvents && segments.size() == f.segs && openSeg == f.at
+        && (curOwner == noOwner || joinClocks.empty() || ends[curOwner].own > joinClocks.back()) && youngFree(v)) {
+        /* The same for a young force (of a cell of another owner's) that
+           wrote nothing outside the segment it opened at its start but its
+           cell, with a young-free value: what it allocated is garbage too.
+           Its owner's ends stay: what its forces left is what was before. */
+        assert(!heldFrom(f.at));
         curOwner = f.saved;
         if (!segments.empty() && segments.back().owner == f.saved) {
             openSeg = segStart(segments.back());

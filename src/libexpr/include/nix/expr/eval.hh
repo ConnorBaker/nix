@@ -392,6 +392,21 @@ struct EvalRegion
 
 extern EvalRegion evalRegion;
 
+/* For the force hooks' inline checks (unforce.cc): a Boolean frame's
+   record, whose `s` is set while one is open; the start of the open job's
+   current owner segment; how many loops' steps are open; the cell of the
+   innermost open force that changed the owner, or null. */
+struct UnforceFrameRecord
+{
+    const char * lowC;
+    const char * s;
+};
+
+extern UnforceFrameRecord unforceFrame;
+extern char * unforceOpenSeg;
+extern unsigned unforceStepsOpen;
+extern const Value * unforceTopOpen;
+
 #if !NIX_USE_BOEHMGC
 /**
  * `calloc(n, 1)`, in the open job's region while there is one. Out of line,
@@ -1144,15 +1159,22 @@ private:
      */
     [[gnu::always_inline]] void logPreImage(Value & v, PosIdx pos)
     {
+        /* A cell of the current owner's open segment needs nothing while no
+           loop's steps are open. */
         if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
-            logPreImageSlow(v, pos);
+            if (unforceStepsOpen || (const char *) &v < unforceOpenSeg || (const char *) &v >= evalRegion.cur)
+                logPreImageSlow(v, pos);
     }
 
     /** The end of a force of `v`; `completed`: with a value, not by throwing. */
     [[gnu::always_inline]] void endLoggedForce(Value & v, bool completed)
     {
+        /* Only the end of a force that changed the owner, or of one in a
+           Boolean frame, needs anything: a failure outside every frame ticks
+           a count that only a frame open across it reads. */
         if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]
-            endLoggedForceSlow(v, completed);
+            if (&v == unforceTopOpen || unforceFrame.s)
+                endLoggedForceSlow(v, completed);
     }
 
     [[gnu::noinline, gnu::cold]] void logPreImageSlow(Value & v, PosIdx pos);
