@@ -131,6 +131,17 @@ static void * mapAnonymous(size_t bytes)
 }
 #endif
 
+/* Whether a job has a region (`openRegion`): only on Linux, with a 64-bit
+   address space. */
+static constexpr bool jobsHaveRegion()
+{
+#if defined(__linux__)
+    return sizeof(void *) >= 8;
+#else
+    return false;
+#endif
+}
+
 /* Open the job's region. Only Linux on a 64-bit system has one: elsewhere,
    the job allocates as outside any job, and its end reverts nothing. The
    mapping is as large as the system gives: the largest power of two a
@@ -142,7 +153,7 @@ static void * mapAnonymous(size_t bytes)
 static void openRegion()
 {
 #if defined(__linux__)
-    if (sizeof(void *) < 8)
+    if (!jobsHaveRegion())
         return;
     if (!mapping || unforceTestFailMapping || size_t(mapping + 2 * regionBytes - keptTop) < regionBytes) {
         auto bytes = ~(SIZE_MAX >> 1);
@@ -1707,7 +1718,7 @@ const char * unforceNativeCode(const EvalState & state)
 
 bool unforceEnabled(const EvalState & state)
 {
-    if (NIX_USE_BOEHMGC || state.debugRepl)
+    if (NIX_USE_BOEHMGC || !jobsHaveRegion() || state.debugRepl)
         return false;
     if (auto reason = unforceNativeCode(state)) {
         static std::atomic<const char *> reported = nullptr;

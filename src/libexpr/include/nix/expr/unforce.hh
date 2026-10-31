@@ -526,7 +526,8 @@ public:
 
 /**
  * Whether front ends open unforce jobs in `state`: not with Boehm GC, nor
- * with the debugger, nor where native code may run (`unforceNativeCode`).
+ * where a job has no region to free (only 64-bit Linux has one), nor with
+ * the debugger, nor where native code may run (`unforceNativeCode`).
  */
 bool unforceEnabled(const EvalState & state);
 

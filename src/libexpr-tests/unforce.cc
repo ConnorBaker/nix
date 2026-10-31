@@ -1448,3 +1448,25 @@ TEST_F(UnforceTest, corpus)
 } // namespace nix
 
 #endif
+
+#if !NIX_USE_BOEHMGC
+
+namespace nix {
+
+void unforceTestReset();
+
+/* Front ends open jobs only where a job has a region to free: elsewhere
+   (a 32-bit system, another kernel) they take no path of unforcing's. */
+TEST_F(LibExprTest, unforceOnlyWithRegion)
+{
+    unforceTestReset();
+    if (!unforceEnabled(state))
+        return;
+    state.beginUnforceScope();
+    EXPECT_NE(evalRegion.base, nullptr);
+    state.endUnforceScope();
+}
+
+} // namespace nix
+
+#endif
