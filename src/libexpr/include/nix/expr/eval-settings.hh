@@ -357,9 +357,10 @@ public:
         "unforce-always-revert",
         R"(
           In a build without Boehm GC, a value that an earlier unforce job
-          reverted is kept by default when a later job computes it again. If
-          set to true, it is reverted again at every job's end and computed
-          anew wherever it is read next: less memory, possibly more time.
+          reverted is kept by default when a later job computes it again, as
+          is a value that a later element of the same job needs. If set to
+          true, such values are reverted at every job's end too and computed
+          anew wherever they are read next: less memory, possibly more time.
         )"};
 
     Setting<bool> builtinsTraceDebugger{
@@ -504,8 +505,9 @@ public:
           Deprecated: accepted, but has no effect.
 
           An [attribute set update expression](@docroot@/language/operators.md#update)
-          now always layers its right operand over its left one, and keeps an attribute
-          set of n attributes within log2(n) + 1 layers, whatever the operands' sizes:
+          now keeps an attribute set of n attributes within log2(n) + 1 layers,
+          whatever the operands' sizes, layering its right operand over its left one
+          and merging it with the left one's top layers where the bound needs it:
           there is nothing left to tune.
     )"};
 };
