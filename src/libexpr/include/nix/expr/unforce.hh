@@ -334,6 +334,40 @@ public:
         unforceNestedElementStart(state, &v, loop);
 }
 
+/** What unforcing did in this process (`NIX_SHOW_STATS`). */
+struct UnforceStats
+{
+    uint64_t jobs = 0, jobsKeptWhole = 0, cellsReverted = 0, cellsPromoted = 0, bytesKept = 0, bytesFreed = 0;
+    uint64_t stepEnds = 0, stepBytesFreed = 0;
+};
+
+extern UnforceStats unforceStats;
+
+/* A loop's open steps (unforce.cc, "Steps"), here so that a step inside a
+   batch is decided inline. `unforceStepSpan`: what a batch must hold to end
+   (a page). */
+struct UnforceStepFrame
+{
+    char * start = nullptr;
+    /* The loop's frame: slots at or above it are outside the steps. */
+    const char * sp = nullptr;
+    /* At the batch's start: the sizes of `stepWrites`, the log, the young
+       failures and `opens`; the owner; the job. */
+    size_t writes = 0, log = 0, failures = 0, opens = 0;
+    uint32_t owner = UINT32_MAX;
+    uint64_t job = 0;
+    /* Whether a batch is open; whether the step's cell is the loop's own
+       (`cell` allocated it); the cell the batch's first step read, and
+       whether it is the loop's own (a batch's end put the value there). */
+    bool batch = false, own = false;
+    Value * prev = nullptr;
+    bool prevOwn = false;
+};
+
+extern std::vector<UnforceStepFrame> unforceStepFrames;
+extern std::vector<Value *> unforceStepWrites;
+extern size_t unforceStepSpan;
+
 /**
  * The steps of a primop's loop that hands a value on from step to step
  * (`foldl'`'s accumulator). Between steps the loop holds nothing that its
@@ -373,7 +407,14 @@ public:
      */
     [[gnu::always_inline]] Value * cell(Value * given)
     {
-        return open ? cellSlow(given) : given ? given : state.allocValue();
+        if (open) [[unlikely]] {
+            /* Inside a batch of this job's; else one starts. */
+            auto & f = unforceStepFrames.back();
+            if (!f.batch || f.job != unforceStats.jobs) [[unlikely]]
+                return cellSlow(given);
+            f.own = !given;
+        }
+        return given ? given : state.allocValue();
     }
 
     /**
@@ -382,7 +423,18 @@ public:
      */
     [[gnu::always_inline]] Value * step(Value * v)
     {
-        return open ? stepSlow(v) : v;
+        if (open) [[unlikely]] {
+            /* The batch goes on while what it holds (its memory, its writes
+               and entries) spans less than a page, unless the step's cell
+               was given (the loop's last); else it ends. */
+            auto & f = unforceStepFrames.back();
+            if (!f.own || f.job != unforceStats.jobs
+                || size_t(evalRegion.cur - f.start) + (unforceStepWrites.size() - f.writes) * sizeof(Value *)
+                           + (state.undoLog.size() - f.log) * sizeof(UnforceUndoEntry)
+                       >= unforceStepSpan) [[unlikely]]
+                return stepSlow(v);
+        }
+        return v;
     }
 };
 
@@ -397,15 +449,6 @@ bool unforceIsReverted(const Expr * expr);
 
 /** Whether unforcing has reverted a cell in this process. */
 extern bool unforceAnyReverted;
-
-/** What unforcing did in this process (`NIX_SHOW_STATS`). */
-struct UnforceStats
-{
-    uint64_t jobs = 0, jobsKeptWhole = 0, cellsReverted = 0, cellsPromoted = 0, bytesKept = 0, bytesFreed = 0;
-    uint64_t stepEnds = 0, stepBytesFreed = 0;
-};
-
-extern UnforceStats unforceStats;
 
 /* Boolean frames (unforce.cc). `unforceFrame`: the innermost open frame's
    start, and the lowest cell older than it written with a pointer at or

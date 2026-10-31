@@ -160,6 +160,7 @@ static void openRegion()
     evalRegion.base = evalRegion.cur = jobTop = keptTop;
     /* Under AddressSanitizer every frame that allocates poisons what it may. */
     unforceFrameSpan = NIX_ASAN_ENABLED ? 1 : pageSize();
+    unforceStepSpan = pageSize();
     roomEnd = keptTop + regionBytes;
     evalRegion.end = dirtyTop > keptTop ? keptTop : roomEnd;
 #endif
@@ -1325,35 +1326,19 @@ static size_t releaseDead(const Targets & targets, const std::vector<bool> & pro
    else to a new cell at `start`. So a loop's cells do not pile up.
    --------------------------------------------------------------------------- */
 
-namespace {
+using StepFrame = UnforceStepFrame;
 
-struct StepFrame
-{
-    char * start = nullptr;
-    /* The loop's frame: slots at or above it are outside the steps. */
-    const char * sp = nullptr;
-    /* At the batch's start: the sizes of `stepWrites`, the log, the young
-       failures and `opens`; the owner; the job. */
-    size_t writes = 0, log = 0, failures = 0, opens = 0;
-    uint32_t owner = noOwner;
-    uint64_t job = 0;
-    /* Whether a batch is open; whether the step's cell is the loop's own
-       (`cell` allocated it); the cell the batch's first step read, and
-       whether it is the loop's own (a batch's end put the value there). */
-    bool batch = false, own = false;
-    Value * prev = nullptr;
-    bool prevOwn = false;
-};
-
-} // namespace
-
-/* Plain statics, like `segments` and `opens`: steps open only in a job
+/* Plain globals (declared in unforce.hh for the inline steps), not
+   thread-locals, like `segments` and `opens`: steps open only in a job
    (`begin`), and only its owner's thread forces in it (`logPreImageSlow` runs
    while `isolationDepth` is set, which only the job's owner has), so no other
    thread touches them; a thread-local here cost a `__tls_get_addr` call per
    access from libnixexpr.so, several per step and per force. */
-static std::vector<StepFrame> stepFrames;
-static std::vector<Value *> stepWrites;
+std::vector<StepFrame> unforceStepFrames;
+std::vector<Value *> unforceStepWrites;
+size_t unforceStepSpan = SIZE_MAX;
+static auto & stepFrames = unforceStepFrames;
+static auto & stepWrites = unforceStepWrites;
 unsigned unforceStepsOpen = 0;
 
 /* Whether `p` lies outside the memory and the frames of step frame `f`. */
@@ -1403,35 +1388,29 @@ bool UnforceSteps::begin()
 Value * UnforceSteps::cellSlow(Value * given)
 {
     auto & f = stepFrames.back();
-    if (!f.batch || f.job != unforceStats.jobs) {
-        /* A batch starts here, before its first cell. A batch of another
-           job's ends unchecked, and a cell of another job's is not the
-           loop's to write. */
-        if (f.batch)
-            dropStepWrites(f);
-        f.prevOwn = f.prevOwn && f.job == unforceStats.jobs;
-        f.start = evalRegion.cur;
-        f.writes = stepWrites.size();
-        f.log = state.undoLog.size();
-        f.failures = youngFailures.size();
-        f.opens = opens.size();
-        f.owner = curOwner;
-        f.job = unforceStats.jobs;
-        f.batch = true;
-    }
+    /* A batch starts here, before its first cell (`cell`). A batch of
+       another job's ends unchecked, and a cell of another job's is not the
+       loop's to write. */
+    if (f.batch)
+        dropStepWrites(f);
+    f.prevOwn = f.prevOwn && f.job == unforceStats.jobs;
+    f.start = evalRegion.cur;
+    f.writes = stepWrites.size();
+    f.log = state.undoLog.size();
+    f.failures = youngFailures.size();
+    f.opens = opens.size();
+    f.owner = curOwner;
+    f.job = unforceStats.jobs;
+    f.batch = true;
     f.own = !given;
     return given ? given : state.allocValue();
 }
 
 Value * UnforceSteps::stepSlow(Value * v)
 {
+    /* The batch ends (`step`). */
     auto & f = stepFrames.back();
     auto top = evalRegion.cur;
-    if (f.own && f.job == unforceStats.jobs
-        && size_t(top - f.start) + (stepWrites.size() - f.writes) * sizeof(Value *)
-                   + (state.undoLog.size() - f.log) * sizeof(UnforceUndoEntry)
-               < pageSize())
-        return v;
     f.batch = false;
     /* Whether the batch's argument, the loop's own cell, may take its
        value: nothing it leaves points to it. `escapes` clears it as it
@@ -1580,7 +1559,7 @@ static const char * maxYoung(const Value & v)
 }
 
 /* A force ended in a frame, or failed. */
-[[gnu::noinline, gnu::cold]] static void frameForceEnd(const Value & v, bool completed)
+static void frameForceEnd(const Value & v, bool completed)
 {
     if (!completed)
         unforceFailures++;
