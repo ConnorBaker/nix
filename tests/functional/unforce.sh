@@ -281,6 +281,12 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     vgCheck 'let r = { a = builtins.pathExists ./k/x; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }' \
         '{"vg1":true,"vg2":null,"vg3":true}' nix eval --impure --json -f
 
+    # The REPL keeps the cell of every read, as stock keeps a forced thunk: r.a prints its first result after the edit
+    # (a list: a string target is kept by copy anyway).
+    replRun() { nix repl --file "$1" <<< $':p r\n:p builtins.seq wait null\n:p r'; }
+    vgRun '{ r = { a = [ (builtins.readFile ./f) ]; }; inherit wait; }' "printf B > $vg/f" replRun
+    [[ $vgRc == 0 && $(grep -c '"A"' "$vg/out") == 2 ]] || fail "repl: $vgRc $(< "$vg/out") $(< "$vg/err")"
+
     # A store path that the evaluation itself builds is no changed file: the cell that found it missing keeps its
     # value, and a new read finds it.
     o=$(nix eval --impure --raw --expr "(import $PWD/simple.nix).outPath")
