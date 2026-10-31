@@ -498,12 +498,21 @@ static bool onFakeStack(const void * p)
    thread-local). */
 static const char * jobStackMark = nullptr;
 static const char * jobStackLow = nullptr;
+static const char * jobStackHigh = nullptr;
 
 /* Whether `p` is a slot of a stack frame entered during the open job, which
    will have returned when it ends: such a cell is never logged, as the end
    must not write it. */
 static bool isJobStackSlot(const void * p)
 {
+    /* Forced on another stack (a coroutine's, as a binary cache store runs
+       a path filter on), whose slots look like cells: keep the job whole,
+       so that its end writes none of them once that stack is gone. */
+    auto here = (const char *) __builtin_dwarf_cfa();
+    if (here < jobStackLow || here >= jobStackHigh) {
+        keepWhole = stepsUnsafe = true;
+        return true;
+    }
 #if defined(__linux__)
 #  if NIX_ASAN_ENABLED
     /* On one of AddressSanitizer's fake stacks, whose addresses tell nothing
@@ -2161,6 +2170,7 @@ void EvalState::beginUnforceScope(const void * stackMark)
        not known, the frames entered during the job cannot be told apart. */
     auto & stack = threadStack();
     jobStackLow = stack.low;
+    jobStackHigh = stack.low + stack.size;
     jobHolders = &holders;
     keepWhole = stepsUnsafe = !(jobStackMark > stack.low && size_t(jobStackMark - stack.low) <= stack.size);
     /* Opened in a boolean frame (never, by the level rule): searches for the

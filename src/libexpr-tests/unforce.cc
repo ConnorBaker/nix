@@ -11,6 +11,7 @@
 #include "nix/util/finally.hh"
 #include "nix/util/memory-source-accessor.hh"
 #include "nix/util/mounted-source-accessor.hh"
+#include "nix/util/serialise.hh"
 #include "nix/util/signals.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
@@ -1106,6 +1107,23 @@ TEST_F(UnforceTest, boolFrameKeepsSlot)
     state.forceValue(*f, noPos);
     state.beginUnforceScope();
     conditionForcesSlot(state, *f);
+    state.endUnforceScope();
+}
+
+/* A thunk in a frame on a coroutine's stack (a binary cache store runs a
+   path filter on one), forced in the job to a value of the job's memory:
+   the job's end reads or writes no such slot once the coroutine is gone. */
+TEST_F(UnforceTest, coroutineSlot)
+{
+    auto t = oldThunk("{ a = 1; }");
+    state.beginUnforceScope();
+    auto source = sinkToSource([&](Sink & sink) {
+        Value slot = *t;
+        state.forceValue(slot, noPos);
+        sink(printValue(state, slot));
+    });
+    EXPECT_EQ(source->drain(), "{ a = 1; }");
+    source.reset();
     state.endUnforceScope();
 }
 
