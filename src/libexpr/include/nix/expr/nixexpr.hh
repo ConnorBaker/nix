@@ -457,6 +457,12 @@ struct ExprAttrs : Expr
 
     std::shared_ptr<const StaticEnv> bindInheritSources(EvalState & es, const std::shared_ptr<const StaticEnv> & env);
     Env * buildInheritFromEnv(EvalState & state, Env & up);
+
+    /**
+     * `eval` of a set that is not `rec` and has dynamic attributes: their
+     * names first, so that the attributes whose name is null take no room.
+     */
+    void evalDynamic(EvalState & state, Env & env, Value & v);
     void showBindings(const SymbolTable & symbols, std::ostream & str) const;
     void moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc);
 };

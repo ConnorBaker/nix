@@ -1371,8 +1371,54 @@ Env * ExprAttrs::buildInheritFromEnv(EvalState & state, Env & up)
     return &inheritEnv;
 }
 
+void ExprAttrs::evalDynamic(EvalState & state, Env & env, Value & v)
+{
+    /* Nothing else in the set is evaluated before its Bindings exist
+       (maybeThunk evaluates nothing), so evaluating the names first
+       evaluates in the same order. Each is checked as it comes, against
+       the static names and those before it. */
+    std::vector<std::pair<Symbol, const DynamicAttrDef *>> names;
+    for (auto & i : *dynamicAttrs) {
+        Value nameVal;
+        i.nameExpr->eval(state, env, nameVal);
+        state.forceValue(nameVal, i.pos);
+        if (nameVal.type() == nNull)
+            continue;
+        state.forceStringNoCtx(nameVal, i.pos, "while evaluating the name of a dynamic attribute");
+        auto nameSym = state.symbols.create(nameVal.string_view());
+        auto j = attrs->find(nameSym);
+        auto k = std::ranges::find(names, nameSym, [](auto & n) { return n.first; });
+        if (j != attrs->end() || k != names.end())
+            state
+                .error<EvalError>(
+                    "dynamic attribute '%1%' already defined at %2%",
+                    state.symbols[nameSym],
+                    state.positions[j != attrs->end() ? j->second.pos : k->second->pos])
+                .atPos(i.pos)
+                .withFrame(env, *this)
+                .debugThrow();
+        i.valueExpr->setName(nameSym);
+        names.emplace_back(nameSym, &i);
+    }
+
+    /* At least one: a set of its own, with its position, even when every
+       name is null (not the shared empty set). */
+    auto bindings = state.buildBindings(std::max<size_t>(attrs->size() + names.size(), 1));
+    Env * inheritEnv = inheritFromExprs ? buildInheritFromEnv(state, env) : nullptr;
+    for (auto & i : *attrs)
+        bindings.insert(
+            i.first, i.second.e->maybeThunk(state, *i.second.chooseByKind(&env, &env, inheritEnv)), i.second.pos);
+    for (auto & [nameSym, i] : names)
+        bindings.insert(nameSym, i->valueExpr->maybeThunk(state, env), i->pos);
+    bindings.bindings->pos = pos;
+    v.mkAttrs(bindings.finish());
+}
+
 void ExprAttrs::eval(EvalState & state, Env & env, Value & v)
 {
+    if (!recursive && !dynamicAttrs->empty()) [[unlikely]]
+        return evalDynamic(state, env, v);
+
     auto bindings = state.buildBindings(attrs->size() + dynamicAttrs->size());
     auto dynamicEnv = &env;
     bool sort = false;

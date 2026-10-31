@@ -310,3 +310,9 @@ frames=197
 # first element's job is forced again, in the next one, as it was made.
 [[ $(nix eval --expr 'let m = builtins.mapAttrs (n: v: [ v n v ]) { a = 1; }; in builtins.seq m { x = builtins.length m.a; y = m.a; }') \
     == '{ x = 3; y = [ 1 "a" 1 ]; }' ]]
+
+# An empty set that removeAttrs or null dynamic names leave is a set of its
+# own, as before: printers show «repeated» only for one set shown twice.
+# shellcheck disable=SC2016 # The ${} in this is Nix, not shell
+[[ $(nix eval --expr 'let s = { a = 1; }; n = null; in [ (removeAttrs s [ "a" ]) (removeAttrs s [ "a" ]) { ${n} = 1; } { } ]') \
+    == '[ { } { } { } { } ]' ]]

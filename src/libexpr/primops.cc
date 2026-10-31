@@ -3526,7 +3526,15 @@ static RegisterPrimOp primop_isAttrs({
     /* Copy all attributes not in `names`.  Note that we don't need
        to sort them because they are a subset of an already sorted
        vector. */
-    auto attrs = state.buildBindings(from.size());
+    /* Exactly as many as remain: the distinct names that `from` has go.
+       None left of a non-empty set: room for one, so that the result is a
+       set of its own (not the shared empty one), as without counting. */
+    size_t removed = 0;
+    for (size_t k = 0; k < names.size(); ++k)
+        if ((k == 0 || names[k].name != names[k - 1].name) && from.get(names[k].name))
+            ++removed;
+    auto left = from.size() - removed;
+    auto attrs = state.buildBindings(left || from.empty() ? left : 1);
     std::set_difference(from.begin(), from.end(), names.begin(), names.end(), std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
 }
