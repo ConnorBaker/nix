@@ -183,25 +183,17 @@ public:
                 --remaining;
             }
 
-            void consume(Symbol name) noexcept
-            {
-                while (!empty() && current->name <= name)
-                    increment();
-            }
-
             GENERATE_CMP(BindingsCursor, me->current->name, me->priority)
         };
 
         using QueueStorageType = boost::container::static_vector<BindingsCursor, maxLayers>;
 
         /**
-         * Comparator implementing the override priority / name ordering
-         * for BindingsCursor.
-         */
-        static constexpr auto comp = std::greater<BindingsCursor>();
-
-        /**
-         * A priority queue used to implement an on-the-fly k-way merge.
+         * One cursor per non-empty layer. Merging, each step emits the least
+         * name, from the cursor of highest priority that has it, and moves
+         * every cursor at that name past it (the names it shadows). A chain
+         * has few layers (at most `maxLayers`), so a linear scan finds the
+         * least cursor with fewer instructions than a heap's sift.
          */
         QueueStorageType cursorHeap;
 
@@ -215,62 +207,33 @@ public:
          */
         bool doMerge = true;
 
-        void push(BindingsCursor cursor) noexcept
-        {
-            cursorHeap.push_back(cursor);
-            std::ranges::make_heap(cursorHeap, comp);
-        }
-
-        [[nodiscard]] BindingsCursor pop() noexcept
-        {
-            std::ranges::pop_heap(cursorHeap, comp);
-            auto cursor = cursorHeap.back();
-            cursorHeap.pop_back();
-            return cursor;
-        }
-
         iterator & finished() noexcept
         {
             current = nullptr;
             return *this;
         }
 
-        void next(BindingsCursor cursor) noexcept
+        /* Point at the least name of the cursors, the highest priority's. */
+        void settle() noexcept
         {
-            current = &cursor.get();
-            cursor.increment();
-
-            if (!cursor.empty())
-                push(cursor);
-        }
-
-        std::optional<BindingsCursor> consumeAllUntilCurrentName() noexcept
-        {
-            auto cursor = pop();
-            Symbol lastHandledName = current->name;
-
-            while (cursor->name <= lastHandledName) {
-                cursor.consume(lastHandledName);
-                if (!cursor.empty())
-                    push(cursor);
-
-                if (cursorHeap.empty())
-                    return std::nullopt;
-
-                cursor = pop();
+            if (cursorHeap.empty()) {
+                current = nullptr;
+                return;
             }
-
-            return cursor;
+            auto best = cursorHeap.begin();
+            for (auto i = best + 1; i != cursorHeap.end(); ++i)
+                if (*i < *best)
+                    best = i;
+            current = best->current;
         }
 
         explicit iterator(const Bindings & attrs) noexcept
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
-                auto first = layer.attrs;
-                push(
+                cursorHeap.push_back(
                     BindingsCursor{
-                        .current = first,
+                        .current = layer.attrs,
                         .remaining = layer.numAttrs,
                         .priority = priority++,
                     });
@@ -286,17 +249,11 @@ public:
                 return;
             }
 
-            const Bindings * layer = &attrs;
-            while (layer) {
+            for (auto layer = &attrs; layer; layer = layer->baseLayer)
                 if (layer->numAttrs != 0)
                     pushBindings(*layer);
-                layer = layer->baseLayer;
-            }
 
-            if (cursorHeap.empty())
-                return;
-
-            next(pop());
+            settle();
         }
 
     public:
@@ -321,14 +278,20 @@ public:
                 return *this;
             }
 
-            if (cursorHeap.empty())
-                return finished();
-
-            auto cursor = consumeAllUntilCurrentName();
-            if (!cursor)
-                return finished();
-
-            next(*cursor);
+            auto name = current->name;
+            for (size_t k = 0; k < cursorHeap.size();) {
+                auto & c = cursorHeap[k];
+                if (c->name == name) {
+                    c.increment();
+                    if (c.empty()) {
+                        c = cursorHeap.back();
+                        cursorHeap.pop_back();
+                        continue;
+                    }
+                }
+                ++k;
+            }
+            settle();
             return *this;
         }
 
