@@ -22,6 +22,47 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
     return new (allocBytes<Attr, sizeof(Bindings)>(capacity)) Bindings();
 }
 
+const Bindings * EvalMemory::shareLayer(const Bindings & top, const Bindings & base)
+{
+    assert(!top.isLayered());
+    stats.nrAttrsets++;
+    auto b = new (allocBytes(sizeof(Bindings))) Bindings();
+    b->arrayOf = &top;
+    b->numAttrs = top.numAttrs;
+    b->baseLayer = &base;
+    b->numLayers = base.numLayers + 1;
+    b->countChain();
+    return b;
+}
+
+void Bindings::countChain()
+{
+    auto & base = *baseLayer;
+    auto own = layer();
+
+    size_type duplicates = 0;
+
+    /* If the base is smaller than this layer, iterate both with
+       std::set_intersection in O(|base| + |own|); otherwise look each of
+       this layer's attributes up in the base, so that a small layer over a
+       large base does not iterate the base. */
+    if (own.size() > base.size()) {
+        std::set_intersection(
+            base.begin(),
+            base.end(),
+            own.begin(),
+            own.end(),
+            boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+    } else {
+        for (const auto & attr : own) {
+            if (base.get(attr.name))
+                ++duplicates;
+        }
+    }
+
+    numAttrsInChain = base.numAttrsInChain + own.size() - duplicates;
+}
+
 Value & BindingsBuilder::alloc(Symbol name, PosIdx pos)
 {
     auto value = mem.get().allocValue();

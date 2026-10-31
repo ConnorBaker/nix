@@ -466,6 +466,12 @@ public:
 
     Bindings * allocBindings(size_t capacity);
 
+    /**
+     * A layer of `top`'s attributes over `base`'s chain that shares `top`'s
+     * array (see `Bindings::arrayOf`); `top` is not layered.
+     */
+    const Bindings * shareLayer(const Bindings & top, const Bindings & base);
+
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
     {
         return BindingsBuilder(*this, symbols, allocBindings(capacity), capacity);

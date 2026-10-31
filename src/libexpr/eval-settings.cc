@@ -29,6 +29,18 @@ void DeprecatedWarnSetting::override(const bool & v)
     assign(v);
 }
 
+void DeprecatedIgnoredSetting::appendOrSet(unsigned newValue, bool append)
+{
+    warn("'%s' is deprecated and has no effect", name);
+    BaseSetting<unsigned>::appendOrSet(newValue, append);
+}
+
+void DeprecatedIgnoredSetting::override(const unsigned & v)
+{
+    warn("'%s' is deprecated and has no effect", name);
+    BaseSetting<unsigned>::override(v);
+}
+
 /* Very hacky way to parse $NIX_PATH, which is colon-separated, but
    can contain URLs (e.g. "nixpkgs=https://bla...:foo=https://"). */
 Strings EvalSettings::parseNixPath(const std::string & s)

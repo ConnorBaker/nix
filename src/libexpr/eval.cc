@@ -40,6 +40,7 @@
 #include <cstring>
 #include <optional>
 #include <unistd.h>
+#include <bit>
 #include <sys/time.h>
 #include <fstream>
 #include <functional>
@@ -2269,63 +2270,55 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    /* Simple heuristic for determining whether attrs2 should be "layered" on top of
-       attrs1 instead of copying to a new Bindings. */
-    bool shouldLayer = [&]() -> bool {
-        if (bindings1.isLayerListFull())
-            return false;
+    /* The result is a new layer of bindings2's attributes over bindings1's
+       layers, which a chain of n attributes has at most log2(n) + 1 of.
 
-        if (bindings2.size() > state.settings.bindingsUpdateLayerRhsSizeThreshold)
-            return false;
+       An unlayered bindings2 becomes a layer that shares its array, while
+       the chain stays within that bound. Otherwise the new layer is a copy
+       that takes in bindings1's top layers down to the deepest one that
+       would not be larger than everything above it, after which every layer
+       is larger than all the layers above it together (so the bound holds). */
+    size_t merged = 0, depth = 0, above = bindings2.size();
+    for (auto l = &bindings1; l; l = l->below()) {
+        ++depth;
+        if (l->layer().size() <= above)
+            merged = depth;
+        above += l->layer().size();
+    }
 
-        return true;
-    }();
+    if (!bindings2.isLayered() && depth + 1 <= size_t(std::bit_width(above))) {
+        v.mkAttrs(state.mem.shareLayer(bindings2, bindings1));
+        return;
+    }
 
-    if (shouldLayer) {
+    if (!merged) {
         auto attrs = state.buildBindings(bindings2.size());
         attrs.layerOnTopOf(bindings1);
-
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
-
         state.nrOpUpdateValuesCopied += bindings2.size();
         return;
     }
 
-    auto attrs = state.buildBindings(bindings1.size() + bindings2.size());
-
-    /* Merge the sets, preferring values from the second set.  Make
-       sure to keep the resulting vector in sorted order. */
-    auto i = bindings1.begin();
-    auto j = bindings2.begin();
-
-    while (i != bindings1.end() && j != bindings2.end()) {
-        if (i->name == j->name) {
-            attrs.insert(*j);
-            ++i;
-            ++j;
-        } else if (i->name < j->name) {
-            attrs.insert(*i);
-            ++i;
-        } else {
-            attrs.insert(*j);
-            ++j;
-        }
+    /* Merge, layer by layer from the top, preferring the attributes merged
+       so far; the result is sorted, without the names shadowed. */
+    std::vector<Attr> acc(bindings2.begin(), bindings2.end()), next;
+    const Bindings * rest = &bindings1;
+    for (size_t k = 0; k < merged; ++k, rest = rest->below()) {
+        next.clear();
+        next.reserve(acc.size() + rest->layer().size());
+        auto layer = rest->layer();
+        std::set_union(acc.begin(), acc.end(), layer.begin(), layer.end(), std::back_inserter(next));
+        std::swap(acc, next);
     }
 
-    while (i != bindings1.end()) {
-        attrs.insert(*i);
-        ++i;
-    }
-
-    while (j != bindings2.end()) {
-        attrs.insert(*j);
-        ++j;
-    }
-
+    auto attrs = state.buildBindings(acc.size());
+    if (rest)
+        attrs.layerOnTopOf(*rest);
+    std::ranges::copy(acc, std::back_inserter(attrs));
     v.mkAttrs(attrs.alreadySorted());
 
-    state.nrOpUpdateValuesCopied += v.attrs()->size();
+    state.nrOpUpdateValuesCopied += acc.size();
 }
 
 void ExprOpUpdate::eval(EvalState & state, Env & env, Value & v)

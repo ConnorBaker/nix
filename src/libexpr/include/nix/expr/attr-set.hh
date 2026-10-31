@@ -4,7 +4,7 @@
 #include "nix/expr/nixexpr.hh"
 #include "nix/expr/symbol-table.hh"
 
-#include <boost/container/static_vector.hpp>
+#include <boost/container/small_vector.hpp>
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <algorithm>
@@ -101,9 +101,29 @@ private:
     const Bindings * baseLayer = nullptr;
 
     /**
+     * The Bindings whose `attrs` hold this layer's attributes: itself, or,
+     * for a layer that an update (`//`) made of its right operand, that
+     * operand, whose sorted array it shares instead of copying it. A pointer
+     * to the object, not into it: the garbage collector ignores interior
+     * pointers, and this one keeps the operand alive.
+     */
+    const Bindings * arrayOf = this;
+
+    /**
      * Flexible array member of attributes.
      */
     Attr attrs[0];
+
+    const Attr * data() const noexcept
+    {
+        return arrayOf->attrs;
+    }
+
+    /**
+     * Count the attributes of the chain, this layer's minus those that
+     * also are in the layers below.
+     */
+    void countChain();
 
     constexpr Bindings() = default;
     Bindings(const Bindings &) = delete;
@@ -116,9 +136,10 @@ private:
     friend class BindingsBuilder;
 
     /**
-     * Maximum length of the Bindings layer chains.
+     * The layers a Bindings iterator holds without allocating. Longer chains
+     * exist (see ExprOpUpdate::eval); their iterators allocate.
      */
-    static constexpr unsigned maxLayers = 8;
+    static constexpr unsigned inlineLayers = 8;
 
 public:
     size_type size() const
@@ -186,14 +207,15 @@ public:
             GENERATE_CMP(BindingsCursor, me->current->name, me->priority)
         };
 
-        using QueueStorageType = boost::container::static_vector<BindingsCursor, maxLayers>;
+        using QueueStorageType = boost::container::small_vector<BindingsCursor, inlineLayers>;
 
         /**
          * One cursor per non-empty layer. Merging, each step emits the least
          * name, from the cursor of highest priority that has it, and moves
          * every cursor at that name past it (the names it shadows). A chain
-         * has few layers (at most `maxLayers`), so a linear scan finds the
-         * least cursor with fewer instructions than a heap's sift.
+         * has few layers (at most log2 of its attributes plus one, see
+         * ExprOpUpdate::eval), so a linear scan finds the least cursor with
+         * fewer instructions than a heap's sift.
          */
         QueueStorageType cursorHeap;
 
@@ -227,13 +249,15 @@ public:
             current = best->current;
         }
 
-        explicit iterator(const Bindings & attrs) noexcept
+        /* Not noexcept: a chain of more than `inlineLayers` layers allocates
+           its cursors, and failing to is `std::bad_alloc`. */
+        explicit iterator(const Bindings & attrs)
             : doMerge(attrs.baseLayer)
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 cursorHeap.push_back(
                     BindingsCursor{
-                        .current = layer.attrs,
+                        .current = layer.data(),
                         .remaining = layer.numAttrs,
                         .priority = priority++,
                     });
@@ -243,7 +267,7 @@ public:
                 if (attrs.empty())
                     return;
 
-                current = attrs.attrs;
+                current = attrs.data();
                 pushBindings(attrs);
 
                 return;
@@ -295,7 +319,7 @@ public:
             return *this;
         }
 
-        iterator operator++(int) noexcept
+        iterator operator++(int)
         {
             iterator tmp = *this;
             ++*this;
@@ -322,7 +346,7 @@ public:
     const Attr * get(Symbol name) const noexcept
     {
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
-            auto first = chunk.attrs;
+            auto first = chunk.data();
             auto last = first + chunk.numAttrs;
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
@@ -348,15 +372,23 @@ public:
     {
         if (isLayered()) [[unlikely]]
             unreachable();
-        return {attrs, numAttrs};
+        return {data(), numAttrs};
     }
 
     /**
-     * Check if the layer chain is full.
+     * The attributes of this layer alone, without those of the layers below.
      */
-    bool isLayerListFull() const noexcept
+    std::span<const Attr> layer() const noexcept
     {
-        return numLayers == Bindings::maxLayers;
+        return {data(), numAttrs};
+    }
+
+    /**
+     * The layer below this one, or null.
+     */
+    const Bindings * below() const noexcept
+    {
+        return baseLayer;
     }
 
     /**
@@ -388,7 +420,7 @@ public:
     {
         if (isLayered()) [[unlikely]]
             unreachable();
-        return attrs[pos];
+        return data()[pos];
     }
 
     void sort();
@@ -456,37 +488,8 @@ private:
      */
     void finishSizeIfNecessary()
     {
-        if (!hasBaseLayer())
-            return;
-
-        auto & base = *bindings->baseLayer;
-        auto attrs = std::span(bindings->attrs, bindings->numAttrs);
-
-        Bindings::size_type duplicates = 0;
-
-        /* If the base bindings is smaller than the newly added attributes
-           iterate using std::set_intersection to run in O(|base| + |attrs|) =
-           O(|attrs|). Otherwise use an O(|attrs| * log(|base|)) per-attr binary
-           search to check for duplicates. Note that if we are in this code path then
-           |attrs| <= bindingsUpdateLayerRhsSizeThreshold, which 16 by default. We are
-           optimizing for the case when a small attribute set gets "layered" on top of
-           a much larger one. When attrsets are already small it's fine to do a linear
-           scan, but we should avoid expensive iterations over large "base" attrsets. */
-        if (attrs.size() > base.size()) {
-            std::set_intersection(
-                base.begin(),
-                base.end(),
-                attrs.begin(),
-                attrs.end(),
-                boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
-        } else {
-            for (const auto & attr : attrs) {
-                if (base.get(attr.name))
-                    ++duplicates;
-            }
-        }
-
-        bindings->numAttrsInChain = base.numAttrsInChain + attrs.size() - duplicates;
+        if (hasBaseLayer())
+            bindings->countChain();
     }
 
 public:

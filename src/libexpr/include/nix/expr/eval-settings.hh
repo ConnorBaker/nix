@@ -46,6 +46,23 @@ public:
     }
 };
 
+/**
+ * A setting that is still accepted but no longer has an effect. Setting it
+ * emits a deprecation warning.
+ */
+class DeprecatedIgnoredSetting : public BaseSetting<unsigned>
+{
+public:
+    DeprecatedIgnoredSetting(Config * options, unsigned def, const std::string & name, const std::string & description)
+        : BaseSetting<unsigned>(def, true, name, description)
+    {
+        options->addSetting(this);
+    }
+
+    void appendOrSet(unsigned newValue, bool append) override;
+    void override(const unsigned & v) override;
+};
+
 struct EvalSettings : Config
 {
 private:
@@ -479,23 +496,17 @@ public:
         )",
     };
 
-    Setting<unsigned> bindingsUpdateLayerRhsSizeThreshold{
+    DeprecatedIgnoredSetting bindingsUpdateLayerRhsSizeThreshold{
         this,
         sizeof(void *) == 4 ? 8192 : 16,
         "eval-attrset-update-layer-rhs-threshold",
         R"(
-          Tunes the maximum size of an attribute set that, when used
-          as a right operand in an [attribute set update expression](@docroot@/language/operators.md#update),
-          uses a more space-efficient linked-list representation of attribute sets.
+          Deprecated: accepted, but has no effect.
 
-          Setting this to larger values generally leads to less memory allocations,
-          but may lead to worse evaluation performance.
-
-          A value of `0` disables this optimization completely.
-
-          This is an advanced performance tuning option and typically should not be changed.
-          The default value is chosen to balance performance and memory usage. On 32 bit systems
-          where memory is scarce, the default is a large value to reduce the amount of allocations.
+          An [attribute set update expression](@docroot@/language/operators.md#update)
+          now always layers its right operand over its left one, and keeps an attribute
+          set of n attributes within log2(n) + 1 layers, whatever the operands' sizes:
+          there is nothing left to tune.
     )"};
 };
 
