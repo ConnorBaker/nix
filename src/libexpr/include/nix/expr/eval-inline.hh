@@ -110,7 +110,8 @@ Env & EvalMemory::allocEnv(size_t size)
 [[gnu::always_inline]]
 void EvalState::forceValue(Value & v, const PosIdx pos)
 {
-    if (v.isThunk()) {
+    auto t = v.internalType();
+    if (t == tThunk) {
         /* Before anything is loaded, so that nothing is live across it. A
            force that throws is ended by the handler. */
         logPreImage(v, pos);
@@ -128,7 +129,9 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             throw;
         }
         endLoggedForce(v, true);
-    } else if (v.isApp()) {
+    } else if (unsigned(t - tApp) <= tAttrApp - tApp) {
+        if (t == tAttrApp)
+            return forceAttrApp(v, pos);
         logPreImage(v, pos);
         Value savedApp = v;
         try {
@@ -138,7 +141,7 @@ void EvalState::forceValue(Value & v, const PosIdx pos)
             throw;
         }
         endLoggedForce(v, true);
-    } else if (v.isFailed()) {
+    } else if (t == tFailed) {
         handleEvalFailed(v, pos);
     }
 }

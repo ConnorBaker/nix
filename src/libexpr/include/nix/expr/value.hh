@@ -56,6 +56,8 @@ enum InternalType {
     tListSmall = tFirstPairOfPointers,
     tPrimOpApp,
     tApp,
+    /* Next to `tApp`: `forceValue` tests both with one comparison. */
+    tAttrApp,
     tThunk,
     tLambda,
     tLastPairOfPointers = tLambda,
@@ -88,6 +90,7 @@ typedef enum {
 } ValueType;
 
 class Bindings;
+struct Attr;
 struct Env;
 struct Expr;
 struct ExprLambda;
@@ -424,6 +427,17 @@ struct ValueBase
         ExprLambda * fun;
     };
 
+    /**
+     * `fun attr.name attr.value`, not yet called: an attribute of
+     * `builtins.mapAttrs`'s result, without a cell for `fun attr.name`.
+     * `attr` lies in the argument's attribute array.
+     */
+    struct AttrApplicationThunk
+    {
+        Value * fun;
+        const Attr * attr;
+    };
+
     using SmallList = std::array<Value *, 2>;
 
     struct List
@@ -512,6 +526,7 @@ struct PayloadTypeToInternalType
     MACRO(ValueBase::ClosureThunk, thunk, tThunk)                   \
     MACRO(ValueBase::FunctionApplicationThunk, app, tApp)           \
     MACRO(ValueBase::Lambda, lambda, tLambda)                       \
+    MACRO(ValueBase::AttrApplicationThunk, attrApp, tAttrApp)       \
     MACRO(PrimOp *, primOp, tPrimOp)                                \
     MACRO(ValueBase::PrimOpApplicationThunk, primOpApp, tPrimOpApp) \
     MACRO(ExternalValueBase *, external, tExternal)                 \
@@ -864,6 +879,7 @@ protected:
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(FunctionApplicationThunk, .left, .right)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(ClosureThunk, .env, .expr)
     NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(Lambda, .env, .fun)
+    NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(AttrApplicationThunk, .fun, .attr)
 
 #undef NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS
 
@@ -1246,6 +1262,11 @@ public:
         return isa<tApp>();
     }
 
+    inline bool isAttrApp() const
+    {
+        return isa<tAttrApp>();
+    }
+
     inline bool isBlackhole() const;
 
     // type() == nFunction
@@ -1295,6 +1316,7 @@ public:
             t[tLambda] = nFunction;
             t[tPrimOpApp] = nFunction;
             t[tApp] = nThunk;
+            t[tAttrApp] = nThunk;
             t[tThunk] = nThunk;
             t[tListSmall] = nList;
             t[tListN] = nList;
@@ -1336,6 +1358,7 @@ public:
             panic("attempt to use uninitialized Value");
         case tFailed:
         case tApp:
+        case tAttrApp:
         case tThunk:
             return false;
         case tInt:
@@ -1429,6 +1452,11 @@ public:
     inline void mkApp(Value * l, Value * r) noexcept
     {
         setStorage(FunctionApplicationThunk{.left = l, .right = r});
+    }
+
+    inline void mkAttrApp(Value * fun, const Attr * attr) noexcept
+    {
+        setStorage(AttrApplicationThunk{.fun = fun, .attr = attr});
     }
 
     inline void mkLambda(Env * e, ExprLambda * f) noexcept
@@ -1589,6 +1617,11 @@ public:
     FunctionApplicationThunk app() const noexcept
     {
         return getStorage<FunctionApplicationThunk>();
+    }
+
+    AttrApplicationThunk attrApp() const noexcept
+    {
+        return getStorage<AttrApplicationThunk>();
     }
 
     const char * pathStr() const noexcept

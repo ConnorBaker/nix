@@ -357,6 +357,8 @@ static std::optional<PosIdx> ownPos(const Value & v)
 {
     if (v.isApp())
         return ownPos(*v.app().left);
+    if (v.isAttrApp())
+        return ownPos(*v.attrApp().fun);
     if (v.type() == nAttrs)
         return v.attrs()->pos;
     if (v.isLambda())
@@ -368,7 +370,7 @@ static std::optional<PosIdx> ownPos(const Value & v)
    `ExprReforce::eval` evaluates (`reforcePreImage`). */
 static bool reforceable(const Value & preImage)
 {
-    return (preImage.isThunk() && !preImage.isBlackhole()) || preImage.isApp();
+    return (preImage.isThunk() && !preImage.isBlackhole()) || preImage.isApp() || preImage.isAttrApp();
 }
 
 /* What a target that holds `now` at the job's end is reverted to: its
@@ -386,7 +388,14 @@ static Value reforcePreImage(EvalState & state, const Value & preImage, PosIdx p
         if (!unforceIsReverted(t.expr))
             v.mkThunk(t.env, internReforce({t.expr, noPos, ownPos(now)}));
     } else {
-        auto a = preImage.app();
+        /* An attribute application is called again as the application
+           `mapAttrs` made before it had a cell for `fun name`. */
+        auto a = preImage.isApp() ? preImage.app() : [&] {
+            auto x = preImage.attrApp();
+            auto f = state.allocValue();
+            f->mkApp(x.fun, Value::toPtr(state.symbols[x.attr->name]));
+            return Value::FunctionApplicationThunk{.left = f, .right = x.attr->value};
+        }();
         auto operands = (Value **) state.mem.allocBytes(2 * sizeof(Value *));
         operands[0] = a.left;
         operands[1] = a.right;
@@ -537,6 +546,10 @@ static void valueEdges(const Value & v, E && edge)
         edge(v.app().left);
         edge(v.app().right);
         break;
+    case tAttrApp:
+        edge(v.attrApp().fun);
+        edge(v.attrApp().attr);
+        break;
     case tPrimOpApp:
         edge(v.primOpApp().left);
         edge(v.primOpApp().right);
@@ -567,7 +580,7 @@ static void valueEdges(const Value & v, E && edge)
    again. */
 static bool youngFree(const Value & v)
 {
-    if (v.isThunk() || v.isApp() || v.internalType() == tUninitialized)
+    if (v.isThunk() || v.isApp() || v.isAttrApp() || v.internalType() == tUninitialized)
         return false;
     bool young = false;
     valueEdges(v, [&](const void * p) { young = young || evalRegion.contains(p); });
@@ -2071,7 +2084,7 @@ bool UnforceNest::trap(EvalState & state)
        limit): a throw leaves every trapped cell's value in `traps`, which the
        job's end, as the throw unwinds the traversal, puts back. */
     for (auto i = log.begin() + trapFrom; i != log.end(); ++i)
-        if (auto c = i->target; !c->isThunk() && !c->isApp() && !c->isFailed() && !youngFree(*c)) {
+        if (auto c = i->target; !c->isThunk() && !c->isApp() && !c->isAttrApp() && !c->isFailed() && !youngFree(*c)) {
             traps.emplace(c, *c);
             c->mkThunk(reinterpret_cast<Env *>(c), &trapExpr);
         }

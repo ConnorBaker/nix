@@ -191,6 +191,7 @@ std::string showType(const Value & v)
     case tThunk:
         return v.isBlackhole() ? "a black hole" : "a thunk";
     case tApp:
+    case tAttrApp:
         return "a function application";
     default:
         return std::string(showType(v.type()));
@@ -210,6 +211,8 @@ PosIdx Value::determinePos(const PosIdx pos) const
         return lambda().fun->pos;
     case tApp:
         return app().left->determinePos(pos);
+    case tAttrApp:
+        return attrApp().fun->determinePos(pos);
     case tThunk:
         /* A cell that unforcing reverted or trapped has its value's position. */
         if (unforceAnyReverted) [[unlikely]] {
@@ -229,7 +232,7 @@ bool Value::isTrivial() const
     /* A cell that unforcing reverted or trapped holds a value without unforcing. */
     if (auto t = isa<tThunk>() ? unforceTrapped(thunk().expr, thunk().env) : nullptr)
         return t->isTrivial();
-    return !isa<tApp, tPrimOpApp>()
+    return !isa<tApp, tAttrApp, tPrimOpApp>()
            && (!isa<tThunk>()
                || (dynamic_cast<ExprAttrs *>(thunk().expr) && ((ExprAttrs *) thunk().expr)->dynamicAttrs->empty())
                || dynamic_cast<ExprLambda *>(thunk().expr) || dynamic_cast<ExprList *>(thunk().expr)
@@ -1688,7 +1691,7 @@ void ExprOpHasAttr::eval(EvalState & state, Env & env, Value & v)
             return;
         }
 
-        if (vTmp.isThunk() || vTmp.isApp() || vTmp.isFailed()) [[unlikely]]
+        if (vTmp.isThunk() || vTmp.isApp() || vTmp.isAttrApp() || vTmp.isFailed()) [[unlikely]]
             forceHasAttrOperand(state, vTmp, *this);
         const Attr * j;
         auto name = getName(attrPath[0], state, env);
@@ -1845,6 +1848,46 @@ void EvalState::callPrimOpApp(
         addBuiltinTrace(*this, e, pos, *fn);
         throw;
     }
+}
+
+void EvalState::forceAttrApp(Value & v, const PosIdx pos)
+{
+    logPreImage(v, pos);
+    Value savedApp = v;
+    auto a = v.attrApp();
+    Value * name = Value::toPtr(symbols[a.attr->name]);
+    /* `fun name` called into a result here (never forced, so never
+       logged), then applied to the value at the call depth of `callFunction`
+       on `mapAttrs`'s cell `fun name`. A force of the cell from within
+       calls `fun name` again, where that cell holds the first call's result:
+       called before the depth is taken, it fails at the depth where that
+       cell fails (`fun name`'s own body runs a level shallower). On a
+       failure it is kept on the heap, once the force has ended, if the cell
+       keeps a recovery. */
+    Value fun2;
+    bool called = false;
+    try {
+        if (profiler.getNeededHooks().any()) [[unlikely]] {
+            /* The cell as `mapAttrs` makes it without `tAttrApp`, forced as
+               `forceValue` forces it: the hooks see the same calls, and a
+               force from within uses the same `fun name`. */
+            auto app = allocValue();
+            app->mkApp(a.fun, name);
+            savedApp.mkApp(app, a.attr->value);
+            v = savedApp;
+            callFunction(*app, *a.attr->value, v, pos);
+        } else {
+            callFunction(*a.fun, *name, fun2, pos);
+            called = true;
+            auto _level = addCallDepth(pos);
+            std::span<Value * const> args(&a.attr->value, 1);
+            callFunctionBody(fun2, args, v, pos);
+        }
+    } catch (...) {
+        handleEvalExceptionForApp(v, savedApp, called ? &fun2 : nullptr);
+        throw;
+    }
+    endLoggedForce(v, true);
 }
 
 /* Binds the formals of `lambda` to the attributes of `arg` in `env2`. */
@@ -2636,7 +2679,10 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
 }
 
 [[gnu::noinline]]
-void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
+/* `fun2`: of a `tAttrApp` cell, the result of `fun name` when the call
+   returned; the recovery applies a copy of it, made after the force's end
+   (which must not allocate). */
+void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp, const Value * fun2)
 {
     endLoggedForce(v, false);
     auto e = std::current_exception();
@@ -2654,6 +2700,11 @@ void EvalState::handleEvalExceptionForApp(Value & v, const Value & savedApp)
     }
     if (recovery) {
         *recovery = savedApp;
+        if (fun2) {
+            auto kept = allocValue();
+            *kept = *fun2;
+            recovery->mkApp(kept, savedApp.attrApp().attr->value);
+        }
     }
     v.mkFailed(e, recovery);
     if (!NIX_USE_BOEHMGC && isolationDepth) [[unlikely]]

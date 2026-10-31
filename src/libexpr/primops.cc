@@ -3832,10 +3832,16 @@ static void prim_mapAttrs(EvalState & state, CallSite callSite, Value * const * 
     auto attrs = state.buildBindings(args[1]->attrs()->size());
 
     for (auto & i : *args[1]->attrs()) {
+#if NIX_USE_BOEHMGC
+        /* A `tAttrApp` points into the argument's array, which the
+           collector does not see as a reference (no interior pointers). */
         Value * vName = Value::toPtr(state.symbols[i.name]);
         Value * vFun2 = state.allocValue();
         vFun2->mkApp(args[0], vName);
         attrs.alloc(i.name).mkApp(vFun2, i.value);
+#else
+        attrs.alloc(i.name).mkAttrApp(args[0], &i);
+#endif
     }
 
     v.mkAttrs(attrs.alreadySorted());

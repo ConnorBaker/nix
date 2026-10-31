@@ -821,7 +821,7 @@ private:
      *
      * This code is factored out so that it's not in the heavily inlined hot path.
      */
-    void handleEvalExceptionForApp(Value & v, const Value & savedApp);
+    void handleEvalExceptionForApp(Value & v, const Value & savedApp, const Value * fun2 = nullptr);
 
     void handleEvalFailed(Value & v, PosIdx pos);
 
@@ -1213,6 +1213,13 @@ public:
     bool isFunctor(const Value & fun) const;
 
     void callFunction(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
+
+    /**
+     * `forceValue` of a `tAttrApp` cell: call its function with the
+     * attribute's name and value, into the cell. Out of line, so that
+     * `forceValue`'s inlined copies stay small.
+     */
+    [[gnu::noinline]] void forceAttrApp(Value & v, const PosIdx pos);
 
     /**
      * `call` of the variable `var` with one argument: `callFunction` of the

@@ -287,3 +287,26 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     [[ $(nix eval --impure --json --expr "let c = { x = builtins.pathExists \"$o\"; }; in
       [ c.x (builtins.seq (builtins.readDir (import $PWD/simple.nix)) c.x) (builtins.pathExists \"$o\") ]") == '[false,false,true]' ]]
 fi
+
+# A mapAttrs attribute (a tAttrApp cell without Boehm GC) that forces itself
+# fails at stock's call depth; one whose function's outer body recurses
+# (`f name`) runs it a call level shallower than stock, so it fails one
+# level later (two frames more), never sooner. With the profiler's hooks on,
+# the cell is forced as stock forces it.
+mapFrames() {
+    expectStderr 1 nix-instantiate --eval --show-trace --max-call-depth 100 "$@" | grep -o '[0-9]* duplicate frames'
+}
+prof=(--option eval-profiler flamegraph --option eval-profile-file "$TEST_ROOT/prof")
+# shellcheck disable=SC2016 # The ${} in these is Nix, not shell
+self='let r = builtins.mapAttrs (n: v: r.${n}) { a = 1; }; in r.a'
+outer='let g = k: g (k + 1); in (builtins.mapAttrs (n: g 0) { a = 1; }).a'
+[[ $(mapFrames -E "$self") == '299 duplicate frames' ]]
+[[ $(mapFrames "${prof[@]}" -E "$self") == '299 duplicate frames' ]]
+[[ $(mapFrames "${prof[@]}" -E "$outer") == '195 duplicate frames' ]]
+frames=197
+[[ $(jobsOf nix-instantiate --eval -E 1) == - ]] && frames=195
+[[ $(mapFrames -E "$outer") == "$frames duplicate frames" ]]
+# An attribute made before the traversal and reverted at the end of the
+# first element's job is forced again, in the next one, as it was made.
+[[ $(nix eval --expr 'let m = builtins.mapAttrs (n: v: [ v n v ]) { a = 1; }; in builtins.seq m { x = builtins.length m.a; y = m.a; }') \
+    == '{ x = 3; y = [ 1 "a" 1 ]; }' ]]
