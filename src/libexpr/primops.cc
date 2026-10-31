@@ -3519,6 +3519,18 @@ static RegisterPrimOp primop_isAttrs({
     .impl = prim_isAttrs,
 });
 
+/* Out of line, as is intersectAttrsResult: the iterators are not in the
+   primop's frame while it forces its arguments. */
+[[gnu::noinline]] static void removeAttrsResult(EvalState & state, const Bindings & from, std::span<const Attr> names, Value & v)
+{
+    /* Copy all attributes not in `names`.  Note that we don't need
+       to sort them because they are a subset of an already sorted
+       vector. */
+    auto attrs = state.buildBindings(from.size());
+    std::set_difference(from.begin(), from.end(), names.begin(), names.end(), std::back_inserter(attrs));
+    v.mkAttrs(attrs.alreadySorted());
+}
+
 static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
 {
     state.forceAttrs(*args[0], noPos, "while evaluating the first argument passed to builtins.removeAttrs");
@@ -3537,13 +3549,7 @@ static void prim_removeAttrs(EvalState & state, CallSite callSite, Value * const
     }
     std::sort(names.begin(), names.end());
 
-    /* Copy all attributes not in that set.  Note that we don't need
-       to sort v.attrs because it's a subset of an already sorted
-       vector. */
-    auto attrs = state.buildBindings(args[0]->attrs()->size());
-    std::set_difference(
-        args[0]->attrs()->begin(), args[0]->attrs()->end(), names.begin(), names.end(), std::back_inserter(attrs));
-    v.mkAttrs(attrs.alreadySorted());
+    removeAttrsResult(state, *args[0]->attrs(), {names.data(), names.size()}, v);
 }
 
 static RegisterPrimOp primop_removeAttrs({
@@ -3653,14 +3659,9 @@ static RegisterPrimOp primop_listToAttrs({
     .impl = prim_listToAttrs,
 });
 
-static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+[[gnu::noinline]] static void
+intersectAttrsResult(EvalState & state, const Bindings & left, const Bindings & right, Value & v)
 {
-    state.forceAttrs(*args[0], noPos, "while evaluating the first argument passed to builtins.intersectAttrs");
-    state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.intersectAttrs");
-
-    auto & left = *args[0]->attrs();
-    auto & right = *args[1]->attrs();
-
     auto attrs = state.buildBindings(std::min(left.size(), right.size()));
 
     // The current implementation has good asymptotic complexity and is reasonably
@@ -3716,6 +3717,13 @@ static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * co
     }
 
     v.mkAttrs(attrs.alreadySorted());
+}
+
+static void prim_intersectAttrs(EvalState & state, CallSite callSite, Value * const * args, Value & v)
+{
+    state.forceAttrs(*args[0], noPos, "while evaluating the first argument passed to builtins.intersectAttrs");
+    state.forceAttrs(*args[1], noPos, "while evaluating the second argument passed to builtins.intersectAttrs");
+    intersectAttrsResult(state, *args[0]->attrs(), *args[1]->attrs(), v);
 }
 
 static RegisterPrimOp primop_intersectAttrs({
