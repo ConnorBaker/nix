@@ -2292,7 +2292,8 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     if (!merged) {
-        auto attrs = state.buildBindings(bindings2.size());
+        /* One more: the slot `layerOnTopOf` takes. */
+        auto attrs = state.buildBindings(bindings2.size() + 1);
         attrs.layerOnTopOf(bindings1);
         std::ranges::copy(bindings2, std::back_inserter(attrs));
         v.mkAttrs(attrs.alreadySorted());
@@ -2312,7 +2313,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         std::swap(acc, next);
     }
 
-    auto attrs = state.buildBindings(acc.size());
+    auto attrs = state.buildBindings(acc.size() + (rest ? 1 : 0));
     if (rest)
         attrs.layerOnTopOf(*rest);
     std::ranges::copy(acc, std::back_inserter(attrs));

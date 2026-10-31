@@ -26,18 +26,18 @@ const Bindings * EvalMemory::shareLayer(const Bindings & top, const Bindings & b
 {
     assert(!top.isLayered());
     stats.nrAttrsets++;
-    auto b = new (allocBytes(sizeof(Bindings))) Bindings();
-    b->arrayOf = &top;
+    auto b = new (allocBytes(sizeof(Bindings) + sizeof(Attr))) Bindings();
     b->numAttrs = top.numAttrs;
-    b->baseLayer = &base;
     b->numLayers = base.numLayers + 1;
+    Bindings::Layering l{&base, &top};
+    std::memcpy(static_cast<void *>(b->attrs), &l, sizeof l);
     b->countChain();
     return b;
 }
 
 void Bindings::countChain()
 {
-    auto & base = *baseLayer;
+    auto & base = *baseLayer();
     auto own = layer();
 
     size_type duplicates = 0;
@@ -77,7 +77,7 @@ Value & BindingsBuilder::alloc(std::string_view name, PosIdx pos)
 
 void Bindings::sort()
 {
-    std::sort(attrs, attrs + numAttrs);
+    std::sort(own(), own() + numAttrs);
 }
 
 Value & Value::mkAttrs(BindingsBuilder & bindings)

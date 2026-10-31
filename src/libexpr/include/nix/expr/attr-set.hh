@@ -8,6 +8,7 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <algorithm>
+#include <cstring>
 #include <functional>
 #include <ranges>
 #include <optional>
@@ -96,27 +97,56 @@ private:
     uint32_t numLayers = 1;
 
     /**
-     * Bindings that this attrset is "layered" on top of.
-     */
-    const Bindings * baseLayer = nullptr;
-
-    /**
-     * The Bindings whose `attrs` hold this layer's attributes: itself, or,
-     * for a layer that an update (`//`) made of its right operand, that
-     * operand, whose sorted array it shares instead of copying it. A pointer
-     * to the object, not into it: the garbage collector ignores interior
-     * pointers, and this one keeps the operand alive.
-     */
-    const Bindings * arrayOf = this;
-
-    /**
-     * Flexible array member of attributes.
+     * Flexible array member of attributes. A layered Bindings starts it with
+     * one slot, its `Layering`; an unlayered one, most of them, has none, and
+     * a 16-byte header.
      */
     Attr attrs[0];
 
+    /**
+     * Of a layered Bindings: the Bindings it is layered on top of, and the
+     * Bindings whose array holds its attributes when it shares the array of
+     * an update's (`//`) right operand instead of copying it (else null: they
+     * follow the slot). Pointers to the objects, not into them: the garbage
+     * collector ignores interior pointers, and these keep the objects alive.
+     */
+    struct Layering
+    {
+        const Bindings * base;
+        const Bindings * arrayOf;
+    };
+
+    static_assert(sizeof(Layering) <= sizeof(Attr));
+
+    Layering layering() const noexcept
+    {
+        Layering l;
+        std::memcpy(&l, attrs, sizeof l);
+        return l;
+    }
+
+    /**
+     * Where this Bindings' own attributes go.
+     */
+    Attr * own() noexcept
+    {
+        return attrs + (numLayers > 1);
+    }
+
     const Attr * data() const noexcept
     {
-        return arrayOf->attrs;
+        if (numLayers <= 1)
+            return attrs;
+        auto l = layering();
+        return l.arrayOf ? l.arrayOf->attrs : attrs + 1;
+    }
+
+    /**
+     * Bindings that this attrset is "layered" on top of.
+     */
+    const Bindings * baseLayer() const noexcept
+    {
+        return numLayers > 1 ? layering().base : nullptr;
     }
 
     /**
@@ -252,7 +282,7 @@ public:
         /* Not noexcept: a chain of more than `inlineLayers` layers allocates
            its cursors, and failing to is `std::bad_alloc`. */
         explicit iterator(const Bindings & attrs)
-            : doMerge(attrs.baseLayer)
+            : doMerge(attrs.baseLayer())
         {
             auto pushBindings = [this, priority = unsigned{0}](const Bindings & layer) mutable {
                 cursorHeap.push_back(
@@ -273,7 +303,7 @@ public:
                 return;
             }
 
-            for (auto layer = &attrs; layer; layer = layer->baseLayer)
+            for (auto layer = &attrs; layer; layer = layer->baseLayer())
                 if (layer->numAttrs != 0)
                     pushBindings(*layer);
 
@@ -336,7 +366,7 @@ public:
 
     void push_back(const Attr & attr)
     {
-        attrs[numAttrs++] = attr;
+        own()[numAttrs++] = attr;
         numAttrsInChain = numAttrs;
     }
 
@@ -359,7 +389,7 @@ public:
             const Attr * maybeAttr = getInChunk(*currentChunk);
             if (maybeAttr)
                 return maybeAttr;
-            currentChunk = currentChunk->baseLayer;
+            currentChunk = currentChunk->baseLayer();
         }
 
         return nullptr;
@@ -388,7 +418,7 @@ public:
      */
     const Bindings * below() const noexcept
     {
-        return baseLayer;
+        return baseLayer();
     }
 
     /**
@@ -474,7 +504,7 @@ private:
 
     bool hasBaseLayer() const noexcept
     {
-        return bindings->baseLayer;
+        return bindings->isLayered();
     }
 
     /**
@@ -521,11 +551,17 @@ public:
      *
      * This operation amortizes the need to copy over all attributes and allows
      * for efficient implementation of attribute set merges (ExprOpUpdate::eval).
+     *
+     * Before any attribute is added; the slot this takes (`Bindings::Layering`)
+     * counts in the capacity.
      */
     void layerOnTopOf(const Bindings & base) noexcept
     {
-        bindings->baseLayer = &base;
+        assert(bindings->numAttrs == 0 && capacity_ > 0);
         bindings->numLayers = base.numLayers + 1;
+        Bindings::Layering l{&base, nullptr};
+        std::memcpy(static_cast<void *>(bindings->attrs), &l, sizeof l);
+        --capacity_;
     }
 
     Value & alloc(Symbol name, PosIdx pos = noPos);
