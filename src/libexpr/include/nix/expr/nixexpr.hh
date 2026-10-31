@@ -538,11 +538,23 @@ struct ExprLambda : Expr
     Symbol arg;
 
 private:
-    bool hasFormals;
-    bool ellipsis;
+    bool hasFormals : 1;
+    bool ellipsis : 1;
+    /* See `callEnvMayEscape`; set by `bindVars`. */
+    bool envMayEscape : 1 = true;
     uint16_t nFormals;
     Formal * formalsStart;
 public:
+
+    /**
+     * Whether the Env of a call can outlive the call: whether the lambda has
+     * formals, or evaluating the body can make a thunk or a closure in it, or
+     * an Env on top of it. When not, `callFunction` puts the Env on the stack.
+     */
+    bool callEnvMayEscape() const
+    {
+        return envMayEscape;
+    }
 
     std::optional<Formals> getFormals() const
     {

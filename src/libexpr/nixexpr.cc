@@ -5,6 +5,7 @@
 #include "nix/expr/print.hh"
 
 #include <cstdlib>
+#include <typeinfo>
 #include <sstream>
 
 #include "nix/util/strings-inline.hh"
@@ -458,6 +459,69 @@ void ExprList::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> &
         i->bindVars(es, env);
 }
 
+/* Whether `e`'s cell is made without a thunk in the Env it is evaluated in
+   (`maybeThunk`): a constant, `[]`, or a variable not from a `with`, whose
+   slot is filled before the body runs. */
+static bool sharesCell(const Expr * e)
+{
+    if (dynamic_cast<const ExprInt *>(e) || dynamic_cast<const ExprFloat *>(e) || dynamic_cast<const ExprString *>(e)
+        || dynamic_cast<const ExprPath *>(e))
+        return true;
+    if (typeid(*e) == typeid(ExprVar))
+        return !static_cast<const ExprVar *>(e)->fromWith;
+    if (auto l = dynamic_cast<const ExprList *>(e))
+        return l->elems.empty();
+    return false;
+}
+
+/* Whether evaluating `e` in an Env can leave a pointer to the Env behind:
+   only the expressions below are known not to; anything else may. */
+static bool mayCapture(const Expr * e)
+{
+    if (!e || sharesCell(e) || typeid(*e) == typeid(ExprVar) || dynamic_cast<const ExprPos *>(e))
+        return false;
+    auto names = [](std::span<const AttrName> path) {
+        return std::ranges::any_of(path, [](auto & n) { return mayCapture(n.expr); });
+    };
+    if (auto x = dynamic_cast<const ExprSelect *>(e))
+        return mayCapture(x->e) || mayCapture(x->def) || names(x->getAttrPath());
+    if (auto x = dynamic_cast<const ExprOpHasAttr *>(e))
+        return mayCapture(x->e) || names(x->attrPath);
+    if (auto x = dynamic_cast<const ExprAttrs *>(e))
+        return x->recursive || x->inheritFromExprs
+               || std::ranges::any_of(*x->attrs, [](auto & a) { return !sharesCell(a.second.e); })
+               || std::ranges::any_of(
+                   *x->dynamicAttrs, [](auto & a) { return mayCapture(a.nameExpr) || !sharesCell(a.valueExpr); });
+    if (auto x = dynamic_cast<const ExprList *>(e))
+        return !std::ranges::all_of(x->elems, sharesCell);
+    if (auto x = dynamic_cast<const ExprCall *>(e))
+        return mayCapture(x->fun) || !std::ranges::all_of(*x->args, sharesCell);
+    if (auto x = dynamic_cast<const ExprIf *>(e))
+        return mayCapture(x->cond) || mayCapture(x->then) || mayCapture(x->else_);
+    if (auto x = dynamic_cast<const ExprAssert *>(e))
+        return mayCapture(x->cond) || mayCapture(x->body);
+    if (auto x = dynamic_cast<const ExprOpNot *>(e))
+        return mayCapture(x->e);
+    auto binary = [](auto * x) { return mayCapture(x->e1) || mayCapture(x->e2); };
+    if (auto x = dynamic_cast<const ExprOpEq *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpNEq *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpAnd *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpOr *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpImpl *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpConcatLists *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprOpUpdate *>(e))
+        return binary(x);
+    if (auto x = dynamic_cast<const ExprConcatStrings *>(e))
+        return std::ranges::any_of(x->es, [](auto & p) { return mayCapture(p.second); });
+    return true;
+}
+
 void ExprLambda::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv> & env)
 {
     if (es.debugRepl)
@@ -483,6 +547,10 @@ void ExprLambda::bindVars(EvalState & es, const std::shared_ptr<const StaticEnv>
     }
 
     body->bindVars(es, newEnv);
+
+    /* Only a plain lambda's Env, one slot that the call fills first, is
+       taken off the heap. */
+    envMayEscape = hasFormals || mayCapture(body);
 }
 
 void ExprCall::moveDataToAllocator(std::pmr::polymorphic_allocator<char> & alloc)

@@ -1901,7 +1901,20 @@ void EvalState::callFunctionBody(Value & fun, std::span<Value * const> & args, V
             ExprLambda & lambda(*vCur.lambda().fun);
 
             auto size = (!lambda.arg ? 0 : 1) + (lambda.getFormals() ? lambda.getFormals()->formals.size() : 0);
-            Env & env2(mem.allocEnv(size));
+            /* The Env of a plain lambda's call that it cannot outlive is in
+               this frame, in a slot of fixed size (one value): a variable-size
+               one costs every call. Not when a debugger is configured: its
+               frames (`withFrame`) keep Envs, also those recorded while tryEval
+               or completion hides it by clearing `debugRepl`; `exprEnvs` is
+               filled by every binding done while one is configured, and never
+               emptied. */
+            struct
+            {
+                Env env;
+                Value * arg;
+            } plainEnv;
+            Env & env2(
+                !lambda.callEnvMayEscape() && !debugRepl && exprEnvs.empty() ? plainEnv.env : mem.allocEnv(size));
             env2.up = vCur.lambda().env;
 
             if (lambda.getFormals())

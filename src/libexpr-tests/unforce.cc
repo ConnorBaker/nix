@@ -899,10 +899,12 @@ TEST_F(UnforceTest, steps)
         {forcedLists, "builtins.foldl' (builtins.foldl' (a: x: [ a ])) null xs", "r", false, false},
         {forcedLists, "builtins.foldl' (builtins.foldl' (a: x: a + x)) 0 xs", "r", false, true},
     };
+    /* From 200 steps: a loop keeps its last batch, which steps that
+       allocate less (an Env in the caller's frame) fill later. */
     for (auto & k : cases) {
-        auto grew = run(k, 100);
+        auto grew = run(k, 200);
         if (k.frees)
-            EXPECT_LE(run(k, 200), grew + 2 * sizeof(Value)) << k.r;
+            EXPECT_LE(run(k, 400), grew + 2 * sizeof(Value)) << k.r;
     }
 }
 
