@@ -3883,7 +3883,11 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
-    return parseExprFromFile(path, staticEnv, path.resolveSymlinks().readFile());
+    /* Read with room for the lexer's two terminators, so that appending
+       them does not copy the file into a buffer twice its size. */
+    StringSink sink;
+    path.resolveSymlinks().readFile(sink, [&](uint64_t size) { sink.s.reserve(size + 2); });
+    return parseExprFromFile(path, staticEnv, std::move(sink.s));
 }
 
 Expr *
