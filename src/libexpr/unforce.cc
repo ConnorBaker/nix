@@ -150,6 +150,10 @@ static constexpr bool jobsHaveRegion()
 #endif
 }
 
+/* mimalloc's, when it is the process's allocator (the `nix` binary links
+   it): gives the memory it holds freed back to the system. Else null. */
+extern "C" [[gnu::weak]] void mi_collect(bool force) noexcept;
+
 /* Open the job's region. Only Linux on a 64-bit system has one: elsewhere,
    the job allocates as outside any job, and its end reverts nothing. The
    mapping is as large as the system gives: the largest power of two a
@@ -163,6 +167,10 @@ static void openRegion()
 #if defined(__linux__)
     if (!jobsHaveRegion())
         return;
+    /* mimalloc gives freed memory back only seconds later, longer than
+       many evaluations run: it goes back here, before the job runs. */
+    if (mi_collect)
+        mi_collect(true);
     if (!mapping || unforceTestFailMapping || size_t(mapping + 2 * regionBytes - keptTop) < regionBytes) {
         auto bytes = ~(SIZE_MAX >> 1);
         auto p = MAP_FAILED;
