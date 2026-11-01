@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include "nix/expr/tests/libexpr.hh"
+#include "nix/expr/eval-cache.hh"
 #include "nix/expr/get-drvs.hh"
 #include "nix/expr/print.hh"
 #include "nix/expr/print-ambiguous.hh"
@@ -684,6 +685,23 @@ TEST_F(UnforceTest, driverHoldKeepsJob)
     EXPECT_FALSE(v->isThunk());
     EXPECT_FALSE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
     EXPECT_THAT(*w, IsIntEq(1));
+}
+
+/* An eval-cache cursor holds the cell it reads through: one its job built,
+   in a set the job forced, is kept, as `nix search` reads a set's cursor
+   after each of its elements' jobs. A later job reuses what the first freed. */
+TEST_F(UnforceTest, cursorKeepsJobsCell)
+{
+    auto v = oldThunk("{ x = { s = 1 + 1; }; }");
+    auto cache = make_ref<eval_cache::EvalCache>(std::nullopt, state, [&] { return v; });
+    state.beginUnforceScope();
+    auto x = cache->getRoot()->getAttr("x");
+    state.endUnforceScope();
+    state.beginUnforceScope();
+    state.forceValueDeep(*oldThunk("builtins.genList (i: { a = i; b = [ i ]; }) 3000"));
+    state.endUnforceScope();
+    EXPECT_EQ(x->getAttr("s")->getInt().value, 2);
+    EXPECT_EQ(&x->forceValue(), v->attrs()->get(createSymbol("x"))->value);
 }
 
 /* An interrupted force leaves its cell failed with a recovery value the job
