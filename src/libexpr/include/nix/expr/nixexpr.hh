@@ -902,6 +902,19 @@ public:
         return alloc.new_object<C>(std::forward<decltype(args)>(args)...);
     }
 
+    /* An attribute set's definitions are built in this allocator from the
+       start, where `ExprAttrs::moveDataToAllocator` would move them after
+       the parse: the parse does not hold a second copy on the heap. */
+    template<class C>
+    [[gnu::always_inline]]
+    C * add(auto &&... args)
+        requires(std::same_as<C, ExprAttrs>)
+    {
+        auto e = alloc.new_object<C>(std::forward<decltype(args)>(args)...);
+        e->attrs.emplace(alloc);
+        return e;
+    }
+
     // we define some calls to add explicitly so that the argument can be passed in as initializer lists
     template<class C>
     [[gnu::always_inline]]
