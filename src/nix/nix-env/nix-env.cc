@@ -910,10 +910,9 @@ struct JSONQuery
     Globals & globals;
     bool printOutPath, printDrvPath, printMeta;
     /* The members of the object printed, by attribute path (nlohmann's
-       order for an object's members): each as `dump(2)` prints it in the
-       object less the object's indentation, or the error that printing it
-       threw, raised where the object's `dump` would raise it. So no document
-       of every element is built. */
+       order): each as `dump(2)` prints it less the object's indentation, or
+       what printing it threw, raised where the object's `dump` would. So no
+       document of every element is built. */
     std::map<std::string, std::variant<std::string, std::exception_ptr>> members;
     /* Set if the elements were queried in the walk's jobs that found them,
        with what their queries threw, by attribute path. */
@@ -1084,14 +1083,13 @@ static void opQuery(Globals & globals, Strings opFlags, Strings opArgs)
     if (source == sInstalled || compareVersions || printStatus)
         installedElems = queryInstalled(*globals.state, globals.profile);
 
-    /* `--json` queries each available element that a selector picks in the
-       walk's job that found it, so that nothing holds what the job built;
-       not where --system-filter, --status or --prebuilt-only read the
-       elements after the walk. queryJSON throws what a query threw. Only
-       with unforcing, which frees what the jobs built. The table, with or
-       without unforcing, reads only their names after the walk unless it
-       prints more than names, attribute paths and versions: the walk lists
-       them by name only. */
+    /* With unforcing, `--json` queries each available element that a
+       selector picks in the walk's job that found it, so that nothing holds
+       what the job built, unless --system-filter, --status or --prebuilt-only
+       read the elements after the walk; queryJSON throws what a query threw.
+       The table, with or without unforcing, reads only names after the walk
+       unless it prints more than names, attribute paths and versions: the
+       walk lists them by name. */
     JSONQuery jsonQuery{globals, printOutPath, printDrvPath, printMeta};
     bool readAfter = globals.instSource.systemFilter != "*" || printStatus || globals.prebuiltOnly;
     jsonQuery.walked = jsonOutput && source == sAvailable && !readAfter && unforceEnabled(*globals.state);

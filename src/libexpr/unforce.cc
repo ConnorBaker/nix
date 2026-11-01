@@ -248,25 +248,23 @@ static void closeRegion(char * keepTo)
    Re-forcing.
 
    A target reverted at a job's end holds its pre-image wrapped in an
-   `ExprReforce`, and is evaluated again by whatever forces it next. Evaluation
-   is deterministic, so the re-force repeats work that the evaluation without
-   unforcing did. It runs at the call depth and on the native stack of the
-   force that finds it reverted, as do the cells it builds again, which
-   consumers forced before the target was reverted: a chain forced front to
-   back without unforcing may be forced back to front. So recomputation may
-   fail on `max-call-depth` where the evaluation without unforcing does not,
-   instead of giving its value or its error, or overflow the native stack,
-   which ends the process; the exactness contract allows both.
+   `ExprReforce`, evaluated again by whatever forces it next: evaluation is
+   deterministic, so the re-force repeats work the evaluation without
+   unforcing did. It runs at the depth and on the native stack of the force
+   that finds it, as do the cells it builds again, which consumers forced
+   before the target was reverted: a chain forced front to back without
+   unforcing may be forced back to front. So it may fail on `max-call-depth`,
+   or overflow the native stack (which ends the process), where the evaluation
+   without unforcing does not; the exactness contract allows both.
 
-   An old target whose force failed keeps its failure (see Promotion). A
-   failed young cell inside a reverted owner is built again, and throws the
-   same error again when re-forced (or fails on `max-call-depth` first, as
-   above). A failure on `max-call-depth` depends on the depth of the force
-   that met it, so one met in a job has a recovery value, as an interrupted
-   or recoverable one has: every later read retries it at its own depth,
-   where it may succeed, also where the evaluation without unforcing fails,
-   which the exactness contract allows. A failure that its job retried is
-   reverted to the failure, which retries again where it is forced next.
+   An old target whose force failed keeps its failure (see Promotion); a
+   failed young cell inside a reverted owner is built again and throws again.
+   A `max-call-depth` failure depends on its force's depth, so one met in a
+   job has a recovery value, as an interrupted or recoverable one has: every
+   later read retries it at its own depth, where it may succeed (also where
+   the evaluation without unforcing fails, which the exactness contract
+   allows). A failure its job retried is reverted to the failure, which
+   retries where it is forced next.
 
    An application's pre-image becomes a thunk whose environment is the
    function and its argument, called at its first force's position (a primop
@@ -648,27 +646,24 @@ static void forgetYoungCell(const Value::Failed & f)
    The owner timeline.
 
    The owner of a young object x is the first old cell on its creator chain
-   (x, the cell being forced when x was allocated, the cell being forced
-   when that one was allocated, ...): the target whose re-force is the only
-   thing that can build x again, or none (the driver, outside any force). It
-   is a function of allocation time: one force at a time is the current
-   owner, and everything allocated then is its.
-   - A logged force of an old cell t makes t the current owner until it
-     ends.
-   - A force of a young cell c makes c's owner the current one until it
-     ends: what c's evaluation builds is built again only by re-forcing the
-     target that rebuilds c.
+   (x, the cell being forced when x was allocated, the cell being forced when
+   that one was, ...): the target whose re-force alone can build x again, or
+   none (the driver). It is a function of allocation time: one force at a
+   time is the current owner, and everything allocated then is its.
+   - A logged force of an old cell t makes t the current owner until it ends.
+   - A force of a young cell c makes c's owner the current one until it ends
+     (only re-forcing the target that rebuilds c builds what c's evaluation
+     builds).
    - Any other force (a stack slot, a cell of the current owner) keeps it.
-   The bump cursor is the allocation clock, so owner changes cut the
-   region's used part into segments of one owner each, in address order:
-   the closed ones (`segments`) and the open one, [openSeg, cur), whose
-   owner is `curOwner`. Adjacent segments never have the same owner. Owners
-   are named by the log index of their force (`noOwner`: the driver).
 
-   A force that changes the owner pushes itself on `opens`, and its end, in
-   `forceValue` or its exception handler, pops itself and restores the
-   owner. The hooks make room for every push first, so that a force's end
-   never allocates.
+   The bump cursor is the allocation clock, so owner changes cut the region's
+   used part into segments of one owner each, in address order: the closed
+   ones (`segments`) and the open one, [openSeg, cur), owned by `curOwner`;
+   adjacent segments never have the same owner. Owners are named by the log
+   index of their force (`noOwner`: the driver). A force that changes the
+   owner pushes itself on `opens`, and its end pops itself and restores the
+   owner; the hooks make room for every push first, so an end never
+   allocates.
    --------------------------------------------------------------------------- */
 
 static constexpr uint32_t noOwner = UINT32_MAX;
@@ -794,85 +789,72 @@ static void openForce(const Value & v, uint32_t entry, uint32_t o)
 /* ---------------------------------------------------------------------------
    Promotion.
 
-   Reverting a target t breaks the evaluator's pointer identity (`eqValues`
-   short-cuts on `&v1 == &v2`; Nixpkgs relies on it) when a promoted value
-   keeps a young cell that re-forcing t builds again: two cells then stand
-   for one of the evaluation without unforcing. So the promoted set S is
-   closed under ownership: every young identity-bearing object (a cell, a
-   Bindings layer, an element array) that a promoted value reaches has its
-   owner in S, or none. Then a reverted target, re-forced later, rebuilds
-   only cells that nothing kept.
+   Reverting a target t breaks pointer identity (`eqValues` short-cuts on
+   `&v1 == &v2`; Nixpkgs relies on it) when a promoted value keeps a young
+   cell that re-forcing t builds again: two cells would stand for one. So the
+   promoted set S is closed under ownership: every young identity-bearing
+   object (a cell, a Bindings layer, an element array) a promoted value
+   reaches has its owner in S, or none, and a reverted target, re-forced
+   later, rebuilds only cells that nothing kept.
 
-   S is decided from records alone. While t is being forced, the young
-   cells it owns are visible only to its own evaluation and to the forces of
-   those cells (no other cell's evaluation can reach them but through a
-   cell's value, and t has none yet). So a value reaches t's young objects
-   only once t's force has ended, and what the forces a promoted target owns
-   (its own, and those of its young cells) leave reachable was allocated
-   before the last of them ended, below the bump cursor then, and reaches
-   only targets whose forces ended before then. Promoting those too, until
-   none is added, closes S under ownership without visiting anything. The
-   job keeps its memory below the highest cursor at the end of a force that
-   S owns, and frees the rest.
+   S is decided from records alone. While t is forced, its young cells are
+   visible only to its own evaluation and to their forces (t has no value
+   yet), so a value reaches them only once t's force has ended. What the
+   forces a promoted target owns (its own, and its young cells') leave
+   reachable was allocated before the last of them ended, below the cursor
+   then, and reaches only targets whose forces ended before then. Promoting
+   those too, until none is added, closes S without visiting anything. The job
+   keeps its memory below the highest cursor at the end of a force that S
+   owns, and frees the rest.
 
-   S starts from the nominated targets: those under whose force an effect
-   ran (`keep`); those an earlier job reverted, which are evidently shared
-   between jobs (reverting them again would only make each job evaluate them
-   anew); those a holder keeps; the owners of the young objects holders hold
-   (see unforce.hh); and those whose young cells a later element of the job
-   forced (see "Elements"). A young object a holder holds that the driver
-   owns keeps the job whole. A failed target is not nominated. Its failure
-   (`Value::Failed` and its exception) is allocated outside the region, so
-   one whose value holds no pointer into it (no young recovery value,
-   `youngFree`) keeps its value, as the evaluation without unforcing does:
-   later reads throw the first force's error again, with its frames. A
-   failed young cell inside a reverted owner is still built again. With
-   `unforce-always-revert`, a target an earlier job reverted, or one whose
-   young cells a later element forced, is not nominated: every job reverts
-   it again.
+   S starts from the nominated targets: those under whose force an effect ran
+   (`keep`); those an earlier job reverted (evidently shared between jobs,
+   which reverting again would make each evaluate anew); those a holder keeps;
+   the owners of the young objects holders hold (see unforce.hh); and those
+   whose young cells a later element of the job forced (see "Elements"). A
+   young object a holder holds that the driver owns keeps the job whole. A
+   failed target is not nominated: its failure is allocated outside the
+   region, so one with no young recovery value (`youngFree`) keeps its value,
+   as without unforcing, and later reads throw its first error again, with its
+   frames. With `unforce-always-revert`, a target an earlier job reverted, or
+   one whose young cells a later element forced, is not nominated: every job
+   reverts it again.
 
-   A target whose value is a string keeps it outside S, by a copy: neither
-   the first three nominations nor the time closure put it in S, so it
-   raises neither the horizon nor the cut. A string reaches no cell,
-   Bindings or list, and strings are compared by content, so no identity
-   rests on where its bytes are. Its young objects leave its force only
-   through its value, through a holder (whose young pointers name it as
-   their owner, which keeps it in S as before), or through a table that
-   keeps values across forces, of which there is none (the import cache
-   gives each file a cell of its own). So once its force has ended nothing
-   reaches them; a force of one of them after its own, which would show
-   otherwise (its `last` past its `own`), keeps it in S. Another target
-   that shares its value is decided on its own, and a young cell that does
-   was written while that cell's owner was current, below that owner's
-   `at`: under the cut if the owner is in S, unreachable if not. The parts
-   of its value that the job's end frees (its bytes, its context array with
-   the array's elements; see below) are copied out of the region
-   (`copyStringOut`), and the cell, at its own address, keeps its value.
+   A target whose value is a string keeps it outside S, by a copy
+   (`copyStringOut`): neither the first three nominations nor the time closure
+   put it in S, so it raises neither the horizon nor the cut. A string reaches
+   no cell, Bindings or list and is compared by content, so no identity rests
+   on where its bytes are. Its young objects leave its force only through its
+   value, through a holder (which names it as their owner, keeping it in S),
+   or through a table that keeps values across forces, of which there is none
+   (the import cache gives each file a cell of its own). So once its force has
+   ended nothing reaches them; a force of one of them after its own (its
+   `last` past its `own`) keeps it in S. Another target sharing its value is
+   decided on its own, and a young cell that does was written below its
+   owner's `at`: under the cut if that owner is in S, unreachable if not. The
+   parts of its value that the end frees (its bytes, its context array and the
+   array's elements) are copied out of the region; the cell keeps its value at
+   its own address.
 
    Below the cut, a target neither in S nor kept by copy owns memory that
-   nothing kept reaches: the argument above holds for objects of every kind,
-   not only for those that bear identity, as a value reaches another owner's
-   objects (its strings and their contexts, its environments too) only
-   through that owner's cells, written once its force has ended. So the
-   job's end gives the whole pages of such targets' runs back to the system
-   (`releaseDead`), never to be reused: the next job starts at the cut. The
-   driver's runs stay, as a holder may reach them. A string kept by copy is
-   outside S, and may hold another target's bytes (its value taken from that
-   target's, whose force enclosed a promoted one and allocated them before
-   it): it is copied out of those runs too.
+   nothing kept reaches (the argument above holds for objects of every kind: a
+   value reaches another owner's objects only through that owner's cells,
+   written once its force has ended). The job's end gives the whole pages of
+   such targets' runs back to the system (`releaseDead`), never reused: the
+   next job starts at the cut. The driver's runs stay, as a holder may reach
+   them. A string kept by copy may hold another target's bytes (its value
+   taken from one whose force enclosed a promoted one): it is copied out of
+   those runs too.
 
-   A seen set's entry for a set (`UnforceSeen`) stands only for its
-   address, which the set compares. One that is the value of the target
-   whose force built it (its owner) does not nominate the target: if the
-   target is reverted, nothing the job keeps reaches the set (what does was
-   made after the target's force ended, so that its promotion would
-   promote the target by time), and only the target's re-force builds what
-   stands for it from then on. So the set forgets the address, which the
-   job may free, and records the cell, which is reverted to a thunk that
-   `ExprReforce::eval` evaluates (`rebuilds`): the re-force puts the set it
-   builds in the entry's place before anything reads the cell. Other
-   entries (a list's cell, a set inside a value, one the driver owns)
-   nominate as before.
+   A seen set's entry for a set (`UnforceSeen`) stands only for the set's
+   address. One that is the value of the target whose force built it does not
+   nominate the target: if the target is reverted, nothing kept reaches the
+   set (what does was made after the target's force ended and would promote it
+   by time). So the set forgets the address, which the job may free, and
+   records the cell, reverted to a thunk that `ExprReforce::eval` evaluates
+   (`rebuilds`): the re-force puts the set it builds in the entry's place
+   before anything reads the cell. Other entries (a list's cell, a set inside
+   a value, one the driver owns) nominate as before.
    --------------------------------------------------------------------------- */
 
 /* A job's targets, each once, in the order of their first entries, and the
@@ -1101,32 +1083,30 @@ static void copyStringOut(EvalState & state, Value & v, auto && freed)
 
 /* ---------------------------------------------------------------------------
    Elements. A job that a traversal continues past an element's boundary
-   (`unforceElementStart`) runs several elements. Taken as one stretch of
-   time, its latest promoted value could reach anything an earlier element
-   allocated, as a read of a cell already forced leaves no record. So at
-   each such boundary every cell logged since the one before whose value
-   points into the region is trapped: it holds a thunk of `trapExpr`, whose
-   environment is the cell, and its value waits in `traps`. Forcing the cell
-   gives the value back, the same bits, and is logged as a *read* of it
-   that ends in the reading element; forcing a copy of the trap forces the
-   cell and copies its value, which is what a copy of the value would hold.
-   A holder that holds the job's memory at the boundary could let go of it
-   before the job's end, after a later element read through it: the job
-   ends there instead. A seen set does not: it lets go of nothing before the
-   job's end (only `ended` clears it) and is read only by address, so the
-   end sees what it holds if it still lives, and nothing reads it if it does
-   not. So an element reaches what an earlier one allocated only through a
-   read, a holder that the end asks, or a value the end keeps, and
-   the argument above holds in each element on its own: the time closure
-   gives each element its own horizon. A promoted target raises the horizon
-   of the element its force ended in to its forces' last end there, and that
-   of each later element where a force of one of its young cells ended to
-   that end; every entry, a read too, that ended in an element by its
-   horizon promotes its target. A read allocates nothing: it raises no
-   horizon and no cut. The job's end puts every trapped value back before it
-   decides anything; a read's entry is never written back (the cell ends
-   with its first entry's pre-image). A boundary where this cannot be done
-   ends the job instead (see `UnforceNest::trap`).
+   (`unforceElementStart`) runs several elements. As one stretch of time, its
+   latest promoted value could reach anything an earlier element allocated, as
+   a read of a cell already forced leaves no record. So at each such boundary
+   every cell logged since the one before whose value points into the region
+   is trapped: it holds a thunk of `trapExpr`, whose environment is the cell,
+   and its value waits in `traps`. Forcing the cell gives the value back, the
+   same bits, and is logged as a *read* of it that ends in the reading
+   element; forcing a copy of the trap forces the cell and copies its value,
+   as a copy of the value would hold. A holder that holds the job's memory at
+   the boundary could let go of it before the job's end, after a later element
+   read through it: the job ends there instead. A seen set lets go of nothing
+   before the job's end (only `ended` clears it) and is read only by address,
+   so the end sees what it holds if it still lives. So an element reaches what
+   an earlier one allocated only through a read, a holder that the end asks,
+   or a value the end keeps, and the argument above holds in each element on
+   its own, with a horizon of its own. A promoted target raises the horizon of
+   the element its force ended in to its forces' last end there, and that of
+   each later element where a force of one of its young cells ended to that
+   end; every entry, a read too, that ended in an element by its horizon
+   promotes its target. A read allocates nothing: it raises no horizon and no
+   cut. The job's end puts every trapped value back before it decides
+   anything; a read's entry is never written back (the cell ends with its
+   first entry's pre-image). A boundary where this cannot be done ends the job
+   instead (see `UnforceNest::trap`).
    --------------------------------------------------------------------------- */
 
 struct ExprTrap : Expr
@@ -1325,43 +1305,42 @@ static size_t releaseDead(const Targets & targets, const std::vector<bool> & pro
 /* ---------------------------------------------------------------------------
    Steps.
 
-   A loop's steps (`UnforceSteps`) free their memory inside a job, by
-   records, without a walk or a move. They end in batches: a batch's steps
-   run on until what it holds (its memory, its writes and its log entries)
-   spans a page, as a boolean frame must to give anything back, or a step's
-   cell was given (the loop's last), or the job is gone. A batch's memory is
-   what the bump cursor passed during it, [start, cur). It starts before its
-   first step's cell, so every cell its steps write a value to lies in it,
-   but a given one. Nothing allocated before the batch points into it unless
-   the batch wrote it, and its steps write a cell outside it only by forcing
-   it, or as the given cell. So once its last step's call has returned, a
-   pointer into its memory can only be in:
+   A loop's steps (`UnforceSteps`) free their memory inside a job, by records,
+   without a walk or a move. They end in batches: a batch's steps run on until
+   what it holds (its memory, its writes and its log entries) spans a page, as
+   a boolean frame must to give anything back, or a step's cell was given (the
+   loop's last), or the job is gone. A batch's memory, [start, cur), starts
+   before its first step's cell, so every cell its steps write a value to lies
+   in it, but a given one. Nothing allocated before the batch points into it
+   unless the batch wrote it, and its steps write a cell outside it only by
+   forcing it, or as the given cell. So once its last step's call has
+   returned, a pointer into its memory can only be in:
    - the last step's value;
    - a cell logged during the batch (an old cell): its value or pre-image;
    - a young cell below `start`, or a slot of a frame outside the steps (the
      loop's and its callers'), forced during the batch (`stepWrites`);
-   - a holder (`youngTop`), a young failure recorded during the batch, or
-     what native code holds.
-   The records accumulate over the batch: writes are dropped only at its
-   end, and a log entry only by its force's end with a young-free value
-   (`endOwnerForce`), whose cell then points to nothing young. The batch's
-   end looks at the own pointers of each (`valueEdges`), not further: what
-   they point to outside its memory was allocated before it, and points
-   into it only if the batch wrote it, which is a record above. A failed
-   value is taken to point into it. If none does, the cursor goes back to
-   `start`, the memory is zeroed, and the owner timeline is cut back to
-   `start`.
+   - a holder (`youngTop`), a young failure recorded during the batch, or what
+     native code holds.
+
+   The records accumulate over the batch: writes are dropped only at its end,
+   and a log entry only by its force's end with a young-free value
+   (`endOwnerForce`), whose cell then points to nothing young. The batch's end
+   looks at the own pointers of each (`valueEdges`), not further: what they
+   point to outside its memory was allocated before it, and points into it
+   only if the batch wrote it, which is a record above. A failed value is
+   taken to point into it. If none does, the cursor goes back to `start`, the
+   memory is zeroed, and the owner timeline is cut back to `start`.
 
    This rests on each step writing its own value's cell once, at its end, by
    copy: no evaluation keeps the address of the cell its result goes to
-   (`callFunction` evaluates into a local and copies). Between steps the
-   loop reads only that cell; a step's memory may hold the cells earlier
-   steps of its batch wrote, which only the step after each reads.
+   (`callFunction` evaluates into a local and copies). Between steps the loop
+   reads only that cell; a step's memory may hold the cells earlier steps of
+   its batch wrote, which only the step after each reads.
 
-   A freed batch's last value, in a cell of the batch's, moves out of it:
-   to the cell the batch's first step read (`prev`) if that is the loop's
-   own and nothing reads it any more (no record and no holder points to it),
-   else to a new cell at `start`. So a loop's cells do not pile up.
+   A freed batch's last value moves out of it: to the cell the batch's first
+   step read (`prev`) if that is the loop's own and nothing reads it any more
+   (no record and no holder points to it), else to a new cell at `start`. So a
+   loop's cells do not pile up.
    --------------------------------------------------------------------------- */
 
 using StepFrame = UnforceStepFrame;
@@ -2144,15 +2123,11 @@ void unforceElementStart(UnforceLoop loop)
     if (t.opener) {
         /* The next element runs in the open job too, unless memory in use
            (what ended jobs keep, and the open job's top) rose past the most
-           there was at any earlier boundary, or the open job holds more than
-           any one element took: the job's end then frees what its elements
-           left for later ones to reuse. The first mark counts what the
-           elements of a job left at the boundary that ends it, so each such
-           job raises it by an element; the second counts each element on its
-           own, so that a job holds at most what the largest element took,
-           and the element that crossed it. Such a job is a job of several
-           elements, decided at its end as any job (the levels of the element
-           before have returned). A job kept whole, or one a nested level's
+           at any earlier boundary, or the open job holds more than any one
+           element took (so it holds at most what the largest element took,
+           and the element that crossed it): the job's end then frees what
+           its elements left for later ones to reuse. Such a job is decided
+           at its end as any job. A job kept whole, or one a nested level's
            switch opened, ends here. */
         auto top = std::max(jobTop, evalRegion.cur);
         auto inUse = keptMemory + uint64_t(top - evalRegion.base);
