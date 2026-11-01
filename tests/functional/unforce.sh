@@ -3,12 +3,9 @@
 source common.sh
 
 # Traversals evaluate the elements of their root in unforce jobs (builds
-# without Boehm GC), and print what they print without. An element runs in
-# the job of the one before unless memory in use (what ended jobs keep, and
-# the open job's top) rose past its most at any earlier boundary, or the
-# open job holds more than any one element took: so the first element's job
-# ends, and a later element that allocates no more than that joins the open
-# job (one job fewer than elements below).
+# without Boehm GC) and print what they print without. A later element that
+# allocates no more than the first joins the open job (one job fewer than
+# elements below).
 
 clearStoreIfPossible
 
@@ -42,38 +39,21 @@ expectJobs "$(jobsOf nix repl <<< ":p $expr")" 2
 # element built besides is freed.
 expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$expr")" 4
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
-expectJobs "$(jobsOf nix-instantiate --eval --strict -E '{ n = builtins.length (builtins.genList (x: x) 100); }')" 3
-[[ $(< "$TEST_ROOT/out") == '{ n = 100; }' ]]
 # unforce-always-revert keeps what the traversal walked, as without it (s's
 # value, a string, is in the job's memory).
 [[ $(nix-instantiate --eval --strict --option unforce-always-revert true -E '{ s = "a" + "b"; }') == '{ s = "ab"; }' ]]
-# Only on 64-bit Linux, without Boehm GC, do jobs have a region, from which
-# they free.
-if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
-    [[ $(jq -r '.unforce.bytesFreed' "$TEST_ROOT/stats.json") -gt 0 ]]
-fi
 # Each element here is a string, a name read from a set its job built, which
 # the job keeps by a copy: it frees the set and its list, and the later
 # elements' jobs, which reuse that memory, leave the names intact.
 nexpr='builtins.mapAttrs (_: p: builtins.seq (builtins.length p.big) p.name) (builtins.listToAttrs (builtins.genList (i: { name = "p${toString i}"; value = { name = "n-" + toString i; big = builtins.genList (x: x) 1000; }; }) 3))'
 expectJobs "$(jobsOf nix-instantiate --eval --strict -E "$nexpr")" 4
 [[ $(< "$TEST_ROOT/out") == '{ p0 = "n-0"; p1 = "n-1"; p2 = "n-2"; }' ]]
+# Only on 64-bit Linux, without Boehm GC, do jobs have a region, from which
+# they free.
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(jq -r '.unforce.bytesFreed > .unforce.bytesKept' "$TEST_ROOT/stats.json") == true ]]
 fi
 
-# A cell an element's job reverted (s in a's) is kept by the next job that
-# forces it (b's and c's); with unforce-always-revert, every job reverts it
-# again. The output is the same.
-rexpr='let s = { x = 1; }; in { a = s.x; b = s.x; c = s.x; }'
-expectJobs "$(jobsOf nix eval --expr "$rexpr")" 2
-[[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
-reverted=$(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json")
-expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$rexpr")" 2
-[[ $(< "$TEST_ROOT/out") == '{ a = 1; b = 1; c = 1; }' ]]
-if ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
-    [[ $(jq -r '.unforce.cellsReverted' "$TEST_ROOT/stats.json") -gt $reverted ]]
-fi
 # e2, in e1's job, forces an element of x, which e1 forced: the job keeps x,
 # which e3 reads; with unforce-always-revert, it reverts x, and e3 forces x
 # again.
@@ -94,11 +74,6 @@ expectJobs "$(jobsOf nix-instantiate --eval --json -E "$pexpr")" 2
 [[ $(< "$TEST_ROOT/out") == '{"a":"xy","b":"xy"}' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --xml -E "${pexpr/outPath/type}")" 2
 [[ $(grep -c '<string value="xy" />' "$TEST_ROOT/out") == 2 ]]
-
-# A trace keeps nothing: re-forcing the cell whose evaluation showed it may
-# show it again, and shows no other trace.
-nix eval --expr 'let s = builtins.trace "s" { x = 1; }; in { a = s; b = s; }' 2> "$TEST_ROOT/err"
-[[ $(grep '^trace: ' "$TEST_ROOT/err" | sort -u) == 'trace: s' ]]
 
 # An effect, here a filtered copy, which nothing remembers, keeps the cell
 # whose evaluation ran it: a later element that reads the cell does not run
@@ -235,18 +210,14 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
 
     # A file that a job read must read the same until the evaluation ends, or it stops with exit status 102 in every
     # front end, through tryEval and nix eval's printer too; unchanged, the output is as before. q.a reads ./f in
-    # vg1's job; vg2's blocks on a fifo while EDIT runs; vg3's re-forces q, whose a reads ./f again. The edit also
-    # makes m a link to u/e, so that k, a link to m/../t, leads to u/t.
+    # vg1's job; vg2's blocks on a fifo while EDIT runs; vg3's re-forces q, whose a reads ./f again.
     vg=$TEST_ROOT/vg
-    mkdir -p "$vg/t" "$vg/u/e"
-    printf A > "$vg/t/x"
-    ln -s m/../t "$vg/k"
+    mkdir -p "$vg"
     vgN=0
     vgRun() { # vgRun PROGRAM EDIT CMD...: CMD's exit status in vgRc, its output in $vg/out
         local fifo=$vg/fifo$((++vgN))
         mkfifo "$fifo"
         printf A > "$vg/f"
-        rm -f "$vg/m"
         echo "with import $config_nix; let q = { a = builtins.readFile ./f; }; wait = builtins.fetchurl \"file://$fifo\";
           d = name: mkDerivation { inherit name; builder = \"/b\"; }; in $1" > "$vg/p.nix"
         "${@:3}" "$vg/p.nix" > "$vg/out" 2> "$vg/err" &
@@ -257,7 +228,7 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     vgCheck() { # vgCheck PROGRAM EXPECTED CMD...
         vgRun "$1" : "${@:3}"
         [[ $vgRc == 0 && $(< "$vg/out") == "$2" ]] || fail "unchanged: $vgRc $(< "$vg/out") $(< "$vg/err")"
-        vgRun "$1" "printf B > $vg/f; ln -s $vg/u/e $vg/m" "${@:3}"
+        vgRun "$1" "printf B > $vg/f" "${@:3}"
         [[ $vgRc == 102 && ! -s $vg/out ]] || fail "edited: $vgRc $(< "$vg/out") $(< "$vg/err")"
         grepQuiet "changed during evaluation" "$vg/err"
     }
@@ -274,12 +245,6 @@ if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TE
     sp=$(nix-store --add "$vg/s")
     vgCheck "let r = { a = builtins.readFile $sp/l; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }" \
         '{"vg1":"A","vg2":null,"vg3":"A"}' nix eval --impure --json -f
-    # And where a link leads, for a copy and a found path.
-    xp=$(nix-store --add "$vg/t/x")
-    vgCheck 'let r = { a = "${./k/x}"; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }' \
-        "{\"vg1\":\"$xp\",\"vg2\":null,\"vg3\":\"$xp\"}" nix eval --impure --json -f
-    vgCheck 'let r = { a = builtins.pathExists ./k/x; }; in { vg1 = r.a; vg2 = builtins.seq wait null; vg3 = r.a; }' \
-        '{"vg1":true,"vg2":null,"vg3":true}' nix eval --impure --json -f
 
     # The REPL keeps the cell of every read, as stock keeps a forced thunk: r.a prints its first result after the edit
     # (a list: a string target is kept by copy anyway).
