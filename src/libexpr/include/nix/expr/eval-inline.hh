@@ -159,7 +159,7 @@ inline void EvalState::forceAttrs(Value & v, Callable getPos, std::string_view e
     PosIdx pos = getPos();
     forceValue(v, pos);
     if (v.type() != nAttrs)
-        throwExpectedAttrs(v, pos, errorCtx);
+        throwExpected("expected a set but found %1%: %2%", v, pos, errorCtx);
 }
 
 [[gnu::always_inline]]
@@ -167,7 +167,7 @@ inline void EvalState::forceList(Value & v, const PosIdx pos, std::string_view e
 {
     forceValue(v, pos);
     if (!v.isList())
-        throwExpectedList(v, pos, errorCtx);
+        throwExpected("expected a list but found %1%: %2%", v, pos, errorCtx);
 }
 
 [[gnu::always_inline]]

@@ -2967,16 +2967,9 @@ void EvalState::forceValueDeep(Value & v, bool traversal)
         walk(v, std::false_type{});
 }
 
-void EvalState::throwExpectedAttrs(Value & v, const PosIdx pos, std::string_view errorCtx)
+void EvalState::throwExpected(const char * expected, Value & v, const PosIdx pos, std::string_view errorCtx)
 {
-    error<TypeError>("expected a set but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
-        .withTrace(pos, errorCtx)
-        .debugThrow();
-}
-
-void EvalState::throwExpectedList(Value & v, const PosIdx pos, std::string_view errorCtx)
-{
-    error<TypeError>("expected a list but found %1%: %2%", showType(v), ValuePrinter(*this, v, errorPrintOptions))
+    error<TypeError>(expected, showType(v), ValuePrinter(*this, v, errorPrintOptions))
         .withTrace(pos, errorCtx)
         .debugThrow();
 }
@@ -3143,17 +3136,10 @@ void addPeelTrace(EvalState & state, Error & e, PosIdx pos, PeelTrace what, cons
 
 void throwToStringReturn(EvalState & state, Value & v, PosIdx pos, bool should)
 {
-    if (should)
-        state
-            .error<TypeError>(
-                "`__toString` should return a string, but got %1%: %2%",
-                showType(v),
-                ValuePrinter(state, v, errorPrintOptions))
-            .atPos(pos)
-            .debugThrow();
     state
         .error<TypeError>(
-            "`__toString` must return a string, but got %1%: %2%",
+            should ? "`__toString` should return a string, but got %1%: %2%"
+                   : "`__toString` must return a string, but got %1%: %2%",
             showType(v),
             ValuePrinter(state, v, errorPrintOptions))
         .atPos(pos)
@@ -3222,12 +3208,6 @@ throwCannotCoerceToString(EvalState & state, Value & v, const PosIdx pos, std::s
     throwCannotCoerceToString(state, v, pos, errorCtx);
 }
 
-[[gnu::noinline, gnu::cold]] static void
-addListElementTrace(EvalState & state, Error & e, const PosIdx pos, std::string_view errorCtx)
-{
-    e.addTrace(state.positions[pos], errorCtx);
-}
-
 /* A list, with `coerceMore`: its elements' strings, separated by spaces. */
 [[gnu::noinline]] static BackedStringView coerceListToString(
     EvalState & state,
@@ -3245,7 +3225,7 @@ addListElementTrace(EvalState & state, Error & e, const PosIdx pos, std::string_
             result += *state.coerceToString(
                 pos, *v2, context, "while evaluating one element of the list", true, copyToStore, canonicalizePath);
         } catch (Error & e) {
-            addListElementTrace(state, e, pos, errorCtx);
+            addTraceAt(state, e, pos, errorCtx);
             throw;
         }
         if (n < v.listSize() - 1

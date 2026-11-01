@@ -856,9 +856,7 @@ public:
      * The type errors of the inline `forceAttrs` and `forceList`.
      */
     [[noreturn, gnu::noinline, gnu::cold]] void
-    throwExpectedAttrs(Value & v, const PosIdx pos, std::string_view errorCtx);
-    [[noreturn, gnu::noinline, gnu::cold]] void
-    throwExpectedList(Value & v, const PosIdx pos, std::string_view errorCtx);
+    throwExpected(const char * expected, Value & v, const PosIdx pos, std::string_view errorCtx);
 
     /**
      * @param v either lambda or primop
