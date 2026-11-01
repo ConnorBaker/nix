@@ -142,14 +142,6 @@ private:
     }
 
     /**
-     * Bindings that this attrset is "layered" on top of.
-     */
-    const Bindings * baseLayer() const noexcept
-    {
-        return numLayers > 1 ? layering().base : nullptr;
-    }
-
-    /**
      * Count the attributes of the chain, this layer's minus those that
      * also are in the layers below.
      */
@@ -426,11 +418,11 @@ public:
     }
 
     /**
-     * The layer below this one, or null.
+     * Bindings that this attrset is "layered" on top of.
      */
-    const Bindings * below() const noexcept
+    const Bindings * baseLayer() const noexcept
     {
-        return baseLayer();
+        return numLayers > 1 ? layering().base : nullptr;
     }
 
     /**

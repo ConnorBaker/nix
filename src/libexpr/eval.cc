@@ -2420,7 +2420,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
        and further only as far as the bound needs. */
     size_t merged = 0, depth = 0, above = bindings2.size(), top = 0;
     bool run = true;
-    for (auto l = &bindings1; l; l = l->below()) {
+    for (auto l = &bindings1; l; l = l->baseLayer()) {
         ++depth;
         if (l->layer().size() <= above) {
             merged = depth;
@@ -2432,7 +2432,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     size_t depth2 = 0, entries = above - bindings2.size();
-    for (auto l = &bindings2; l; l = l->below()) {
+    for (auto l = &bindings2; l; l = l->baseLayer()) {
         ++depth2;
         entries += l->layer().size();
     }
@@ -2447,7 +2447,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         auto names = bindings1.size() + bindings2.size() - shadowed;
         if (entries - names <= names && shadowed <= names - shadowed) {
             auto share = [&](auto & self, const Bindings & l) -> const Bindings * {
-                auto below = l.below();
+                auto below = l.baseLayer();
                 auto & base = below ? *self(self, *below) : bindings1;
                 /* The top layer's chain, or any layer's when the operands have
                    no name in common, has bindings1's other names besides. */
@@ -2477,10 +2477,10 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 
     /* Merge bindings2's layers and bindings1's top `merged` ones. */
     std::vector<std::span<const Attr>> layers;
-    for (auto l = &bindings2; l; l = l->below())
+    for (auto l = &bindings2; l; l = l->baseLayer())
         layers.push_back(l->layer());
     const Bindings * rest = &bindings1;
-    for (size_t k = 0; k < merged; ++k, rest = rest->below())
+    for (size_t k = 0; k < merged; ++k, rest = rest->baseLayer())
         layers.push_back(rest->layer());
     auto acc = mergeLayers(std::move(layers));
 
