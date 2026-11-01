@@ -322,3 +322,8 @@ frames=197
 # shellcheck disable=SC2016 # The ${} in this is Nix, not shell
 [[ $(nix eval --expr 'let s = { a = 1; }; n = null; in [ (removeAttrs s [ "a" ]) (removeAttrs s [ "a" ]) { ${n} = 1; } { } ]') \
     == '[ { } { } { } { } ]' ]]
+
+# `//` shares the layers of a layered right operand: the result is one set,
+# «repeated» where it is printed again.
+[[ $(nix eval --expr 'let q = { x = 1; } // { y = 2; }; r = { a = 0; b = 1; c = 2; d = 3; } // q; in [ r r (r // { }) ]') \
+    == '[ { a = 0; b = 1; c = 2; d = 3; x = 1; y = 2; } «repeated» «repeated» ]' ]]

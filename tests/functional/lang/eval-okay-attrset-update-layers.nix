@@ -8,9 +8,24 @@ let
   shared = foldl' (acc: i: acc // { "a${toString i}" = -i; "n${toString i}" = i; }) big (genList (i: i * 37) 20);
   # Right operands as large as the chain, overriding c0: compactions.
   compacted = foldl' (acc: i: acc // mk "c${toString i}-" (8 * i + 1) // { c0 = i; }) (mk "c" 2) (genList (i: i) 12);
-  # A layered right operand (bound to a name: `a // (b // c)` is evaluated as one chain): copied, all its layers.
+  # A layered right operand (bound to a name: `a // (b // c)` is evaluated as one chain): each of its layers
+  # shared, the upper one an array shared in its turn, ...
   rhs = mk "z" 3 // { z0 = "rhs"; };
   layeredRhs = big // rhs;
+  # ... or a copy that a merge made over a lower layer (`copied`'s upper layer).
+  rq1 = mk "q" 2 // { q0 = "top"; };
+  rq3 = rq1 // { q9 = 9; };
+  copied = mk "p" 8 // { p0 = "x"; } // rq3;
+  sharedCopy = big // copied;
+  # A shared lower layer of a layered right operand under a merge's copy, which counts on that layer's size: with
+  # the left operand's names besides (`relayered`), or with the left operand's names that it shadows (z9) and that
+  # only the upper layer shadows (q) (`relayeredQ`).
+  rz = mk "z" 10 // { z0 = "rhs"; q = 1; };
+  over7 = listToAttrs (genList (i: { name = "z${toString (i + 1)}"; value = "x"; }) 7);
+  lr = { b0 = 0; } // rz;
+  relayered = lr // over7;
+  lrq = { b0 = 0; q = 0; z9 = 0; } // rz;
+  relayeredQ = lrq // over7;
   small = mk "s" 3 // { s9 = 9; };
   # A layered right operand over a short chain: merged into one layer, its upper layer's q0 winning.
   rq = mk "q" 2 // { q0 = "top"; q9 = 9; };
@@ -32,9 +47,9 @@ let
     inter2 = h (attrNames (intersectAttrs s (mk "a" 50 // mk "c5-" 50)));
   };
 in
-mapAttrs (_: check) { inherit shared compacted layeredRhs small under flattened; }
+mapAttrs (_: check) { inherit shared compacted layeredRhs small under flattened copied sharedCopy relayered relayeredQ; }
 // {
-  rhsWins = [ shared.a37 shared.n37 layeredRhs.z0 compacted.c0 compacted.c11-0 under.a199 under.zz flattened.q0 ];
+  rhsWins = [ shared.a37 shared.n37 layeredRhs.z0 compacted.c0 compacted.c11-0 under.a199 under.zz flattened.q0 sharedCopy.q0 sharedCopy.p0 sharedCopy.a1 relayered.z1 relayered.q relayeredQ.q relayeredQ.z0 ];
   repeated = [ small small (small // { }) { inner = small; } ];
   posOfLayer = builtins.unsafeGetAttrPos "n37" shared;
 }

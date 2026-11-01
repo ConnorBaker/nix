@@ -468,10 +468,10 @@ public:
 
     /**
      * A layer of `top`'s attributes over `base`'s chain that shares `top`'s
-     * array (see `Bindings::arrayOf`); `top` is not layered. `size`: the
-     * names of the new chain, which the caller has counted.
+     * array (see `Bindings::arrayOf`): of `top`'s own layer, if it is layered.
+     * `size`: the new chain's names, if the caller knows them.
      */
-    const Bindings * shareLayer(const Bindings & top, const Bindings & base, size_t size);
+    const Bindings * shareLayer(const Bindings & top, const Bindings & base, std::optional<size_t> size = {});
 
     BindingsBuilder buildBindings(SymbolTable & symbols, size_t capacity)
     {

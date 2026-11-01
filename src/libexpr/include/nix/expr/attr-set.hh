@@ -105,8 +105,9 @@ private:
     /**
      * Of a layered Bindings: the Bindings it is layered on top of, and the
      * Bindings whose array holds its attributes when it shares the array of
-     * an update's (`//`) right operand instead of copying it (else null: they
-     * follow the slot). Pointers to the objects, not into them: the garbage
+     * (a layer of) an update's (`//`) right operand instead of copying it
+     * (else null: they follow the slot; a layered `arrayOf`'s follow its
+     * slot). Pointers to the objects, not into them: the garbage
      * collector ignores interior pointers, and these keep the objects alive.
      */
     struct Layering
@@ -137,7 +138,7 @@ private:
         if (numLayers <= 1)
             return attrs;
         auto l = layering();
-        return l.arrayOf ? l.arrayOf->attrs : attrs + 1;
+        return l.arrayOf ? l.arrayOf->attrs + (l.arrayOf->numLayers > 1) : attrs + 1;
     }
 
     /**
@@ -406,6 +407,14 @@ public:
         if (isLayered()) [[unlikely]]
             unreachable();
         return {data(), numAttrs};
+    }
+
+    /**
+     * The Bindings whose own array holds this layer's attributes.
+     */
+    const Bindings * owner() const noexcept
+    {
+        return isLayered() && layering().arrayOf ? layering().arrayOf : this;
     }
 
     /**
