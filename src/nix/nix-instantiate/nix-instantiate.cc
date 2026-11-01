@@ -70,22 +70,19 @@ void processExpr(
                 vRes = v;
             else
                 state.autoCallFunction(autoArgs, v, vRes);
+            /* A traversal runs its elements in jobs only if it forces what
+               it reads: without --strict, the printer reads cells as they
+               are, which an earlier element's job end may have reverted. */
+            std::optional<UnforceJobs> jobs;
+            if (strict && (output == okXML || output == okJSON))
+                jobs.emplace(state, &vRes);
             if (output == okRaw)
                 std::cout << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
             // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
             // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
-            else if (output == okXML) {
-                /* A traversal runs its elements in jobs only if it forces what
-                   it reads: without --strict, the printer reads cells as they
-                   are, which an earlier element's job end may have reverted. */
-                std::optional<UnforceJobs> jobs;
-                if (strict)
-                    jobs.emplace(state, &vRes);
+            else if (output == okXML)
                 printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
-            } else if (output == okJSON) {
-                std::optional<UnforceJobs> jobs;
-                if (strict)
-                    jobs.emplace(state, &vRes);
+            else if (output == okJSON) {
                 printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
                 std::cout << std::endl;
             } else {
