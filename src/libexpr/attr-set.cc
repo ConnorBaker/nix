@@ -42,17 +42,24 @@ void Bindings::countChain()
 
     size_type duplicates = 0;
 
-    /* If the base is smaller than this layer, iterate both with
-       std::set_intersection in O(|base| + |own|); otherwise look each of
-       this layer's attributes up in the base, so that a small layer over a
-       large base does not iterate the base. */
+    /* Look the names of the smaller side up in the larger one. The base's
+       are looked up in this layer by galloping on from the last one found,
+       so that a few over many cost a few searches, not a pass over this
+       layer, and as many cost about one pass. */
     if (own.size() > base.size()) {
-        std::set_intersection(
-            base.begin(),
-            base.end(),
-            own.begin(),
-            own.end(),
-            boost::make_function_output_iterator([&]([[maybe_unused]] auto && _) { ++duplicates; }));
+        auto i = own.begin();
+        for (const auto & attr : base) {
+            size_t n = own.end() - i, lo = 0, hi = 1;
+            while (hi <= n && i[hi - 1] < attr) {
+                lo = hi;
+                hi *= 2;
+            }
+            i = std::lower_bound(i + lo, i + std::min(hi, n), attr);
+            if (i == own.end())
+                break;
+            if (i->name == attr.name)
+                ++duplicates;
+        }
     } else {
         for (const auto & attr : own) {
             if (base.get(attr.name))

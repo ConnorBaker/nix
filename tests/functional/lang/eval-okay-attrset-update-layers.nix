@@ -12,6 +12,8 @@ let
   rhs = mk "z" 3 // { z0 = "rhs"; };
   layeredRhs = big // rhs;
   small = mk "s" 3 // { s9 = 9; };
+  # Names spread through a large right operand's array, under it.
+  under = builtins.seq big (listToAttrs (genList (i: { name = "a${toString (i * 199)}"; value = "under"; }) 6 ++ [ { name = "zz"; value = 0; } ]) // big);
   check = s: {
     names = h (attrNames s);
     size = builtins.length (attrNames s);
@@ -27,9 +29,9 @@ let
     inter2 = h (attrNames (intersectAttrs s (mk "a" 50 // mk "c5-" 50)));
   };
 in
-mapAttrs (_: check) { inherit shared compacted layeredRhs small; }
+mapAttrs (_: check) { inherit shared compacted layeredRhs small under; }
 // {
-  rhsWins = [ shared.a37 shared.n37 layeredRhs.z0 compacted.c0 compacted.c11-0 ];
+  rhsWins = [ shared.a37 shared.n37 layeredRhs.z0 compacted.c0 compacted.c11-0 under.a199 under.zz ];
   repeated = [ small small (small // { }) { inner = small; } ];
   posOfLayer = builtins.unsafeGetAttrPos "n37" shared;
 }

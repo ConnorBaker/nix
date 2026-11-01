@@ -5,7 +5,6 @@
 #include "nix/expr/symbol-table.hh"
 
 #include <boost/container/small_vector.hpp>
-#include <boost/iterator/function_output_iterator.hpp>
 
 #include <algorithm>
 #include <cstring>
