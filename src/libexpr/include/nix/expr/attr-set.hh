@@ -377,6 +377,10 @@ public:
         auto getInChunk = [key = Attr{name, nullptr}](const Bindings & chunk) -> const Attr * {
             auto first = chunk.data();
             auto last = first + chunk.numAttrs;
+            /* Most layers that updates put over a set are small: a name
+               outside a layer's range skips its search. */
+            if (first == last || key < *first || last[-1] < key)
+                return nullptr;
             const Attr * i = std::lower_bound(first, last, key);
             if (i != last && i->name == key.name)
                 return i;
