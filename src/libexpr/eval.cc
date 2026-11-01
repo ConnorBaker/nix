@@ -2356,6 +2356,37 @@ void ExprOpImpl::eval(EvalState & state, Env & env, Value & v)
         || state.evalBool(env, e2, "in the right operand of '->'"));
 }
 
+/* The attributes of `layers`, the first taking precedence, in one sorted
+   array without the names shadowed. Merging the adjacent pair of least total
+   size first copies an attribute once per halving of the layers, not once
+   per layer above it, whatever order the sizes are in. */
+static std::vector<Attr> mergeLayers(std::vector<std::span<const Attr>> layers)
+{
+    /* owned[i]: the array of layers[i] when a merge made it. */
+    std::vector<std::vector<Attr>> owned(layers.size());
+    while (layers.size() > 1) {
+        size_t best = 0;
+        for (size_t i = 1; i + 1 < layers.size(); ++i)
+            if (layers[i].size() + layers[i + 1].size() < layers[best].size() + layers[best + 1].size())
+                best = i;
+        std::vector<Attr> out;
+        out.reserve(layers[best].size() + layers[best + 1].size());
+        std::set_union(
+            layers[best].begin(),
+            layers[best].end(),
+            layers[best + 1].begin(),
+            layers[best + 1].end(),
+            std::back_inserter(out));
+        owned[best] = std::move(out);
+        layers[best] = owned[best];
+        layers.erase(layers.begin() + best + 1);
+        owned.erase(owned.begin() + best + 1);
+    }
+    if (!owned[0].empty())
+        return std::move(owned[0]);
+    return {layers[0].begin(), layers[0].end()};
+}
+
 void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
 {
     state.nrOpUpdates++;
@@ -2393,7 +2424,7 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    if (!merged) {
+    if (!merged && !bindings2.isLayered()) {
         /* One more: the slot `layerOnTopOf` takes. */
         auto attrs = state.buildBindings(bindings2.size() + 1);
         attrs.layerOnTopOf(bindings1);
@@ -2403,17 +2434,14 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
         return;
     }
 
-    /* Merge, layer by layer from the top, preferring the attributes merged
-       so far; the result is sorted, without the names shadowed. */
-    std::vector<Attr> acc(bindings2.begin(), bindings2.end()), next;
+    /* Merge bindings2's layers and bindings1's top `merged` ones. */
+    std::vector<std::span<const Attr>> layers;
+    for (auto l = &bindings2; l; l = l->below())
+        layers.push_back(l->layer());
     const Bindings * rest = &bindings1;
-    for (size_t k = 0; k < merged; ++k, rest = rest->below()) {
-        next.clear();
-        next.reserve(acc.size() + rest->layer().size());
-        auto layer = rest->layer();
-        std::set_union(acc.begin(), acc.end(), layer.begin(), layer.end(), std::back_inserter(next));
-        std::swap(acc, next);
-    }
+    for (size_t k = 0; k < merged; ++k, rest = rest->below())
+        layers.push_back(rest->layer());
+    auto acc = mergeLayers(std::move(layers));
 
     auto attrs = state.buildBindings(acc.size() + (rest ? 1 : 0));
     if (rest)
