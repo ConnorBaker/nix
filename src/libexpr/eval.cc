@@ -2404,10 +2404,15 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     /* The result is a new layer of bindings2's attributes over bindings1's
-       layers, which a chain of n attributes has at most log2(n) + 1 of.
+       layers, at most log2(s) + 1 of them, s the size of bindings2 and those
+       of bindings1's layers together (`above`; a name that upper layers
+       shadow counted again).
 
        An unlayered bindings2 becomes a layer that shares its array, while
-       the chain stays within that bound. Otherwise the new layer is a copy
+       the chain stays within that bound, its layers hold no more shadowed
+       attributes than names, and bindings2 shadows at most half of those
+       names (layers over names they hide would make lookups search them
+       all). Otherwise the new layer is a copy
        that takes in bindings1's top layers down to the deepest one that
        would not be larger than everything above it, after which every layer
        is larger than all the layers above it together (so the bound holds). */
@@ -2420,8 +2425,17 @@ void ExprOpUpdate::eval(EvalState & state, Value & v, Value & v1, Value & v2)
     }
 
     if (!bindings2.isLayered() && depth + 1 <= size_t(std::bit_width(above))) {
-        v.mkAttrs(state.mem.shareLayer(bindings2, bindings1));
-        return;
+        /* The names that both have, looked up from the smaller side. */
+        auto & fewer = bindings1.size() < bindings2.size() ? bindings1 : bindings2;
+        auto & more = &fewer == &bindings1 ? bindings2 : bindings1;
+        size_t shadowed = 0;
+        for (auto & attr : fewer)
+            shadowed += more.get(attr.name) != nullptr;
+        auto names = bindings1.size() + bindings2.size() - shadowed;
+        if (above - names <= names && shadowed <= names - shadowed) {
+            v.mkAttrs(state.mem.shareLayer(bindings2, bindings1, names));
+            return;
+        }
     }
 
     if (!merged && !bindings2.isLayered()) {

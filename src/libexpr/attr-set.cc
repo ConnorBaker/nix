@@ -22,7 +22,7 @@ Bindings * EvalMemory::allocBindings(size_t capacity)
     return new (allocBytes<Attr, sizeof(Bindings)>(capacity)) Bindings();
 }
 
-const Bindings * EvalMemory::shareLayer(const Bindings & top, const Bindings & base)
+const Bindings * EvalMemory::shareLayer(const Bindings & top, const Bindings & base, size_t size)
 {
     assert(!top.isLayered());
     stats.nrAttrsets++;
@@ -31,7 +31,7 @@ const Bindings * EvalMemory::shareLayer(const Bindings & top, const Bindings & b
     b->numLayers = base.numLayers + 1;
     Bindings::Layering l{&base, &top};
     std::memcpy(static_cast<void *>(b->attrs), &l, sizeof l);
-    b->countChain();
+    b->numAttrsInChain = size;
     return b;
 }
 

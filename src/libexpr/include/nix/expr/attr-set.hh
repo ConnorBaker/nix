@@ -242,9 +242,9 @@ public:
          * One cursor per non-empty layer. Merging, each step emits the least
          * name, from the cursor of highest priority that has it, and moves
          * every cursor at that name past it (the names it shadows). A chain
-         * has few layers (at most log2 of its attributes plus one, see
-         * ExprOpUpdate::eval), so a linear scan finds the least cursor with
-         * fewer instructions than a heap's sift.
+         * has few layers (at most log2 of the sizes an update sums plus one,
+         * see ExprOpUpdate::eval), so a linear scan finds the least cursor
+         * with fewer instructions than a heap's sift.
          */
         QueueStorageType cursorHeap;
 
