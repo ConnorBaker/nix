@@ -603,6 +603,12 @@ protected:
         return internalType;
     }
 
+    template<InternalType type>
+    bool isType() const noexcept
+    {
+        return internalType == type;
+    }
+
     static bool isAtomic()
     {
         return false;
@@ -842,24 +848,35 @@ protected:
     InternalType getInternalType() const noexcept
     {
         Payload payload = loadPayload();
-        switch (auto pd = getPrimaryDiscriminator(payload[0])) {
-        case pdUninitialized:
-            /* Discriminator value of zero is used to distinguish uninitialized values. */
-            return tUninitialized;
-        case pdSingleDWord:
-            /* Payloads that only use up a single double word store the InternalType
-               in the upper bits of the first double word. */
-            return InternalType(payload[0] >> discriminatorBits);
-        /* The order must match that of the enumerations defined in InternalType. */
-        case pdListN:
-        case pdString:
-        case pdPath:
-            return static_cast<InternalType>(tFirstSingleUntaggable + (pd - pdListN));
-        case pdPairOfPointers:
-            return static_cast<InternalType>(tFirstPairOfPointers + (payload[1] & discriminatorMask));
-        [[unlikely]] default:
+        auto pd = getPrimaryDiscriminator(payload[0]);
+        if (pd > pdPairOfPointers) [[unlikely]]
             nixUnreachableWhenHardened();
-        }
+        /* Selects, not a switch, which Clang compiles to a jump table. An
+           uninitialized value's payload is all zero, so its upper bits give
+           tUninitialized as a single-dword payload's give its type. The order must
+           match that of the enumerations defined in InternalType. */
+        PackedPointer single = payload[0] >> discriminatorBits;
+        PackedPointer untaggable = tFirstSingleUntaggable + (pd - pdListN);
+        PackedPointer pair = tFirstPairOfPointers + (payload[1] & discriminatorMask);
+        return InternalType(pd == pdPairOfPointers ? pair : pd >= pdListN ? untaggable : single);
+    }
+
+    /** Whether the storage holds `type`: tests its tag bits without decoding the others. */
+    template<InternalType type>
+    bool isType() const noexcept
+    {
+        static_assert(type < tNumberOfInternalTypes);
+        Payload payload = loadPayload();
+        auto pd = getPrimaryDiscriminator(payload[0]);
+        if constexpr (type >= tFirstPairOfPointers && type <= tLastPairOfPointers)
+            return (pd | (payload[1] & discriminatorMask) << discriminatorBits)
+                   == (pdPairOfPointers | PackedPointer(type - tFirstPairOfPointers) << discriminatorBits);
+        else if constexpr (type >= tFirstSingleUntaggable)
+            return pd == pdListN + (type - tFirstSingleUntaggable);
+        else if constexpr (type == tUninitialized)
+            return pd == pdUninitialized;
+        else
+            return payload[0] == (pdSingleDWord | PackedPointer(type) << discriminatorBits);
     }
 
 #define NIX_VALUE_STORAGE_DEF_PAIR_OF_PTRS(TYPE, MEMBER_A, MEMBER_B)                                   \
@@ -1225,7 +1242,7 @@ private:
     template<InternalType... discriminator>
     bool isa() const noexcept
     {
-        return ((getInternalType() == discriminator) || ...);
+        return (isType<discriminator>() || ...);
     }
 
     template<typename T>
