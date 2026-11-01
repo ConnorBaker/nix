@@ -93,9 +93,7 @@ typedef std::vector<AttrName> AttrSelectionPath;
 
 std::string showAttrSelectionPath(const SymbolTable & symbols, std::span<const AttrName> attrPath);
 
-/**
- * The operands of a chain of `//`, evaluated.
- */
+/** The operands of a chain of `//`, evaluated. */
 using UpdateQueue = SmallTemporaryValueVector<conservativeStackReservation>::base_type;
 
 /* Abstract syntax of Nix expressions. */
@@ -140,9 +138,7 @@ struct Expr
      */
     virtual void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q, std::string_view errorCtx);
 
-    /**
-     * How many values `evalForUpdate` pushes.
-     */
+    /** How many values `evalForUpdate` pushes. */
     virtual size_t updateOperands() const
     {
         return 1;
@@ -637,9 +633,7 @@ struct ExprCall : Expr
     std::optional<std::pmr::vector<Expr *>> args;
     PosIdx pos;
     std::optional<PosIdx> cursedOrEndPos; // used during parsing to warn about https://github.com/NixOS/nix/issues/11118
-    /**
-     * Whether `fun` is an `ExprVar` (`EvalState::callVar1`).
-     */
+    /** Whether `fun` is an `ExprVar` (`EvalState::callVar1`). */
     bool funIsVar;
 
     ExprCall(const PosIdx & pos, Expr * fun, std::pmr::vector<Expr *> && args)
@@ -797,9 +791,7 @@ private:
     /** Special case for merging of two attrsets. */
     void eval(EvalState & state, Value & v, Value & v1, Value & v2);
     void evalForUpdate(EvalState & state, Env & env, UpdateQueue & q);
-    /**
-     * `eval`, with room on the stack for `N` operand values.
-     */
+    /** `eval`, with room on the stack for `N` operand values. */
     template<size_t N>
     void evalWith(EvalState & state, Env & env, Value & v);
 
@@ -851,9 +843,7 @@ struct ExprConcatStrings : Expr
     COMMON_METHODS
 
 private:
-    /**
-     * `eval`, with room on the stack for `N` operand values.
-     */
+    /** `eval`, with room on the stack for `N` operand values. */
     template<size_t N>
     void evalWith(EvalState & state, Env & env, Value & v);
 };

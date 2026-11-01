@@ -852,9 +852,7 @@ public:
 
     inline void forceList(Value & v, const PosIdx pos, std::string_view errorCtx);
 
-    /**
-     * The type errors of the inline `forceAttrs` and `forceList`.
-     */
+    /** The type errors of the inline `forceAttrs` and `forceList`. */
     [[noreturn, gnu::noinline, gnu::cold]] void
     throwExpected(const char * expected, Value & v, const PosIdx pos, std::string_view errorCtx);
 
@@ -1087,9 +1085,7 @@ public:
 private:
 
     inline Value * lookupVar(Env * env, const ExprVar & var, bool noEval);
-    /**
-     * lookupVar's search of the `with` scopes, out of ExprVar::eval's frame.
-     */
+    /** lookupVar's search of the `with` scopes, out of ExprVar::eval's frame. */
     [[gnu::noinline]] Value * lookupVarWith(Env * env, const ExprVar & var);
 
     friend struct ExprVar;
@@ -1226,23 +1222,17 @@ public:
      */
     [[gnu::noinline]] void callVar1(ExprCall & call, ExprVar & var, Env & env, Value & vRes);
 
-    /**
-     * `callFunction`, inlined into the ExprCall::eval helpers.
-     */
+    /** `callFunction`, inlined into the ExprCall::eval helpers. */
     [[gnu::always_inline]] inline void
     callFunctionInline(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
 
 private:
-    /**
-     * callFunction's work, inlined into callFunction and callFunctionProfiled.
-     */
+    /** callFunction's work, inlined into callFunction and callFunctionProfiled. */
     [[gnu::always_inline]] inline void
     callFunctionBody(Value & fun, std::span<Value * const> & args, Value & vRes, const PosIdx pos);
     [[gnu::noinline, gnu::cold]] void
     callFunctionProfiled(Value & fun, std::span<Value * const> args, Value & vRes, const PosIdx pos);
-    /**
-     * Calls a partially applied primop with its last arguments.
-     */
+    /** Calls a partially applied primop with its last arguments. */
     [[gnu::noinline]] void callPrimOpApp(
         Value & vCur,
         Value * primOp,

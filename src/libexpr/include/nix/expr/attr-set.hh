@@ -125,9 +125,7 @@ private:
         return l;
     }
 
-    /**
-     * Where this Bindings' own attributes go.
-     */
+    /** Where this Bindings' own attributes go. */
     Attr * own() noexcept
     {
         return attrs + (numLayers > 1);
@@ -401,17 +399,13 @@ public:
         return {data(), numAttrs};
     }
 
-    /**
-     * The Bindings whose own array holds this layer's attributes.
-     */
+    /** The Bindings whose own array holds this layer's attributes. */
     const Bindings * owner() const noexcept
     {
         return isLayered() && layering().arrayOf ? layering().arrayOf : this;
     }
 
-    /**
-     * The attributes of this layer alone, without those of the layers below.
-     */
+    /** The attributes of this layer alone, without those of the layers below. */
     std::span<const Attr> layer() const noexcept
     {
         return {data(), numAttrs};
