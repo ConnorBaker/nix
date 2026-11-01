@@ -16,7 +16,9 @@
 #include "nix/util/terminal.hh"
 #include "nix/util/tests/test-data.hh"
 
+#include <cinttypes>
 #include <cstdint>
+#include <fstream>
 
 /* Jobs revert only where they have a region (unforce.cc): in builds without
    a garbage collector, on 64-bit Linux. Elsewhere these tests are left out. */
@@ -559,6 +561,42 @@ TEST_F(UnforceTest, poisonsFreed)
     state.endUnforceScope();
 }
 #  endif
+
+/* The `VmFlags` of the mapping that holds `a` (/proc/self/smaps), and its end. */
+static std::pair<std::string, uintptr_t> vmFlagsAt(uintptr_t a)
+{
+    std::ifstream in("/proc/self/smaps");
+    uintptr_t lo = 0, hi = 0;
+    bool here = false;
+    for (std::string line; std::getline(in, line);)
+        if (sscanf(line.c_str(), "%" SCNxPTR "-%" SCNxPTR, &lo, &hi) == 2)
+            here = lo <= a && a < hi;
+        else if (here && line.starts_with("VmFlags:"))
+            return {line + " ", hi};
+    return {};
+}
+
+/* A core holds every page a job wrote, and not the mapping's rest, which no
+   job touched (` dd `: left out of core dumps), also once a job reaches past
+   the part dumped so far. */
+TEST_F(UnforceTest, coreHoldsWrittenPages)
+{
+    state.beginUnforceScope();
+    auto page = uintptr_t(sysconf(_SC_PAGESIZE));
+    state.mem.allocBytes(1);
+    auto top = vmFlagsAt(uintptr_t(evalRegion.cur) - 1).second;
+    state.mem.allocBytes(top - uintptr_t(evalRegion.cur) + page);
+    for (auto a = uintptr_t(evalRegion.base); a < uintptr_t(evalRegion.cur);) {
+        auto [flags, end] = vmFlagsAt(a);
+        EXPECT_EQ(flags.find(" dd "), std::string::npos) << flags;
+        ASSERT_GT(end, a);
+        a = end;
+    }
+    auto end = vmFlagsAt(uintptr_t(evalRegion.cur) - 1).second;
+    EXPECT_GT(end, top);
+    EXPECT_NE(vmFlagsAt(end).first.find(" dd "), std::string::npos);
+    state.endUnforceScope();
+}
 
 /* A job does not run without its region: where none can be mapped, opening
    the job runs out of memory, also where a traversal prints an element's

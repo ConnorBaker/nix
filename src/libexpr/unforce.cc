@@ -108,6 +108,14 @@ static size_t regionBytes = 0;
 static char * roomEnd = nullptr;
 static char * dirtyTop = nullptr;
 
+/* The end of the mapping's part that a core dump holds: every page a job
+   wrote lies below it, and the rest of the mapping, which no job touched, is
+   left out (`MADV_DONTDUMP`), else a core would carry all of it. It moves
+   ahead of `end`, to twice the span below where the cursor reached, so that
+   it moves as often as the span doubles. If moving it fails, the rest of
+   the mapping is put back in cores as a whole, as before it was left out. */
+static char * dumpTop = nullptr;
+
 #endif
 
 static size_t granuleOf(const void * p)
@@ -165,7 +173,9 @@ static void openRegion()
         /* The old mapping keeps the pages of what its jobs kept. */
         if (mapping)
             munmap(pageUp(keptTop), mapping + 2 * regionBytes - pageUp(keptTop));
-        mapping = keptTop = dirtyTop = (char *) p;
+        mapping = keptTop = dirtyTop = dumpTop = (char *) p;
+        if (madvise(p, bytes, MADV_DONTDUMP) != 0)
+            dumpTop = mapping + bytes;
         regionBytes = bytes / 2;
     }
     evalRegion.base = evalRegion.cur = jobTop = keptTop;
@@ -173,7 +183,7 @@ static void openRegion()
     unforceFrameSpan = NIX_ASAN_ENABLED ? 1 : pageSize();
     unforceStepSpan = pageSize();
     roomEnd = keptTop + regionBytes;
-    evalRegion.end = dirtyTop > keptTop ? keptTop : roomEnd;
+    evalRegion.end = dirtyTop > keptTop ? keptTop : std::min(dumpTop, roomEnd);
 #endif
 }
 
@@ -194,7 +204,15 @@ void * EvalRegion::more(size_t n)
             ASAN_POISON_MEMORY_REGION(end, zeroed);
 #  endif
         }
-        end = to < dirtyTop ? to : roomEnd;
+        if (to > dumpTop) {
+            auto top = std::min(pageUp(to + (to - mapping)), pageUp(roomEnd));
+            if (madvise(dumpTop, top - dumpTop, MADV_DODUMP) != 0) {
+                top = mapping + 2 * regionBytes;
+                madvise(dumpTop, top - dumpTop, MADV_DODUMP);
+            }
+            dumpTop = top;
+        }
+        end = to < dirtyTop ? to : std::min(dumpTop, roomEnd);
         return bump(n);
     }
 #endif
