@@ -42,23 +42,6 @@ extern bool unforceTestFailMapping;
    log is full. */
 extern uint32_t unforceTestLogLimit;
 
-/* While alive, a job's region cannot be mapped (`unforceTestFailMapping`). */
-struct FailMapping
-{
-    FailMapping()
-    {
-        unforceTestFailMapping = true;
-    }
-
-    ~FailMapping()
-    {
-        unforceTestFailMapping = false;
-    }
-
-    FailMapping(const FailMapping &) = delete;
-    FailMapping & operator=(const FailMapping &) = delete;
-};
-
 class UnforceTest : public LibExprTest
 {
 protected:
@@ -197,14 +180,12 @@ TEST_F(UnforceTest, promotesOwner)
     }
 }
 
-/* A traversal runs each element of its root in a job of its own: a
-   printer prints what it prints without, «repeated» included, and the
-   elements are thunks again afterwards. A set whose cell an element's job
-   reverts (`s`, in `a`'s) is forgotten, and found again once a later
-   element forces the cell again (`b`); a set that the next job builds where
-   it lay is not found. One whose cell the job keeps stays found: `a`'s set
-   `u` promotes `a`, and `s` with it by time. A cell that held an
-   application (`map`'s) is found again as it is re-forced too. */
+/* A traversal runs each element of its root in a job of its own: a printer
+   prints what it prints without, «repeated» included, and the elements are
+   thunks again afterwards. A reverted set (`s`, in `a`'s job) is found again
+   once a later element forces its cell again (`b`), not a set the next job
+   builds where it lay; a kept one (`u`, which promotes `a` and `s`) stays
+   found, and so does a re-forced application's (`map`'s). */
 TEST_F(UnforceTest, printerJobs)
 {
     auto attr = [&](const char * expr, const char * name) {
@@ -233,42 +214,27 @@ TEST_F(UnforceTest, getDerivationCallback)
     EXPECT_TRUE(w->isThunk());
 }
 
-/* Native code turns unforcing off: here, `importNative`. */
+/* Native code turns unforcing off: `importNative`; a plugin's
+   `extraPrimOps` entry; a plugin's lookup path hook that changed the
+   builtins, from then on; C API code, in a state a C API host built, or
+   once a client's primop or external value exists, in any state (last: it
+   holds for the process). */
 TEST_F(UnforceTest, nativeCodeTurnsOff)
 {
-    EXPECT_TRUE(unforceEnabled(state));
+    auto fresh = [&] {
+        return std::make_unique<EvalState>(LookupPath{}, state.store, fetchSettings, evalSettings, nullptr);
+    };
+    EXPECT_TRUE(unforceEnabled(*fresh()));
     evalSettings.enableNativeCode = true;
-    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
-    EXPECT_FALSE(unforceEnabled(other));
-}
-
-/* So does a plugin's `extraPrimOps` entry. */
-TEST_F(UnforceTest, extraPrimOpTurnsOff)
-{
+    EXPECT_FALSE(unforceEnabled(*fresh()));
+    evalSettings.enableNativeCode = false;
     evalSettings.extraPrimOps.push_back({
         .name = "__unforceTest",
         .arity = 1,
         .impl = [](EvalState &, CallSite, Value * const * args, Value & v) { v = *args[0]; },
     });
-    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
-    EXPECT_FALSE(unforceEnabled(other));
-}
-
-/* And C API code: in a state a C API host built, or once a client's
-   primop or external value exists, in any state. */
-TEST_F(UnforceTest, cApiTurnsOff)
-{
-    EvalState other({}, state.store, fetchSettings, evalSettings, nullptr);
-    unforceNoteCApiState(other);
-    EXPECT_FALSE(unforceEnabled(other));
-    EXPECT_TRUE(unforceEnabled(state));
-    unforceNoteCApiCode();
-    EXPECT_FALSE(unforceEnabled(state));
-}
-
-/* And a plugin's lookup path hook that changed the builtins, from then on. */
-TEST_F(UnforceTest, builtinsChangeTurnsOff)
-{
+    EXPECT_FALSE(unforceEnabled(*fresh()));
+    evalSettings.extraPrimOps.pop_back();
     auto & slot = state.baseEnv.values[state.staticBaseEnv->vars.begin()->second];
     {
         UnforceBuiltinsCheck check(state);
@@ -280,6 +246,12 @@ TEST_F(UnforceTest, builtinsChangeTurnsOff)
         slot->mkNull();
     }
     EXPECT_FALSE(unforceEnabled(state));
+    auto host = fresh(), other = fresh();
+    unforceNoteCApiState(*host);
+    EXPECT_FALSE(unforceEnabled(*host));
+    EXPECT_TRUE(unforceEnabled(*other));
+    unforceNoteCApiCode();
+    EXPECT_FALSE(unforceEnabled(*other));
 }
 
 /* An effect in the driver's evaluation (no cell's force), which nothing runs
@@ -605,7 +577,8 @@ TEST_F(UnforceTest, unmappableRegionNotSwallowed)
 {
     auto v = oldThunk("{ a = 1; }");
     state.forceValue(*v, noPos);
-    FailMapping fail;
+    unforceTestFailMapping = true;
+    Finally restore([] { unforceTestFailMapping = false; });
     std::ostringstream out;
     UnforceJobs jobs(state, v);
     EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
@@ -1291,7 +1264,8 @@ TEST_F(UnforceTest, nestedOpenFails)
         UnforceJobs outer(state);
         outer.element(true);
         state.forceValue(*oldThunk("[ 1 ]"), noPos);
-        FailMapping fail;
+        unforceTestFailMapping = true;
+        Finally restore([] { unforceTestFailMapping = false; });
         EXPECT_THROW(
             sibling(state, state.parseExprFromString("{ }", state.rootPath(CanonPath::root)), true, true),
             std::bad_alloc);
@@ -1433,13 +1407,10 @@ static bool printsAsOrMoreEvaluated(std::string want, std::string got)
 /* The corpus, the .nix files in data/unforce (a function is called with
    its defaults): each program, as each front end evaluates it, prints
    what it prints in an evaluator without unforcing, or fails with the same
-   error at the same position (its trace may differ: a failed young cell
-   inside a reverted owner is built again, and its re-force throws again
-   under other frames), but that a failure's message may show more of what
-   is evaluated
-   (`printsAsOrMoreEvaluated`). In an evaluator of its own each time, so
-   that nothing is forced before. The store is a dummy one: derivations'
-   paths are computed, not written. */
+   error at the same position (its trace may differ), though a failure's
+   message may show more of what is evaluated (`printsAsOrMoreEvaluated`).
+   In an evaluator of its own each time. The store is a dummy one:
+   derivations' paths are computed, not written. */
 TEST_F(UnforceTest, corpus)
 {
     auto readOnly = std::exchange(nix::settings.readOnlyMode, true);
