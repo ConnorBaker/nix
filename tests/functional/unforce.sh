@@ -21,13 +21,14 @@ expectJobs() {
 }
 
 # A set printed in an earlier element's job is «repeated» in a later one's;
-# b builds s again, no more than a did, so c runs in b's job.
+# b builds s again, no more than a did, so c runs in b's job. nix eval
+# evaluates the expression in a job of its own first.
 expr='let s = { x = 1; }; in { a = s; b = s; c = [ 1 2 3 ]; }'
-expectJobs "$(jobsOf nix eval --expr "$expr")" 2
+expectJobs "$(jobsOf nix eval --expr "$expr")" 3
 [[ $(< "$TEST_ROOT/out") == '{ a = { x = 1; }; b = «repeated»; c = [ 1 2 3 ]; }' ]]
 # Strict JSON printing nests: an element of a printed set or list is a job of
 # its own too, once its parent's job is not empty (a's x, c's first element).
-expectJobs "$(jobsOf nix eval --json --expr "$expr")" 4
+expectJobs "$(jobsOf nix eval --json --expr "$expr")" 5
 [[ $(< "$TEST_ROOT/out") == '{"a":{"x":1},"b":{"x":1},"c":[1,2,3]}' ]]
 # nix-instantiate evaluates its root, and then each attribute path, in a job
 # of its own first.
@@ -58,9 +59,9 @@ fi
 # which e3 reads; with unforce-always-revert, it reverts x, and e3 forces x
 # again.
 xexpr='let x = builtins.trace "x" (builtins.genList (i: i * 2) 3); in { e0 = builtins.length (builtins.genList (i: i) 1000); e1 = builtins.length x; e2 = builtins.seq (builtins.elemAt x 1) (builtins.length (builtins.genList (i: i) 2000)); e3 = builtins.length x; }'
-expectJobs "$(jobsOf nix eval --expr "$xexpr" 2> "$TEST_ROOT/err")" 3
+expectJobs "$(jobsOf nix eval --expr "$xexpr" 2> "$TEST_ROOT/err")" 4
 [[ $(grep -c '^trace: x$' "$TEST_ROOT/err") == 1 ]]
-expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$xexpr" 2> "$TEST_ROOT/err")" 3
+expectJobs "$(jobsOf nix eval --option unforce-always-revert true --expr "$xexpr" 2> "$TEST_ROOT/err")" 4
 [[ $(< "$TEST_ROOT/out") == '{ e0 = 1000; e1 = 3; e2 = 2000; e3 = 3; }' ]]
 if ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
     [[ $(grep -c '^trace: x$' "$TEST_ROOT/err") == 2 ]]
@@ -80,6 +81,12 @@ expectJobs "$(jobsOf nix-instantiate --eval --xml -E "${pexpr/outPath/type}")" 2
 texpr='rec { a = { type = builtins.trace a ("deriv" + "ation"); name = "n"; outputName = "out";
   drvPath = "${builtins.storeDir}/00000000000000000000000000000000-${a.type}.drv"; }; }'
 [[ $(nix-instantiate -E "$texpr" -A a 2> /dev/null) == */00000000000000000000000000000000-derivation.drv ]]
+# nix eval's job for the expression, kept whole, lets a loop's steps free
+# what each built, as nix-instantiate's root job does: its peak (GNU time's
+# maximum resident set) is no higher.
+lexpr="builtins.foldl' (a: i: builtins.seq (builtins.genList (j: j) 1000) (a + 1)) 0 (builtins.genList (i: i) 5000)"
+peak() { command time -f %M -o "$TEST_ROOT/peak" "$@" > /dev/null && cat "$TEST_ROOT/peak"; }
+(( $(peak nix eval --expr "$lexpr") < 2 * $(peak nix-instantiate --eval -E "$lexpr") ))
 
 # An effect, here a filtered copy, which nothing remembers, keeps the cell
 # whose evaluation ran it: a later element that reads the cell does not run
@@ -100,7 +107,7 @@ grepQuiet '^trace: f$' "$TEST_ROOT/err"
 nix eval --impure --option unforce-always-revert true --expr "$(copy src) { a = builtins.seq p 1; b = builtins.seq p 2; }" 2> "$TEST_ROOT/err" > /dev/null
 [[ $(grep -c '^trace: f$' "$TEST_ROOT/err") == $(grep -c '^trace: f$' "$TEST_ROOT/err1") ]]
 if [[ $system == *-linux && $system != i686-linux ]] && ! jq -e 'has("gc")' "$TEST_ROOT/stats.json" > /dev/null; then
-    [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 0 ]]
+    [[ $(jq -r '.unforce.jobsKeptWhole' "$TEST_ROOT/stats.json") == 1 ]] # nix eval's root job
 fi
 
 # An element reads what an earlier element of its job forced through a trap,
@@ -123,7 +130,7 @@ nix repl <<< ":p ${sexpr/e2 = s/e2 = throw \"boom\"}" | sed -e 's/\x1b\[[0-9;]*m
 # t's list, which it gives back, so e2 and e3 run in one job.
 gexpr='let p = { y = builtins.genList (x: x) 10; z = 1; }; t = builtins.seq (builtins.genList (x: x) 300000) (builtins.length p.y);
   in { e0 = p.z; e1 = builtins.seq p.z t; e2 = builtins.length (builtins.genList (x: x) 1000); e3 = 1; }'
-expectJobs "$(jobsOf nix eval --expr "$gexpr")" 3
+expectJobs "$(jobsOf nix eval --expr "$gexpr")" 4
 [[ $(< "$TEST_ROOT/out") == '{ e0 = 1; e1 = 10; e2 = 1000; e3 = 1; }' ]]
 
 # A job holds at most what the largest element took, and the element that
@@ -131,7 +138,7 @@ expectJobs "$(jobsOf nix eval --expr "$gexpr")" 3
 # two after the first (counting what a job of several left as in use, each
 # such job would let the next take one element more: 1, 2, 3, 4).
 cexpr='let f = i: builtins.length (builtins.genList (x: x + i) 1000); in builtins.listToAttrs (builtins.genList (i: { name = "e${toString i}"; value = f i; }) 10)'
-expectJobs "$(jobsOf nix eval --expr "$cexpr")" 6
+expectJobs "$(jobsOf nix eval --expr "$cexpr")" 7
 [[ $(< "$TEST_ROOT/out") == '{ e0 = 1000; e1 = 1000; e2 = 1000; e3 = 1000; e4 = 1000; e5 = 1000; e6 = 1000; e7 = 1000; e8 = 1000; e9 = 1000; }' ]]
 
 # flake check checks each output in a job of its own.

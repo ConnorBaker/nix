@@ -58,6 +58,23 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         return catSecondary;
     }
 
+    /* The job open while the installable is parsed and evaluated. */
+    std::optional<UnforceJobs> * root = nullptr;
+
+    void run(ref<Store> store) override
+    {
+        /* The installable (an --expr or a --file is evaluated as it is
+           parsed), --apply, --raw and --write-to are evaluated in a job of
+           their own, as nix-instantiate's root is, kept whole: its loops'
+           steps free what each step built (unforce.cc, "Steps"). The
+           printers' traversals start once it has ended. */
+        std::optional<UnforceJobs> job(std::in_place, *getSourceExprEvalState());
+        job->element();
+        unforceKeepJob();
+        root = &job;
+        InstallableCommand::run(store);
+    }
+
     void run(ref<Store> store, ref<InstallableValue> installable) override
     {
         if (raw && json)
@@ -116,11 +133,13 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         }
 
         else if (json) {
+            root->reset();
             UnforceJobs jobs(*state);
             printJSON(printValueAsJSON(*state, true, *v, pos, context, false, true));
         }
 
         else {
+            root->reset();
             UnforceJobs jobs(*state);
             ValuePrinter printer(
                 *state, *v, PrintOptions{.force = true, .derivationPaths = true, .unforceJobs = true}, &context);

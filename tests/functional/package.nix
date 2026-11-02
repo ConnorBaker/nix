@@ -10,6 +10,7 @@
   jq,
   git,
   mercurial,
+  time,
   unixtools,
   util-linux,
 
@@ -54,6 +55,7 @@ mkMesonDerivation (
       jq
       git
       mercurial
+      time
       unixtools.script
 
       # Explicitly splice the hostHost variant to fix LLVM tests. The nix-cli

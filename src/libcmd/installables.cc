@@ -444,22 +444,27 @@ static StorePath getDeriver(ref<Store> store, const Installable & i, const Store
     return *derivers.begin();
 }
 
+ref<EvalState> SourceExprCommand::getSourceExprEvalState()
+{
+    if (file && expr)
+        throw UsageError("'--file' and '--expr' are exclusive");
+
+    // FIXME: backward compatibility hack
+    if (file) {
+        if (evalSettings.pureEval && evalSettings.pureEval.overridden)
+            throw UsageError("'--file' is not compatible with '--pure-eval'");
+        evalSettings.pureEval = false;
+    }
+
+    return getEvalState();
+}
+
 Installables SourceExprCommand::parseInstallables(ref<Store> store, std::vector<std::string> ss)
 {
     Installables result;
 
     if (file || expr) {
-        if (file && expr)
-            throw UsageError("'--file' and '--expr' are exclusive");
-
-        // FIXME: backward compatibility hack
-        if (file) {
-            if (evalSettings.pureEval && evalSettings.pureEval.overridden)
-                throw UsageError("'--file' is not compatible with '--pure-eval'");
-            evalSettings.pureEval = false;
-        }
-
-        auto state = getEvalState();
+        auto state = getSourceExprEvalState();
         auto vFile = state->allocValue();
 
         if (file == "-") {

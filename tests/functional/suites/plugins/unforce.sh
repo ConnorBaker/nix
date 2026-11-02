@@ -11,9 +11,10 @@ unforcing() {
     jq -r 'if .unforce then "\(.unforce.jobs) \(.unforce.off // "on")" else "-" end' "$TEST_ROOT/stats.json"
 }
 
-# a allocates nothing, which is no rise in memory in use: b runs in a's job.
+# nix eval evaluates the expression in a job of its own, then a and b in
+# theirs.
 res=$(unforcing nix eval --expr '{ a = null; b = [ 1 ]; }')
-[[ $res == - || $res == "1 on" ]]
+[[ $res == - || $res == "3 on" ]]
 
 plugin=$(findPlugin libplugintest)
 res=$(unforcing nix --option plugin-files "$plugin" eval --expr '{ a = builtins.anotherNull; b = [ 1 ]; }')

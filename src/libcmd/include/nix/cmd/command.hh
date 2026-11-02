@@ -153,6 +153,9 @@ struct SourceExprCommand : virtual Args, MixFlakeOptions
 
     SourceExprCommand();
 
+    /** The state that --file and --expr are evaluated in, once they are checked. */
+    ref<EvalState> getSourceExprEvalState();
+
     Installables parseInstallables(ref<Store> store, std::vector<std::string> ss);
 
     ref<Installable> parseInstallable(ref<Store> store, const std::string & installable);
