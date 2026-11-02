@@ -827,6 +827,32 @@ TEST_F(UnforceTest, failureKeepsFirstTrace)
     EXPECT_TRUE(first);
 }
 
+#  if !NIX_ASAN_ENABLED
+/* A failure whose cell a job's end frees keeps nothing past the end, its
+   error included: each element here fails with a message of 1 MiB, and the
+   process grows by less than half of what the 64 messages hold. (ASan's
+   quarantine keeps what is freed.) */
+TEST_F(UnforceTest, freedFailureKeepsNothing)
+{
+    auto resident = [] {
+        long size = 0, pages = 0;
+        std::ifstream("/proc/self/statm") >> size >> pages;
+        return pages * sysconf(_SC_PAGESIZE);
+    };
+    auto v = oldThunk(
+        "let m = builtins.concatStringsSep \"\" (builtins.genList (_: \"0123456789abcdef\") 65536); in "
+        "builtins.seq m (builtins.genList (i: (builtins.tryEval (throw (m + toString i))).success) 64)");
+    state.forceValue(*v, noPos);
+    auto before = resident();
+    auto out = printed(*v, true);
+    EXPECT_LT(resident() - before, 32 << 20);
+    std::string want = "[";
+    for (int i = 0; i < 64; ++i)
+        want += " false";
+    EXPECT_EQ(out, want + " ]");
+}
+#  endif
+
 /* `foldl'`'s steps, in one force in a job. Each case's `r` is forced after
    its list `xs`, made in the job, or before it (`old`). Then, once the job
    has allocated over what the steps freed, as zeroed memory, `c` prints as

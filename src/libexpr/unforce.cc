@@ -1003,7 +1003,8 @@ static void noteRebuilt(const Value & cell)
 /* The young cells whose force failed in the open job, and whether one could
    not be recorded (then the job is kept whole). Not nominations: a job's
    end makes each failure it made forget the job's cells (`forgetYoungCell`),
-   as no walk tells which failures outlive it. */
+   as no walk tells which failures outlive it, and releases the records of
+   those whose cells it frees. */
 static std::vector<const Value *> youngFailures;
 static bool youngFailuresLost = false;
 
@@ -2244,6 +2245,7 @@ void EvalState::endUnforceJob(const char * ender)
     /* The top of what the job keeps. */
     char * keptTo = nullptr;
     std::vector<SeenEntry> forget;
+    std::vector<Value::Failed *> dead;
     if (!keep) {
         PauseRegion pause;
         try {
@@ -2261,13 +2263,24 @@ void EvalState::endUnforceJob(const char * ender)
                     std::set<const Value *> owner{targets.cells[e.target]};
                     e.owner = owner.extract(owner.begin());
                 }
-                /* Each failure the job made forgets the job's cells. */
+                /* Each failure the job made forgets the job's cells. Those
+                   of the young cells the end frees (above the cut, or in a
+                   run `releaseDead` gives back) go with them, as no copy of a
+                   failed cell's value outlives the cell (a read rethrows its
+                   error): their records, and the error with its last one. A
+                   cell may have failed more than once. */
                 for (auto & e : undoLog)
                     if (e.target->isFailed())
                         forgetYoungCell(e.target->failed());
                 for (auto x : youngFailures)
-                    if (x->isFailed())
+                    if (x->isFailed()) {
                         forgetYoungCell(x->failed());
+                        auto p = (const char *) x;
+                        if (p >= keptTo || (ownerOf(p) != noOwner && !promote[targets.ofEntry[ownerOf(p)]]))
+                            dead.push_back(&x->failed());
+                    }
+                std::ranges::sort(dead);
+                dead.erase(std::ranges::unique(dead).begin(), dead.end());
                 for (size_t i = 0; i < undoLog.size(); ++i) {
                     auto & e = undoLog[i];
                     if (youngFree(*e.target) || promote[targets.ofEntry[i]] || isRead(e))
@@ -2298,6 +2311,10 @@ void EvalState::endUnforceJob(const char * ender)
         unforceStats.cellsPromoted += promoted;
         for (auto & e : forget)
             e.set->forget(e.p, std::move(e.owner));
+        for (auto f : dead) {
+            delete f->exRef;
+            delete f;
+        }
     }
     for (auto h : holders)
         h->ended();
