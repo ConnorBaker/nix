@@ -108,7 +108,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
     {
         // Hide the progress bar during printing because it might interfere
         auto suspension = logger->suspend();
-        UnforceJobs jobs(*state, &v);
+        UnforceJobs jobs(*state);
         ::nix::printValue(
             *state,
             str,
@@ -120,6 +120,7 @@ struct NixRepl : AbstractNixRepl, detail::ReplCompleterMixin, gc
                 .maxDepth = maxDepth,
                 .prettyIndent = 2,
                 .errors = ErrorPrintBehavior::ThrowTopLevel,
+                .unforceJobs = true,
             });
     }
 };

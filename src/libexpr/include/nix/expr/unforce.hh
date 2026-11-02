@@ -267,7 +267,7 @@ public:
  */
 enum class UnforceLoop : unsigned char { other, nests, json, drvs };
 
-[[gnu::noinline]] void unforceJobsBegin(EvalState & state, const Value * root);
+[[gnu::noinline]] void unforceJobsBegin(EvalState & state);
 [[gnu::noinline]] void unforceJobsEnd();
 [[gnu::noinline]] void unforceElementStart(UnforceLoop loop = UnforceLoop::other);
 [[gnu::noinline]] void unforceNestedElementStart(EvalState & state, const Value * v, UnforceLoop loop);
@@ -280,18 +280,19 @@ enum class UnforceLoop : unsigned char { other, nests, json, drvs };
  * in it too) or when this ends, unless the traversal itself runs in a job.
  * The traversal is a loop
  * in the caller's frame that calls `element` before each element, or a
- * recursive walk of `root` whose levels call `unforceElement`: only the
- * outermost level's elements are jobs. Nothing a job allocated may outlive
- * its element but through the cells it forced or a holder
- * (`UnforceHolder`). This holds nothing, and covers one call of the
+ * recursive walk whose levels call `unforceLevelElement`: only the elements
+ * of the level that the caller's own call of it says is the outermost (no
+ * walk that an evaluation reaches says so) are jobs. Nothing a job
+ * allocated may outlive its element but through the cells it forced or a
+ * holder (`UnforceHolder`). This holds nothing, and covers one call of the
  * traversal: a level is told by its frame.
  */
 class UnforceJobs
 {
 public:
-    [[gnu::always_inline]] explicit UnforceJobs(EvalState & state, const Value * root = nullptr)
+    [[gnu::always_inline]] explicit UnforceJobs(EvalState & state)
     {
-        unforceJobsBegin(state, root);
+        unforceJobsBegin(state);
     }
 
     [[gnu::always_inline]] ~UnforceJobs()
@@ -313,22 +314,16 @@ public:
     }
 };
 
-/** An element of `v` starts, in a level of a traversal (`UnforceJobs`). */
-[[gnu::always_inline]] inline void unforceElement(EvalState & state, const Value & v)
-{
-    if (state.unforceRoot == &v) [[unlikely]]
-        unforceElementStart();
-}
-
 /**
- * `unforceElement` for a `loop` whose levels may nest (unforce.cc, "Nested
- * levels"): a level iterates `v`'s attributes or list (or a copy's), reads
- * nothing else across its elements but copies, and never `v` after its
- * first element, which a switch may have reverted.
+ * An element of `v` starts, in a level of a traversal (`UnforceJobs`): the
+ * outermost (`top`), or one of a `loop` whose levels may nest (unforce.cc,
+ * "Nested levels"). A level iterates `v`'s attributes or list (or a
+ * copy's), reads nothing else across its elements but copies, and never `v`
+ * after its first element, which a switch may have reverted.
  */
-[[gnu::always_inline]] inline void unforceLevelElement(EvalState & state, const Value & v, UnforceLoop loop)
+[[gnu::always_inline]] inline void unforceLevelElement(EvalState & state, const Value & v, UnforceLoop loop, bool top)
 {
-    if (state.unforceRoot == &v) [[unlikely]]
+    if (top) [[unlikely]]
         unforceElementStart(loop);
     else if (loop != UnforceLoop::other && evalRegion.cur) [[unlikely]]
         unforceNestedElementStart(state, &v, loop);

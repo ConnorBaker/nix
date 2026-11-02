@@ -15,6 +15,8 @@ static XMLAttrs singletonAttrs(const std::string & name, std::string_view value)
     return attrs;
 }
 
+/* `top`: `v` is the root of the caller's traversal (`printValueAsXML`). */
+template<bool top = false>
 static void printValueAsXML(
     EvalState & state,
     bool strict,
@@ -124,7 +126,7 @@ static void showAttrs(
     if (v.type() == nAttrs) {
         XMLOpenElement _(doc, "attrs");
         for (auto & a : v.attrs()->lexicographicOrder(state.symbols)) {
-            unforceElement(state, v);
+            unforceElementStart();
             openAttrElement(state, location, *a, doc);
             CloseAttrElement _{doc};
             printValueAsXML(state, strict, location, *a->value, doc, context, drvsSeen, a->pos);
@@ -132,7 +134,7 @@ static void showAttrs(
     } else {
         XMLOpenElement _(doc, "list");
         for (auto v2 : v.listView()) {
-            unforceElement(state, v);
+            unforceElementStart();
             printValueAsXML(state, strict, location, *v2, doc, context, drvsSeen, pos);
         }
     }
@@ -220,6 +222,7 @@ static void showAttrs(
     }
 }
 
+template<bool top>
 static void printValueAsXML(
     EvalState & state,
     bool strict,
@@ -242,7 +245,7 @@ static void printValueAsXML(
     case nAttrs:
         if (state.isDerivation(v))
             printDerivationAsXML(state, strict, location, v, doc, context, drvsSeen);
-        else if (state.unforceRoot == &v) [[unlikely]]
+        else if (top)
             printElementsAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
         else {
             XMLOpenElement _(doc, "attrs");
@@ -251,7 +254,7 @@ static void printValueAsXML(
         break;
 
     case nList: {
-        if (state.unforceRoot == &v) [[unlikely]] {
+        if (top) {
             printElementsAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
             break;
         }
@@ -295,12 +298,16 @@ void printValueAsXML(
     Value & v,
     std::ostream & out,
     NixStringContext & context,
-    const PosIdx pos)
+    const PosIdx pos,
+    bool traversal)
 {
     XMLWriter doc(true, out);
     XMLOpenElement root(doc, "expr");
     StringSet drvsSeen;
-    printValueAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
+    if (traversal)
+        printValueAsXML<true>(state, strict, location, v, doc, context, drvsSeen, pos);
+    else
+        printValueAsXML(state, strict, location, v, doc, context, drvsSeen, pos);
 }
 
 } // namespace nix

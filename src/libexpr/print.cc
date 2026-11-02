@@ -379,7 +379,8 @@ private:
 
                 printAttributeName(output, i.first);
                 output << " = ";
-                unforceElement(state, v);
+                if (options.unforceJobs && !depth)
+                    unforceElementStart();
                 print(*i.second, depth + 1);
                 output << ";";
                 totalAttrsPrinted++;
@@ -446,7 +447,8 @@ private:
                 }
 
                 if (elem) {
-                    unforceElement(state, v);
+                    if (options.unforceJobs && !depth)
+                        unforceElementStart();
                     print(*elem, depth + 1);
                 } else {
                     printNullptr();

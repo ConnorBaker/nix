@@ -2908,7 +2908,7 @@ void EvalState::forceValueDeep(Value & v, bool traversal)
     /* Its last job ends here, while `seen` holds what it walked. */
     std::optional<UnforceJobs> jobs;
     if (traversal)
-        jobs.emplace(*this, &v);
+        jobs.emplace(*this);
 
     /* `top`: whether `v` is the top level, whose elements are jobs if
        `jobs` is open. A type: the levels below have no room for it, nor

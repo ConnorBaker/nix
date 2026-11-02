@@ -1913,7 +1913,6 @@ struct Traversal
 {
     EvalState & state;
     bool unforce;
-    const Value * savedRoot;
     const char * opener = nullptr;
 };
 
@@ -2030,11 +2029,10 @@ void UnforceNest::start(EvalState & state, const char * frame, const Value * con
             return;
         levels.push_back({frame, container, state.callDepth});
     }
-    /* Only the levels' loops run (no force is open): the level rule above
-       implies it, but does not need it, as an evaluation reaching a missed
-       level may well have no force open. */
-    assert(jobOwner.load() == &state && opens.empty() && stepFrames.empty() && !evalRegion.paused);
-    if (keepWhole || (evalRegion.cur == evalRegion.base && state.undoLog.empty()))
+    /* Only the levels' loops run (no force, step or frame is open), by the
+       level rule above: a level it mistook would switch nothing. */
+    if (jobOwner.load() != &state || !opens.empty() || !stepFrames.empty() || unforceFrame.s || evalRegion.paused
+        || keepWhole || (evalRegion.cur == evalRegion.base && state.undoLog.empty()))
         return;
     /* A slot logged in a frame between the job's opener and the outermost
        level's, of a level still running or of a frame that returned and
@@ -2104,18 +2102,15 @@ void unforceNestedElementStart(EvalState & state, const Value * v, UnforceLoop l
     nest.start(state, (const char *) __builtin_dwarf_cfa(), v, loop);
 }
 
-void unforceJobsBegin(EvalState & state, const Value * root)
+void unforceJobsBegin(EvalState & state)
 {
-    auto unforce = unforceEnabled(state);
-    traversals.push_back({state, unforce, state.unforceRoot});
-    state.unforceRoot = unforce ? root : nullptr;
+    traversals.push_back({state, unforceEnabled(state)});
 }
 
 void unforceJobsEnd()
 {
     auto t = traversals.back();
     traversals.pop_back();
-    t.state.unforceRoot = t.savedRoot;
     if (t.opener) {
         nest.levels.clear();
         t.state.endUnforceScope(__builtin_dwarf_cfa());

@@ -98,6 +98,13 @@ struct PrintOptions
     ErrorPrintBehavior errors = ErrorPrintBehavior::Print;
 
     /**
+     * The value printed is the root of the traversal (`UnforceJobs`) that
+     * the caller opened for this printer: each of its attributes or elements
+     * is printed in a job.
+     */
+    bool unforceJobs = false;
+
+    /**
      * True if pretty-printing is enabled.
      */
     inline bool shouldPrettyPrint()

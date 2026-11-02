@@ -1125,9 +1125,6 @@ public:
     /** Why native code may run in this evaluator, or null (`unforceNativeCode`). */
     std::atomic<const char *> unforceNativeCodeReason = nullptr;
 
-    /** The root of the traversal whose elements run in unforce jobs (`UnforceJobs`), or null. */
-    const Value * unforceRoot = nullptr;
-
     /** Whether a front end clears the file caches while the values it forced stay (the REPL; `UnforceImpure`). */
     bool fileCachesReset = false;
     /** The store paths that a temporary root holds, and whether each was found valid (`unforceReadChange`). */

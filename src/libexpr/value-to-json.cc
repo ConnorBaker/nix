@@ -35,9 +35,10 @@ using json = nlohmann::json;
     state.error<TypeError>("cannot convert %1% to JSON", showType(v)).atPos(v.determinePos(pos)).debugThrow();
 }
 
-// TODO: rename. It doesn't print.
-json printValueAsJSON(
-    EvalState & state, bool strict, Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
+/* `top`: `v` is the root of the caller's traversal (`printValueAsJSON`). */
+template<bool top>
+static json
+valueToJSON(EvalState & state, bool strict, Value & v, const PosIdx pos, NixStringContext & context, bool copyToStore)
 {
     checkInterrupt();
 
@@ -79,18 +80,19 @@ json printValueAsJSON(
                     // In some coercions, Nix would coerce paths to a raw string
                     // if they came from a __toString result.
                     auto copyToStore2 = copyToStore && !cameThroughToString;
-                    return printValueAsJSON(state, strict, *peeled, pos, context, copyToStore2);
+                    return valueToJSON<false>(state, strict, *peeled, pos, context, copyToStore2);
                 }
                 // Peelable attrs handled. Returned attrs are not peelable.
                 // Quirk: builtins.toJSON { outPath.foo = true; } == "{\"foo\":true}"
                 // All that remains is to return a JSON object.
                 json obj = json::object();
                 for (auto & a : peeled->attrs()->lexicographicOrder(state.symbols)) {
-                    unforceLevelElement(state, *peeled, strict ? UnforceLoop::json : UnforceLoop::other);
+                    unforceLevelElement(
+                        state, *peeled, strict ? UnforceLoop::json : UnforceLoop::other, top && peeled == &v);
                     try {
                         obj.emplace(
                             state.symbols[a->name],
-                            printValueAsJSON(state, strict, *a->value, a->pos, context, copyToStore));
+                            valueToJSON<false>(state, strict, *a->value, a->pos, context, copyToStore));
                     } catch (Error & e) {
                         addAttrTraceJSON(state, e, *a);
                         throw;
@@ -105,9 +107,9 @@ json printValueAsJSON(
         out = json::array();
         int i = 0;
         for (auto elem : v.listView()) {
-            unforceLevelElement(state, v, strict ? UnforceLoop::json : UnforceLoop::other);
+            unforceLevelElement(state, v, strict ? UnforceLoop::json : UnforceLoop::other, top);
             try {
-                out.push_back(printValueAsJSON(state, strict, *elem, pos, context, copyToStore));
+                out.push_back(valueToJSON<false>(state, strict, *elem, pos, context, copyToStore));
             } catch (Error & e) {
                 addListElemTraceJSON(state, e, pos, i);
                 throw;
@@ -133,6 +135,20 @@ json printValueAsJSON(
     return out;
 }
 
+// TODO: rename. It doesn't print.
+json printValueAsJSON(
+    EvalState & state,
+    bool strict,
+    Value & v,
+    const PosIdx pos,
+    NixStringContext & context,
+    bool copyToStore,
+    bool traversal)
+{
+    return traversal ? valueToJSON<true>(state, strict, v, pos, context, copyToStore)
+                     : valueToJSON<false>(state, strict, v, pos, context, copyToStore);
+}
+
 void JSONSerializationError::anchor() {}
 
 void printValueAsJSON(
@@ -142,10 +158,11 @@ void printValueAsJSON(
     const PosIdx pos,
     std::ostream & str,
     NixStringContext & context,
-    bool copyToStore)
+    bool copyToStore,
+    bool traversal)
 {
     try {
-        str << printValueAsJSON(state, strict, v, pos, context, copyToStore);
+        str << printValueAsJSON(state, strict, v, pos, context, copyToStore, traversal);
     } catch (nlohmann::json::exception & e) {
         throw JSONSerializationError("JSON serialization error: %s", e.what());
     }

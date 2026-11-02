@@ -75,15 +75,16 @@ void processExpr(
                are, which an earlier element's job end may have reverted. */
             std::optional<UnforceJobs> jobs;
             if (strict && (output == okXML || output == okJSON))
-                jobs.emplace(state, &vRes);
+                jobs.emplace(state);
             if (output == okRaw)
                 std::cout << *state.coerceToString(noPos, vRes, context, "while generating the nix-instantiate output");
             // We intentionally don't output a newline here. The default PS1 for Bash in NixOS starts with a newline
             // and other interactive shells like Zsh are smart enough to print a missing newline before the prompt.
             else if (output == okXML)
-                printValueAsXML(state, strict, location, vRes, std::cout, context, noPos);
+                printValueAsXML(state, strict, location, vRes, std::cout, context, noPos, jobs.has_value());
             else if (output == okJSON) {
-                printValueAsJSON(state, strict, vRes, v.determinePos(noPos), std::cout, context);
+                printValueAsJSON(
+                    state, strict, vRes, v.determinePos(noPos), std::cout, context, true, jobs.has_value());
                 std::cout << std::endl;
             } else {
                 if (strict)

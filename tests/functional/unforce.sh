@@ -74,6 +74,12 @@ expectJobs "$(jobsOf nix-instantiate --eval --json -E "$pexpr")" 2
 [[ $(< "$TEST_ROOT/out") == '{"a":"xy","b":"xy"}' ]]
 expectJobs "$(jobsOf nix-instantiate --eval --xml -E "${pexpr/outPath/type}")" 2
 [[ $(grep -c '<string value="xy" />' "$TEST_ROOT/out") == 2 ]]
+# Only a traversal's own level starts its elements, not a trace that prints
+# its root while getDerivations forces the root's type (a job opened there
+# would end with the traversal, and free the type that drvPath reads).
+texpr='rec { a = { type = builtins.trace a ("deriv" + "ation"); name = "n"; outputName = "out";
+  drvPath = "${builtins.storeDir}/00000000000000000000000000000000-${a.type}.drv"; }; }'
+[[ $(nix-instantiate -E "$texpr" -A a 2> /dev/null) == */00000000000000000000000000000000-derivation.drv ]]
 
 # An effect, here a filtered copy, which nothing remembers, keeps the cell
 # whose evaluation ran it: a later element that reads the cell does not run

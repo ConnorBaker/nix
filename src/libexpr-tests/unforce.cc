@@ -100,8 +100,8 @@ protected:
         std::ostringstream out;
         std::optional<UnforceJobs> traversal;
         if (jobs)
-            traversal.emplace(state, &v);
-        printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true});
+            traversal.emplace(state);
+        printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true, .unforceJobs = jobs});
         return out.str();
     }
 };
@@ -581,8 +581,8 @@ TEST_F(UnforceTest, unmappableRegionNotSwallowed)
     unforceTestFailMapping = true;
     Finally restore([] { unforceTestFailMapping = false; });
     std::ostringstream out;
-    UnforceJobs jobs(state, v);
-    EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true}), std::bad_alloc);
+    UnforceJobs jobs(state);
+    EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true, .unforceJobs = true}), std::bad_alloc);
 }
 
 /* A job's memory 64 GiB and more above its start: v's set, which a seen set
@@ -1199,8 +1199,8 @@ TEST_F(UnforceTest, nestedLevelJobs)
         NixStringContext context;
         std::optional<UnforceJobs> traversal;
         if (jobs)
-            traversal.emplace(state, &v);
-        return printValueAsJSON(state, true, v, noPos, context, false).dump();
+            traversal.emplace(state);
+        return printValueAsJSON(state, true, v, noPos, context, false, jobs).dump();
     };
     auto jobs = unforceStats.jobs;
     auto whole = unforceStats.jobsKeptWhole;
@@ -1222,9 +1222,10 @@ TEST_F(UnforceTest, nestedJsonNonStrict)
         "builtins.seq a (builtins.seq top { inherit top; })");
     state.forceValue(*v, noPos);
     NixStringContext context;
-    UnforceJobs traversal(state, v);
+    UnforceJobs traversal(state);
     EXPECT_EQ(
-        printValueAsJSON(state, false, *v, noPos, context, false).dump(), "{\"top\":{\"a\":\"xy\",\"b\":\"xy\"}}");
+        printValueAsJSON(state, false, *v, noPos, context, false, true).dump(),
+        "{\"top\":{\"a\":\"xy\",\"b\":\"xy\"}}");
 }
 
 /* `getDerivations` finds the derivations of the sets it recurses into in
@@ -1336,23 +1337,23 @@ static const std::vector<std::pair<std::string, std::function<std::string(EvalSt
      [](EvalState & state, Value & v) {
          NixStringContext context;
          std::ostringstream out;
-         UnforceJobs jobs(state, &v);
-         printValueAsXML(state, true, false, v, out, context, noPos);
+         UnforceJobs jobs(state);
+         printValueAsXML(state, true, false, v, out, context, noPos, true);
          return out.str();
      }},
     {"nix eval --json",
      [](EvalState & state, Value & v) {
          NixStringContext context;
          std::ostringstream out;
-         UnforceJobs jobs(state, &v);
-         printValueAsJSON(state, true, v, noPos, out, context, false);
+         UnforceJobs jobs(state);
+         printValueAsJSON(state, true, v, noPos, out, context, false, true);
          return out.str();
      }},
     {"nix eval",
      [](EvalState & state, Value & v) {
          std::ostringstream out;
-         UnforceJobs jobs(state, &v);
-         printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true});
+         UnforceJobs jobs(state);
+         printValue(state, out, v, PrintOptions{.force = true, .derivationPaths = true, .unforceJobs = true});
          return out.str();
      }},
     {"nix-instantiate",

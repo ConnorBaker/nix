@@ -116,13 +116,14 @@ struct CmdEval : MixJSON, InstallableValueCommand, MixReadOnlyOption
         }
 
         else if (json) {
-            UnforceJobs jobs(*state, v);
-            printJSON(printValueAsJSON(*state, true, *v, pos, context, false));
+            UnforceJobs jobs(*state);
+            printJSON(printValueAsJSON(*state, true, *v, pos, context, false, true));
         }
 
         else {
-            UnforceJobs jobs(*state, v);
-            ValuePrinter printer(*state, *v, PrintOptions{.force = true, .derivationPaths = true}, &context);
+            UnforceJobs jobs(*state);
+            ValuePrinter printer(
+                *state, *v, PrintOptions{.force = true, .derivationPaths = true, .unforceJobs = true}, &context);
             logger->cout("%s", printer);
         }
 

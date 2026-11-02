@@ -461,6 +461,8 @@ static bool isAttrPathComponent(std::string_view symbol)
     return true;
 }
 
+/* `top`: `vIn` is the root of the caller's traversal (`UnforceJobs`). */
+template<bool top = false>
 static void getDerivations(
     EvalState & state,
     Value & vIn,
@@ -482,10 +484,11 @@ static void getDerivations(
     Done & done,
     bool ignoreAssertionFailures)
 {
-    UnforceJobs jobs(state, &channel);
-    getDerivations(state, channel, pathPrefix, autoArgs, drvs, done, ignoreAssertionFailures);
+    UnforceJobs jobs(state);
+    getDerivations<true>(state, channel, pathPrefix, autoArgs, drvs, done, ignoreAssertionFailures);
 }
 
+template<bool top>
 static void getDerivations(
     EvalState & state,
     Value & vIn,
@@ -522,7 +525,7 @@ static void getDerivations(
                 if (!isAttrPathComponent(symbol))
                     continue;
                 if (!combineChannels)
-                    unforceLevelElement(state, vIn, UnforceLoop::drvs);
+                    unforceLevelElement(state, vIn, UnforceLoop::drvs, top);
                 std::string pathPrefix2 = addToPath(pathPrefix, symbol);
                 if (combineChannels)
                     getChannelDerivations(state, *i->value, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -549,7 +552,7 @@ static void getDerivations(
     else if (v.type() == nList) {
         auto listView = v.listView();
         for (auto [n, elem] : enumerate(listView)) {
-            unforceLevelElement(state, vIn, UnforceLoop::drvs);
+            unforceLevelElement(state, vIn, UnforceLoop::drvs, top);
             std::string pathPrefix2 = addToPath(pathPrefix, fmt("%d", n));
             if (getDerivation(state, *elem, pathPrefix2, drvs, done, ignoreAssertionFailures))
                 getDerivations(state, *elem, pathPrefix2, autoArgs, drvs, done, ignoreAssertionFailures);
@@ -574,8 +577,8 @@ void getDerivations(
     done->use = std::move(use);
     /* Each attribute (or element) of `v` is found in a job of its own, the
        last one ending while `done` holds what it found. */
-    UnforceJobs jobs(state, &v);
-    getDerivations(state, v, pathPrefix, autoArgs, drvs, *done, ignoreAssertionFailures);
+    UnforceJobs jobs(state);
+    getDerivations<true>(state, v, pathPrefix, autoArgs, drvs, *done, ignoreAssertionFailures);
 }
 
 } // namespace nix
