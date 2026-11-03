@@ -958,7 +958,10 @@ bool UnforceSeen::see(const void * p, Kind kind)
     if (!insert(p).second)
         return false;
     if (evalRegion.contains(p)) {
-        young.emplace_back(p, kind);
+        /* Only the end of a job not kept whole reads `young` (`held`), and a
+           job kept whole stays so until its end. */
+        if (!keepWhole)
+            young.emplace_back(p, kind);
         youngTop = std::max(youngTop, (const void *) p, std::less<>());
     }
     return true;
