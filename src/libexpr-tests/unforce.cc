@@ -771,9 +771,11 @@ TEST_F(UnforceTest, seenKeepsRecovered)
     EXPECT_FALSE(seen.see(v->attrs(), UnforceHolder::Kind::bindings));
 }
 
-/* Every failure a job made forgets the job's cells: here an infinite
-   recursion found in a young cell, by a young cell that survives the job
-   with its owner, and by an old cell, which keeps its failure. */
+/* An infinite recursion's error forgets the cell it names once it has
+   marked where the recursion is entered, so that no later job's cell at
+   that address matches it: here one found in a young cell, by a young cell
+   that survives the job with its owner, and by an old cell, which keeps its
+   failure. */
 TEST_F(UnforceTest, keptFailureForgetsYoungCell)
 {
     auto forgets = [](const Value & c) {

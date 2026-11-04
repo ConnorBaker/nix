@@ -635,24 +635,6 @@ static bool youngFree(const Value & v)
     return !young;
 }
 
-/* A failure that outlives its job may name one of the job's cells: an
-   `InfiniteRecursionError` names the cell whose force found it blackholed,
-   which `handleEvalExceptionForThunk` compares with the cells whose forces
-   it unwinds, to mark where the recursion is entered. Freed and reused, the
-   address could match a later job's cell. Without unforcing it matches no
-   cell after the error's first propagation, which has ended with the job,
-   so it is forgotten. */
-static void forgetYoungCell(const Value::Failed & f)
-{
-    try {
-        std::rethrow_exception(f.exRef->ex);
-    } catch (InfiniteRecursionError & e) {
-        if (evalRegion.contains(e.v))
-            e.v = nullptr;
-    } catch (...) {
-    }
-}
-
 /* ---------------------------------------------------------------------------
    The owner timeline.
 
@@ -1008,9 +990,7 @@ static void noteRebuilt(const Value & cell)
 
 /* The young cells whose force failed in the open job, and whether one could
    not be recorded (then the job is kept whole). Not nominations: a job's
-   end makes each failure it made forget the job's cells (`forgetYoungCell`),
-   as no walk tells which failures outlive it, and releases the records of
-   those whose cells it frees. */
+   end releases the records of those whose cells it frees. */
 static std::vector<const Value *> youngFailures;
 static bool youngFailuresLost = false;
 
@@ -2268,18 +2248,13 @@ void EvalState::endUnforceJob(const char * ender)
                     std::set<const Value *> owner{targets.cells[e.target]};
                     e.owner = owner.extract(owner.begin());
                 }
-                /* Each failure the job made forgets the job's cells. Those
-                   of the young cells the end frees (above the cut, or in a
-                   run `releaseDead` gives back) go with them, as no copy of a
-                   failed cell's value outlives the cell (a read rethrows its
-                   error): their records, and the error with its last one. A
-                   cell may have failed more than once. */
-                for (auto & e : undoLog)
-                    if (e.target->isFailed())
-                        forgetYoungCell(e.target->failed());
+                /* The failures of the young cells the end frees (above the
+                   cut, or in a run `releaseDead` gives back) go with them, as
+                   no copy of a failed cell's value outlives the cell (a read
+                   rethrows its error): their records, and the error with its
+                   last one. A cell may have failed more than once. */
                 for (auto x : youngFailures)
                     if (x->isFailed()) {
-                        forgetYoungCell(x->failed());
                         auto p = (const char *) x;
                         if (p >= keptTo || (ownerOf(p) != noOwner && !promote[targets.ofEntry[ownerOf(p)]]))
                             dead.push_back(&x->failed());

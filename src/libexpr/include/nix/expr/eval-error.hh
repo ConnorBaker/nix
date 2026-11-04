@@ -90,7 +90,7 @@ public:
     /**
      * Memory location of the Value that was found to be a blackhole, used to
      * mark where the recursion starts in the printed trace. Only pointer
-     * identity is of interest. Unforcing clears it when the cell is freed.
+     * identity is of interest. Cleared once it has marked it.
      */
     const Value * v;
 

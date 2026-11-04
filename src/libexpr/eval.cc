@@ -2772,9 +2772,14 @@ void EvalState::handleEvalExceptionForThunk(Env * env, Expr * expr, Value & v, c
         // 1. re-forcing of the thunk at stack tip (`env` is null)
         // 2. initial forcing of the thunk, which is where the cycle starts
         // Only the first force has an `env`, so we expect this entry to be added once.
-        if (env && ir.v == &v)
+        if (env && ir.v == &v) {
             ir.addTrace(
                 nullptr, HintFmt(ANSI_WARNING "entering the infinite recursion" ANSI_NORMAL), TracePrint::Always);
+            /* No other force of `v` is running (it was blackholed), and a read
+               of a failed cell rethrows without coming here: nothing matches
+               it again. Forgotten, as a job's end may free and reuse it. */
+            ir.v = nullptr;
+        }
     } catch (const StackOverflowError & e) {
         /* In a job, a later read retries it at its own depth (unforce.cc, Re-forcing). */
         if (!NIX_USE_BOEHMGC && isolationDepth)
