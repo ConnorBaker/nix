@@ -198,6 +198,9 @@ static void openRegion()
 void * EvalRegion::more(size_t n)
 {
 #if defined(__linux__)
+    /* `bump` relies on it: the mapping, its page bounds, and cursors, which
+       move by multiples of 16. */
+    assert(!((uintptr_t) cur & 15) && !((uintptr_t) end & 15) && !((uintptr_t) roomEnd & 15));
     if (size_t(roomEnd - cur) >= n) {
         auto to = pageUp(cur + n);
         if (end < dirtyTop) {

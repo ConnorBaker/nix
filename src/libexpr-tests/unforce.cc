@@ -585,6 +585,16 @@ TEST_F(UnforceTest, unmappableRegionNotSwallowed)
     EXPECT_THROW(printValue(state, out, *v, PrintOptions{.force = true, .unforceJobs = true}), std::bad_alloc);
 }
 
+/* A job runs out of memory for a size so large that rounding it up would
+   wrap around (`builtins.genList` of 2^61 - 1 elements asks for one), as
+   evaluation outside a job does, instead of handing out nothing. */
+TEST_F(UnforceTest, hugeAllocationFails)
+{
+    state.beginUnforceScope();
+    EXPECT_THROW(state.mem.allocBytes(SIZE_MAX - 7), std::bad_alloc);
+    state.endUnforceScope();
+}
+
 /* A job's memory 64 GiB and more above its start: v's set, which a seen set
    holds, lies there, below the start of the segment that u's force opened
    once a 32-bit offset wraps. The set names v, its value, which the seen set

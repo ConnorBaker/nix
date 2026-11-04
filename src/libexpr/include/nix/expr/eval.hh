@@ -373,9 +373,12 @@ struct EvalRegion
     /** 16-byte aligned, as `malloc`'s allocations are; zeroed. */
     [[gnu::always_inline]] void * bump(size_t n)
     {
-        n = (n + 15) & ~size_t(15);
+        /* Checked before it is rounded up, which wraps around to 0 for a size
+           within 15 bytes of `SIZE_MAX`: the cursor and `end` are 16-byte
+           aligned, so a size fits exactly when its rounded size does. */
         if (size_t(end - cur) < n) [[unlikely]]
             return more(n);
+        n = (n + 15) & ~size_t(15);
         auto p = cur;
         cur += n;
 #if NIX_ASAN_ENABLED
