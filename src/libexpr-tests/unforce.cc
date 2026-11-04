@@ -987,19 +987,27 @@ TEST_F(UnforceTest, stepsBatch)
     state.endUnforceScope();
 }
 
-/* A step in which a failure was caught is kept: the job's end reads the
-   failure's cell. */
-TEST_F(UnforceTest, failedStepKept)
+/* A step in which a failure was caught is freed, and the failed cell's
+   record with it: the job's end has nothing of it left to read (under
+   AddressSanitizer, a record read or deleted again would fail). So are an
+   inner loop's steps, in an outer step that catches failures too. */
+TEST_F(UnforceTest, failedStepFreed)
 {
-    auto v =
-        oldThunk("builtins.foldl' (acc: x: acc + (if (builtins.tryEval (throw \"x\")).success then 1 else 0)) 0 [ 1 ]");
-    state.beginUnforceScope();
-    auto ends = unforceStats.stepEnds;
-    state.forceValue(*v, noPos);
-    EXPECT_EQ(unforceStats.stepEnds, ends);
-    state.endUnforceScope();
-    state.forceValue(*v, noPos);
-    EXPECT_THAT(*v, IsIntEq(0));
+    auto f = "(if (builtins.tryEval (throw \"x\")).success then 1 else 2)";
+    const std::pair<std::string, int> cases[] = {
+        {fmt("builtins.foldl' (acc: x: acc + %s) 0 [ 1 ]", f), 2},
+        {fmt("builtins.foldl' (acc: x: acc + %1% + builtins.foldl' (a: y: a + %1%) 0 [ 1 2 ]) 0 [ 1 ]", f), 6},
+    };
+    for (auto & [loop, want] : cases) {
+        auto v = oldThunk(loop);
+        state.beginUnforceScope();
+        auto ends = unforceStats.stepEnds;
+        state.forceValue(*v, noPos);
+        EXPECT_GT(unforceStats.stepEnds, ends) << loop;
+        state.endUnforceScope();
+        state.forceValue(*v, noPos);
+        EXPECT_THAT(*v, IsIntEq(want)) << loop;
+    }
 }
 
 /* A step frees what an old cell's force allocated in it (x's value is k's

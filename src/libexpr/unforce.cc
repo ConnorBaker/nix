@@ -1314,17 +1314,20 @@ static size_t releaseDead(const Targets & targets, const std::vector<bool> & pro
    - a cell logged during the batch (an old cell): its value or pre-image;
    - a young cell below `start`, or a slot of a frame outside the steps (the
      loop's and its callers'), forced during the batch (`stepWrites`);
-   - a holder (`youngTop`), a young failure recorded during the batch, or what
-     native code holds.
+   - a holder (`youngTop`), or what native code holds.
 
    The records accumulate over the batch: writes are dropped only at its end,
    and a log entry only by its force's end with a young-free value
    (`endOwnerForce`), whose cell then points to nothing young. The batch's end
    looks at the own pointers of each (`valueEdges`), not further: what they
    point to outside its memory was allocated before it, and points into it
-   only if the batch wrote it, which is a record above. A failed value is
-   taken to point into it. If none does, the cursor goes back to `start`, the
-   memory is zeroed, and the owner timeline is cut back to `start`.
+   only if the batch wrote it, which is a record above. A failed value points
+   into it only through its recovery value: its record and error lie outside
+   the region, and an infinite recursion's error names no cell once it has
+   left the cell's force. If none does, the failures of the batch's cells go
+   with them (no copy of a failed cell's value outlives the cell), the cursor
+   goes back to `start`, the memory is zeroed, and the owner timeline is cut
+   back to `start`.
 
    This rests on each step writing its own value's cell once, at its end, by
    copy: no evaluation keeps the address of the cell its result goes to
@@ -1430,8 +1433,6 @@ Value * UnforceSteps::stepSlow(Value * v)
        every check has run in full. */
     bool spare = f.prevOwn;
     auto escapes = [&](const Value & x) {
-        if (x.isFailed())
-            return true;
         bool into = false;
         valueEdges(x, [&](const void * p) {
             into = into || ((const char *) p >= f.start && (const char *) p < top);
@@ -1440,7 +1441,7 @@ Value * UnforceSteps::stepSlow(Value * v)
         return into;
     };
     bool kept = f.job != unforceStats.jobs || jobOwner.load() != &state || evalRegion.paused || youngFailuresLost
-                || youngFailures.size() != f.failures || opens.size() != f.opens || curOwner != f.owner || stepsUnsafe
+                || opens.size() != f.opens || curOwner != f.owner || stepsUnsafe
                 || unforceNativeCode(state)
                 || std::ranges::any_of(*jobHolders, [&](auto h) { return !std::less<>()(h->youngTop, f.start); })
                 || escapes(*v)
@@ -1457,6 +1458,23 @@ Value * UnforceSteps::stepSlow(Value * v)
         /* Frames' ends may have poisoned some of it (`giveBack`). */
         ASAN_UNPOISON_MEMORY_REGION(f.start, top - f.start);
 #endif
+        youngFailures.erase(
+            std::remove_if(
+                youngFailures.begin() + f.failures,
+                youngFailures.end(),
+                [&](auto x) {
+                    if ((const char *) x < f.start || (const char *) x >= top)
+                        return false;
+                    if (x->isFailed()) {
+                        auto & r = x->failed();
+                        delete r.exRef;
+                        delete &r;
+                        /* Not again for another entry of the cell's. */
+                        const_cast<Value *>(x)->mkNull();
+                    }
+                    return true;
+                }),
+            youngFailures.end());
         memset(f.start, 0, top - f.start);
 #if NIX_ASAN_ENABLED
         ASAN_POISON_MEMORY_REGION(f.start, top - f.start);
