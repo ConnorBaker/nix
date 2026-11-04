@@ -2213,6 +2213,10 @@ void EvalState::endUnforceScope(const void * ender)
 
 void EvalState::endUnforceJob(const char * ender)
 {
+    /* A job ends between a traversal's elements, or as an exception leaves
+       the traversal: no force, loop step or boolean frame of it is open,
+       whose end would write what this end reverts or frees. */
+    assert(opens.empty() && stepFrames.empty() && !unforceFrame.s);
     /* Trapped values first: the end decides from values (see "Elements"). */
     for (auto & [cell, v] : traps)
         *const_cast<Value *>(cell) = v;
