@@ -61,6 +61,7 @@ suites = [
       'build-cores.sh',
       'build-delete.sh',
       'build-dry.sh',
+      'build-remote-ca-rebuild-after-delete.sh',
       'build-remote-content-addressed-cache-loss.sh',
       'build-remote-content-addressed-cache-loss-fresh.sh',
       'build-remote-content-addressed-fixed.sh',
