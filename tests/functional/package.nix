@@ -8,6 +8,7 @@
   pkg-config,
 
   jq,
+  sqlite,
   git,
   mercurial,
   unixtools,
@@ -52,6 +53,8 @@ mkMesonDerivation (
       pkg-config
 
       jq
+      # For tests that read or lock the store database
+      sqlite
       git
       mercurial
       unixtools.script

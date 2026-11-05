@@ -79,14 +79,16 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     }
 }
 
-void LocalOverlayStore::registerDrvOutputUnchecked(const Realisation & info)
+bool LocalOverlayStore::isValidPathOutsideDB(const StorePath & path)
 {
-    // First do queryRealisation on lower layer to populate DB
-    auto res = lowerStore->queryRealisation(info.id);
-    if (res)
-        LocalStore::registerDrvOutputUnchecked({*res, info.id});
+    /* The lower store was opened from its own URL and holds no reference
+       to this store, so asking it with our state locked cannot deadlock. */
+    return lowerStore->isValidPath(path);
+}
 
-    LocalStore::registerDrvOutputUnchecked(info);
+std::shared_ptr<const UnkeyedRealisation> LocalOverlayStore::queryRealisationOutsideDB(const DrvOutput & id)
+{
+    return lowerStore->queryRealisation(id);
 }
 
 void LocalOverlayStore::queryPathInfoUncached(
@@ -111,32 +113,6 @@ void LocalOverlayStore::queryPathInfoUncached(
                                               return callbackPtr->rethrow();
                                           }
                                       }});
-        }});
-}
-
-void LocalOverlayStore::queryRealisationUncached(
-    const DrvOutput & drvOutput, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept
-{
-    auto callbackPtr = std::make_shared<decltype(callback)>(std::move(callback));
-
-    LocalStore::queryRealisationUncached(
-        drvOutput, {[this, drvOutput, callbackPtr](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) {
-            try {
-                auto info = fut.get();
-                if (info)
-                    return (*callbackPtr)(std::move(info));
-            } catch (...) {
-                return callbackPtr->rethrow();
-            }
-            // If we don't have it, check lower store
-            lowerStore->queryRealisation(
-                drvOutput, {[callbackPtr](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) {
-                    try {
-                        (*callbackPtr)(fut.get());
-                    } catch (...) {
-                        return callbackPtr->rethrow();
-                    }
-                }});
         }});
 }
 

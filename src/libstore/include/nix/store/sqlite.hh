@@ -159,7 +159,14 @@ struct SQLiteTxn
     bool active = false;
     sqlite3 * db;
 
-    SQLiteTxn(sqlite3 * db);
+    /**
+     * An immediate transaction takes the write lock when it starts, and
+     * SQLite's busy handler waits while another connection holds it. A
+     * deferred one takes it when it first writes; if it has read by then,
+     * that write fails with SQLITE_BUSY at once while another connection
+     * holds the lock, or has written since the read.
+     */
+    SQLiteTxn(sqlite3 * db, bool immediate = false);
 
     void commit();
 

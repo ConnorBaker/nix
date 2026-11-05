@@ -431,6 +431,28 @@ protected:
      */
     virtual VerificationResult verifyAllValidPaths(RepairFlag repair);
 
+    /**
+     * Whether `path` is valid although the database does not list it.
+     * Called with the state locked, and when registering a realisation
+     * with the database's write lock held. `_state` is not recursive, so
+     * an override must not call back into this store (`isValidPath` would
+     * deadlock). It may call another store, e.g. a daemon, which only
+     * makes both locks last longer.
+     */
+    virtual bool isValidPathOutsideDB(const StorePath & path)
+    {
+        return false;
+    }
+
+    /**
+     * The build trace of `id` in a store beneath this one, if any. Called
+     * like `isValidPathOutsideDB`.
+     */
+    virtual std::shared_ptr<const UnkeyedRealisation> queryRealisationOutsideDB(const DrvOutput & id)
+    {
+        return nullptr;
+    }
+
 public:
 
     /**
@@ -469,7 +491,7 @@ public:
         State & state, const uint64_t deriver, const std::string & outputName, const StorePath & output);
 
     std::optional<const UnkeyedRealisation> queryRealisation_(State & state, const DrvOutput & id);
-    std::optional<std::pair<int64_t, UnkeyedRealisation>> queryRealisationCore_(State & state, const DrvOutput & id);
+    std::vector<UnkeyedRealisation> queryRealisationCore_(State & state, const DrvOutput & id);
     void queryRealisationUncached(
         const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
 
@@ -540,6 +562,7 @@ private:
 
     // Internal versions that are not wrapped in retry_sqlite.
     bool isValidPath_(State & state, const StorePath & path);
+    bool isValidOutput_(State & state, const StorePath & path);
     void queryReferrers(State & state, const StorePath & path, StorePathSet & referrers);
 
     void addBuildLog(const StorePath & drvPath, std::string_view log) override;

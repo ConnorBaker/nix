@@ -113,7 +113,6 @@ struct LocalStore::State::Stmts
     SQLiteStmt InvalidatePath;
     SQLiteStmt AddDerivationOutput;
     SQLiteStmt RegisterRealisedOutput;
-    SQLiteStmt UpdateRealisedOutput;
     SQLiteStmt DeleteRealisedOutputByName;
     SQLiteStmt QueryValidDerivers;
     SQLiteStmt QueryDerivationOutputs;
@@ -382,16 +381,6 @@ LocalStore::LocalStore(ref<const Config> config)
                 values (?, ?, ?, ?)
                 ;
             )");
-        state->stmts->UpdateRealisedOutput.create(
-            state->db,
-            R"(
-                update BuildTraceV3
-                    set signatures = ?
-                where
-                    drvPath = ? and
-                    outputName = ?
-                ;
-            )");
         state->stmts->DeleteRealisedOutputByName.create(
             state->db,
             R"(
@@ -406,7 +395,7 @@ LocalStore::LocalStore(ref<const Config> config)
             R"(
                 select id, outputPath, signatures from BuildTraceV3
                     where drvPath = ? and outputName = ?
-                    ;
+                    order by id;
             )");
     }
 }
@@ -683,44 +672,43 @@ void LocalStore::registerDrvOutputUnchecked(const Realisation & info)
     experimentalFeatureSettings.require(Xp::CaDerivations);
     retrySQLite<void>([&]() {
         auto state(_state->lock());
+        /* Immediate, so that nothing changes between reading the trace
+           and writing ours, and waiting for another writer happens in
+           SQLite. */
+        SQLiteTxn txn(state->db, true);
         auto oldR = queryRealisation_(*state, info.id);
-        /* When the recorded output is gone (garbage collected)
-         * a differing rebuild replaces the trace instead of conflicting with it.
+        /* A trace naming the same output keeps its signatures. When the
+         * recorded output is gone (garbage collected) a differing
+         * realisation, from a rebuild or `nix copy`, replaces the trace
+         * instead of conflicting with it.
          */
-        if (oldR && !info.isCompatibleWith(*oldR) && !isValidPath_(*state, oldR->outPath)) {
-            state->stmts->DeleteRealisedOutputByName.use()
-                .apply(info.id.drvPath.to_string())
-                .apply(info.id.outputName)
-                .exec();
-            oldR.reset();
-        }
-        if (oldR) {
-            if (info.isCompatibleWith(*oldR)) {
-                auto combinedSignatures = oldR->signatures;
-                combinedSignatures.insert(info.signatures.begin(), info.signatures.end());
-                state->stmts->UpdateRealisedOutput.use()
-                    .apply(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))
-                    .apply(info.id.drvPath.to_string())
-                    .apply(info.id.outputName)
-                    .exec();
-            } else {
-                throw Error(
-                    "Trying to register a realisation of '%s', but we already "
-                    "have another one locally.\n"
-                    "Local:  %s\n"
-                    "Remote: %s",
-                    info.id.to_string(),
-                    printStorePath(oldR->outPath),
-                    printStorePath(info.outPath));
-            }
-        } else {
-            state->stmts->RegisterRealisedOutput.use()
-                .apply(info.id.drvPath.to_string())
-                .apply(info.id.outputName)
-                .apply(printStorePath(info.outPath))
-                .apply(concatStringsSep(" ", Signature::toStrings(info.signatures)))
-                .exec();
-        }
+        auto signatures = info.signatures;
+        if (oldR && info.isCompatibleWith(*oldR))
+            signatures.insert(oldR->signatures.begin(), oldR->signatures.end());
+        else if (oldR && isValidOutput_(*state, oldR->outPath))
+            throw Error(
+                "Trying to register a realisation of '%s', but we already "
+                "have another one locally.\n"
+                "Local:  %s\n"
+                "Remote: %s",
+                info.id.to_string(),
+                printStorePath(oldR->outPath),
+                printStorePath(info.outPath));
+        /* Other rows naming the same output keep their signatures too. */
+        for (auto & row : queryRealisationCore_(*state, info.id))
+            if (info.isCompatibleWith(row))
+                signatures.insert(row.signatures.begin(), row.signatures.end());
+        state->stmts->DeleteRealisedOutputByName.use()
+            .apply(info.id.drvPath.to_string())
+            .apply(info.id.outputName)
+            .exec();
+        state->stmts->RegisterRealisedOutput.use()
+            .apply(info.id.drvPath.to_string())
+            .apply(info.id.outputName)
+            .apply(printStorePath(info.outPath))
+            .apply(concatStringsSep(" ", Signature::toStrings(signatures)))
+            .exec();
+        txn.commit();
     });
 }
 
@@ -1711,33 +1699,60 @@ void LocalStore::addSignatures(const StorePath & storePath, const std::set<Signa
     });
 }
 
-std::optional<std::pair<int64_t, UnkeyedRealisation>>
-LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & id)
+std::vector<UnkeyedRealisation> LocalStore::queryRealisationCore_(LocalStore::State & state, const DrvOutput & id)
 {
+    std::vector<UnkeyedRealisation> rows;
     auto useQueryRealisedOutput(
         state.stmts->QueryRealisedOutput.use().apply(id.drvPath.to_string()).apply(id.outputName));
-    if (!useQueryRealisedOutput.next())
-        return std::nullopt;
-    auto realisationDbId = useQueryRealisedOutput.getInt(0);
-    auto outputPath = parseStorePath(useQueryRealisedOutput.getStr(1));
-    auto signatures = tokenizeString<StringSet>(useQueryRealisedOutput.getStr(2));
+    while (useQueryRealisedOutput.next())
+        rows.push_back({
+            .outPath = parseStorePath(useQueryRealisedOutput.getStr(1)),
+            .signatures = Signature::parseMany(tokenizeString<StringSet>(useQueryRealisedOutput.getStr(2))),
+        });
+    return rows;
+}
 
-    return {
-        {realisationDbId,
-         UnkeyedRealisation{
-             .outPath = outputPath,
-             .signatures = Signature::parseMany(signatures),
-         }}};
+bool LocalStore::isValidOutput_(State & state, const StorePath & path)
+{
+    return isValidPath_(state, path) || isValidPathOutsideDB(path);
 }
 
 std::optional<const UnkeyedRealisation> LocalStore::queryRealisation_(LocalStore::State & state, const DrvOutput & id)
 {
-    auto maybeCore = queryRealisationCore_(state, id);
-    if (!maybeCore)
-        return std::nullopt;
-    auto [realisationDbId, res] = *maybeCore;
+    /* Versions that registered without a transaction may have left
+       several rows. Ours is the first row whose output our database
+       lists, else the first whose output the store beneath has, else the
+       first. When a store beneath this one has a trace too, the one that
+       counts is ours if its output is valid (in either store), else
+       theirs if its output is valid, else ours, else theirs:
 
-    return {res};
+         ours \ theirs   none   valid    stale
+         valid           ours   ours     ours
+         stale           ours   theirs   ours
+         none            -      theirs   theirs
+
+       Our database is cheaper to ask than the store beneath, so it goes
+       first.
+     */
+    auto ours = queryRealisationCore_(state, id);
+    for (auto & row : ours)
+        if (isValidPath_(state, row.outPath))
+            return row;
+    auto theirs = queryRealisationOutsideDB(id);
+    if (theirs || ours.size() > 1)
+        for (auto & row : ours)
+            if (isValidPathOutsideDB(row.outPath))
+                return row;
+    if (ours.empty()) {
+        if (theirs)
+            return *theirs;
+        return std::nullopt;
+    }
+    /* None of our outputs is valid, so neither is theirs if it is one. */
+    auto isOurs = [&](auto & row) { return row.outPath == theirs->outPath; };
+    if (theirs && std::ranges::none_of(ours, isOurs) && isValidOutput_(state, theirs->outPath))
+        return *theirs;
+    return ours.front();
 }
 
 void LocalStore::queryRealisationUncached(

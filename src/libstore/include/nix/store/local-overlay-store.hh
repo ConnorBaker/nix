@@ -135,10 +135,17 @@ private:
     ref<LocalFSStore> lowerStore;
 
     /**
-     * First copy up any lower store realisation with the same key, so we
-     * merge rather than mask it.
+     * The upper DB lists a lower store path only once
+     * `isValidPathUncached` or `registerValidPaths` has copied it up, so
+     * check the lower store.
      */
-    void registerDrvOutputUnchecked(const Realisation & info) override;
+    bool isValidPathOutsideDB(const StorePath & path) override;
+
+    /**
+     * The lower store's build trace; `LocalStore::queryRealisation_`
+     * decides whether it or ours counts.
+     */
+    std::shared_ptr<const UnkeyedRealisation> queryRealisationOutsideDB(const DrvOutput & id) override;
 
     /**
      * Check lower store if upper DB does not have.
@@ -174,12 +181,6 @@ private:
      * merge rather than mask it.
      */
     void registerValidPaths(const ValidPathInfos & infos) override;
-
-    /**
-     * Check lower store if upper DB does not have.
-     */
-    void queryRealisationUncached(
-        const DrvOutput &, Callback<std::shared_ptr<const UnkeyedRealisation>> callback) noexcept override;
 
     /**
      * Call `remountIfNecessary` after collecting garbage normally.
