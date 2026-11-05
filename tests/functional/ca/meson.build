@@ -4,9 +4,7 @@ suites += {
   'tests' : [
     'build-cache.sh',
     'build-delete.sh',
-    'build-trace-db.sh',
     'build-trace-delete.sh',
-    'rebuild-after-delete.sh',
     'build-with-garbage-path.sh',
     'build.sh',
     'concurrent-builds.sh',

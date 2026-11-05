@@ -401,8 +401,7 @@ static int main_build_remote(int argc, char ** argv)
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(drv).hasKnownOutputPaths()) {
             for (auto & outputName : wantedOutputs) {
                 auto thisOutputId = DrvOutput{*drvPath, outputName};
-                auto existing = store->queryRealisation(thisOutputId);
-                if (!existing || !store->isValidPath(existing->outPath)) {
+                if (!store->queryRealisation(thisOutputId)) {
                     debug("missing output %s", outputName);
                     assert(optResult);
                     auto & result = *optResult;

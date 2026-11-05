@@ -258,10 +258,10 @@ bool SQLiteStmt::Use::isNull(int col)
     return sqlite3_column_type(stmt, col) == SQLITE_NULL;
 }
 
-SQLiteTxn::SQLiteTxn(sqlite3 * db, bool immediate)
+SQLiteTxn::SQLiteTxn(sqlite3 * db)
 {
     this->db = db;
-    if (sqlite3_exec(db, immediate ? "begin immediate;" : "begin;", 0, 0, 0) != SQLITE_OK)
+    if (sqlite3_exec(db, "begin;", 0, 0, 0) != SQLITE_OK)
         SQLiteError::throw_(db, "starting transaction");
     active = true;
 }
