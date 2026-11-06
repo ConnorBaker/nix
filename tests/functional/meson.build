@@ -184,6 +184,7 @@ suites = [
       'nix-daemon-acceptor-trust.sh',
       'nix-daemon-stdio-trust.sh',
       'test-infra.sh',
+      'through-loader.sh',
       'timeout.sh',
       'toString-path.sh',
       'user-envs-migration.sh',
