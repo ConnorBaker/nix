@@ -46,4 +46,13 @@ void restoreProcessContext(bool restoreMounts = true);
  */
 std::optional<std::filesystem::path> getSelfExe();
 
+#ifdef __linux__
+/**
+ * Whether this process was started through the dynamic loader (`ld.so
+ * /path/to/program`), which makes /proc/self/exe the loader: the kernel
+ * loaded no interpreter (AT_BASE is 0), yet the program has one.
+ */
+bool startedThroughLoader();
+#endif
+
 } // namespace nix

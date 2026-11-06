@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
 
 #include "nix/util/current-process.hh"
@@ -23,6 +24,8 @@
 #ifdef __linux__
 #  include "nix/util/cgroup.hh"
 #  include "nix/util/linux-namespaces.hh"
+#  include <link.h>
+#  include <sys/auxv.h>
 #endif
 
 #ifdef __FreeBSD__
@@ -87,9 +90,63 @@ void restoreProcessContext(bool restoreMounts)
 
 //////////////////////////////////////////////////////////////////////
 
+#ifdef __linux__
+/**
+ * The address of the program's first loadable segment, if this process
+ * was started through the dynamic loader: the kernel loaded no
+ * interpreter (AT_BASE is 0), yet the program, the first object that
+ * dl_iterate_phdr reports, has one.
+ */
+static std::optional<uintptr_t> programStartedThroughLoader()
+{
+    std::optional<uintptr_t> start;
+    if (!getauxval(AT_BASE))
+        dl_iterate_phdr(
+            [](dl_phdr_info * info, size_t, void * data) {
+                bool interpreter = false;
+                uintptr_t load = 0;
+                for (int i = info->dlpi_phnum; i--;) {
+                    if (info->dlpi_phdr[i].p_type == PT_INTERP)
+                        interpreter = true;
+                    if (info->dlpi_phdr[i].p_type == PT_LOAD)
+                        load = info->dlpi_addr + info->dlpi_phdr[i].p_vaddr;
+                }
+                if (interpreter)
+                    *static_cast<std::optional<uintptr_t> *>(data) = load;
+                return 1;
+            },
+            &start);
+    return start;
+}
+
+bool startedThroughLoader()
+{
+    return programStartedThroughLoader().has_value();
+}
+#endif
+
 std::optional<std::filesystem::path> getSelfExe()
 {
     static auto cached = []() -> std::optional<std::filesystem::path> {
+#ifdef __linux__
+        /* Started through the dynamic loader, /proc/self/exe is the
+           loader; the program is the file mapped at its first loadable
+           segment, named by map_files rather than maps, which escapes
+           newlines. If map_files cannot be read, this falls back to
+           /proc/self/exe as before. */
+        if (auto start = programStartedThroughLoader()) {
+            auto page = *start & ~uintptr_t(getpagesize() - 1);
+            for (auto & line : tokenizeString<std::vector<std::string>>(readFile("/proc/self/maps"), "\n")) {
+                unsigned long low, high;
+                if (sscanf(line.c_str(), "%lx-%lx", &low, &high) != 2 || page < low || page >= high)
+                    continue;
+                std::error_code ec;
+                auto program = std::filesystem::read_symlink(fmt("/proc/self/map_files/%lx-%lx", low, high), ec);
+                if (!ec)
+                    return program;
+            }
+        }
+#endif
 #if defined(__linux__) || defined(__GNU__)
         return readLink(std::filesystem::path{"/proc/self/exe"});
 #elif defined(__APPLE__)
