@@ -393,11 +393,15 @@ void mainWrapped(int argc, char ** argv)
        self-aware. That is, it has to know where it is installed. We
        don't think it's sentient.
      */
-    settings.getWorkerSettings().buildHook.setDefault(
-        Strings{
-            getNixBin({}).string(),
-            "__build-remote",
-        });
+    auto nixBin = getNixBin({});
+    Strings buildHook{nixBin.string(), "__build-remote"};
+#ifdef __linux__
+    /* Started through the dynamic loader, run the hook through it too, as
+       throughLoader() does, if it is this program. */
+    if (startedThroughLoader() && nixBin == getSelfExe())
+        buildHook.push_front(readLink(std::filesystem::path{"/proc/self/exe"}).string());
+#endif
+    settings.getWorkerSettings().buildHook.setDefault(buildHook);
 
     initNix();
     initGC();

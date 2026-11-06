@@ -449,7 +449,7 @@ static void daemonLoop(
                    for security. Also Apple frameworks don't play well with fork-without-exec, as do several of
                    our dependencies like libcurl. */
                 spawnProgram(
-                    {
+                    throughLoader({
                         .program = *selfProgramPath,
                         .lookupPath = false,
                         .args = std::move(args),
@@ -462,7 +462,7 @@ static void daemonLoop(
                         .dieWithParent = false,
                         // Background the daemon.
                         .setSid = true,
-                    },
+                    }),
                     std::to_array<FdRedirection>({
                         {.from = remote.get(), .to = FdRedirection::stdInput},
                         {.from = remote.get(), .to = FdRedirection::stdOut},

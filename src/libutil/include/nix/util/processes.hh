@@ -175,6 +175,17 @@ struct SpawnOptions
     bool restoreMounts = true;
 };
 
+#ifndef _WIN32
+/**
+ * `options` for running a copy of this program (/proc/self/exe) or a
+ * program installed with it. On Linux, if this process was started
+ * through the dynamic loader (see startedThroughLoader()), which
+ * /proc/self/exe then is, they run that program through the loader
+ * too, so that its own interpreter need not exist.
+ */
+SpawnOptions throughLoader(SpawnOptions options);
+#endif
+
 struct RunOptions
 {
     SpawnOptions spawnOptions;

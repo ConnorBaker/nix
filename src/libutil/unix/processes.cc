@@ -363,6 +363,19 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
 
 #endif
 
+SpawnOptions throughLoader(SpawnOptions options)
+{
+#ifdef __linux__
+    if (startedThroughLoader()) {
+        auto program = options.program == "/proc/self/exe" ? *getSelfExe() : options.program;
+        options.args.insert(
+            options.args.begin(), {"--argv0", options.argv0.value_or(options.program.native()), program.native()});
+        options.program = "/proc/self/exe";
+    }
+#endif
+    return options;
+}
+
 //////////////////////////////////////////////////////////////////////
 
 std::string statusToString(int status)
