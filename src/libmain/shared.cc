@@ -1,6 +1,7 @@
 #include "nix/store/globals.hh"
 #include "nix/util/current-process.hh"
 #include "nix/util/executable-path.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/library-versions.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -388,26 +389,29 @@ RunPager::RunPager()
 #ifdef _WIN32
     return;
 #else
+    /* Spawned, not forked: a fork of this multithreaded process must not
+       allocate. Without a pager to run, the output is not paged. */
+    SpawnOptions options{.lookupPath = false, .environment = getEnvOs()};
+    options.environment->try_emplace("LESS", "FRSXMK");
+    if (pager) {
+        options.program = shProgram();
+        options.args = {"-c", pager};
+    } else {
+        auto path = ExecutablePath::load();
+        for (auto name : {"pager", "less", "more"})
+            if (options.program.empty())
+                options.program = path.findName(name).value_or("");
+    }
+    if (options.program.empty())
+        return;
+
     logger->stop();
 
     Pipe toPager;
     toPager.create();
 
-    const auto & sh = shProgram();
-
-    pid = startProcess([&]() {
-        if (dup2(toPager.readSide.get(), STDIN_FILENO) == -1)
-            throw SysError("dupping stdin");
-        if (!getenv("LESS"))
-            setEnv("LESS", "FRSXMK");
-        restoreProcessContext();
-        if (pager)
-            execl(sh.c_str(), "sh", "-c", pager, nullptr);
-        execlp("pager", "pager", nullptr);
-        execlp("less", "less", nullptr);
-        execlp("more", "more", nullptr);
-        throw SysError("executing '%1%'", pager);
-    });
+    pid = spawnProgram(
+        options, std::to_array<FdRedirection>({{.from = toPager.readSide.get(), .to = FdRedirection::stdInput}}));
 
     pid.setKillSignal(SIGINT);
     std_out = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 0);
