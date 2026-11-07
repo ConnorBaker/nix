@@ -55,3 +55,11 @@ inTerminal bash -c "': \$(:)'"
 grepQuiet "allocator call in a forked child" "$log"
 out=$(inTerminal TERM=xterm "NIX_PAGER='cat; echo PAGER-RAN'" nix-store -q)
 [[ $out = *PAGER-RAN* && ! -s $log ]] || { cat "$log" >&2; fail "the pager's child allocated or did not run"; }
+
+# Local builds: unsandboxed and sandboxed (the last skipped where the
+# sandbox is unavailable).
+localDrv="with import ${config_nix}; mkDerivation { name = \"fork-alloc-local\"; buildCommand = \"echo > \$out\"; }"
+expectNoChildAlloc nix-build --no-out-link -E "$localDrv"
+requireSandboxSupport
+NIX_STORE_DIR=/my/store NIX_REMOTE=$TEST_ROOT/store0 \
+    expectNoChildAlloc nix-build --no-out-link -E "$localDrv" --option sandbox true --option sandbox-paths /nix/store

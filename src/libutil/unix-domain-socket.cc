@@ -243,11 +243,18 @@ void unix::sendMessageWithFds(Descriptor sockfd, std::span<const std::byte> data
         }
     }
 
+    int sendFlags = 0;
+#  ifdef MSG_NOSIGNAL
+    /* A closed peer is an EPIPE error, not a SIGPIPE that kills a program
+       that does not ignore it. */
+    sendFlags |= MSG_NOSIGNAL;
+#  endif
+
     // Loop to handle partial writes. Ancillary data (FDs) is only
     // sent with the first successful sendmsg call. Use do/while so
     // SOCK_DGRAM zero-length messages still trigger sendmsg.
     do {
-        ssize_t sent = sendmsg(sockfd, &msg, 0);
+        ssize_t sent = sendmsg(sockfd, &msg, sendFlags);
         if (sent < 0)
             throw SysError("sendmsg");
 

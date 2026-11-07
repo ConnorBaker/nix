@@ -71,6 +71,7 @@ suites = [
       'build-remote-trustless-should-pass-3.sh',
       'build-remote-with-mounted-ssh-ng.sh',
       'build.sh',
+      'build-child.sh',
       'ca-old-daemon.sh',
       'characterisation-test-infra.sh',
       'check-refs.sh',
@@ -228,6 +229,21 @@ if nix_store.found()
       ],
       'tests' : [
         'fork-alloc.sh',
+      ],
+      'workdir' : meson.current_source_dir(),
+    }
+    suites += {
+      'name' : 'build-child-faults',
+      'deps' : [
+        shared_module(
+          'build-child-faults-shim',
+          'build-child-faults/shim.c',
+          name_prefix : '',
+          build_by_default : false,
+        ),
+      ],
+      'tests' : [
+        'build-child-faults.sh',
       ],
       'workdir' : meson.current_source_dir(),
     }

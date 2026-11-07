@@ -28,7 +28,7 @@ extend-glob = ["cli-guideline.md"] # plural of the COMMAND placeholder in usage 
 extend-identifiers = { COMMANDs = "COMMANDs" }
 
 [type.allow-msg_controllen]
-extend-glob = ["sender.c", "smuggler.c", "unix-domain-socket.cc"] # field of `struct msghdr`
+extend-glob = ["sender.c", "shim.c", "smuggler.c", "unix-domain-socket.cc"] # field of `struct msghdr`
 extend-identifiers = { msg_controllen = "msg_controllen" }
 
 [type.allow-gl_pathc]
