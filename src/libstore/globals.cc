@@ -84,8 +84,10 @@ Settings::Settings()
     if (s) {
         Strings ss;
         for (auto & p : tokenizeString<Strings>(*s, ":"))
-            ss.push_back("@" + p);
-        builders = concatStringsSep("\n", ss);
+            /* In `builders`, '#' starts a comment. */
+            if (p.find('#') == p.npos)
+                ss.push_back("@" + p);
+        builders = concatStringsSep(";", ss);
     }
 
 #if (defined(__linux__) || defined(__FreeBSD__)) && defined(SANDBOX_SHELL)
