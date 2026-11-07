@@ -80,14 +80,14 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     }
 }
 
-void LocalOverlayStore::registerDrvOutputUnchecked(const Realisation & info)
+void LocalOverlayStore::registerBuildTraces(const StorePath & drvPath, const SingleDrvOutputs & outputs, TracesOf from)
 {
     // First do queryRealisation on lower layer to populate DB
-    auto res = lowerStore->queryRealisation(info.id);
-    if (res)
-        LocalStore::registerDrvOutputUnchecked({*res, info.id});
+    for (auto & [outputName, _] : outputs)
+        if (auto res = lowerStore->queryRealisation({drvPath, outputName}))
+            LocalStore::registerBuildTraces(drvPath, {{outputName, *res}}, TracesOf::Lone);
 
-    LocalStore::registerDrvOutputUnchecked(info);
+    LocalStore::registerBuildTraces(drvPath, outputs, from);
 }
 
 void LocalOverlayStore::queryPathInfoUncached(

@@ -145,7 +145,7 @@ private:
      * First copy up any lower store realisation with the same key, so we
      * merge rather than mask it.
      */
-    void registerDrvOutputUnchecked(const Realisation & info) override;
+    void registerBuildTraces(const StorePath & drvPath, const SingleDrvOutputs & outputs, TracesOf from) override;
 
     /**
      * Check lower store if upper DB does not have.

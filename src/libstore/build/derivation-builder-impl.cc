@@ -164,8 +164,10 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         assert(initialOutput);
         auto & initialInfo = *initialOutput;
 
-        /* Don't register if already valid, and not checking */
-        bool wanted = buildMode == bmCheck || !(initialInfo.known && initialInfo.known->isValid());
+        /* Don't register if already valid, and not checking, unless the build
+           might not reproduce it: then all outputs of one build are registered. */
+        bool wanted = buildMode == bmCheck || !type(drv).hasKnownOutputPaths()
+                      || !(initialInfo.known && initialInfo.known->isValid());
         if (!wanted) {
             outputReferencesIfUnregistered.insert_or_assign(
                 outputName, AlreadyRegistered{.path = initialInfo.known->path});
@@ -557,6 +559,10 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             }
         }
 
+        /* A content-addressed path made again keeps its signatures. */
+        if (newInfo.ca && localStore.isValidPath(newInfo.path))
+            newInfo.sigs = localStore.queryPathInfo(newInfo.path)->sigs;
+
         /* Move files, if needed */
         if (store->toRealPath(newInfo.path) != actualPath) {
             if (buildMode == bmRepair) {
@@ -704,7 +710,6 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         };
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(drv).isImpure()) {
             localStore.signRealisation(thisRealisation);
-            localStore.registerDrvOutput(thisRealisation, NoCheckSigs);
         }
         builtOutputs.emplace(outputName, thisRealisation);
     }
@@ -759,7 +764,6 @@ SingleDrvOutputs DerivationBuilderImpl::checkSubmittedOutputs(LocalStore & local
         };
 
         localStore.signRealisation(realisation);
-        localStore.registerDrvOutput(realisation, NoCheckSigs);
         builtOutputs.emplace(outputName, realisation);
 
         // TODO: handle --check

@@ -119,6 +119,7 @@ struct LocalStore::State::Stmts
     SQLiteStmt QueryValidDerivers;
     SQLiteStmt QueryDerivationOutputs;
     SQLiteStmt QueryRealisedOutput;
+    SQLiteStmt QueryRealisedOutputNames;
     SQLiteStmt QueryPathFromHashPart;
     SQLiteStmt QueryValidPaths;
 };
@@ -409,6 +410,8 @@ LocalStore::LocalStore(ref<const Config> config)
                     where drvPath = ? and outputName = ?
                     ;
             )");
+        state->stmts->QueryRealisedOutputNames.create(
+            state->db, "select outputName from BuildTraceV3 where drvPath = ?;");
     }
 }
 
@@ -681,36 +684,53 @@ void LocalStore::registerDrvOutput(const Realisation & info, CheckSigsFlag check
 
 void LocalStore::registerDrvOutputUnchecked(const Realisation & info)
 {
+    registerBuildTraces(info.id.drvPath, {{info.id.outputName, info}}, TracesOf::Lone);
+}
+
+void LocalStore::registerBuildTraces(const StorePath & drvPath, const SingleDrvOutputs & outputs, TracesOf from)
+{
     experimentalFeatureSettings.require(Xp::CaDerivations);
     retrySQLite<void>([&]() {
         auto state(_state->lock());
-        if (auto oldR = queryRealisation_(*state, info.id)) {
-            if (info.isCompatibleWith(*oldR)) {
+        SQLiteTxn txn(state->db);
+        for (auto & [outputName, info] : outputs) {
+            auto oldR = queryRealisation_(*state, {drvPath, outputName});
+            if (oldR && info.isCompatibleWith(*oldR)) {
                 auto combinedSignatures = oldR->signatures;
                 combinedSignatures.insert(info.signatures.begin(), info.signatures.end());
                 state->stmts->UpdateRealisedOutput.use()
                     .apply(concatStringsSep(" ", Signature::toStrings(combinedSignatures)))
-                    .apply(info.id.drvPath.to_string())
-                    .apply(info.id.outputName)
+                    .apply(drvPath.to_string())
+                    .apply(outputName)
                     .exec();
-            } else {
+            } else if (oldR && (from != TracesOf::WholeBuild || isValidPath_(*state, oldR->outPath))) {
+                auto here = config->getReference();
+                if (auto & root = config->rootDir.get())
+                    here.params.insert_or_assign("root", root->string());
+                std::string ids;
+                for (auto use(state->stmts->QueryRealisedOutputNames.use().apply(drvPath.to_string())); use.next();)
+                    ids += " " + escapeShellArgAlways(printStorePath(drvPath) + "^" + use.getStr(0));
                 throw Error(
-                    "Trying to register a realisation of '%s', but we already "
-                    "have another one locally.\n"
-                    "Local:  %s\n"
-                    "Remote: %s",
-                    info.id.to_string(),
-                    printStorePath(oldR->outPath),
-                    printStorePath(info.outPath));
+                    "output '%s' of '%s' at '%s' differs from the build traces recorded here; to use it, "
+                    "delete them with: nix store build-trace delete --extra-experimental-features 'nix-command "
+                    "ca-derivations' --store %s%s; then try again (with '--option substitute false' if a "
+                    "substituter serves them again)",
+                    outputName,
+                    printStorePath(drvPath),
+                    printStorePath(info.outPath),
+                    escapeShellArgAlways(here.render()),
+                    ids);
+            } else {
+                state->stmts->DeleteRealisedOutputByName.use().apply(drvPath.to_string()).apply(outputName).exec();
+                state->stmts->RegisterRealisedOutput.use()
+                    .apply(drvPath.to_string())
+                    .apply(outputName)
+                    .apply(printStorePath(info.outPath))
+                    .apply(concatStringsSep(" ", Signature::toStrings(info.signatures)))
+                    .exec();
             }
-        } else {
-            state->stmts->RegisterRealisedOutput.use()
-                .apply(info.id.drvPath.to_string())
-                .apply(info.id.outputName)
-                .apply(printStorePath(info.outPath))
-                .apply(concatStringsSep(" ", Signature::toStrings(info.signatures)))
-                .exec();
         }
+        txn.commit();
     });
 }
 
