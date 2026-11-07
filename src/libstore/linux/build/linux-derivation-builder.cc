@@ -606,6 +606,7 @@ void LinuxDerivationBuilder::runBuildChild()
        sent, made our parent's child (CLONE_PARENT). This process has no
        threads, so the child may run any code. */
     try {
+        initLibStore(false);
         while (true) {
             int targets[8];
             auto received = unix::receiveMessageWithFds(STDIN_FILENO, std::as_writable_bytes(std::span(targets)));
@@ -640,7 +641,6 @@ void LinuxDerivationBuilder::runBuildChildOnce()
     try {
         auto bytes = drainFD(STDIN_FILENO);
         StringSource spec(bytes);
-        initLibStore(false);
         auto config = readStringMap(spec);
         for (auto & [name, value] : config)
             globalConfig.set(name, value);
