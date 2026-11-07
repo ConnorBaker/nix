@@ -15,6 +15,7 @@
 #  include <fcntl.h>
 #  include <sys/socket.h>
 #  include <sys/un.h>
+#  include <sys/wait.h>
 #  include "nix/util/processes.hh"
 #endif
 #include <unistd.h>
@@ -146,33 +147,21 @@ static void bindConnectProcHelper(
         if (tryBindConnectAtDir(operationName, operation, operationAt, fd, path))
             return;
 
-        Pipe pipe;
-        pipe.create();
-        Pid pid = startProcess([&] {
-            try {
-                pipe.readSide.close();
-                auto dir = path.parent_path();
-                if (chdir(dir.c_str()) == -1)
-                    throw SysError("chdir to %s failed", PathFmt(dir));
-                auto base = path.filename();
-                if (base.native().size() + 1 >= sizeof(addr.sun_path))
-                    throw Error("socket path %s is too long", PathFmt(path));
-                memcpy(addr.sun_path, base.c_str(), base.native().size() + 1);
-                if (operation(fd, psaddr, sizeof(addr)) == -1)
-                    throw SysError("cannot %s to socket at %s", operationName, PathFmt(path));
-                writeFull(pipe.writeSide.get(), "0\n");
-            } catch (SysError & e) {
-                writeFull(pipe.writeSide.get(), fmt("%d\n", e.errNo));
-            } catch (...) {
-                writeFull(pipe.writeSide.get(), "-1\n");
-            }
-        });
-        pipe.writeSide.close();
-        auto errNo = string2Int<int>(chomp(drainFD(pipe.readSide.get())));
-        if (!errNo || *errNo == -1)
-            throw Error("cannot %s to socket at %s", operationName, PathFmt(path));
-        else if (*errNo > 0)
-            throw SysError(*errNo, "cannot %s to socket at %s", operationName, PathFmt(path));
+        /* The child is a copy of a multithreaded process, so everything is
+           prepared here: it makes only async-signal-safe calls and returns
+           errno as its exit code. */
+        auto dir = path.parent_path();
+        auto base = path.filename();
+        if (base.native().size() + 1 >= sizeof(addr.sun_path))
+            throw Error("socket path %s is too long", PathFmt(path));
+        memcpy(addr.sun_path, base.c_str(), base.native().size() + 1);
+        Pid pid = startProcess(
+            [&] { _exit(chdir(dir.c_str()) == -1 || operation(fd, psaddr, sizeof(addr)) == -1 ? errno : 0); });
+        int status = pid.wait();
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+            throw SysError(WEXITSTATUS(status), "cannot %s to socket at %s", operationName, PathFmt(path));
+        if (status != 0)
+            throw Error("cannot %s to socket at %s: %s", operationName, PathFmt(path), statusToString(status));
 #endif
     } else {
         memcpy(addr.sun_path, pathStr.c_str(), pathStr.size() + 1);
