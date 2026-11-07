@@ -30,3 +30,18 @@ grepQuiet "allocator call in a forked child" "$log"
 mkdir -p "$TEST_ROOT/sock"
 detect nix store info --store "unix://$TEST_ROOT/sock/$(printf 's%.0s' {1..96})" || true
 [[ ! -s $log ]] || { cat "$log" >&2; fail "the socket helper's child allocated"; }
+
+# The external builder.
+cat > "$TEST_ROOT/fork-alloc.nix" <<EOF2
+with import ${config_nix};
+mkDerivation { name = "fork-alloc"; system = "x68_46-xunil"; buildCommand = "true"; }
+EOF2
+cat > "$TEST_ROOT/fork-alloc-builder.sh" <<EOF2
+#! $SHELL -e
+printf '\2\n'
+printf foo > "\$(PATH=${PATH@Q} jq -r .env.out < "\$1")"
+EOF2
+chmod +x "$TEST_ROOT/fork-alloc-builder.sh"
+expectNoChildAlloc nix build --no-link -f "$TEST_ROOT/fork-alloc.nix" \
+    --extra-experimental-features external-builders \
+    --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"program\": \"$TEST_ROOT/fork-alloc-builder.sh\", \"args\": []}]"

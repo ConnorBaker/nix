@@ -486,6 +486,12 @@ void UnixDerivationBuilderImpl::prepareSandbox()
 
 void UnixDerivationBuilderImpl::openSlave()
 {
+    if (dup2(openRawSlave().get(), STDERR_FILENO) == -1)
+        throw SysError("cannot pipe standard error into log file");
+}
+
+AutoCloseFD UnixDerivationBuilderImpl::openRawSlave()
+{
     std::string slaveName = getPtsName(builderOut.get());
 
     AutoCloseFD builderOut = open(slaveName.c_str(), O_RDWR | O_NOCTTY | O_CLOEXEC);
@@ -502,8 +508,7 @@ void UnixDerivationBuilderImpl::openSlave()
     if (tcsetattr(builderOut.get(), TCSANOW, &term))
         throw SysError("putting pseudoterminal into raw mode");
 
-    if (dup2(builderOut.get(), STDERR_FILENO) == -1)
-        throw SysError("cannot pipe standard error into log file");
+    return builderOut;
 }
 
 #if NIX_WITH_AWS_AUTH
