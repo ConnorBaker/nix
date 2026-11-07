@@ -45,3 +45,13 @@ chmod +x "$TEST_ROOT/fork-alloc-builder.sh"
 expectNoChildAlloc nix build --no-link -f "$TEST_ROOT/fork-alloc.nix" \
     --extra-experimental-features external-builders \
     --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"program\": \"$TEST_ROOT/fork-alloc-builder.sh\", \"args\": []}]"
+
+# The pager, which needs a terminal: the shim goes to the command in it.
+inTerminal() {
+    : > "$log"
+    script -qec "LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/fork-alloc-shim.so $*" /dev/null 9>> "$log"
+}
+inTerminal bash -c "': \$(:)'"
+grepQuiet "allocator call in a forked child" "$log"
+out=$(inTerminal TERM=xterm "NIX_PAGER='cat; echo PAGER-RAN'" nix-store -q)
+[[ $out = *PAGER-RAN* && ! -s $log ]] || { cat "$log" >&2; fail "the pager's child allocated or did not run"; }
