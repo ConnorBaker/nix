@@ -157,6 +157,10 @@ struct SpawnOptions
     std::optional<std::string> argv0;
     std::optional<uid_t> uid;
     std::optional<uid_t> gid;
+    /**
+     * The supplementary groups to set along with `gid`.
+     */
+    std::vector<gid_t> supplementaryGroups;
 #endif
     std::optional<std::filesystem::path> chdir;
     std::optional<OsStringMap> environment;

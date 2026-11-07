@@ -322,12 +322,12 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
             }
             if (options.chdir && chdir((*options.chdir).c_str()) == -1)
                 throw SysError("chdir failed");
-            if (options.gid && setgid(*options.gid) == -1)
+            if (options.gid && (setgid(*options.gid) == -1 || getgid() != *options.gid || getegid() != *options.gid))
                 throw SysError("setgid failed");
-            /* Drop all other groups if we're setgid. */
-            if (options.gid && setgroups(0, 0) == -1)
+            /* Set the supplementary groups (by default none) if we're setgid. */
+            if (options.gid && setgroups(options.supplementaryGroups.size(), options.supplementaryGroups.data()) == -1)
                 throw SysError("setgroups failed");
-            if (options.uid && setuid(*options.uid) == -1)
+            if (options.uid && (setuid(*options.uid) == -1 || getuid() != *options.uid || geteuid() != *options.uid))
                 throw SysError("setuid failed");
 
             Strings args_(options.args);
