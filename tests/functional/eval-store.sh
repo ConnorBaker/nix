@@ -54,6 +54,16 @@ ls "$NIX_STORE_DIR"/*dependencies-top/foobar
 clearStore
 rm -rf "$eval_store"
 
+# `builtins.storePath`, `builtins.appendContext` and `builtins.fetchurl` with a hash copy a path that only the build store has from there
+echo -n "eval-store fetchurl" > "$TEST_ROOT/fetchurl-file"
+path=$(nix-store --add-fixed sha256 "$TEST_ROOT/fetchurl-file")
+[[ $(nix eval --eval-store "$TEST_ROOT/es1" --impure --raw --expr "builtins.storePath \"$path\"") = "$path" ]]
+[[ $(nix eval --eval-store "$TEST_ROOT/es2" --impure --raw --expr "builtins.appendContext \"$path\" { \"$path\".path = true; }") = "$path" ]]
+[[ $(nix eval --eval-store "$TEST_ROOT/es3" --impure --raw --expr "builtins.fetchurl { url = \"file://$TEST_ROOT/missing/fetchurl-file\"; sha256 = \"$(nix-hash --type sha256 --flat "$TEST_ROOT/fetchurl-file")\"; }") = "$path" ]]
+# A path that neither store has fails as before
+missingPath="$NIX_STORE_DIR/00000000000000000000000000000000-eval-store-missing"
+expectStderr 1 nix eval --eval-store "$TEST_ROOT/es1" --impure --expr "builtins.storePath \"$missingPath\"" | grepQuiet "path '$missingPath' is required, but there is no substituter"
+
 [[ $(nix develop -f ./shell.nix shellDrv --eval-store "$eval_store" -c printenv VAR_FROM_NIX) = bar ]]
 
 # Can't write .drv by default
