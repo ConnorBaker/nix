@@ -1,5 +1,4 @@
 #include "unix-derivation-builder-impl.hh"
-#include "child-impl.hh"
 #include "nix/util/system-error.hh"
 
 namespace nix {
@@ -80,35 +79,36 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         auto jsonFile = std::filesystem::path{topTmpDir} / "build.json";
         writeFile(jsonFile, json.dump());
 
-        pid = startProcess([&]() {
-            openSlave();
-            try {
-                commonChildInit();
+        /* What `openSlave`, `commonChildInit` and `setUser` did in a forked
+           child, prepared here: a fork of this process must not allocate. */
+        SpawnOptions options{
+            .program = externalBuilder.program,
+            .lookupPath = false,
+            .args = OsStrings(externalBuilder.args.begin(), externalBuilder.args.end()),
+            .chdir = tmpDir,
+            .setSid = true,
+            .restoreMounts = false,
+        };
+        options.args.push_back(jsonFile.native());
+        if (buildUser) {
+            options.uid = buildUser->getUID();
+            options.gid = buildUser->getGID();
+            options.supplementaryGroups = buildUser->getSupplementaryGIDs();
+        }
 
-                Strings args = {externalBuilder.program};
+        chownToBuilder(topTmpDir);
 
-                if (!externalBuilder.args.empty()) {
-                    args.insert(args.end(), externalBuilder.args.begin(), externalBuilder.args.end());
-                }
+        auto slave = openRawSlave();
+        auto devNull = openNullFD();
 
-                args.insert(args.end(), jsonFile);
-
-                if (chdir(tmpDir.c_str()) == -1)
-                    throw SysError("changing into %1%", PathFmt(tmpDir));
-
-                chownToBuilder(topTmpDir);
-
-                setUser();
-
-                debug("executing external builder: %s", concatStringsSep(" ", args));
-                execv(externalBuilder.program.c_str(), stringsToCharPtrs(args).data());
-
-                throw SysError("executing %s", PathFmt(externalBuilder.program));
-            } catch (...) {
-                handleChildException(true);
-                _exit(1);
-            }
+        auto fds = std::to_array<FdRedirection>({
+            {.from = devNull.get(), .to = STDIN_FILENO},
+            {.from = slave.get(), .to = STDOUT_FILENO},
+            {.from = slave.get(), .to = STDERR_FILENO},
         });
+
+        debug("executing external builder: %s %s", PathFmt(options.program), concatStringsSep(" ", options.args));
+        pid = spawnProgram(options, fds);
     }
 };
 
