@@ -564,8 +564,11 @@ struct ChildStore : BuildingStore
 
 } // namespace
 
+static void bindInSandbox(Source & spec);
+
 void LinuxDerivationBuilder::runBuildChild()
 {
+    bool bind = false;
     try {
         auto bytes = drainFD(STDIN_FILENO);
         StringSource spec(bytes);
@@ -575,6 +578,8 @@ void LinuxDerivationBuilder::runBuildChild()
             globalConfig.set(name, value);
         verbosity = (Verbosity) readNum<unsigned>(spec);
         auto mode = readString(spec);
+        if ((bind = mode == "bind"))
+            bindInSandbox(spec);
 
         /* A builder made from what the parent's builder sent. It is
            never destroyed, which would delete the build's directories. */
@@ -612,7 +617,7 @@ void LinuxDerivationBuilder::runBuildChild()
             chroot->startBuilder(std::move(args));
         builder->runChild(std::move(args));
     } catch (...) {
-        handleChildException(true);
+        handleChildException(!bind);
     }
     _exit(1);
 }
@@ -1164,26 +1169,41 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
     /* Bind-mount the path into the sandbox. This requires
        entering its mount namespace, which is not possible
        in multithreaded programs. So we do this in a
-       child process.*/
-    Pid child(startProcess([&]() {
-        if (usingUserNamespace && (setns(sandboxUserNamespace.get(), CLONE_NEWUSER) == -1))
-            throw SysError("entering sandbox user namespace");
-
-        if (setns(sandboxMountNamespace.get(), CLONE_NEWNS) == -1)
-            throw SysError("entering sandbox mount namespace");
-
-        /* We really do have to reopen the dirfd in the child, otherwise move_mount dies with EINVAL. */
-        auto chrootRootDirFd = valueOr(
-            openDirectory(chrootRootDir, FinalSymlink::DontFollow),
-            NIX_THROW_NATIVE_SYS_ERROR_HANDLER("opening directory %s", PathFmt(chrootRootDir)));
-        doBind(source, chrootRootDirFd.get(), targetRelPath, chrootRootDir);
-
-        _exit(0);
-    }));
+       build child (see bindInSandbox()). */
+    StringSink spec;
+    spec << "bind" << usingUserNamespace << chrootRootDir.native() << source.native() << targetRelPath.native();
+    std::vector<FdRedirection> fds{{.from = sandboxMountNamespace.get(), .to = 3}};
+    if (usingUserNamespace)
+        fds.push_back({.from = sandboxUserNamespace.get(), .to = 4});
+    Pid child = nix::spawnBuildChild(spec.s, std::move(fds));
 
     int status = child.wait();
     if (!statusOk(status))
         throw Error("could not add path '%s' to sandbox: %s", store->printStorePath(path), statusToString(status));
+}
+
+/**
+ * In the build child: bind-mount a path into the sandbox whose mount and
+ * user namespaces are fds 3 and 4.
+ */
+static void bindInSandbox(Source & spec)
+{
+    auto usingUserNamespace = readNum<bool>(spec);
+    std::filesystem::path chrootRootDir = readString(spec), source = readString(spec), target = readString(spec);
+
+    if (usingUserNamespace && (setns(4, CLONE_NEWUSER) == -1))
+        throw SysError("entering sandbox user namespace");
+
+    if (setns(3, CLONE_NEWNS) == -1)
+        throw SysError("entering sandbox mount namespace");
+
+    /* We really do have to reopen the dirfd in the child, otherwise move_mount dies with EINVAL. */
+    auto chrootRootDirFd = valueOr(
+        openDirectory(chrootRootDir, FinalSymlink::DontFollow),
+        NIX_THROW_NATIVE_SYS_ERROR_HANDLER("opening directory %s", PathFmt(chrootRootDir)));
+    doBind(source, chrootRootDirFd.get(), target, chrootRootDir);
+
+    _exit(0);
 }
 
 } // namespace nix
