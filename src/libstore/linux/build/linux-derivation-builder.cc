@@ -469,11 +469,24 @@ void buildChildMain(int argc, char ** argv, void (*initPlugins)())
         ownBuiltins.insert(name);
 }
 
+static thread_local BuildChildServers * currentBuildChildServers = nullptr;
+
+BuildChildServers::BuildChildServers()
+    : previous(currentBuildChildServers)
+{
+    currentBuildChildServers = this;
+}
+
+BuildChildServers::~BuildChildServers()
+{
+    currentBuildChildServers = previous;
+}
+
 /**
  * Start a child of this process that runs Nix with `state` on stdin after
  * the settings, and `fds`. A fork of this multithreaded process could run
- * no Nix code, so a fresh exec of Nix, started once per process (and once
- * more for plugins), forks it instead (see runBuildChild()).
+ * no Nix code, so a fresh exec of Nix forks it instead (see
+ * runBuildChild()), one per BuildChildServers (and one more for plugins).
  */
 static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fds, bool self = false)
 {
@@ -493,53 +506,74 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
     valueOr(seek(specFd.get(), 0, SEEK_SET), NIX_THROW_NATIVE_SYS_ERROR_HANDLER("seeking in the build child's memfd"));
     fds.insert(fds.begin(), {.from = specFd.get(), .to = STDIN_FILENO});
 
-    static std::mutex mutex;
-    static std::pair<pid_t, AutoCloseFD> servers[2];
-    std::lock_guard lock(mutex);
-    auto & [owner, server] = servers[self];
-    if (owner != getpid()) {
-        int sv[2];
-        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == -1)
-            throw SysError("creating socket pair");
-        server = sv[0];
-        AutoCloseFD theirs = sv[1];
-        SpawnOptions options{
-            .program = "/proc/self/exe",
-            .lookupPath = false,
-            .args = {"__build-child"},
-            .dieWithParent = false,
-            .restoreMounts = false};
-#ifdef NIX_LIBEXEC_DIR
-        /* The helper installed with this library. */
-        if (!self)
-            options.program = NIX_LIBEXEC_DIR "/nix-build-child";
-#else
-        if (!buildChildEntry)
-            throw Error(
-                "this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main()");
-#endif
-        /* It exits when this process closes its socket. */
-        spawnProgram(throughLoader(options), std::to_array<FdRedirection>({{.from = theirs.get(), .to = STDIN_FILENO}}))
-            .release();
-        owner = getpid();
-    }
-
     std::vector<int> targets, sources;
     for (auto & fd : fds) {
         targets.push_back(fd.to);
         sources.push_back(fd.from);
     }
-    pid_t pid;
-    try {
-        unix::sendMessageWithFds(server.get(), std::as_bytes(std::span(targets)), sources);
-        readFull(server.get(), reinterpret_cast<char *>(&pid), sizeof pid);
-    } catch (...) {
-        owner = 0; /* start another next time */
-        throw;
+
+    std::optional<BuildChildServers> own;
+    if (!currentBuildChildServers)
+        own.emplace();
+    auto & server = currentBuildChildServers->servers[self];
+    for (bool retry = true;; retry = false) {
+        if (!server.pid) {
+            int sv[2];
+            if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == -1)
+                throw SysError("creating socket pair");
+            server.socket = sv[0];
+            AutoCloseFD theirs = sv[1];
+            /* In its own session, out of reach of the terminal's signals. */
+            SpawnOptions options{
+                .program = "/proc/self/exe",
+                .lookupPath = false,
+                .args = {"__build-child"},
+                .setSid = true,
+                .restoreMounts = false};
+#ifdef NIX_LIBEXEC_DIR
+            /* The helper installed with this library. */
+            if (!self)
+                options.program = NIX_LIBEXEC_DIR "/nix-build-child";
+#else
+            if (!buildChildEntry)
+                throw Error(
+                    "this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main()");
+#endif
+            server.pid = spawnProgram(
+                throughLoader(options), std::to_array<FdRedirection>({{.from = theirs.get(), .to = STDIN_FILENO}}));
+        }
+        /* If it went away: reap it, and try once more with another. */
+        auto restart = [&] {
+            server.socket.close();
+            server.pid.kill();
+        };
+        try {
+            unix::sendMessageWithFds(server.socket.get(), std::as_bytes(std::span(targets)), sources);
+        } catch (SysError &) {
+            restart();
+            if (!retry)
+                throw;
+            continue;
+        }
+        /* Not interruptible: once the request is sent, the child must get a Pid. */
+        pid_t pid;
+        ssize_t n;
+        while ((n = recv(server.socket.get(), &pid, sizeof pid, 0)) == -1 && errno == EINTR)
+            ;
+        if (n == sizeof pid) {
+            if (pid <= 0)
+                throw SysError(-pid, "starting the build child");
+            return Pid(pid);
+        }
+        if (n == -1 && errno != ECONNRESET) {
+            SysError e("receiving from the build child server");
+            restart();
+            throw e;
+        }
+        restart();
+        if (!retry)
+            throw EndOfFile("the build child server exited");
     }
-    if (pid <= 0)
-        throw SysError(-pid, "starting the build child");
-    return Pid(pid);
 }
 
 Pid LinuxDerivationBuilder::spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds)
@@ -615,6 +649,8 @@ void LinuxDerivationBuilder::runBuildChild()
         while (true) {
             int targets[8];
             auto received = unix::receiveMessageWithFds(STDIN_FILENO, std::as_writable_bytes(std::span(targets)));
+            if (received.bytesReceived != received.fds.size() * sizeof(int))
+                throw Error("malformed build child request");
             std::vector<FdRedirection> fds;
             for (size_t i = 0; i < received.fds.size(); ++i)
                 fds.push_back({.from = received.fds[i].get(), .to = targets[i]});

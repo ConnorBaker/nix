@@ -8,6 +8,7 @@
 #include "nix/store/build/derivation-resolution-goal.hh"
 #include "nix/store/build/derivation-building-goal.hh"
 #include "nix/store/build/derivation-trampoline-goal.hh"
+#include "nix/store/build/derivation-builder.hh"
 #include "nix/util/system-error.hh"
 #ifndef _WIN32 // TODO Enable building on Windows
 #  include "nix/store/build/hook-instance.hh"
@@ -282,6 +283,11 @@ void Worker::waitForCompletion(GoalPtr goal)
 
 void Worker::run(const Goals & _topGoals)
 {
+#ifdef __linux__
+    /* Stopped before this returns, so before the thread that started it
+       exits, and before Nix execs another program. */
+    BuildChildServers buildChildServers;
+#endif
     debug("entered goal loop");
     for (std::shared_ptr<Goal> goal : _topGoals)
         topGoals.insert(std::move(goal));
