@@ -30,6 +30,17 @@ void rethrowExceptionAsError();
 void handleChildException(bool sendException);
 
 /**
+ * Local builds on Linux start their child process as a fresh exec: of the
+ * `nix-build-child` helper, or in a statically linked program, of the
+ * program itself, which must then call this first in `main()`, before it
+ * starts any thread. In the child, this runs it and does not return.
+ *
+ * With `initPlugins`, a plugin's builtin builder also runs in a fresh exec
+ * of the program, which calls it to load the plugins.
+ */
+void buildChildMain(int argc, char ** argv, void (*initPlugins)() = nullptr);
+
+/**
  * Denotes a build failure that stemmed from the builder exiting with a
  * failing exist status.
  */

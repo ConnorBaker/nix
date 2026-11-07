@@ -14,6 +14,7 @@
   util-linux,
 
   nix-store,
+  nix-store-c,
   nix-expr,
   nix-cli,
 
@@ -73,6 +74,7 @@ mkMesonDerivation (
 
     buildInputs = [
       nix-store
+      nix-store-c
       nix-expr
     ];
 

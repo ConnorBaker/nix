@@ -14,6 +14,9 @@
 #include "nix/util/os-filename.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/serialise.hh"
+#include "nix/util/config-global.hh"
+#include "nix/store/derivation/aterm.hh"
+#include "nix/store/builtins.hh"
 #include "linux/fchmodat2-compat.hh"
 #include "nix/util/system-error.hh"
 
@@ -449,6 +452,171 @@ void LinuxDerivationBuilder::enterChroot()
     });
 }
 
+static bool buildChildEntry = false;
+static void (*loadPlugins)() = nullptr;
+/* The program's own builtin builders: plugins are loaded later. */
+static StringSet ownBuiltins;
+
+void buildChildMain(int argc, char ** argv, void (*initPlugins)())
+{
+    loadPlugins = initPlugins;
+    if (argc > 1 && std::string_view(argv[1]) == "__build-child")
+        LinuxDerivationBuilder::runBuildChild();
+    buildChildEntry = true;
+    for (auto & [name, _] : RegisterBuiltinBuilder::builtinBuilders())
+        ownBuiltins.insert(name);
+}
+
+/**
+ * Start a fresh Nix with `state` on stdin after the settings, and `fds`.
+ * A fork of this multithreaded process could run no Nix code.
+ */
+static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fds, bool self = false)
+{
+    std::map<std::string, AbstractConfig::SettingInfo> settings;
+    globalConfig.getSettings(settings);
+    StringMap config;
+    for (auto & [name, info] : settings)
+        config.insert_or_assign(name, info.value);
+    StringSink spec;
+    writeStringMap(spec, config);
+    spec << std::to_underlying(verbosity);
+    spec.s.append(state);
+    AutoCloseFD specFd = memfd_create("nix-build-child", MFD_CLOEXEC);
+    if (!specFd)
+        throw SysError("creating memfd");
+    writeFull(specFd.get(), spec.s);
+    valueOr(seek(specFd.get(), 0, SEEK_SET), NIX_THROW_NATIVE_SYS_ERROR_HANDLER("seeking in the build child's memfd"));
+    fds.insert(fds.begin(), {.from = specFd.get(), .to = STDIN_FILENO});
+    auto moved = moveAboveTargets(fds);
+
+    SpawnOptions options{
+        .program = "/proc/self/exe", .lookupPath = false, .args = {"__build-child"}, .restoreMounts = false};
+#ifdef NIX_LIBEXEC_DIR
+    /* The helper installed with this library. */
+    if (!self)
+        options.program = NIX_LIBEXEC_DIR "/nix-build-child";
+#else
+    if (!buildChildEntry)
+        throw Error("this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main()");
+#endif
+    return spawnProgram(throughLoader(options), fds);
+}
+
+Pid LinuxDerivationBuilder::spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds)
+{
+    StringSink spec;
+    spec << mode << store->storeDir << drv.name;
+    derivation::write(spec, *store, drv);
+    spec << drvOptions.requiredSystemFeatures << systemFeatures;
+    writeChildState(spec);
+#if NIX_WITH_AWS_AUTH
+    Strings aws;
+    if (auto creds = preResolveAwsCredentials()) {
+        aws = {creds->accessKeyId, creds->secretAccessKey};
+        if (creds->sessionToken)
+            aws.push_back(*creds->sessionToken);
+    }
+    spec << aws;
+#endif
+    /* Opened here, before the child can enter a user namespace. */
+    auto slave = openRawSlave();
+    fds.insert(fds.begin(), {{.from = slave.get(), .to = STDOUT_FILENO}, {.from = slave.get(), .to = STDERR_FILENO}});
+    /* A plugin's builtin builder runs in this program, which loads its plugins. */
+    bool self = loadPlugins && drv.isBuiltin() && !ownBuiltins.contains(drv.builder.substr(8));
+    return nix::spawnBuildChild(spec.s, std::move(fds), self);
+}
+
+void LinuxDerivationBuilder::startChild()
+{
+    pid = spawnBuildChild("unix");
+}
+
+namespace {
+
+/**
+ * The part of the store that a builder uses in the build child.
+ */
+struct ChildStore : BuildingStore
+{
+    using BuildingStore::BuildingStore;
+
+    std::filesystem::path getRealStoreDir() const override
+    {
+        unreachable();
+    }
+
+    std::filesystem::path getBuildDir() const override
+    {
+        unreachable();
+    }
+
+    const LocalSettings & getLocalSettings() const override
+    {
+        return settings.getLocalSettings();
+    }
+
+    ref<Store> makeRecursiveNixStore(RestrictionContext &) override
+    {
+        unreachable();
+    }
+};
+
+} // namespace
+
+void LinuxDerivationBuilder::runBuildChild()
+{
+    try {
+        auto bytes = drainFD(STDIN_FILENO);
+        StringSource spec(bytes);
+        initLibStore(false);
+        auto config = readStringMap(spec);
+        for (auto & [name, value] : config)
+            globalConfig.set(name, value);
+        verbosity = (Verbosity) readNum<unsigned>(spec);
+        auto mode = readString(spec);
+
+        /* A builder made from what the parent's builder sent. It is
+           never destroyed, which would delete the build's directories. */
+        auto storeDir = readString(spec);
+        auto store = std::make_shared<ChildStore>(storeDir);
+        BasicDerivation drv;
+        auto name = readString(spec);
+        derivation::read(spec, *store, drv, name);
+        if (loadPlugins && drv.isBuiltin() && !get(RegisterBuiltinBuilder::builtinBuilders(), drv.builder.substr(8)))
+            loadPlugins();
+        DerivationOptions<StorePath> drvOptions;
+        drvOptions.requiredSystemFeatures = readStrings<StringSet>(spec);
+        BuildResult buildResult;
+        StorePathSet inputPaths;
+        BuildMode buildMode = bmNormal;
+        DerivationBuilderParams params{
+            .drvPath = StorePath::dummy,
+            .buildResult = buildResult,
+            .drv = drv,
+            .drvOptions = drvOptions,
+            .inputPaths = inputPaths,
+            .buildMode = buildMode,
+            .systemFeatures = readStrings<StringSet>(spec),
+        };
+        auto builder = mode == "chroot" ? new ChrootLinuxDerivationBuilder(store, nullptr, params)
+                                        : new LinuxDerivationBuilder(store, nullptr, params);
+        builder->readChildState(spec);
+        RunChildArgs args;
+#if NIX_WITH_AWS_AUTH
+        if (auto aws = readStrings<Strings>(spec); !aws.empty())
+            args.awsCredentials.emplace(
+                aws.front(), *std::next(aws.begin()), aws.size() > 2 ? std::optional{aws.back()} : std::nullopt);
+#endif
+        if (auto chroot = dynamic_cast<ChrootLinuxDerivationBuilder *>(builder))
+            chroot->startBuilder(std::move(args));
+        builder->runChild(std::move(args));
+    } catch (...) {
+        handleChildException(true);
+    }
+    _exit(1);
+}
+
 uid_t ChrootLinuxDerivationBuilder::sandboxUid()
 {
     return usingUserNamespace ? (!buildUser || buildUser->getUIDCount() == 1 ? 1000 : 0) : buildUser->getUID();
@@ -526,12 +694,6 @@ void ChrootLinuxDerivationBuilder::prepareSandbox()
 
 void ChrootLinuxDerivationBuilder::startChild()
 {
-    RunChildArgs args{
-#if NIX_WITH_AWS_AUTH
-        .awsCredentials = preResolveAwsCredentials(),
-#endif
-    };
-
     /* Set up private namespaces for the build:
 
         - The PID namespace causes the build to start as PID 1.
@@ -559,9 +721,9 @@ void ChrootLinuxDerivationBuilder::startChild()
         - The UTS namespace ensures that builders see a hostname of
           localhost rather than the actual hostname.
 
-       We use a helper process to do the clone() to work around
-       clone() being broken in multi-threaded programs due to
-       at-fork handlers not being run. Note that we use
+       We use a helper process, a fresh exec of Nix, to do the clone()
+       to work around clone() being broken in multi-threaded programs
+       due to at-fork handlers not being run. Note that we use
        CLONE_PARENT to ensure that the real builder is parented to
        us.
     */
@@ -573,41 +735,8 @@ void ChrootLinuxDerivationBuilder::startChild()
     Pipe sendPid;
     sendPid.create();
 
-    Pid helper = startProcess([&]() {
-        sendPid.readSide.close();
-
-        /* We need to open the slave early, before
-           CLONE_NEWUSER. Otherwise we get EPERM when running as
-           root. */
-        openSlave();
-
-        try {
-            /* Drop additional groups here because we can't do it
-               after we've created the new user namespace. */
-            if (setgroups(0, 0) == -1) {
-                if (errno != EPERM)
-                    throw SysError("setgroups failed");
-                if (store->getLocalSettings().requireDropSupplementaryGroups)
-                    throw Error(
-                        "setgroups failed. Set the require-drop-supplementary-groups option to false to skip this step.");
-            }
-
-            ProcessOptions options;
-            options.cloneFlags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_PARENT | SIGCHLD;
-            if (derivationType.isSandboxed())
-                options.cloneFlags |= CLONE_NEWNET;
-            if (usingUserNamespace)
-                options.cloneFlags |= CLONE_NEWUSER;
-
-            pid_t child = startProcess([this, args = std::move(args)]() { runChild(std::move(args)); }, options);
-
-            writeFull(sendPid.writeSide.get(), fmt("%d\n", child));
-            _exit(0);
-        } catch (...) {
-            handleChildException(true);
-            _exit(1);
-        }
-    });
+    Pid helper = spawnBuildChild(
+        "chroot", {{.from = userNamespaceSync.readSide.get(), .to = 3}, {.from = sendPid.writeSide.get(), .to = 4}});
 
     sendPid.writeSide.close();
 
@@ -700,6 +829,55 @@ void ChrootLinuxDerivationBuilder::startChild()
     /* Signal the builder that we've updated its user namespace. */
     writeFull(userNamespaceSync.writeSide.get(), "1\n");
     userNamespaceSyncDone = true;
+}
+
+void ChrootLinuxDerivationBuilder::startBuilder(RunChildArgs args)
+{
+    userNamespaceSync.readSide = 3;
+
+    /* Drop additional groups here because we can't do it
+       after we've created the new user namespace. */
+    if (setgroups(0, 0) == -1) {
+        if (errno != EPERM)
+            throw SysError("setgroups failed");
+        if (store->getLocalSettings().requireDropSupplementaryGroups)
+            throw Error(
+                "setgroups failed. Set the require-drop-supplementary-groups option to false to skip this step.");
+    }
+
+    ProcessOptions options;
+    options.cloneFlags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_PARENT | SIGCHLD;
+    if (derivationType.isSandboxed())
+        options.cloneFlags |= CLONE_NEWNET;
+    if (usingUserNamespace)
+        options.cloneFlags |= CLONE_NEWUSER;
+
+    pid_t child = startProcess([this, args = std::move(args)]() { runChild(std::move(args)); }, options);
+
+    writeFull(4, fmt("%d\n", child));
+    _exit(0);
+}
+
+void ChrootLinuxDerivationBuilder::writeChildState(Sink & sink)
+{
+    UnixDerivationBuilderImpl::writeChildState(sink);
+    sink << chrootRootDir.native() << pathsInChroot.size();
+    for (auto & [target, path] : pathsInChroot)
+        sink << target.native() << path.source.native() << path.optional;
+    sink << usingUserNamespace << (cgroup ? cgroup->native() : "");
+}
+
+void ChrootLinuxDerivationBuilder::readChildState(Source & source)
+{
+    UnixDerivationBuilderImpl::readChildState(source);
+    chrootRootDir = readString(source);
+    for (auto n = readNum<size_t>(source); n--;) {
+        std::filesystem::path target = readString(source), path = readString(source);
+        pathsInChroot.insert_or_assign(target, ChrootPath{.source = path, .optional = readNum<bool>(source)});
+    }
+    usingUserNamespace = readNum<bool>(source);
+    if (auto path = readString(source); !path.empty())
+        cgroup = path;
 }
 
 void ChrootLinuxDerivationBuilder::enterChroot()

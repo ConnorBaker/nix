@@ -225,6 +225,13 @@ endif
 # by joining it with prefix, unless it was already an absolute path
 # (which is the default for store-dir, localstatedir, and log-dir).
 configdata_priv.set_quoted('NIX_STORE_DIR', store_dir)
+# The build child of programs that do not call buildChildMain(). A static
+# nix runs itself, and its closure should not get this output.
+static_build = get_option('default_library') == 'static'
+build_child_helper = host_machine.system() == 'linux' and not static_build
+if build_child_helper
+  configdata_priv.set_quoted('NIX_LIBEXEC_DIR', libexecdir)
+endif
 # On Windows, NIX_STATE_DIR, NIX_LOG_DIR, and NIX_CONF_DIR are determined at
 # runtime using the Windows known folders API (FOLDERID_ProgramData), so we
 # don't define them at compile time.
@@ -384,6 +391,18 @@ this_library = library(
 )
 
 install_headers(headers, subdir : 'nix/store', preserve_path : true)
+
+if build_child_helper
+  executable(
+    'nix-build-child',
+    'linux/build/build-child-main.cc',
+    link_with : this_library,
+    dependencies : deps_public + deps_public_no_pkgconfig + deps_private_no_pkgconfig,
+    include_directories : include_dirs,
+    install : true,
+    install_dir : libexecdir,
+  )
+endif
 
 libraries_private = []
 

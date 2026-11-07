@@ -2,11 +2,16 @@
 #include "nix/store/store-open.hh"
 #include "nix/store/build.hh"
 #include "nix/store/build-result.hh"
+#include "nix_api_store.h"
 #include <iostream>
 
 int main(int argc, char ** argv)
 {
     using namespace nix;
+
+#ifdef BUILD_CHILD_MAIN
+    nix_build_child_main(argc, argv);
+#endif
 
     try {
         if (argc != 2) {

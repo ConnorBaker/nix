@@ -10,6 +10,7 @@
 #include "nix/store/globals.hh"
 #include "nix/cmd/legacy.hh"
 #include "nix/main/shared.hh"
+#include "nix/main/plugin.hh"
 #include "nix/store/store-open.hh"
 #include "nix/store/store-registration.hh"
 #include "nix/store/filetransfer.hh"
@@ -24,6 +25,7 @@
 #include "nix/flake/flake.hh"
 #include "nix/flake/settings.hh"
 
+#include "nix/store/build/derivation-builder.hh"
 #include "self-exe.hh"
 #include "crash-handler.hh"
 #include "cli-config-private.hh"
@@ -375,9 +377,10 @@ void mainWrapped(int argc, char ** argv)
 
     registerCrashHandler();
 
-    /* The chroot helper needs to be run before any threads have been
-       started. */
+    /* The chroot helper and the build child need to be run before any
+       threads have been started. */
 #ifndef _WIN32
+    buildChildMain(argc, argv, initPlugins);
     if (argc > 0 && argv[0] == chrootHelperName) {
         chrootHelper(argc, argv);
         return;

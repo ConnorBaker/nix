@@ -1,5 +1,7 @@
 #include "nix/util/config-global.hh"
 #include "nix/expr/primops.hh"
+#include "nix/store/builtins.hh"
+#include "nix/util/file-system.hh"
 
 namespace nix {
 
@@ -19,6 +21,10 @@ static void prim_anotherNull(EvalState & state, CallSite callSite, Value * const
     else
         v.mkBool(false);
 }
+
+static RegisterBuiltinBuilder rb("plugintest", [](const BuiltinBuilderContext & ctx) {
+    writeFile(ctx.outputs.at("out"), "from-plugin");
+});
 
 static RegisterPrimOp rp({
     .name = "anotherNull",

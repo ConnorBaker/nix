@@ -10,6 +10,7 @@
 #include "nix/store/store-api.hh"
 #include "nix/store/build.hh"
 #include "nix/store/store-open.hh"
+#include "nix/store/build/derivation-builder.hh"
 #include "nix/store/store-reference.hh"
 #include "nix/store/build-result.hh"
 #include "nix/store/local-fs-store.hh"
@@ -18,6 +19,13 @@
 #include "nix/store/globals.hh"
 
 extern "C" {
+
+void nix_build_child_main(int argc, char ** argv)
+{
+#ifndef _WIN32
+    nix::buildChildMain(argc, argv);
+#endif
+}
 
 nix_err nix_libstore_init(nix_c_context * context)
 {

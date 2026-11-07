@@ -12,6 +12,15 @@
 namespace nix {
 
 /**
+ * Point `fds` at copies of their sources above every target (owned by the
+ * result), so that applying them in order cannot overwrite a later source.
+ */
+std::vector<AutoCloseFD> moveAboveTargets(std::span<FdRedirection> fds);
+
+void writeStringMap(Sink & sink, const StringMap & map);
+StringMap readStringMap(Source & source);
+
+/**
  * This class represents the state for building locally on Unix.
  *
  * @todo Ideally, it would not be a class, but a single function.
@@ -284,6 +293,14 @@ protected:
      * Otherwise this function throws an Error.
      */
     void writeBuilderFile(const OsFilename & name, std::string_view contents);
+
+    /**
+     * The state that runChild() reads that the derivation, its required
+     * system features and the settings do not give, for a builder made
+     * from them in a fresh process.
+     */
+    virtual void writeChildState(Sink & sink);
+    virtual void readChildState(Source & source);
 
     /**
      * Arguments passed to runChild().

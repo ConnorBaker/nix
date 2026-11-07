@@ -52,6 +52,16 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
 
     void startChild() override;
 
+    /**
+     * In the build child: clone the builder into its namespaces, and send
+     * its pid to fd 4.
+     */
+    [[noreturn]] void startBuilder(RunChildArgs args);
+
+    void writeChildState(Sink & sink) override;
+
+    void readChildState(Source & source) override;
+
     void enterChroot() override;
 
     void setUser() override;

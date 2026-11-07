@@ -101,6 +101,21 @@ void preserveDeathSignal(fun<void()> setCredentials)
 
 void UnixDerivationBuilderImpl::anchor() {}
 
+std::vector<AutoCloseFD> moveAboveTargets(std::span<FdRedirection> fds)
+{
+    int above = 0;
+    for (auto & fd : fds)
+        above = std::max(above, fd.to + 1);
+    std::vector<AutoCloseFD> moved;
+    for (auto & fd : fds) {
+        moved.emplace_back(fcntl(fd.from, F_DUPFD_CLOEXEC, above));
+        if (!moved.back())
+            throw SysError("moving fd %d above %d", fd.from, above);
+        fd.from = moved.back().get();
+    }
+    return moved;
+}
+
 const std::filesystem::path UnixDerivationBuilderImpl::homeDir = "/homeless-shelter";
 
 void UnixDerivationBuilderImpl::killSandbox(bool getStats)
@@ -980,6 +995,87 @@ void UnixDerivationBuilderImpl::execBuilder(const Strings & args, const Strings 
 {
     execve(requireCString(drv.builder), stringsToCharPtrs(args).data(), stringsToCharPtrs(envStrs).data());
 }
+
+void writeStringMap(Sink & sink, const StringMap & map)
+{
+    sink << map.size();
+    for (auto & [name, value] : map)
+        sink << name << value;
+}
+
+StringMap readStringMap(Source & source)
+{
+    StringMap map;
+    for (auto n = readNum<size_t>(source); n--;) {
+        auto name = readString(source);
+        map.insert_or_assign(std::move(name), readString(source));
+    }
+    return map;
+}
+
+void UnixDerivationBuilderImpl::writeChildState(Sink & sink)
+{
+    StringMap outputs;
+    for (auto & [name, path] : scratchOutputs)
+        outputs.insert_or_assign(name, store->printStorePath(path));
+    sink << tmpDir.native() << topTmpDir.native();
+    writeStringMap(sink, env);
+    writeStringMap(sink, inputRewrites);
+    writeStringMap(sink, outputs);
+    Strings user;
+    if (buildUser) {
+        for (auto id : buildUser->getSupplementaryGIDs())
+            user.push_back(std::to_string(id));
+        user.push_front(std::to_string(buildUser->getUIDCount()));
+        user.push_front(std::to_string(buildUser->getGID()));
+        user.push_front(std::to_string(buildUser->getUID()));
+    }
+    sink << user;
+}
+
+void UnixDerivationBuilderImpl::readChildState(Source & source)
+{
+    struct User : UserLock
+    {
+        std::vector<uid_t> ids;
+
+        uid_t getUID() override
+        {
+            return ids[0];
+        }
+
+        gid_t getGID() override
+        {
+            return ids[1];
+        }
+
+        uid_t getUIDCount() override
+        {
+            return ids[2];
+        }
+
+        std::vector<gid_t> getSupplementaryGIDs() override
+        {
+            return {ids.begin() + 3, ids.end()};
+        }
+    };
+
+    tmpDir = readString(source);
+    topTmpDir = readString(source);
+    env = readStringMap(source);
+    inputRewrites = readStringMap(source);
+    for (auto & [name, path] : readStringMap(source))
+        scratchOutputs.insert_or_assign(name, store->parseStorePath(path));
+    auto user = std::make_unique<User>();
+    for (auto & id : readStrings<Strings>(source))
+        user->ids.push_back(std::stoul(id));
+    if (!user->ids.empty())
+        buildUser = std::move(user);
+}
+
+#ifndef __linux__
+void buildChildMain(int, char **, void (*)()) {}
+#endif
 
 void UnixDerivationBuilderImpl::cleanupBuild(bool force)
 {
