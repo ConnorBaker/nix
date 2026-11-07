@@ -36,6 +36,16 @@ typedef struct Store Store;
 nix_err nix_libstore_init(nix_c_context * context);
 
 /**
+ * @brief Runs a local build's child process, if this process is one.
+ *
+ * A statically linked program that builds locally must call this first in
+ * `main()`, before it starts any thread; another one may, to run as its
+ * own build child instead of the `nix-build-child` helper. It returns
+ * unless this process is a build child.
+ */
+void nix_build_child_main(int argc, char ** argv);
+
+/**
  * @brief Like nix_libstore_init, but does not load the Nix configuration.
  *
  * This is useful when external configuration is not desired, such as when running unit tests.

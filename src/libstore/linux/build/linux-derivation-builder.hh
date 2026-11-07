@@ -26,6 +26,19 @@ struct LinuxDerivationBuilder : virtual UnixDerivationBuilderImpl
     using UnixDerivationBuilderImpl::UnixDerivationBuilderImpl;
 
     void enterChroot() override;
+
+    void startChild() override;
+
+    /**
+     * Start the build child, a fresh exec of Nix, in `mode` with the pty
+     * slave as stdout and stderr and `fds` passed on; see runBuildChild().
+     */
+    Pid spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds = {});
+
+    /**
+     * Run the build child that spawnBuildChild() started.
+     */
+    [[noreturn]] static void runBuildChild();
 };
 
 } // namespace nix
