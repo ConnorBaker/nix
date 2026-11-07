@@ -529,9 +529,14 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
         targets.push_back(fd.to);
         sources.push_back(fd.from);
     }
-    unix::sendMessageWithFds(server.get(), std::as_bytes(std::span(targets)), sources);
     pid_t pid;
-    readFull(server.get(), reinterpret_cast<char *>(&pid), sizeof pid);
+    try {
+        unix::sendMessageWithFds(server.get(), std::as_bytes(std::span(targets)), sources);
+        readFull(server.get(), reinterpret_cast<char *>(&pid), sizeof pid);
+    } catch (...) {
+        owner = 0; /* start another next time */
+        throw;
+    }
     if (pid <= 0)
         throw SysError(-pid, "starting the build child");
     return Pid(pid);
