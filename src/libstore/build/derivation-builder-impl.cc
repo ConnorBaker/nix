@@ -81,7 +81,7 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
         // although makeTempPath should be unique, we can't
         // guarantee that.
         do {
-            oldPath = makeTempPath(storePath, ".old");
+            oldPath = makeTempPath(storePath.parent_path(), storePath.filename().string() + ".old");
             // store paths are often directories so we can't just unlink() it
             // let's make sure the path doesn't exist before we try to use it
         } while (pathExists(oldPath));
