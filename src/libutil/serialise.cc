@@ -430,7 +430,11 @@ std::unique_ptr<FinishSink> sourceToSink(fun<void(Source &)> reader)
 
         void finish() override
         {
-            if (coro && *coro)
+            if (!coro) {
+                // Nothing was written: the reader still reads the stream, which is empty
+                StringSource empty{std::string_view{}};
+                reader(empty);
+            } else if (*coro)
                 (*coro)(true);
         }
     };

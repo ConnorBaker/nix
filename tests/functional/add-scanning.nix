@@ -33,6 +33,9 @@ mkDerivation {
     nix-store -qR "$felis" | grep "$mao"
     nix-store -qR "$felis" | grep "${dependency}"
 
+    : > empty
+    nix store add --scan --mode flat ./empty
+
     nix-store -qR "$felis" > "$out"
   '';
 }
