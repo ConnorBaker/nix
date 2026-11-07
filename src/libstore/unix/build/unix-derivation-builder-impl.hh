@@ -7,6 +7,7 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/user-lock.hh"
 #include "nix/util/os-filename.hh"
+#include "nix/util/processes.hh"
 
 namespace nix {
 
@@ -207,6 +208,11 @@ protected:
      * Open the slave side of the pseudoterminal and use it as stderr.
      */
     void openSlave();
+
+    /**
+     * Open the slave side of the pseudoterminal in raw mode.
+     */
+    AutoCloseFD openRawSlave();
 
     /**
      * Called by prepareBuild() to start the child process for the

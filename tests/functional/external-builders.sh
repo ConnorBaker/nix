@@ -26,6 +26,7 @@ cat > "$external_builder" <<EOF
 PATH=${PATH@Q}
 
 [[ "\$1" = bla ]]
+[[ \$(pwd -P) = \$(realpath "\$(jq -r .tmpDir < "\$2")") ]]
 
 system="\$(jq -r .system < "\$2")"
 builder="\$(jq -r .builder < "\$2")"
