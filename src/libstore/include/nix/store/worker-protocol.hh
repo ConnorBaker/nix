@@ -157,6 +157,11 @@ struct WorkerProto
     static constexpr std::string_view featureAddTempRoots = "addTempRoots";
 
     /**
+     * Not an operation: a `BuildResult` carries `BuildResult::Success::tracesTogether`.
+     */
+    static constexpr std::string_view featureBuildTracesTogether = "build-traces-together";
+
+    /**
      * A unidirectional read connection, to be used by the read half of the
      * canonical serializers below.
      */

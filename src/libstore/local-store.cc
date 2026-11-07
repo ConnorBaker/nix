@@ -693,6 +693,8 @@ void LocalStore::registerBuildTraces(const StorePath & drvPath, const SingleDrvO
     retrySQLite<void>([&]() {
         auto state(_state->lock());
         SQLiteTxn txn(state->db);
+        auto traced = [&] { return state->stmts->QueryRealisedOutputNames.use().apply(drvPath.to_string()); };
+        bool anyTraced = from == TracesOf::MaybeMixed && traced().next();
         for (auto & [outputName, info] : outputs) {
             auto oldR = queryRealisation_(*state, {drvPath, outputName});
             if (oldR && info.isCompatibleWith(*oldR)) {
@@ -703,12 +705,12 @@ void LocalStore::registerBuildTraces(const StorePath & drvPath, const SingleDrvO
                     .apply(drvPath.to_string())
                     .apply(outputName)
                     .exec();
-            } else if (oldR && (from != TracesOf::WholeBuild || isValidPath_(*state, oldR->outPath))) {
+            } else if (oldR ? from != TracesOf::WholeBuild || isValidPath_(*state, oldR->outPath) : anyTraced) {
                 auto here = config->getReference();
                 if (auto & root = config->rootDir.get())
                     here.params.insert_or_assign("root", root->string());
                 std::string ids;
-                for (auto use(state->stmts->QueryRealisedOutputNames.use().apply(drvPath.to_string())); use.next();)
+                for (auto use(traced()); use.next();)
                     ids += " " + escapeShellArgAlways(printStorePath(drvPath) + "^" + use.getStr(0));
                 throw Error(
                     "output '%s' of '%s' at '%s' differs from the build traces recorded here; to use it, "

@@ -210,8 +210,14 @@ Goal::Co<DerivationTrampolineGoal::Result> DerivationTrampolineGoal::haveDerivat
         return *success;
     });
 
+    /* One build registered these outputs' traces together: it answers for all of them, also
+       for one found valid before it (which it may have rebuilt since). */
+    auto together = std::ranges::find_if(successes, &BuildResult::Success::tracesTogether);
+    if (together != std::ranges::end(successes))
+        outputs = (*together).builtOutputs;
     for (const auto & success : successes)
         std::ranges::copy(success.builtOutputs, std::inserter(outputs, outputs.end()));
+    std::erase_if(outputs, [&](const auto & o) { return !wantedOutputs.contains(o.first); });
 
     auto statuses = successes | std::views::transform(&BuildResult::Success::status);
 
@@ -246,6 +252,7 @@ Goal::Co<DerivationTrampolineGoal::Result> DerivationTrampolineGoal::haveDerivat
                 BuildResult::Success{
                     .status = std::ranges::min(statuses, compareSuccesses),
                     .builtOutputs = std::move(outputs),
+                    .tracesTogether = together != std::ranges::end(successes),
                 },
         },
     };

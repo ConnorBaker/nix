@@ -398,25 +398,18 @@ static int main_build_remote(int argc, char ** argv)
             optResult = std::move(res[0]);
         }
 
-        std::set<Realisation> missingRealisations;
+        SingleDrvOutputs builtOutputs;
+        bool together = false;
         StorePathSet missingPaths;
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(drv).hasKnownOutputPaths()) {
-            for (auto & outputName : wantedOutputs) {
-                auto thisOutputId = DrvOutput{*drvPath, outputName};
-                if (!store->queryRealisation(thisOutputId)) {
-                    debug("missing output %s", outputName);
-                    assert(optResult);
-                    auto & result = *optResult;
-                    if (auto * successP = result.tryGetSuccess()) {
-                        auto & success = *successP;
-                        auto i = success.builtOutputs.find(outputName);
-                        assert(i != success.builtOutputs.end());
-                        auto & newRealisation = i->second;
-                        missingRealisations.insert({newRealisation, thisOutputId});
-                        missingPaths.insert(newRealisation.outPath);
-                    }
-                }
+            assert(optResult);
+            if (auto * success = optResult->tryGetSuccess()) {
+                builtOutputs = success->builtOutputs;
+                together = success->tracesTogether;
             }
+            for (auto & outputName : wantedOutputs)
+                if (auto * output = get(builtOutputs, outputName); output && !store->isValidPath(output->outPath))
+                    missingPaths.insert(output->outPath);
         } else {
             auto outputPaths = outputsAndOptPaths(drv, *store);
             for (auto & [outputName, hopefullyOutputPath] : outputPaths) {
@@ -434,11 +427,36 @@ static int main_build_remote(int argc, char ** argv)
             copyPaths(*sshStore, *store, missingPaths, NoRepair, NoCheckSigs, NoSubstitute);
         }
         // XXX: Should be done as part of `copyPaths`
-        for (auto & realisation : missingRealisations) {
-            // Should hold, because if the feature isn't enabled the set
-            // of missing realisations should be empty
-            experimentalFeatureSettings.require(Xp::CaDerivations);
-            store->registerDrvOutput(realisation, NoCheckSigs);
+        auto localStore = store.dynamic_pointer_cast<LocalStore>();
+        if (localStore && !builtOutputs.empty()) {
+            try {
+                localStore->registerBuildTraces(
+                    *drvPath,
+                    builtOutputs,
+                    together ? LocalStore::TracesOf::WholeBuild : LocalStore::TracesOf::MaybeMixed);
+            } catch (Error & e) {
+                e.addTrace(
+                    {},
+                    "while registering the outputs built on '%s'%s",
+                    storeUri,
+                    together ? "" : ", which did not say that it built them together");
+                throw;
+            }
+        } else if (!builtOutputs.empty()) {
+            /* One trace at a time, so as MaybeMixed. */
+            bool traced = std::ranges::any_of(
+                drv.outputs, [&](auto & o) { return !!store->queryRealisation({*drvPath, o.first}); });
+            for (auto & [outputName, output] : builtOutputs)
+                if (auto old = store->queryRealisation({*drvPath, outputName});
+                    old ? !output.isCompatibleWith(*old) : traced)
+                    throw Error(
+                        "output '%s' of '%s' built on '%s' differs from the build traces in '%s'",
+                        outputName,
+                        store->printStorePath(*drvPath),
+                        storeUri,
+                        store->config.getHumanReadableURI());
+                else
+                    store->registerDrvOutput({output, {*drvPath, outputName}}, NoCheckSigs);
         }
 
         return 0;

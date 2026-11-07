@@ -1094,4 +1094,25 @@ VERSIONED_CHARACTERIZATION_TEST(
         t;
     }))
 
+/**
+ * `tracesTogether` is sent only if both sides have the feature, and reads as false without it.
+ */
+TEST_F(WorkerProtoTest, buildResult_tracesTogether)
+{
+    BuildResult sent{.inner{BuildResult::Success{.status = BuildResult::Success::Built, .tracesTogether = true}}};
+    auto roundTrip = [&](const WorkerProto::Version & version) {
+        StringSink to;
+        WorkerProto::Serialise<BuildResult>::write(store, {.to = to, .version = version}, sent);
+        StringSource from{to.s};
+        auto got = WorkerProto::Serialise<BuildResult>::read(store, {.from = from, .version = version});
+        EXPECT_EQ(from.pos, to.s.size());
+        return got;
+    };
+    auto version = WorkerProto::latest;
+    EXPECT_EQ(roundTrip(version), sent);
+    version.features.erase(std::string{WorkerProto::featureBuildTracesTogether});
+    auto got = roundTrip(version);
+    EXPECT_FALSE(got.tryGetSuccess()->tracesTogether);
+}
+
 } // namespace nix
