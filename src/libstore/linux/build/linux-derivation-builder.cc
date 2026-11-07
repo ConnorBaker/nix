@@ -15,6 +15,7 @@
 #include "nix/util/logging.hh"
 #include "nix/util/serialise.hh"
 #include "nix/util/config-global.hh"
+#include "nix/util/unix-domain-socket.hh"
 #include "nix/store/derivation/aterm.hh"
 #include "nix/store/builtins.hh"
 #include "linux/fchmodat2-compat.hh"
@@ -36,6 +37,7 @@
 #include <sys/mount.h>
 #include <sys/syscall.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <grp.h>
 
 #if HAVE_SECCOMP
@@ -468,8 +470,10 @@ void buildChildMain(int argc, char ** argv, void (*initPlugins)())
 }
 
 /**
- * Start a fresh Nix with `state` on stdin after the settings, and `fds`.
- * A fork of this multithreaded process could run no Nix code.
+ * Start a child of this process that runs Nix with `state` on stdin after
+ * the settings, and `fds`. A fork of this multithreaded process could run
+ * no Nix code, so a fresh exec of Nix, started once per process (and once
+ * more for plugins), forks it instead (see runBuildChild()).
  */
 static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fds, bool self = false)
 {
@@ -488,19 +492,49 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
     writeFull(specFd.get(), spec.s);
     valueOr(seek(specFd.get(), 0, SEEK_SET), NIX_THROW_NATIVE_SYS_ERROR_HANDLER("seeking in the build child's memfd"));
     fds.insert(fds.begin(), {.from = specFd.get(), .to = STDIN_FILENO});
-    auto moved = moveAboveTargets(fds);
 
-    SpawnOptions options{
-        .program = "/proc/self/exe", .lookupPath = false, .args = {"__build-child"}, .restoreMounts = false};
+    static std::mutex mutex;
+    static std::pair<pid_t, AutoCloseFD> servers[2];
+    std::lock_guard lock(mutex);
+    auto & [owner, server] = servers[self];
+    if (owner != getpid()) {
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == -1)
+            throw SysError("creating socket pair");
+        server = sv[0];
+        AutoCloseFD theirs = sv[1];
+        SpawnOptions options{
+            .program = "/proc/self/exe",
+            .lookupPath = false,
+            .args = {"__build-child"},
+            .dieWithParent = false,
+            .restoreMounts = false};
 #ifdef NIX_LIBEXEC_DIR
-    /* The helper installed with this library. */
-    if (!self)
-        options.program = NIX_LIBEXEC_DIR "/nix-build-child";
+        /* The helper installed with this library. */
+        if (!self)
+            options.program = NIX_LIBEXEC_DIR "/nix-build-child";
 #else
-    if (!buildChildEntry)
-        throw Error("this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main()");
+        if (!buildChildEntry)
+            throw Error(
+                "this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main()");
 #endif
-    return spawnProgram(throughLoader(options), fds);
+        /* It exits when this process closes its socket. */
+        spawnProgram(throughLoader(options), std::to_array<FdRedirection>({{.from = theirs.get(), .to = STDIN_FILENO}}))
+            .release();
+        owner = getpid();
+    }
+
+    std::vector<int> targets, sources;
+    for (auto & fd : fds) {
+        targets.push_back(fd.to);
+        sources.push_back(fd.from);
+    }
+    unix::sendMessageWithFds(server.get(), std::as_bytes(std::span(targets)), sources);
+    pid_t pid;
+    readFull(server.get(), reinterpret_cast<char *>(&pid), sizeof pid);
+    if (pid <= 0)
+        throw SysError(-pid, "starting the build child");
+    return Pid(pid);
 }
 
 Pid LinuxDerivationBuilder::spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds)
@@ -567,6 +601,40 @@ struct ChildStore : BuildingStore
 static void bindInSandbox(Source & spec);
 
 void LinuxDerivationBuilder::runBuildChild()
+{
+    /* Serve the socket on stdin: for each request, a child with the fds it
+       sent, made our parent's child (CLONE_PARENT). This process has no
+       threads, so the child may run any code. */
+    try {
+        while (true) {
+            int targets[8];
+            auto received = unix::receiveMessageWithFds(STDIN_FILENO, std::as_writable_bytes(std::span(targets)));
+            std::vector<FdRedirection> fds;
+            for (size_t i = 0; i < received.fds.size(); ++i)
+                fds.push_back({.from = received.fds[i].get(), .to = targets[i]});
+            pid_t pid;
+            try {
+                pid = startProcess(
+                    [&] {
+                        for (auto & fd : fds)
+                            if (dup2(fd.from, fd.to) == -1)
+                                _exit(1);
+                        runBuildChildOnce();
+                    },
+                    {.cloneFlags = CLONE_PARENT});
+            } catch (SysError & e) {
+                pid = -e.errNo;
+            }
+            writeFull(STDIN_FILENO, {reinterpret_cast<char *>(&pid), sizeof pid});
+        }
+    } catch (EndOfFile &) {
+        _exit(0);
+    } catch (...) {
+    }
+    _exit(1);
+}
+
+void LinuxDerivationBuilder::runBuildChildOnce()
 {
     bool bind = false;
     try {

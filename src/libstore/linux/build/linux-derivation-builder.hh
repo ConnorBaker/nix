@@ -36,9 +36,11 @@ struct LinuxDerivationBuilder : virtual UnixDerivationBuilderImpl
     Pid spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds = {});
 
     /**
-     * Run the build child that spawnBuildChild() started.
+     * Serve the build children that spawnBuildChild() starts.
      */
     [[noreturn]] static void runBuildChild();
+
+    [[noreturn]] static void runBuildChildOnce();
 };
 
 } // namespace nix

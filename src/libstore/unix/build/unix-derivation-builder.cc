@@ -101,21 +101,6 @@ void preserveDeathSignal(fun<void()> setCredentials)
 
 void UnixDerivationBuilderImpl::anchor() {}
 
-std::vector<AutoCloseFD> moveAboveTargets(std::span<FdRedirection> fds)
-{
-    int above = 0;
-    for (auto & fd : fds)
-        above = std::max(above, fd.to + 1);
-    std::vector<AutoCloseFD> moved;
-    for (auto & fd : fds) {
-        moved.emplace_back(fcntl(fd.from, F_DUPFD_CLOEXEC, above));
-        if (!moved.back())
-            throw SysError("moving fd %d above %d", fd.from, above);
-        fd.from = moved.back().get();
-    }
-    return moved;
-}
-
 const std::filesystem::path UnixDerivationBuilderImpl::homeDir = "/homeless-shelter";
 
 void UnixDerivationBuilderImpl::killSandbox(bool getStats)

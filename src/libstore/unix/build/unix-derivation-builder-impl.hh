@@ -11,12 +11,6 @@
 
 namespace nix {
 
-/**
- * Point `fds` at copies of their sources above every target (owned by the
- * result), so that applying them in order cannot overwrite a later source.
- */
-std::vector<AutoCloseFD> moveAboveTargets(std::span<FdRedirection> fds);
-
 void writeStringMap(Sink & sink, const StringMap & map);
 StringMap readStringMap(Source & source);
 
