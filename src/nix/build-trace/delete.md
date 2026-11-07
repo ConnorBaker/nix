@@ -3,6 +3,8 @@ R"MdBoundary(
 
 Delete build traces from the store.
 
+Each id names its outputs, as `<drv>^<output>` or `<drv>^<output>,<output>`; `<drv>^*` (all outputs) is refused.
+
 # Examples
 
 Delete a build trace by its ID:

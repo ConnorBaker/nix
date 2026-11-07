@@ -27,9 +27,11 @@ multiLibPath=$(nix store build-trace info "$multiOutput"^lib --json | jq -r '.[]
 
 # We should be able to delete multiple build traces/realisations at once
 nix-store --delete "$multiOutPath" "$multiLibPath"
-nix store build-trace delete "$multiOutput"^out "$multiOutput"^lib
+nix store build-trace delete "$multiOutput"^out,lib
 
 # out and lib should be deleted, but dev should not
 expect 1 nix store build-trace info "$multiOutput"^out
 expect 1 nix store build-trace info "$multiOutput"^lib
 nix store build-trace info "$multiOutput"^dev
+# '^*' is refused
+expect 1 nix store build-trace delete "$multiOutput"^'*'
