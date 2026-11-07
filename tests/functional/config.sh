@@ -75,3 +75,7 @@ val2=$(nix config show warn-dirty)
 
 # NIX_REMOTE_SYSTEMS becomes builders joined by ';', skipping paths with '#'.
 [[ $(NIX_REMOTE_SYSTEMS='/a:/h#x:/b' nix config show | grep '^builders = ') = 'builders = @/a;@/b' ]]
+
+# A setting value with a newline cannot be written as a configuration line.
+expectStderr 1 nix config show --user-agent-suffix $'a\nb' \
+    | grepQuiet "the value of setting 'user-agent-suffix' has a newline"
