@@ -210,6 +210,28 @@ if nix_store.found()
     'workdir' : meson.current_source_dir(),
   }
 
+  # A sanitizer runtime interposes the allocator too, and the shim cannot see
+  # into a static program.
+  sanitized = get_option('b_sanitize') != 'none'
+  static_build = get_option('default_library') == 'static'
+  if host_machine.system() == 'linux' and not sanitized and not static_build
+    add_languages('c')
+    suites += {
+      'name' : 'fork-alloc',
+      'deps' : [
+        shared_module(
+          'fork-alloc-shim',
+          'fork-alloc/shim.c',
+          name_prefix : '',
+          build_by_default : false,
+        ),
+      ],
+      'tests' : [
+        'fork-alloc.sh',
+      ],
+      'workdir' : meson.current_source_dir(),
+    }
+  endif
 endif
 
 subdir('suites')
