@@ -59,4 +59,15 @@ TEST(LocalOverlayStore, upperLayer_overridden)
     EXPECT_EQ(config.upperLayer.get(), std::filesystem::path{upper});
 }
 
+TEST(LocalOverlayStore, getReference_keepsParams)
+{
+#ifdef _WIN32
+    constexpr std::string_view upper = "C:\\some\\upper";
+#else
+    constexpr std::string_view upper = "/some/upper";
+#endif
+    LocalOverlayStoreConfig config{"", {{"upper-layer", std::string{upper}}}};
+    EXPECT_EQ(config.getReference().params, (StoreReference::Params{{"upper-layer", std::string{upper}}}));
+}
+
 } // namespace nix
