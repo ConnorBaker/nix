@@ -49,7 +49,8 @@ std::string GlobalConfig::toKeyValue(bool overriddenOnly)
     std::map<std::string, Config::SettingInfo> settings;
     globalConfig.getSettings(settings, overriddenOnly);
     for (const auto & [name, data] : settings) {
-        assert(!data.value.contains('\n')); /* Just to be safe. */
+        if (data.value.contains('\n'))
+            throw Error("the value of setting '%s' has a newline, which a configuration line cannot hold", name);
         if (overriddenOnly || !data.excludedFromFullSerialisation)
             res += fmt("%s = %s\n", name, data.value);
     }
