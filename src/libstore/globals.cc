@@ -84,8 +84,11 @@ Settings::Settings()
     if (s) {
         Strings ss;
         for (auto & p : tokenizeString<Strings>(*s, ":"))
-            ss.push_back("@" + p);
-        builders = concatStringsSep("\n", ss);
+            if (p.find('#') == p.npos)
+                ss.push_back("@" + p);
+            else
+                warn("ignoring '%s' in NIX_REMOTE_SYSTEMS: it contains '#'", p);
+        builders = concatStringsSep(";", ss);
     }
 
 #if (defined(__linux__) || defined(__FreeBSD__)) && defined(SANDBOX_SHELL)

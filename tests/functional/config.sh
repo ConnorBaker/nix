@@ -72,3 +72,7 @@ val2=$(nix config show warn-dirty)
 [[ $(nix config show --min-free 64K min-free) = 65536 ]]
 [[ $(nix config show --min-free 1M min-free) = 1048576 ]]
 [[ $(nix config show --min-free 2G min-free) = 2147483648 ]]
+
+# NIX_REMOTE_SYSTEMS becomes builders joined by ';', skipping paths with '#'.
+[[ $(NIX_REMOTE_SYSTEMS='/a:/h#x:/b' nix config show 2> "$TEST_ROOT/w" | grep '^builders = ') = 'builders = @/a;@/b' ]]
+grepQuiet "ignoring '/h#x'" "$TEST_ROOT/w"
