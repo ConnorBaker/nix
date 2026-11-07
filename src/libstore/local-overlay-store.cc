@@ -34,6 +34,7 @@ StoreReference LocalOverlayStoreConfig::getReference() const
             StoreReference::Specified{
                 .scheme = *uriSchemes().begin(),
             },
+        .params = getQueryParams(),
     };
 }
 
