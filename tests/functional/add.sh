@@ -87,6 +87,8 @@ clearStoreIfPossible
     path2=$(nix store add-file ./dummy)
     [[ "$path1" == "$path2" ]]
     path4=$(nix store add --mode flat --hash-algo sha1 ./dummy)
+    touch "$TEST_ROOT/empty"
+    [[ "$(nix store add --mode flat "$TEST_ROOT/empty")" == "$(nix eval --impure --raw --expr "builtins.path { path = $TEST_ROOT/empty; recursive = false; }")" ]]
 )
 (
     path1=$(nix store add --mode text ./dummy)
