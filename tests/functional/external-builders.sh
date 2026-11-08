@@ -19,6 +19,8 @@ mkDerivation {
 }
 EOF
 
+drvPath="$(nix-instantiate "$expr")"
+
 external_builder="$TEST_ROOT/external-builder.sh"
 cat > "$external_builder" <<EOF
 #! $SHELL -e
@@ -33,6 +35,7 @@ args="\$(jq -r '.args | join(" ")' < "\$2")"
 export buildCommand="\$(jq -r .env.buildCommand < "\$2")"
 export out="\$(jq -r .env.out < "\$2")"
 [[ \$system = x68_46-xunil ]]
+[[ "\$(jq -r .drvPath < "\$2")" = ${drvPath@Q} ]]
 
 printf "\2\n"
 

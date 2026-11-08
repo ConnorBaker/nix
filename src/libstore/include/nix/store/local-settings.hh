@@ -679,6 +679,7 @@ public:
               "/nix/store/shkw4qm9…-default-builder.sh"
             ],
             "builder": "/nix/store/s1qkj0ph…-bash-5.2p37/bin/bash",
+            "drvPath": "/nix/store/xhj4pl5n…-hello-2.12.2.drv",
             "env": {
               "HOME": "/homeless-shelter",
               "builder": "/nix/store/s1qkj0ph…-bash-5.2p37/bin/bash",
@@ -703,6 +704,11 @@ public:
             "version": 1
           }
           ```
+
+          `drvPath` identifies the derivation being built.
+          The derivation need not be present in the store, e.g. for a build received over `nix-store --serve` or from a trusted daemon client.
+          For a derivation that is resolved before it is built (such as a floating content-addressing derivation), it is the path of the resolved derivation.
+          Otherwise, e.g. for an input-addressed derivation that does not depend on floating content-addressing derivations, it is the path of the original derivation.
         )",
         {},   // aliases
         true, // document default
