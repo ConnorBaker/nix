@@ -15,3 +15,4 @@ export NIX_BIN_DIR
 
 expectStderr 1 nix build -L --file ./submit-failure.nix noSubmit --no-link | grepQuiet "failed to submit output"
 expectStderr 1 nix build -L --file ./submit-failure.nix duplicate --no-link | grepQuiet "submit duplicate output"
+expectStderr 1 nix build -L --file ./submit-failure.nix notAdded --no-link | grepQuiet "submitted path '.*-not-added' for output 'out', but that path is not valid"

@@ -723,6 +723,13 @@ SingleDrvOutputs DerivationBuilderImpl::checkSubmittedOutputs(LocalStore & local
     std::map<std::string, ValidPathInfo> infos;
 
     for (auto & [outputName, outputPath] : *submittedOutputs) {
+        if (!localStore.isValidPath(outputPath))
+            throw BuildError(
+                BuildResult::Failure::OutputRejected,
+                "builder for '%s' submitted path '%s' for output '%s', but that path is not valid",
+                store->printStorePath(drvPath),
+                store->printStorePath(outputPath),
+                outputName);
         infos.emplace(outputName, *localStore.queryPathInfo(outputPath));
     }
 
