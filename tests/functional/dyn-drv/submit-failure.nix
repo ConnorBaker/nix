@@ -36,6 +36,10 @@ in
     b="$(nix store add -n duplicate ./b)"
     nix store submit-output "$b" out
   '';
+  notAdded = buildSubmitting "not-added" ''
+    echo kot > a
+    nix store submit-output "$(nix store add --dry-run -n not-added ./a)" out
+  '';
   noSubmit = buildSubmitting "no-submit" ''
     mkdir a
     echo "nyaa" > a/neko
