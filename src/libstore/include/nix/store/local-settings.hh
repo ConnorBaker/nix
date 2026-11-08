@@ -679,6 +679,7 @@ public:
               "/nix/store/shkw4qm9…-default-builder.sh"
             ],
             "builder": "/nix/store/s1qkj0ph…-bash-5.2p37/bin/bash",
+            "drvPath": "/nix/store/xhj4pl5n…-hello-2.12.2.drv",
             "env": {
               "HOME": "/homeless-shelter",
               "builder": "/nix/store/s1qkj0ph…-bash-5.2p37/bin/bash",
@@ -703,6 +704,8 @@ public:
             "version": 1
           }
           ```
+
+          `drvPath` is the store path of the derivation being built, which may be the resolved derivation rather than the one originally requested.
         )",
         {},   // aliases
         true, // document default

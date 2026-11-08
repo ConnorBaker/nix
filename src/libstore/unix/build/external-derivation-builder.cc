@@ -43,6 +43,7 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
 
         json.emplace("version", 1);
         json.emplace("builder", drv.builder);
+        json.emplace("drvPath", store->printStorePath(drvPath));
         {
             auto l = nlohmann::json::array();
             for (auto & i : drv.args)
