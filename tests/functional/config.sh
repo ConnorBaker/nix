@@ -75,3 +75,17 @@ val2=$(nix config show warn-dirty)
 
 # A value that a plain configuration line can't hold survives `nix config show` being read back.
 for v in 'a#b' 'x  y' $'a\nb'; do [[ $(NIX_CONFIG=$(nix config show --user-agent-suffix "$v") nix config show user-agent-suffix) = "$v" ]]; done
+
+# NIX_REMOTE_SYSTEMS joins its machines files with ';'.
+[[ $(NIX_REMOTE_SYSTEMS=/a:/b nix config show builders) = '@/a;@/b' ]]
+
+# A machines file is found under a NIX_CONF_DIR or a NIX_REMOTE_SYSTEMS path that the builders list can't hold as is,
+# and a path the list can hold, or that a user wrote, means what it meant before.
+for d in 'h#x' 's;y' $'n\nl' 'p%41' 'p%zz' 'p+s'; do
+    cp -r "$NIX_CONF_DIR" "$TEST_ROOT/$d"; m="$TEST_ROOT/$d/machines"; echo 'ssh-ng://from-file fake-sys' > "$m"
+    for e in NIX_CONF_DIR="$TEST_ROOT/$d" NIX_REMOTE_SYSTEMS="$m" NIX_CONFIG="builders = @$m"; do
+        if [[ $d != p* && $e = NIX_CONFIG=* ]]; then continue; fi
+        expectStderr 100 env "$e" nix-build -j0 --no-out-link -E 'derivation { name = "d"; system = "fake-sys"; builder = "/bin/sh"; }' | grepQuiet "ssh-ng://from-file"
+    done
+    if [[ $d = p* ]]; then [[ $(NIX_CONF_DIR="$TEST_ROOT/$d" nix config show builders) = "@$m" ]]; fi
+done

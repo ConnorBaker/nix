@@ -84,6 +84,12 @@ struct Machine
      * the same format.
      */
     static Machines parseConfig(const StringSet & defaultSystems, const std::string & config);
+
+    /**
+     * The entry that refers to the configuration file at `path`: `@path`, or `@%` and the percent-encoded path if
+     * an entry can't hold the path as is.
+     */
+    static std::string fileReference(const std::string & path);
 };
 
 } // namespace nix

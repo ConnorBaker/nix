@@ -4,6 +4,7 @@
 #include "nix/util/configuration.hh"
 #include "nix/store/global-paths.hh"
 #include "nix/store/store-reference.hh"
+#include "nix/store/machines.hh"
 
 namespace nix {
 
@@ -140,12 +141,13 @@ public:
 
     Setting<std::string> builders{
         this,
-        "@" + (nixConfDir() / "machines").string(),
+        Machine::fileReference((nixConfDir() / "machines").string()),
         "builders",
         R"(
           A semicolon- or newline-separated list of build machines.
 
           In addition to the [usual ways of setting configuration options](@docroot@/command-ref/conf-file.md), the value can be read from a file by prefixing its absolute path with `@`.
+          A path that the list can't hold as is (e.g. with `;`) can be given percent-encoded after `@%`.
 
           > **Example**
           >

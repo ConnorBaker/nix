@@ -10,6 +10,7 @@
 #include "nix/util/compute-levels.hh"
 #include "nix/util/executable-path.hh"
 #include "nix/store/filetransfer.hh"
+#include "nix/store/machines.hh"
 #include "nix/util/system-error.hh"
 
 #include <algorithm>
@@ -84,8 +85,8 @@ Settings::Settings()
     if (s) {
         Strings ss;
         for (auto & p : tokenizeString<Strings>(*s, ":"))
-            ss.push_back("@" + p);
-        builders = concatStringsSep("\n", ss);
+            ss.push_back(Machine::fileReference(p));
+        builders = concatStringsSep(";", ss);
     }
 
 #if (defined(__linux__) || defined(__FreeBSD__)) && defined(SANDBOX_SHELL)

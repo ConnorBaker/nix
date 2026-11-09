@@ -2,6 +2,7 @@
 #include "nix/store/machines.hh"
 #include "nix/store/store-open.hh"
 #include "nix/util/system-error.hh"
+#include "nix/util/url.hh"
 
 #include <algorithm>
 
@@ -96,33 +97,62 @@ ref<Store> Machine::openStore() const
     return nix::openStore(completeStoreReference());
 }
 
-static std::vector<std::string> expandBuilderLines(const std::string & builders)
+/**
+ * The entries of a builders value: its lines up to their comments, split at ';', trimmed, without empty ones.
+ */
+static std::vector<std::string> builderEntries(const std::string & builders)
 {
     std::vector<std::string> result;
     for (auto line : tokenizeString<std::vector<std::string>>(builders, "\n")) {
         line.erase(std::find(line.begin(), line.end(), '#'), line.end());
-        for (auto entry : tokenizeString<std::vector<std::string>>(line, ";")) {
-            entry = trim(entry);
+        for (auto entry : tokenizeString<std::vector<std::string>>(line, ";"))
+            if (entry = trim(entry); !entry.empty())
+                result.push_back(std::move(entry));
+    }
+    return result;
+}
 
-            if (entry.empty()) {
-                // skip blank entries
-            } else if (entry[0] == '@') {
-                const std::string path = trim(std::string_view{entry}.substr(1));
-                std::string text;
-                try {
-                    text = readFile(path);
-                } catch (const SystemError & e) {
-                    if (!e.is(std::errc::no_such_file_or_directory))
-                        throw;
-                    debug("cannot find machines file '%s'", path);
-                    continue;
-                }
+/**
+ * The path that the entry `@...` refers to.
+ */
+static std::string referencedPath(std::string_view entry)
+{
+    if (entry.starts_with("@%"))
+        try {
+            return percentDecode(entry.substr(2));
+        } catch (BadURL &) {
+        }
+    return trim(entry.substr(1));
+}
 
-                const auto entries = expandBuilderLines(text);
-                result.insert(end(result), begin(entries), end(entries));
-            } else {
-                result.emplace_back(entry);
+std::string Machine::fileReference(const std::string & path)
+{
+    auto entry = "@" + path;
+    if (builderEntries(entry) == std::vector{entry} && referencedPath(entry) == path)
+        return entry;
+    return "@%" + percentEncode(path, "/");
+}
+
+static std::vector<std::string> expandBuilderLines(const std::string & builders)
+{
+    std::vector<std::string> result;
+    for (auto & entry : builderEntries(builders)) {
+        if (entry[0] == '@') {
+            const std::string path = referencedPath(entry);
+            std::string text;
+            try {
+                text = readFile(path);
+            } catch (const SystemError & e) {
+                if (!e.is(std::errc::no_such_file_or_directory))
+                    throw;
+                debug("cannot find machines file '%s'", path);
+                continue;
             }
+
+            const auto entries = expandBuilderLines(text);
+            result.insert(end(result), begin(entries), end(entries));
+        } else {
+            result.emplace_back(entry);
         }
     }
     return result;
