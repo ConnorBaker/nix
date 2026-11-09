@@ -6,6 +6,7 @@
 #include "nix/util/util.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/system-error.hh"
+#include "nix/util/url.hh"
 
 #include "nix/util/config-impl.hh"
 
@@ -106,6 +107,14 @@ void Config::getSettings(std::map<std::string, SettingInfo> & res, bool overridd
 }
 
 /**
+ * The tokens of a configuration line: the line up to its comment, split at whitespace.
+ */
+static std::vector<std::string> lineTokens(std::string_view line)
+{
+    return tokenizeString<std::vector<std::string>>(line.substr(0, line.find('#')));
+}
+
+/**
  * Parse configuration in `contents`, and also the configuration files included from there, with their location
  * specified relative to `path`.
  *
@@ -126,10 +135,20 @@ static void parseConfigFiles(
             line += contents[pos++];
         pos++;
 
-        if (auto hash = line.find('#'); hash != line.npos)
-            line = std::string(line, 0, hash);
+        /* `#% name = value` gives the setting on the line before a percent-encoded value; `toKeyValue()` writes it
+           for a value that a line can't hold. Older versions of Nix read it as a comment. */
+        if (hasPrefix(line, "#% ")) {
+            auto tokens = lineTokens(line.substr(3));
+            if (tokens.size() == 3 && tokens[1] == "=" && !parsedContents.empty()
+                && parsedContents.back().first == tokens[0])
+                try {
+                    parsedContents.back().second = percentDecode(tokens[2]);
+                } catch (BadURL &) {
+                }
+            continue;
+        }
 
-        auto tokens = tokenizeString<std::vector<std::string>>(line);
+        auto tokens = lineTokens(line);
         if (tokens.empty())
             continue;
 
@@ -218,14 +237,18 @@ nlohmann::json Config::toJSON()
     return res;
 }
 
-std::string Config::toKeyValue(bool overriddenOnly)
+std::string AbstractConfig::toKeyValue(bool overriddenOnly)
 {
+    std::map<std::string, SettingInfo> settings;
+    getSettings(settings, overriddenOnly);
     std::string res;
-    for (const auto & [name, data] : _settings) {
-        if (data.isAlias || (overriddenOnly && !data.setting->overridden))
+    for (const auto & [name, data] : settings) {
+        if (!overriddenOnly && data.excludedFromFullSerialisation)
             continue;
-        if (overriddenOnly || !data.setting->excludedFromFullSerialisation())
-            res += fmt("%s = %s\n", name, data.setting->to_string());
+        auto plain = concatStringsSep(" ", lineTokens(data.value));
+        res += fmt("%s = %s\n", name, plain);
+        if (plain != data.value)
+            res += "#% " + name + " = " + percentEncode(data.value) + "\n";
     }
     return res;
 }

@@ -106,7 +106,7 @@ public:
      * Outputs all settings in a key-value pair format suitable to be used as
      * `nix.conf`
      */
-    virtual std::string toKeyValue(bool overriddenOnly = false) = 0;
+    std::string toKeyValue(bool overriddenOnly = false);
 
     /**
      * Converts settings to `Args` to be used on the command line interface
@@ -176,8 +176,6 @@ public:
     void resetOverridden() override;
 
     nlohmann::json toJSON() override;
-
-    std::string toKeyValue(bool overriddenOnly = false) override;
 
     void convertToArgs(Args & args, const std::string & category) override;
 };

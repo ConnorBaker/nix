@@ -72,3 +72,6 @@ val2=$(nix config show warn-dirty)
 [[ $(nix config show --min-free 64K min-free) = 65536 ]]
 [[ $(nix config show --min-free 1M min-free) = 1048576 ]]
 [[ $(nix config show --min-free 2G min-free) = 2147483648 ]]
+
+# A value that a plain configuration line can't hold survives `nix config show` being read back.
+for v in 'a#b' 'x  y' $'a\nb'; do [[ $(NIX_CONFIG=$(nix config show --user-agent-suffix "$v") nix config show user-agent-suffix) = "$v" ]]; done

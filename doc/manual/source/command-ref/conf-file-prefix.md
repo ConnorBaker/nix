@@ -41,6 +41,9 @@ keep-outputs = true       # Nice for developers
 keep-derivations = true   # Idem
 ```
 
+A line `#% name = value` right after a line that sets `name` replaces that value with the percent-encoded `value`, so it can hold any character.
+Nix writes such a line for a value that a plain line can't hold, e.g. in the output of `nix config show`; older versions of Nix read it as a comment.
+
 Other files can be included with a line like `include <path>`, where `<path>` is interpreted relative to the current configuration file.
 A missing file is an error unless `!include` is used instead.
 
