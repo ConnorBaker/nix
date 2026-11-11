@@ -647,6 +647,14 @@ static void performOp(
          */
         derivation::read(conn.from, *store, drv, Derivation::nameFromPath(drvPath));
         auto buildMode = WorkerProto::Serialise<BuildMode>::read(*store, rconn);
+
+        /* Repairing is not atomic, so disallowed for "untrusted"
+           clients.
+
+           FIXME: layer violation; see above. */
+        if (buildMode == bmRepair && !trusted)
+            throw Error("repairing is not allowed because you are not in 'trusted-users'");
+
         logger->startWork();
 
         auto drvType = type(drv);
