@@ -384,12 +384,16 @@ DerivationBuilderUnique makeDerivationBuilder(
 /**
  * @param handler Must be chosen such that it supports the given
  * derivation.
+ *
+ * @param canBuildLocally Whether Nix builds the derivation itself if
+ * the external builder declines it; written to build.json.
  */
 DerivationBuilderUnique makeExternalDerivationBuilder(
     std::shared_ptr<BuildingStore> store,
     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
     DerivationBuilderParams params,
-    const ExternalBuilder & handler);
+    const ExternalBuilder & handler,
+    bool canBuildLocally);
 #endif
 
 } // namespace nix
