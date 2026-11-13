@@ -9,13 +9,17 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
 {
     ExternalBuilder externalBuilder;
 
+    bool canBuildLocally;
+
     ExternalDerivationBuilder(
         std::shared_ptr<BuildingStore> store,
         std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
         DerivationBuilderParams params,
-        ExternalBuilder externalBuilder)
+        ExternalBuilder externalBuilder,
+        bool canBuildLocally)
         : UnixDerivationBuilderImpl(store, miscMethods, std::move(params))
         , externalBuilder(std::move(externalBuilder))
+        , canBuildLocally(canBuildLocally)
     {
         experimentalFeatureSettings.require(Xp::ExternalBuilders);
     }
@@ -66,6 +70,9 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         json.emplace("system", drv.platform);
         json.emplace("timeout", settings.getWorkerSettings().buildTimeout.get());
         json.emplace("maxSilentTime", settings.getWorkerSettings().maxSilentTime.get());
+        /* Whether Nix builds the derivation itself if this builder
+           declines it (exits with `externalBuilderDeclinedExitCode`). */
+        json.emplace("canBuildLocally", canBuildLocally);
         {
             auto l = nlohmann::json::array();
             for (auto & i : inputPaths)
@@ -141,9 +148,11 @@ DerivationBuilderUnique makeExternalDerivationBuilder(
     std::shared_ptr<BuildingStore> store,
     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
     DerivationBuilderParams params,
-    const ExternalBuilder & handler)
+    const ExternalBuilder & handler,
+    bool canBuildLocally)
 {
-    return DerivationBuilderUnique(new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler));
+    return DerivationBuilderUnique(
+        new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler, canBuildLocally));
 }
 
 } // namespace nix

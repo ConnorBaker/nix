@@ -833,6 +833,16 @@ Goal::Co<DerivationBuildingGoal::Result> DerivationBuildingGoal::buildWithHook(
 #endif
 }
 
+bool DerivationBuildingGoal::canBuildLocally(const DerivationOptions<StorePath> & drvOptions)
+{
+    bool platformOk = drv->platform == settings.thisSystem.get() || settings.extraPlatforms.get().count(drv->platform)
+                      || drv->isBuiltin();
+    auto required = drvOptions.getRequiredSystemFeatures(*drv);
+    auto & available = worker.store.config.systemFeatures.get();
+    bool featuresOk = std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
+    return worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk;
+}
+
 Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buildLocally(
     LocalBuildCapability localBuildCap,
     const StorePathSet & inputPaths,
@@ -841,6 +851,10 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     PathLocks outputLocks)
 {
     co_await yield();
+
+    /* Computed once, so an external builder is told exactly what Nix
+       will do if it declines. */
+    const bool canBuildHere = canBuildLocally(drvOptions);
 
     std::unique_ptr<BuildLog> buildLog;
     std::unique_ptr<LogFile> logFile;
@@ -992,7 +1006,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
                               makeBuildingStoreFromLocalStore(localBuildCap.localStore),
                               std::make_shared<DerivationBuildingGoalCallbacks>(*this, openLogFile, closeLogFile),
                               std::move(params),
-                              *localBuildCap.externalBuilder)
+                              *localBuildCap.externalBuilder,
+                              canBuildHere)
 #endif
                           : makeDerivationBuilder(
                                 makeBuildingStoreFromLocalStore(localBuildCap.localStore),
@@ -1060,18 +1075,11 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     if (!statusOk(status)) {
         builder->cleanupBuild(false);
         builder.reset();
-        if (localBuildCap.externalBuilder && WIFEXITED(status)
-            && WEXITSTATUS(status) == externalBuilderDeclinedExitCode) {
-            bool platformOk = drv->platform == settings.thisSystem.get()
-                              || settings.extraPlatforms.get().count(drv->platform) || drv->isBuiltin();
-            auto required = drvOptions.getRequiredSystemFeatures(*drv);
-            auto & available = worker.store.config.systemFeatures.get();
-            bool featuresOk = std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
-            if (worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk) {
-                localBuildCap.externalBuilder = nullptr;
-                co_return co_await buildLocally(
-                    std::move(localBuildCap), inputPaths, initialOutputs, drvOptions, std::move(outputLocks));
-            }
+        if (localBuildCap.externalBuilder && WIFEXITED(status) && WEXITSTATUS(status) == externalBuilderDeclinedExitCode
+            && canBuildHere) {
+            localBuildCap.externalBuilder = nullptr;
+            co_return co_await buildLocally(
+                std::move(localBuildCap), inputPaths, initialOutputs, drvOptions, std::move(outputLocks));
         }
         outputLocks.unlock();
         co_return fixupBuilderFailureErrorMessage(
