@@ -57,9 +57,12 @@ struct ExecChildParams
     Descriptor errorPipe;
     bool setGid;
     gid_t gid;
+    const gid_t * groups;
+    size_t groupsSize;
     bool setUid;
     uid_t uid;
     bool dieWithParent;
+    pid_t parentPid;
     bool setSid;
     bool restoreMounts;
 };
@@ -242,20 +245,25 @@ struct ExecChildParams
 #    define NIX_SYS_setgroups SYS_setgroups
 #  endif
 
-    if (params.setGid && ::syscall(NIX_SYS_setgid, params.gid) == -1)
+    if (params.setGid
+        && (::syscall(NIX_SYS_setgid, params.gid) == -1 || ::getgid() != params.gid || ::getegid() != params.gid))
         dieWithErrno("setgid failed");
 
-    /* Drop all other groups if we're setgid. */
-    if (params.setGid && ::syscall(NIX_SYS_setgroups, 0, 0) == -1)
+    /* Set the supplementary groups (by default none) if we're setgid. */
+    if (params.setGid && ::syscall(NIX_SYS_setgroups, params.groupsSize, params.groups) == -1)
         dieWithErrno("setgroups failed");
 
-    if (params.setUid && ::syscall(NIX_SYS_setuid, params.uid) == -1)
+    if (params.setUid
+        && (::syscall(NIX_SYS_setuid, params.uid) == -1 || ::getuid() != params.uid || ::geteuid() != params.uid))
         dieWithErrno("setuid failed");
 
-    /* Technically slightly racy, we might want to do something like what
-       preserveDeathSignal does. */
+    /* As preserveDeathSignal does: die if the parent died before this.
+       Not raise(), which on musl signals the thread id it cached (the
+       parent's, after vfork). */
     if (params.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
         dieWithErrno("setting death signal");
+    if (params.dieWithParent && ::getppid() != params.parentPid)
+        ::kill(::getpid(), SIGKILL);
 
 #  undef NIX_SYS_setuid
 #  undef NIX_SYS_setgid
@@ -353,10 +361,13 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
         .setGid = options.gid.has_value(),
         /* The default is not used, but a bit sketchy to leave zero initialised so "nobody". */
         .gid = options.gid.value_or(65534),
+        .groups = options.supplementaryGroups.data(),
+        .groupsSize = options.supplementaryGroups.size(),
         .setUid = options.uid.has_value(),
         /* The default is not used, but a bit sketchy to leave zero initialised so "nobody". */
         .uid = options.uid.value_or(65534),
         .dieWithParent = options.dieWithParent,
+        .parentPid = ::getpid(),
         .setSid = options.setSid,
         .restoreMounts = options.restoreMounts,
     };
