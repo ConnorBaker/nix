@@ -27,13 +27,42 @@ out=$(nix-build --no-out-link --debug --extra-experimental-features auto-allocat
 # Only argv[0] makes Nix a build child.
 expectStderr 1 nix __build-child < /dev/null | grepQuiet "'__build-child' is not a recognised command"
 
-# The build child refuses what a program from another Nix build sends.
-str() { printf "\\x$(printf %02x ${#1})\\0\\0\\0\\0\\0\\0\\0%s" "$1"; head -c $(( (8 - ${#1} % 8) % 8 )) /dev/zero; }
-str "nix-build-child 0" > "$TEST_ROOT/other-build"
-if (exec -a __build-child nix) < "$TEST_ROOT/other-build" 2> "$TEST_ROOT/other-build.err"; then
-    fail "the build child ran for another Nix build"
+# The build child server refuses a program from another Nix build, after
+# it replied with its own version.
+printf "nix-build-child 0" > "$TEST_ROOT/other-build"
+if (exec -a __build-child nix) <> "$TEST_ROOT/other-build" 2> "$TEST_ROOT/other-build.err"; then
+    fail "the build child server ran for another Nix build"
 fi
-grepQuiet -a "is from a different Nix build" "$TEST_ROOT/other-build.err"
+grepQuiet "is from a different Nix build" "$TEST_ROOT/other-build.err"
+grepQuiet "^nix-build-child 0nix-build-child 1 " "$TEST_ROOT/other-build"
+
+# The build children are forked by a build child server, a child of Nix
+# with argv[0] `__build-child` that has one thread. When it went away
+# between two builds of one goal loop, the second still builds.
+cat > "$TEST_ROOT/kill-server.sh" <<'EOF2'
+ppid() { while read -r key value; do if [[ $key = PPid: ]]; then echo "$value"; fi; done 2> /dev/null < "$1/status"; }
+nix=$(ppid /proc/$$)
+for p in /proc/[0-9]*; do
+    argv0=
+    IFS= read -r -d '' argv0 2> /dev/null < "$p/cmdline" || true
+    if [[ $argv0 = __build-child && $(ppid "$p") = "$nix" ]]; then server=${p#/proc/}; fi
+done
+[[ -n ${server-} ]] || { echo "no build child server"; exit 1; }
+threads=("/proc/$server/task/"*)
+[[ ${#threads[@]} = 1 ]] || { echo "the build child server has ${#threads[@]} threads"; exit 1; }
+kill -9 "$server"
+# Until it is a zombie (or reaped), which has closed its socket.
+while stat=$(< "/proc/$server/stat") && state=${stat##*") "} && [[ ${state%% *} != Z ]]; do sleep 0.01; done
+touch "$out"
+EOF2
+cat > "$TEST_ROOT/kill-server.nix" <<EOF2
+with import ${config_nix};
+rec {
+  kill-server = mkDerivation { name = "kill-server"; builder = $TEST_ROOT/kill-server.sh; };
+  after-kill = mkDerivation { name = "after-kill"; buildCommand = "echo \${kill-server} > \$out"; };
+}
+EOF2
+nix-build --no-out-link --option sandbox false "$TEST_ROOT/kill-server.nix" -A after-kill
 
 # Nix started through a copy of the dynamic loader, because the one the
 # programs name is missing (masked here), runs its build child through it

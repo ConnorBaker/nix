@@ -42,6 +42,25 @@ void handleChildException(bool sendException);
  */
 void buildChildMain(int argc, char ** argv, void (*initPlugins)() = nullptr);
 
+#ifdef __linux__
+/**
+ * While this lives, local builds on this thread start their build children
+ * through one fresh exec of Nix that forks them, which this owns: it is
+ * stopped and reaped when this is destroyed. Without one, each build child
+ * gets its own.
+ */
+struct BuildChildServer
+{
+    Pid pid;
+    AutoCloseFD socket;
+
+    BuildChildServer * previous;
+
+    BuildChildServer();
+    ~BuildChildServer();
+};
+#endif
+
 /**
  * Denotes a build failure that stemmed from the builder exiting with a
  * failing exist status.

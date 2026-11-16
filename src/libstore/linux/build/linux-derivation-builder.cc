@@ -16,6 +16,7 @@
 #include "nix/util/serialise.hh"
 #include "nix/util/config-global.hh"
 #include "nix/util/current-process.hh"
+#include "nix/util/unix-domain-socket.hh"
 #include "nix/store/derivation/aterm.hh"
 #include "nix/store/builtins.hh"
 #include "linux/fchmodat2-compat.hh"
@@ -39,6 +40,7 @@
 #include <sys/prctl.h>
 #include <grp.h>
 #include <dlfcn.h>
+#include <sys/socket.h>
 
 #if HAVE_SECCOMP
 #  include <seccomp.h>
@@ -458,9 +460,9 @@ static bool buildChildEntry = false;
 static void (*loadPlugins)() = nullptr;
 
 /**
- * Sent first to the build child, which refuses to run if it differs: it
- * may be a helper from another build of Nix. Increment the number whenever
- * what spawnBuildChild() sends changes.
+ * Sent first to the build child server, which refuses to run if it differs:
+ * it may be a helper from another build of Nix. Increment the number
+ * whenever what spawnBuildChild() sends changes.
  */
 static const std::string buildChildVersion = "nix-build-child 1 " PACKAGE_VERSION;
 
@@ -495,9 +497,64 @@ static std::filesystem::path buildChildProgram()
         "this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main(), and no nix-build-child was installed with its libnixstore");
 }
 
+static thread_local BuildChildServer * currentBuildChildServer = nullptr;
+
+BuildChildServer::BuildChildServer()
+    : previous(currentBuildChildServer)
+{
+    currentBuildChildServer = this;
+}
+
+BuildChildServer::~BuildChildServer()
+{
+    currentBuildChildServer = previous;
+}
+
 /**
- * Start a fresh Nix with `state` on stdin after the settings, and `fds`.
- * A fork of this multithreaded process could run no Nix code.
+ * Start the build child server, a fresh exec of Nix (see runBuildChild()),
+ * and check that it is from the same build as this one.
+ */
+static void startBuildChildServer(BuildChildServer & server)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == -1)
+        throw SysError("creating socket pair");
+    AutoCloseFD socket = sv[0], theirs = sv[1];
+    /* In its own session, out of reach of the terminal's signals. */
+    SpawnOptions options{
+        .program = buildChildProgram(),
+        .lookupPath = false,
+        .argv0 = "__build-child",
+        .setSid = true,
+        .restoreMounts = false,
+    };
+    Pid pid = spawnProgram(
+        throughLoader(options), std::to_array<FdRedirection>({{.from = theirs.get(), .to = STDIN_FILENO}}));
+    theirs.close();
+
+    if (send(socket.get(), buildChildVersion.data(), buildChildVersion.size(), MSG_NOSIGNAL) == -1)
+        throw SysError("sending to the build child server");
+    char reply[256];
+    ssize_t n;
+    while ((n = recv(socket.get(), reply, sizeof reply, 0)) == -1 && errno == EINTR)
+        ;
+    if (n == -1)
+        throw SysError("receiving from the build child server");
+    if (std::string_view(reply, n) != buildChildVersion)
+        throw Error(
+            "the build child server %s is from a different Nix build (%s) than this program (%s)",
+            PathFmt(options.program),
+            std::string_view(reply, n),
+            buildChildVersion);
+    server.pid = std::move(pid);
+    server.socket = std::move(socket);
+}
+
+/**
+ * Start a child of this process that runs Nix with `state` on stdin after
+ * the settings, and `fds`. A fork of this multithreaded process could run
+ * no Nix code, so the build child server forks it instead (see
+ * BuildChildServer).
  */
 static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fds)
 {
@@ -507,7 +564,6 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
     for (auto & [name, info] : settings)
         config.insert_or_assign(name, info.value);
     StringSink spec;
-    spec << buildChildVersion;
     writeStringMap(spec, config);
     spec << std::to_underlying(verbosity);
     spec.s.append(state);
@@ -517,15 +573,53 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
     writeFull(specFd.get(), spec.s);
     valueOr(seek(specFd.get(), 0, SEEK_SET), NIX_THROW_NATIVE_SYS_ERROR_HANDLER("seeking in the build child's memfd"));
     fds.insert(fds.begin(), {.from = specFd.get(), .to = STDIN_FILENO});
-    auto moved = moveAboveTargets(fds);
 
-    SpawnOptions options{
-        .program = buildChildProgram(),
-        .lookupPath = false,
-        .argv0 = "__build-child",
-        .restoreMounts = false,
+    std::vector<int> targets, sources;
+    for (auto & fd : fds) {
+        targets.push_back(fd.to);
+        sources.push_back(fd.from);
+    }
+
+    std::optional<BuildChildServer> own;
+    if (!currentBuildChildServer)
+        own.emplace();
+    auto & server = *currentBuildChildServer;
+    auto stop = [&] {
+        server.socket.close();
+        server.pid.kill();
     };
-    return spawnProgram(throughLoader(options), fds);
+    for (bool retry = true;; retry = false) {
+        if (!server.pid)
+            startBuildChildServer(server);
+        try {
+            unix::sendMessageWithFds(server.socket.get(), std::as_bytes(std::span(targets)), sources);
+        } catch (SysError &) {
+            /* It went away: reap it, and try once more with another. */
+            stop();
+            if (!retry)
+                throw;
+            continue;
+        }
+        /* The request was sent, so the server may have started the child:
+           never send it again, and wait for the reply even when
+           interrupted, so as to hold the child's Pid. */
+        pid_t pid;
+        ssize_t n;
+        while ((n = recv(server.socket.get(), &pid, sizeof pid, 0)) == -1 && errno == EINTR)
+            ;
+        if (n == sizeof pid) {
+            if (pid <= 0)
+                throw SysError(-pid, "starting the build child");
+            return Pid(pid);
+        }
+        if (n == -1) {
+            SysError e("receiving from the build child server");
+            stop();
+            throw e;
+        }
+        stop();
+        throw Error("the build child server exited before it replied");
+    }
 }
 
 Pid LinuxDerivationBuilder::spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds)
@@ -591,17 +685,62 @@ static void bindInSandbox(Source & spec);
 
 void LinuxDerivationBuilder::runBuildChild()
 {
-    bool bind = false;
+    /* Serve the socket on stdin: first reply to the version with ours, and
+       stop if it differs; then for each request, start a child with the
+       fds it sent, as our parent's child (CLONE_PARENT), and reply with
+       its pid, or minus an errno. This process has no threads, so the
+       child may run any code. */
     try {
-        auto bytes = drainFD(STDIN_FILENO);
-        StringSource spec(bytes);
-        if (auto version = readString(spec); version != buildChildVersion)
+        char buf[256];
+        auto n = ::read(STDIN_FILENO, buf, sizeof buf);
+        if (n == -1)
+            throw SysError("receiving the version");
+        writeFull(STDIN_FILENO, buildChildVersion);
+        if (std::string_view version(buf, n); version != buildChildVersion)
             throw Error(
-                "the build child %s is from a different Nix build (%s) than the program that started it (%s)",
+                "the build child server %s is from a different Nix build (%s) than the program that started it (%s)",
                 PathFmt(getSelfExe().value_or("/proc/self/exe")),
                 buildChildVersion,
                 version);
         initLibStore(false);
+        while (true) {
+            int targets[8];
+            auto received = unix::receiveMessageWithFds(STDIN_FILENO, std::as_writable_bytes(std::span(targets)));
+            pid_t pid = -EINVAL;
+            if (received.bytesReceived == received.fds.size() * sizeof(int)) {
+                std::vector<FdRedirection> fds;
+                for (size_t i = 0; i < received.fds.size(); ++i)
+                    fds.push_back({.from = received.fds[i].get(), .to = targets[i]});
+                try {
+                    pid = startProcess(
+                        [&] {
+                            auto moved = moveAboveTargets(fds);
+                            for (auto & fd : fds)
+                                if (dup2(fd.from, fd.to) == -1)
+                                    _exit(1);
+                            runBuildChildOnce();
+                        },
+                        {.cloneFlags = CLONE_PARENT});
+                } catch (SysError & e) {
+                    pid = -e.errNo;
+                }
+            }
+            writeFull(STDIN_FILENO, {reinterpret_cast<char *>(&pid), sizeof pid});
+        }
+    } catch (EndOfFile &) {
+        _exit(0);
+    } catch (...) {
+        handleChildException(false);
+    }
+    _exit(1);
+}
+
+void LinuxDerivationBuilder::runBuildChildOnce()
+{
+    bool bind = false;
+    try {
+        auto bytes = drainFD(STDIN_FILENO);
+        StringSource spec(bytes);
         auto config = readStringMap(spec);
         /* First the experimental features: a setting that needs one is
            ignored while it is not enabled. */
