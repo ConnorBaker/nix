@@ -23,6 +23,18 @@ struct MaxBuildJobsSetting : public BaseSetting<unsigned int>
     unsigned int parse(const std::string & str) const override;
 };
 
+/**
+ * The `builders` setting, whose `to_string()` puts the list on one line,
+ * so that it can be written as a configuration line.
+ */
+struct BuildersSetting : public Setting<std::string>
+{
+    using Setting<std::string>::Setting;
+    using Setting<std::string>::operator=;
+
+    std::string to_string() const override;
+};
+
 struct WorkerSettings : public virtual Config
 {
 private:
@@ -138,7 +150,7 @@ public:
         "build-hook-kill-timeout",
         "How long to wait in milliseconds for build hooks to exit on interrupt before sending SIGKILL."};
 
-    Setting<std::string> builders{
+    BuildersSetting builders{
         this,
         "@" + (nixConfDir() / "machines").string(),
         "builders",

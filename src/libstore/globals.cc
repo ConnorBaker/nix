@@ -431,6 +431,19 @@ unsigned int MaxBuildJobsSetting::parse(const std::string & str) const
     }
 }
 
+std::string BuildersSetting::to_string() const
+{
+    /* Machine::parseConfig() reads each line up to a '#' and splits it
+       at ';', so dropping the comments and joining the lines with ';'
+       gives the same machines. */
+    Strings lines;
+    for (auto line : tokenizeString<Strings>(get(), "\n")) {
+        line.erase(std::find(line.begin(), line.end(), '#'), line.end());
+        lines.push_back(std::move(line));
+    }
+    return concatStringsSep(";", lines);
+}
+
 template<>
 LocalSettings::ExternalBuilders BaseSetting<LocalSettings::ExternalBuilders>::parse(const std::string & str) const
 {
