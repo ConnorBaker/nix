@@ -65,7 +65,16 @@ void execProgramInStore(
             helperArgs.push_back(arg);
 
         /* TODO: Gate this behind __linux__ and just exec /proc/self/exe. */
-        execv(getSelfExe().value_or("nix").string().c_str(), stringsToCharPtrs(helperArgs).data());
+        std::filesystem::path self = getSelfExe().value_or("nix");
+#ifdef __linux__
+        /* Started through the dynamic loader, run the helper through it too,
+           as throughLoader() does. */
+        if (startedThroughLoader()) {
+            helperArgs.insert(std::next(helperArgs.begin()), {"--argv0", chrootHelperName, self.string()});
+            self = "/proc/self/exe";
+        }
+#endif
+        execv(self.c_str(), stringsToCharPtrs(helperArgs).data());
 
         throw SysError("could not execute chroot helper");
     }
