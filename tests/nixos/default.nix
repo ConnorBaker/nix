@@ -188,6 +188,8 @@ in
 
   functional_root = runNixOSTest ./functional/as-root.nix;
 
+  spawn-program-root = runNixOSTest ./spawn-program-root.nix;
+
   functional_symlinked-home = runNixOSTest ./functional/symlinked-home.nix;
 
   functional_unprivileged-daemon = runNixOSTest ./functional/unprivileged-daemon.nix;

@@ -64,6 +64,12 @@ static int spawnTestArgv0AndChdir(std::string_view argv0, std::string_view argv2
     return EXIT_SUCCESS;
 }
 
+static int spawnTestSleep()
+{
+    sleep(600);
+    return EXIT_SUCCESS;
+}
+
 static int spawnTestSigMask()
 {
     sigset_t current;
@@ -116,6 +122,8 @@ int main(int argc, char ** argv)
             return spawnTestForLeakedFDsMain();
         } else if (argv1 == "__util_test_spawn_chdir_and_argv0" && argc > 2) {
             return spawnTestArgv0AndChdir(argv[0], argv[2]);
+        } else if (argv1 == "__util_test_spawn_sleep") {
+            return spawnTestSleep();
         } else if (argv1 == "__util_test_spawn_sigmask") {
             return spawnTestSigMask();
         } else if (argv1 == "__util_test_spawn_setuid_setgid") {
