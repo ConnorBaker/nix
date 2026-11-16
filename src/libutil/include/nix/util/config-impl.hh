@@ -28,6 +28,12 @@ struct BaseSetting<std::list<std::filesystem::path>>::trait
 };
 
 template<>
+struct BaseSetting<std::set<std::filesystem::path>>::trait
+{
+    static constexpr bool appendable = true;
+};
+
+template<>
 struct BaseSetting<Strings>::trait
 {
     static constexpr bool appendable = true;
@@ -65,6 +71,8 @@ bool BaseSetting<T>::isAppendable()
 
 template<>
 void BaseSetting<std::list<std::filesystem::path>>::appendOrSet(std::list<std::filesystem::path> newValue, bool append);
+template<>
+void BaseSetting<std::set<std::filesystem::path>>::appendOrSet(std::set<std::filesystem::path> newValue, bool append);
 template<>
 void BaseSetting<Strings>::appendOrSet(Strings newValue, bool append);
 template<>

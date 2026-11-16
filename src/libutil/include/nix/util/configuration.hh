@@ -551,9 +551,6 @@ inline void formatHelper(F & f, const Setting<AbsolutePath> & x, const Args &...
 template<class F, typename... Args>
 inline void formatHelper(F & f, const Setting<AbsolutePath> & x) = delete;
 
-template<>
-void BaseSetting<std::set<std::filesystem::path>>::appendOrSet(std::set<std::filesystem::path> newValue, bool append);
-
 struct ExperimentalFeatureSettings : Config
 {
 private:
