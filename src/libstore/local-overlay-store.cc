@@ -80,14 +80,21 @@ LocalOverlayStore::LocalOverlayStore(ref<const Config> config)
     }
 }
 
-void LocalOverlayStore::registerDrvOutputUnchecked(const Realisation & info)
+void LocalOverlayStore::registerBuildTraces(const StorePath & drvPath, const SingleDrvOutputs & outputs, TracesOf from)
 {
-    // First do queryRealisation on lower layer to populate DB
-    auto res = lowerStore->queryRealisation(info.id);
-    if (res)
-        LocalStore::registerDrvOutputUnchecked({*res, info.id});
+    /* Copy up the lower layer's trace of an output this layer has none of, so that it is compared
+       with: once this layer has its own, the lower one no longer counts. */
+    for (auto & [outputName, _] : outputs) {
+        std::shared_ptr<const UnkeyedRealisation> upper;
+        LocalStore::queryRealisationUncached(
+            {drvPath, outputName},
+            {[&](std::future<std::shared_ptr<const UnkeyedRealisation>> fut) { upper = fut.get(); }});
+        if (!upper)
+            if (auto res = lowerStore->queryRealisation({drvPath, outputName}))
+                LocalStore::registerBuildTraces(drvPath, {{outputName, *res}}, TracesOf::Lone);
+    }
 
-    LocalStore::registerDrvOutputUnchecked(info);
+    LocalStore::registerBuildTraces(drvPath, outputs, from);
 }
 
 void LocalOverlayStore::queryPathInfoUncached(

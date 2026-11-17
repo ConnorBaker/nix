@@ -13,6 +13,7 @@ suites += {
     'verify.sh',
     'optimise.sh',
     'stale-file-handle.sh',
+    'ca-build-traces.sh',
   ],
   'workdir' : meson.current_source_dir(),
 }

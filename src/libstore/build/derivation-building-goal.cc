@@ -1105,6 +1105,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
         builtOutputs = drvOptions.getRequiredSystemFeatures(*drv).count(std::string{drvFeatureBuilderRpcV0})
                            ? builder->checkSubmittedOutputs(localBuildCap.localStore)
                            : builder->registerOutputs(localBuildCap.localStore);
+        if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(*drv).isImpure())
+            localBuildCap.localStore.registerBuildTraces(drvPath, builtOutputs, LocalStore::TracesOf::WholeBuild);
         builder->cleanupBuild(true);
     } catch (BuilderFailureError & e) {
         builder.reset();

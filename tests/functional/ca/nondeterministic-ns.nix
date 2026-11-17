@@ -41,4 +41,17 @@ in
       echo dev > $dev/foo
     '';
   };
+
+  # Only bin is not reproducible.
+  partlyReproducible = mkCADerivation {
+    name = "partly-reproducible";
+    outputs = [
+      "out"
+      "bin"
+    ];
+    buildCommand = ''
+      date +%s.%N > $bin
+      echo out > $out
+    '';
+  };
 }
