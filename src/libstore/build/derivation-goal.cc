@@ -310,9 +310,10 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
         } else {
             /* Otherwise the builder will give us info for out output, but
                also for other outputs. Filter down to just our output so as
-               not to leak info on unrelated things. */
+               not to leak info on unrelated things, unless their traces were
+               registered together: then they answer for the others. */
             for (auto it = success.builtOutputs.begin(); it != success.builtOutputs.end();) {
-                if (it->first != wantedOutput) {
+                if (it->first != wantedOutput && !success.tracesTogether) {
                     it = success.builtOutputs.erase(it);
                 } else {
                     ++it;

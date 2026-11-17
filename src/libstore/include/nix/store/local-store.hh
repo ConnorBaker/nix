@@ -470,6 +470,7 @@ public:
     enum struct TracesOf {
         Lone,       ///< copied or substituted: a trace replaces none that differs
         WholeBuild, ///< all outputs of one build: they replace the recorded traces
+        MaybeMixed, ///< outputs perhaps of several builds: taken only if equal or if none is traced
     };
 
     /**

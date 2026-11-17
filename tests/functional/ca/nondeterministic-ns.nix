@@ -13,7 +13,7 @@ let
     );
 in
 
-{
+rec {
   singleOut = mkCADerivation {
     name = "time-single-out";
     buildCommand = ''
@@ -39,6 +39,14 @@ in
       mkdir $dev
       date +%s.%N > $lib/current-time
       echo dev > $dev/foo
+    '';
+  };
+
+  # Names the out and lib of multiOut it was built with.
+  multiOutUser = mkCADerivation {
+    name = "time-multi-out-user";
+    buildCommand = ''
+      echo ${multiOut.out} ${multiOut.lib} > $out
     '';
   };
 

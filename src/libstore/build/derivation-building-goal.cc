@@ -1168,6 +1168,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
         co_return BuildResult::Success{
             .status = BuildResult::Success::Built,
             .builtOutputs = std::move(builtOutputs),
+            /* All outputs of a floating CA derivation were registered together above. */
+            .tracesTogether = buildMode != bmCheck && !type(*drv).hasKnownOutputPaths() && !type(*drv).isImpure(),
         };
     }
 }

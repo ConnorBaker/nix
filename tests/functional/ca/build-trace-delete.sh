@@ -73,3 +73,11 @@ nix-store --delete "$(traced "$partly" bin)"
 nix-build ./nondeterministic-ns.nix -A partlyReproducible.bin --no-out-link
 [[ $(traced "$partly" out) == "$out" ]]
 nix path-info --json "$out" | grepQuiet '"test:'
+
+# Only out gone, and a user of out and lib built alone: the rebuild of multiOut answers for both,
+# so that the user is built with outputs of one build, those that the traces name.
+nix-build ./nondeterministic-ns.nix -A multiOut --no-out-link
+nix-store --delete "$(traced "$multiOutput" out)"
+userPath=$(nix build -f ./nondeterministic-ns.nix multiOutUser --no-link --print-out-paths)
+[[ $(cat "$userPath") == "$(traced "$multiOutput" out) $(traced "$multiOutput" lib)" ]] \
+    || fail "multiOutUser was built with outputs of two builds of multiOut: $(cat "$userPath")"
