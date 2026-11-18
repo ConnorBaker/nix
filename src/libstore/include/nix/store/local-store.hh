@@ -394,8 +394,11 @@ public:
     /**
      * Optimise the disk space usage of the Nix store by hard-linking
      * files with the same contents.
+     *
+     * With `dryRun`, the store is not modified: `stats` counts the
+     * files that would be linked and the bytes that would be freed.
      */
-    void optimiseStore(OptimiseStats & stats);
+    void optimiseStore(OptimiseStats & stats, bool dryRun = false);
 
     void optimiseStore() override;
 
@@ -536,6 +539,7 @@ private:
         OptimiseStats & stats,
         const std::filesystem::path & path,
         InodeHash & inodeHash,
+        boost::unordered_flat_set<Hash> * dryRunHashes,
         RepairFlag repair);
 
     // Internal versions that are not wrapped in retry_sqlite.

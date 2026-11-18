@@ -103,7 +103,12 @@ LocalStore::readDirectoryIgnoringInodes(const std::filesystem::path & path, cons
 }
 
 void LocalStore::optimisePath_(
-    Activity * act, OptimiseStats & stats, const std::filesystem::path & path, InodeHash & inodeHash, RepairFlag repair)
+    Activity * act,
+    OptimiseStats & stats,
+    const std::filesystem::path & path,
+    InodeHash & inodeHash,
+    boost::unordered_flat_set<Hash> * dryRunHashes,
+    RepairFlag repair)
 {
     checkInterrupt();
 
@@ -125,7 +130,7 @@ void LocalStore::optimisePath_(
     if (S_ISDIR(st.st_mode)) {
         auto names = readDirectoryIgnoringInodes(path, inodeHash);
         for (const auto & i : names)
-            optimisePath_(act, stats, path / i.path(), inodeHash, repair);
+            optimisePath_(act, stats, path / i.path(), inodeHash, dryRunHashes, repair);
         return;
     }
 
@@ -166,6 +171,19 @@ void LocalStore::optimisePath_(
 
     /* Check if this is a known hash. */
     std::filesystem::path linkPath = std::filesystem::path{linksDir} / hash.to_string(HashFormat::Nix32, false);
+
+    /* A dry run counts the files that the code below would link: those
+       whose contents are in the links directory or were seen earlier in
+       this run. Recording the inode, as linking does, skips the file's
+       other names. */
+    if (dryRunHashes) {
+        if (pathExists(linkPath) || !dryRunHashes->insert(hash).second) {
+            stats.filesLinked++;
+            stats.bytesFreed += st.st_size;
+        }
+        inodeHash.insert(st.st_ino);
+        return;
+    }
 
     /* Maybe delete the link, if it has been corrupted. */
     if (pathExists(linkPath)) {
@@ -299,12 +317,15 @@ void LocalStore::optimisePath_(
         );
 }
 
-void LocalStore::optimiseStore(OptimiseStats & stats)
+void LocalStore::optimiseStore(OptimiseStats & stats, bool dryRun)
 {
-    Activity act(*logger, actOptimiseStore);
+    /* The progress bar reports `actOptimiseStore` as paths optimised and
+       bytes freed, which a dry run does not do. */
+    Activity act(*logger, dryRun ? actUnknown : actOptimiseStore);
 
     auto paths = queryAllValidPaths();
     InodeHash inodeHash = loadInodeHash();
+    boost::unordered_flat_set<Hash> dryRunHashes;
 
     act.progress(0, paths.size());
 
@@ -316,7 +337,13 @@ void LocalStore::optimiseStore(OptimiseStats & stats)
             continue; /* path was GC'ed, probably */
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("optimising path '%s'", printStorePath(i)));
-            optimisePath_(&act, stats, config->realStoreDir.get() / i.to_string(), inodeHash, NoRepair);
+            optimisePath_(
+                &act,
+                stats,
+                config->realStoreDir.get() / i.to_string(),
+                inodeHash,
+                dryRun ? &dryRunHashes : nullptr,
+                NoRepair);
         }
         done++;
         act.progress(done, paths.size());
@@ -338,7 +365,7 @@ void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag rep
     InodeHash inodeHash;
 
     if (config->getLocalSettings().autoOptimiseStore)
-        optimisePath_(nullptr, stats, path, inodeHash, repair);
+        optimisePath_(nullptr, stats, path, inodeHash, nullptr, repair);
 }
 
 } // namespace nix
