@@ -1501,6 +1501,19 @@ static void checkDerivationName(EvalState & state, std::string_view drvName)
     }
 }
 
+/**
+ * Output names are parts of store path names and of deriving paths, so
+ * they follow the rules for store path names.
+ */
+static void checkOutputName(EvalState & state, std::string_view outputName, Value & v)
+{
+    try {
+        checkName(outputName);
+    } catch (BadStorePathName & e) {
+        state.error<EvalError>("invalid derivation output name: %s", Uncolored(e.message())).atPos(v).debugThrow();
+    }
+}
+
 static void derivationStrictInternal(EvalState & state, std::string_view drvName, const Bindings * attrs, Value & v)
 {
     checkDerivationName(state, drvName);
@@ -1586,8 +1599,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             for (auto & j : ss) {
                 if (outputs.find(j) != outputs.end())
                     state.error<EvalError>("duplicate derivation output '%1%'", j).atPos(v).debugThrow();
-                /* !!! Check whether j is a valid attribute
-                   name. */
+                checkOutputName(state, j, v);
                 /* Derivations cannot be named ‘drvPath’, because
                    we already have an attribute ‘drvPath’ in
                    the resulting set (see state.sDrvPath). */
@@ -2549,6 +2561,7 @@ static void prim_outputOf(EvalState & state, CallSite callSite, Value * const * 
 
     OutputNameView outputName =
         state.forceStringNoCtx(*args[1], noPos, "while evaluating the second argument to builtins.outputOf");
+    checkOutputName(state, outputName, *args[1]);
 
     state.mkSingleDerivedPathString(
         SingleDerivedPath::Built{
