@@ -5,6 +5,8 @@ suites += {
     'text-hashed-output.sh',
     'recursive-mod-json.sh',
     'build-built-drv.sh',
+    'build-built-drv-foreign-path.sh',
+    'build-built-drv-foreign-path-substitute.sh',
     'eval-outputOf.sh',
     'failing-outer.sh',
     'dep-built-drv.sh',
