@@ -17,6 +17,8 @@
 #include <unistd.h>
 #include <errno.h>
 
+#include <nlohmann/json.hpp>
+
 #include "store-config-private.hh"
 
 namespace nix {
@@ -357,6 +359,31 @@ void LocalStore::optimiseStore()
     optimiseStore(stats);
 
     printInfo("%s freed by hard-linking %d files", renderSize(stats.bytesFreed), stats.filesLinked);
+}
+
+std::optional<nlohmann::json> LocalStore::queryStoreStats()
+{
+    OptimiseStats linkable;
+    optimiseStore(linkable, /*dryRun=*/true);
+
+    /* A links directory entry has one name of its own and one per store
+       file with its contents, so `nlink - 2` copies are saved. */
+    uint64_t files = 0, bytes = 0;
+    for (auto & entry : DirectoryIterator{linksDir}) {
+        checkInterrupt();
+        /* A concurrent garbage collection may have removed it. */
+        auto st = maybeLstat(entry.path());
+        if (st && st->st_nlink > 2) {
+            files += st->st_nlink - 2;
+            bytes += (st->st_nlink - 2) * uint64_t(st->st_size);
+        }
+    }
+
+    return nlohmann::json{
+        {"pathCount", queryAllValidPaths().size()},
+        {"dedup", {{"files", files}, {"bytes", bytes}}},
+        {"predictedDedup", {{"files", linkable.filesLinked}, {"bytes", linkable.bytesFreed}}},
+    };
 }
 
 void LocalStore::optimisePath(const std::filesystem::path & path, RepairFlag repair)

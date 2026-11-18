@@ -402,6 +402,8 @@ public:
 
     void optimiseStore() override;
 
+    std::optional<nlohmann::json> queryStoreStats() override;
+
     /**
      * Optimise a single store path. Optionally, test the encountered
      * symlinks for corruption.
