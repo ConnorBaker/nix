@@ -25,6 +25,26 @@ rec {
     outputHashAlgo = "sha256";
   };
 
+  # Input-addressed, so the paths of their outputs are known before they
+  # are built. The output of `producingProducingDrvInputAddressed` is the
+  # derivation of `producingDrvInputAddressed`, whose output is the
+  # derivation of `hello`.
+  producingDrvInputAddressed = mkDerivation {
+    name = "hello.drv";
+    buildCommand = ''
+      cp ${builtins.unsafeDiscardOutputDependency hello.drvPath} $out
+    '';
+    outputHashMode = "text";
+  };
+
+  producingProducingDrvInputAddressed = mkDerivation {
+    name = "hello.drv.drv";
+    buildCommand = ''
+      cp ${builtins.unsafeDiscardOutputDependency producingDrvInputAddressed.drvPath} $out
+    '';
+    outputHashMode = "text";
+  };
+
   wrapper = mkDerivation {
     name = "use-dynamic-drv-in-non-dynamic-drv";
     buildCommand = ''
