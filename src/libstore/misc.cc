@@ -400,6 +400,12 @@ StorePath resolveDerivedPath(Store & store, const SingleDerivedPath & req, Store
             [&](const SingleDerivedPath::Opaque & bo) { return bo.path; },
             [&](const SingleDerivedPath::Built & bfd) {
                 auto drvPath = resolveDerivedPath(store, *bfd.drvPath, evalStore_);
+                /* A derivation that is an output may be missing although
+                   its path is known, e.g. because its producer is
+                   input-addressed and has not been built yet. */
+                if (std::holds_alternative<SingleDerivedPath::Built>(bfd.drvPath->raw()) && !store.isValidPath(drvPath)
+                    && !(evalStore_ && evalStore_->isValidPath(drvPath)))
+                    throw MissingRealisation(store, *bfd.drvPath, drvPath, bfd.output);
                 auto outPath = deepQueryPartialDerivationOutput(store, drvPath, bfd.output, evalStore_);
                 if (!outPath)
                     throw MissingRealisation(store, *bfd.drvPath, drvPath, bfd.output);
