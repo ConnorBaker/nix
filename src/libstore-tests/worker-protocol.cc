@@ -217,6 +217,44 @@ VERSIONED_CHARACTERIZATION_TEST(
         },
     }))
 
+/**
+ * Reading back a derived path with dynamic layers needs
+ * `dynamic-derivations`.
+ */
+struct WorkerProtoDynamicTest : WorkerProtoTest
+{
+    EnableExperimentalFeature xp{"dynamic-derivations"};
+};
+
+/**
+ * Two dynamic layers: the first layer whose `drvPath` is not opaque
+ * must also be written with `!`.
+ */
+VERSIONED_CHARACTERIZATION_TEST(
+    WorkerProtoDynamicTest,
+    derivedPath_1_30_dynamic,
+    "derived-path-1.30-dynamic",
+    (WorkerProto::Version{
+        .number =
+            {
+                .major = 1,
+                .minor = 30,
+            },
+    }),
+    (DerivedPath{DerivedPath::Built{
+        .drvPath = make_ref<const SingleDerivedPath>(SingleDerivedPath::Built{
+            .drvPath = make_ref<const SingleDerivedPath>(SingleDerivedPath::Built{
+                .drvPath = makeConstantStorePathRef(
+                    StorePath{
+                        "g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-bar.drv.drv.drv",
+                    }),
+                .output = "out",
+            }),
+            .output = "out",
+        }),
+        .outputs = OutputsSpec::Names{"x", "y"},
+    }}))
+
 VERSIONED_CHARACTERIZATION_TEST(
     WorkerProtoTest,
     drvOutput,
