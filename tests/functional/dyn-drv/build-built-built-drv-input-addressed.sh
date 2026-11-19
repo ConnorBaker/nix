@@ -6,7 +6,9 @@ source common.sh
 # input-addressed derivation. The path of the derivation in the middle
 # layer is known before it is built, but it cannot be read until it is.
 
-buggyNeedLocalStore "a path with two dynamic layers does not survive the trip to the daemon"
+# The daemon must have dyn-drv-ia-nested's fix; 2.35 fails with "path
+# ...drv is not valid".
+requireDaemonNewerThan "2.36pre"
 
 out1=$(nix build -f ./text-hashed-output.nix hello --no-link --print-out-paths)
 

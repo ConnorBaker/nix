@@ -2,7 +2,9 @@
 
 source common.sh
 
-buggyNeedLocalStore "a path with two dynamic layers does not survive the trip to the daemon"
+# The daemon must have dyn-drv-ia-nested's fix; 2.35 fails with "path
+# ...drv is not valid".
+requireDaemonNewerThan "2.36pre"
 
 helloDrv=$(nix-instantiate ./gc-built-drv.nix -A hello)
 producer=$(nix-instantiate ./gc-built-drv.nix -A producer)
