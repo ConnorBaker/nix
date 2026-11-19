@@ -27,6 +27,9 @@
 #include <sys/types.h>
 #include <fcntl.h>
 #include <unistd.h>
+#ifndef _WIN32
+#  include <sys/wait.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -861,6 +864,16 @@ Goal::Co<DerivationBuildingGoal::Result> DerivationBuildingGoal::buildWithHook(
 #endif
 }
 
+bool DerivationBuildingGoal::canBuildLocally(const DerivationOptions<StorePath> & drvOptions)
+{
+    bool platformOk = drv->platform == settings.thisSystem.get() || settings.extraPlatforms.get().count(drv->platform)
+                      || drv->isBuiltin();
+    auto required = drvOptions.getRequiredSystemFeatures(*drv);
+    auto & available = worker.store.config.systemFeatures.get();
+    bool featuresOk = std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
+    return worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk;
+}
+
 Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buildLocally(
     LocalBuildCapability localBuildCap,
     const StorePathSet & inputPaths,
@@ -869,6 +882,10 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     PathLocks outputLocks)
 {
     co_await yield();
+
+    /* Computed once, so an external builder is told exactly what Nix
+       will do if it declines. */
+    const bool canBuildHere = canBuildLocally(drvOptions);
 
     std::unique_ptr<BuildLog> buildLog;
     std::unique_ptr<LogFile> logFile;
@@ -1020,7 +1037,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
                               makeBuildingStoreFromLocalStore(localBuildCap.localStore),
                               std::make_shared<DerivationBuildingGoalCallbacks>(*this, openLogFile, closeLogFile),
                               std::move(params),
-                              *localBuildCap.externalBuilder)
+                              *localBuildCap.externalBuilder,
+                              canBuildHere)
 #endif
                           : makeDerivationBuilder(
                                 makeBuildingStoreFromLocalStore(localBuildCap.localStore),
@@ -1050,7 +1068,9 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
 
     actLock.reset();
 
-    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, true);
+    /* An external builder gets the build's timeouts in build.json and
+       enforces them itself, as a remote builder does. */
+    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, !localBuildCap.externalBuilder);
 
     started();
 
@@ -1086,6 +1106,12 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     if (!statusOk(status)) {
         builder->cleanupBuild(false);
         builder.reset();
+        if (localBuildCap.externalBuilder && WIFEXITED(status) && WEXITSTATUS(status) == externalBuilderDeclinedExitCode
+            && canBuildHere) {
+            localBuildCap.externalBuilder = nullptr;
+            co_return co_await buildLocally(
+                std::move(localBuildCap), inputPaths, initialOutputs, drvOptions, std::move(outputLocks));
+        }
         outputLocks.unlock();
         co_return fixupBuilderFailureErrorMessage(
             {

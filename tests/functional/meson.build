@@ -97,6 +97,7 @@ suites = [
       'export-graph.sh',
       'export.sh',
       'external-builders.sh',
+      'external-builders-decline.sh',
       'extra-sandbox-profile.sh',
       'fetchClosure.sh',
       'fetchGit.sh',
