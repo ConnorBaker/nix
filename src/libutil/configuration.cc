@@ -556,6 +556,7 @@ template class BaseSetting<unsigned long long>;
 template class BaseSetting<bool>;
 template class BaseSetting<std::string>;
 template class BaseSetting<std::list<std::filesystem::path>>;
+template class BaseSetting<std::set<std::filesystem::path>>;
 template class BaseSetting<Strings>;
 template class BaseSetting<StringSet>;
 template class BaseSetting<StringMap>;

@@ -305,6 +305,24 @@ TEST(Config, applyConfigWithReassignedSetting)
     ASSERT_EQ(settings["name-of-the-setting"].value, "second-value");
 }
 
+TEST(Config, applyConfigAppendsToPathList)
+{
+    Config config;
+    Setting<std::list<std::filesystem::path>> setting{
+        &config, std::list<std::filesystem::path>{"/a"}, "name-of-the-setting", "description"};
+    config.applyConfig("extra-name-of-the-setting = /b\n");
+    ASSERT_EQ(setting.get(), (std::list<std::filesystem::path>{"/a", "/b"}));
+}
+
+TEST(Config, applyConfigAppendsToPathSet)
+{
+    Config config;
+    Setting<std::set<std::filesystem::path>> setting{
+        &config, std::set<std::filesystem::path>{"/a"}, "name-of-the-setting", "description"};
+    config.applyConfig("extra-name-of-the-setting = /b\n");
+    ASSERT_EQ(setting.get(), (std::set<std::filesystem::path>{"/a", "/b"}));
+}
+
 TEST(Config, applyConfigFailsOnMissingIncludes)
 {
     Config config;
