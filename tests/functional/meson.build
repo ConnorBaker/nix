@@ -90,6 +90,7 @@ suites = [
       'derivation-json.sh',
       'dump-db.sh',
       'eval-store.sh',
+      'eval-store-remote.sh',
       'eval-write-to.sh',
       'eval.sh',
       'experimental-features.sh',
