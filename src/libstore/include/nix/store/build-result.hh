@@ -133,6 +133,11 @@ struct BuildResult
          */
         SingleDrvOutputs builtOutputs;
 
+        /**
+         * Whether one local build registered the build traces of all these outputs together.
+         */
+        bool tracesTogether = false;
+
         bool operator==(const BuildResult::Success &) const noexcept;
         std::strong_ordering operator<=>(const BuildResult::Success &) const noexcept;
     };

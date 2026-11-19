@@ -37,6 +37,12 @@ DerivationResolutionGoal::realiseInputs(const Derivation & drv, BuildMode buildM
 
     StorePathSet checkedInputDrvs;
 
+    /* One goal answers for all wanted outputs of an input derivation, with outputs of one build. */
+    std::map<ref<const SingleDerivedPath>, StringSet, RefDeepComparator> wantedOutputs;
+    for (const auto & input : drv.inputs)
+        if (auto * built = std::get_if<SingleDerivedPath::Built>(&input.raw()))
+            wantedOutputs[built->drvPath].insert(built->output);
+
     for (const auto & input : drv.inputs) {
         std::visit(
             overloaded{
@@ -61,7 +67,7 @@ DerivationResolutionGoal::realiseInputs(const Derivation & drv, BuildMode buildM
                     auto g = worker.makeGoal(
                         DerivedPath::Built{
                             .drvPath = built.drvPath,
-                            .outputs = OutputsSpec::Names{built.output},
+                            .outputs = OutputsSpec::Names(wantedOutputs.at(built.drvPath)),
                         },
                         buildMode == bmRepair ? bmRepair : bmNormal);
                     inputGoals.insert_or_assign(inputDrvRef, g);

@@ -28,6 +28,7 @@ const WorkerProto::Version WorkerProto::latest = {
             std::string{WorkerProto::featureRealisationWithPath},
             std::string{WorkerProto::featureDeleteDeadSpecificReferrers},
             std::string{WorkerProto::featureAddTempRoots},
+            std::string{WorkerProto::featureBuildTracesTogether},
         },
 };
 
@@ -332,6 +333,9 @@ BuildResult WorkerProto::Serialise<BuildResult>::read(const StoreDirConfig & sto
         }
     }
 
+    if (conn.version.features.contains(WorkerProto::featureBuildTracesTogether))
+        conn.from >> success.tracesTogether;
+
     res.inner = std::visit(
         overloaded{
             [&](BuildResult::Success::Status s) -> decltype(res.inner) {
@@ -359,7 +363,7 @@ void WorkerProto::Serialise<BuildResult>::write(
        success- or failure-only fields in both cases. This helper
        function helps support this: in each case, we just pass the old
        default value for the fields that don't exist in that case. */
-    auto common = [&](std::string_view errorMsg, bool isNonDeterministic, const auto & builtOutputs) {
+    auto common = [&](std::string_view errorMsg, bool isNonDeterministic, const auto & builtOutputs, bool together) {
         conn.to << errorMsg;
         if (conn.version >= WorkerProto::Version{.number = {1, 29}}) {
             conn.to << res.timesBuilt << isNonDeterministic << res.startTime << res.stopTime;
@@ -387,17 +391,23 @@ void WorkerProto::Serialise<BuildResult>::write(
             }
             WorkerProto::write(store, conn, sm);
         }
+        if (conn.version.features.contains(WorkerProto::featureBuildTracesTogether))
+            conn.to << together;
     };
 
     std::visit(
         overloaded{
             [&](const BuildResult::Failure & failure) {
                 WorkerProto::write(store, conn, BuildResultStatus{failure.status});
-                common(failure.message(), failure.isNonDeterministic, decltype(BuildResult::Success::builtOutputs){});
+                common(
+                    failure.message(),
+                    failure.isNonDeterministic,
+                    decltype(BuildResult::Success::builtOutputs){},
+                    false);
             },
             [&](const BuildResult::Success & success) {
                 WorkerProto::write(store, conn, BuildResultStatus{success.status});
-                common(/*errorMsg=*/"", /*isNonDeterministic=*/false, success.builtOutputs);
+                common(/*errorMsg=*/"", /*isNonDeterministic=*/false, success.builtOutputs, success.tracesTogether);
             },
         },
         res.inner);

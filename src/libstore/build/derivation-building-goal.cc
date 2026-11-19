@@ -1105,6 +1105,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
         builtOutputs = drvOptions.getRequiredSystemFeatures(*drv).count(std::string{drvFeatureBuilderRpcV0})
                            ? builder->checkSubmittedOutputs(localBuildCap.localStore)
                            : builder->registerOutputs(localBuildCap.localStore);
+        if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(*drv).isImpure())
+            localBuildCap.localStore.registerBuildTraces(drvPath, builtOutputs, LocalStore::TracesOf::WholeBuild);
         builder->cleanupBuild(true);
     } catch (BuilderFailureError & e) {
         builder.reset();
@@ -1166,6 +1168,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
         co_return BuildResult::Success{
             .status = BuildResult::Success::Built,
             .builtOutputs = std::move(builtOutputs),
+            /* All outputs of a floating CA derivation were registered together above. */
+            .tracesTogether = buildMode != bmCheck && !type(*drv).hasKnownOutputPaths() && !type(*drv).isImpure(),
         };
     }
 }

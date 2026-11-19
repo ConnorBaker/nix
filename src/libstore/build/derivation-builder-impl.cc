@@ -81,7 +81,7 @@ static void replaceValidPath(const std::filesystem::path & storePath, const std:
         // although makeTempPath should be unique, we can't
         // guarantee that.
         do {
-            oldPath = makeTempPath(storePath, ".old");
+            oldPath = makeTempPath(storePath.parent_path(), storePath.filename().string() + ".old");
             // store paths are often directories so we can't just unlink() it
             // let's make sure the path doesn't exist before we try to use it
         } while (pathExists(oldPath));
@@ -164,8 +164,10 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         assert(initialOutput);
         auto & initialInfo = *initialOutput;
 
-        /* Don't register if already valid, and not checking */
-        bool wanted = buildMode == bmCheck || !(initialInfo.known && initialInfo.known->isValid());
+        /* Don't register if already valid, and not checking, unless the build
+           might not reproduce it: then all outputs of one build are registered. */
+        bool wanted = buildMode == bmCheck || !type(drv).hasKnownOutputPaths()
+                      || !(initialInfo.known && initialInfo.known->isValid());
         if (!wanted) {
             outputReferencesIfUnregistered.insert_or_assign(
                 outputName, AlreadyRegistered{.path = initialInfo.known->path});
@@ -557,6 +559,10 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
             }
         }
 
+        /* A content-addressed path made again keeps its signatures. */
+        if (newInfo.ca && localStore.isValidPath(newInfo.path))
+            newInfo.sigs = localStore.queryPathInfo(newInfo.path)->sigs;
+
         /* Move files, if needed */
         if (store->toRealPath(newInfo.path) != actualPath) {
             if (buildMode == bmRepair) {
@@ -704,7 +710,6 @@ SingleDrvOutputs DerivationBuilderImpl::registerOutputs(LocalStore & localStore)
         };
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations) && !type(drv).isImpure()) {
             localStore.signRealisation(thisRealisation);
-            localStore.registerDrvOutput(thisRealisation, NoCheckSigs);
         }
         builtOutputs.emplace(outputName, thisRealisation);
     }
@@ -758,11 +763,21 @@ SingleDrvOutputs DerivationBuilderImpl::checkSubmittedOutputs(LocalStore & local
             },
         };
 
-        localStore.signRealisation(realisation);
-        localStore.registerDrvOutput(realisation, NoCheckSigs);
-        builtOutputs.emplace(outputName, realisation);
+        /* A check compares the output with the recorded build trace, which it does not replace. */
+        if (buildMode == bmCheck) {
+            if (auto old = localStore.queryRealisation({drvPath, outputName});
+                old && old->outPath != realisation.outPath)
+                throw NotDeterministic(
+                    "derivation '%s' may not be deterministic: output '%s' was submitted as '%s', not '%s'",
+                    store->printStorePath(drvPath),
+                    outputName,
+                    store->printStorePath(realisation.outPath),
+                    store->printStorePath(old->outPath));
+            continue;
+        }
 
-        // TODO: handle --check
+        localStore.signRealisation(realisation);
+        builtOutputs.emplace(outputName, realisation);
     }
 
     return builtOutputs;

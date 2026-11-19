@@ -6,6 +6,7 @@
 #include "nix/store/pathlocks.hh"
 #include "nix/store/store-api.hh"
 #include "nix/store/indirect-root-store.hh"
+#include "nix/store/realisation.hh"
 #include "nix/util/sync.hh"
 #include "nix/util/os-filename.hh"
 
@@ -465,6 +466,17 @@ public:
      */
     void registerDrvOutputUnchecked(const Realisation & info) override;
     void registerDrvOutput(const Realisation & info, CheckSigsFlag checkSigs) override;
+
+    enum struct TracesOf {
+        Lone,       ///< copied or substituted: a trace replaces none that differs
+        WholeBuild, ///< all outputs of one build: they replace the recorded traces
+        MaybeMixed, ///< outputs perhaps of several builds: taken only if equal or if none is traced
+    };
+
+    /**
+     * Register the build traces of `outputs` of `drvPath` together, or none.
+     */
+    virtual void registerBuildTraces(const StorePath & drvPath, const SingleDrvOutputs & outputs, TracesOf from);
     void cacheDrvOutputMapping(
         State & state, const uint64_t deriver, const std::string & outputName, const StorePath & output);
 
