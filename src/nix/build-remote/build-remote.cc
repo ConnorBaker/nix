@@ -290,41 +290,55 @@ static int main_build_remote(int argc, char ** argv)
 
         auto wantedOutputs = readStrings<StringSet>(source);
 
-        AutoCloseFD uploadLock;
-        {
-            auto setUpdateLock = [&](auto && fileName) {
-                uploadLock = openLockFile(currentLoad / (escapeUri(fileName) + ".upload-lock"), true);
-            };
-            try {
-                setUpdateLock(storeUri);
-            } catch (SystemError & e) {
-                if (!e.is(std::errc::filename_too_long))
-                    throw;
-                // Try again hashing the store URL so we have a shorter path
-                auto h = hashString(HashAlgorithm::MD5, storeUri);
-                setUpdateLock(h.to_string(HashFormat::Base64, false));
-            }
-        }
-
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("waiting for the upload lock to '%s'", storeUri));
-
-            auto old = signal(SIGALRM, handleAlarm);
-            alarm(15 * 60);
-            if (!lockFile(uploadLock.get(), ltWrite, true))
-                printError("somebody is hogging the upload lock for '%s', continuing...");
-            alarm(0);
-            signal(SIGALRM, old);
-        }
-
         auto substitute = settings.getWorkerSettings().buildersUseSubstitutes ? Substitute : NoSubstitute;
 
+        /* Only take the upload lock if something needs to be uploaded. */
+        bool anyMissing = false;
         {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
-            copyPaths(*store, *sshStore, inputs, NoRepair, NoCheckSigs, substitute);
+            Activity act(*logger, lvlTalkative, actUnknown, fmt("checking for missing dependencies on '%s'", storeUri));
+            sshStore->addTempRoots(inputs);
+            auto valid = sshStore->queryValidPaths(inputs, substitute);
+            for (auto & path : inputs)
+                if (!valid.count(path)) {
+                    anyMissing = true;
+                    break;
+                }
         }
 
-        uploadLock = -1;
+        if (anyMissing) {
+            AutoCloseFD uploadLock;
+            {
+                auto setUpdateLock = [&](auto && fileName) {
+                    uploadLock = openLockFile(currentLoad / (escapeUri(fileName) + ".upload-lock"), true);
+                };
+                try {
+                    setUpdateLock(storeUri);
+                } catch (SystemError & e) {
+                    if (!e.is(std::errc::filename_too_long))
+                        throw;
+                    // Try again hashing the store URL so we have a shorter path
+                    auto h = hashString(HashAlgorithm::MD5, storeUri);
+                    setUpdateLock(h.to_string(HashFormat::Base64, false));
+                }
+            }
+
+            {
+                Activity act(*logger, lvlTalkative, actUnknown, fmt("waiting for the upload lock to '%s'", storeUri));
+
+                auto old = signal(SIGALRM, handleAlarm);
+                alarm(15 * 60);
+                if (!lockFile(uploadLock.get(), ltWrite, true))
+                    printError("somebody is hogging the upload lock for '%s', continuing...", storeUri);
+                alarm(0);
+                signal(SIGALRM, old);
+            }
+
+            {
+                Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
+                /* copyPaths re-checks validity under the lock, so hooks don't upload the same path twice. */
+                copyPaths(*store, *sshStore, inputs, NoRepair, NoCheckSigs, substitute);
+            }
+        }
 
         auto drv = store->readDerivation(*drvPath);
 
