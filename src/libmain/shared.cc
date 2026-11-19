@@ -57,7 +57,17 @@ void printGCWarning()
 
 void printMissing(ref<Store> store, const std::vector<DerivedPath> & paths, Verbosity lvl, Store * evalStore)
 {
-    printMissing(store, store->queryMissing(paths, evalStore), lvl);
+    auto missing = store->queryMissing(paths, evalStore);
+    /* Sort the derivations to build where they come from, the evaluation
+       store, when it has them all, rather than asking the build store, which
+       may lack them, about each one. The evaluation store is asked as
+       `queryMissing` asks a store, in one request if that is one. */
+    if (evalStore && evalStore != &*store && !missing.willBuild.empty()
+        && (evalStore->queryValidPathsIsOneRequest()
+                ? evalStore->queryValidPaths(missing.willBuild).size() == missing.willBuild.size()
+                : std::ranges::all_of(missing.willBuild, [&](auto & path) { return evalStore->isValidPath(path); })))
+        store = ref<Store>(evalStore->shared_from_this());
+    printMissing(store, missing, lvl);
 }
 
 void printMissing(ref<Store> store, const MissingPaths & missing, Verbosity lvl)

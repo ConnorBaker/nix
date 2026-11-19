@@ -19,6 +19,22 @@ file=./eval-store-query-missing.nix
 eval_store=$TEST_ROOT/eval-store
 graph=(--arg depth "$depth" --arg width "$width")
 
+# Check that the derivations to build in $TEST_ROOT/dry-run.log are listed
+# dependencies first, with the references that store $1 records, and that
+# there are at least $2 of them.
+checkOrder() {
+    local i later refs order
+    mapfile -t order < <(awk '/will be built:$/ { on = 1; next } /will be fetched|know how to build/ { on = 0 }
+        on && /^  \// { print substr($0, 3) }' "$TEST_ROOT/dry-run.log")
+    ((${#order[@]} >= $2))
+    for i in "${!order[@]}"; do
+        refs=$(nix-store --store "$1" --query --references "${order[i]}")
+        for later in "${order[@]:i+1}"; do
+            [[ $refs != *"$later"* ]] || fail "'${order[i]}' is listed before its dependency '$later'"
+        done
+    done
+}
+
 # Dry-run the graph against store $1 and check that it reports $2
 # derivations to build, nothing unknown, and that the daemon logging to $3
 # received at most $4 ops. The ops are left in $TEST_ROOT/ops. A daemon logs
@@ -34,9 +50,8 @@ dryRun() {
     grep -E "will be built|will be fetched|don't know how to build" "$TEST_ROOT/dry-run.log"
     grepQuietInverse "don't know how to build" "$TEST_ROOT/dry-run.log"
     grepQuiet "these $expected derivations will be built" "$TEST_ROOT/dry-run.log"
-    # Not counted: QueryPathInfo (26), with which printMissing sorts the
-    # derivations to build in the build store, once per derivation.
-    tail -n +"$((mark + 1))" "$log" | sed -n 's/.*received daemon op \([0-9]*\).*/\1/p' | grep -vx 26 > "$TEST_ROOT/ops"
+    checkOrder "$eval_store" "$expected"
+    tail -n +"$((mark + 1))" "$log" | sed -n 's/.*received daemon op \([0-9]*\).*/\1/p' > "$TEST_ROOT/ops"
     echo "daemon ops: $(sort -n "$TEST_ROOT/ops" | uniq -c | tr '\n' ' ')"
     (($(wc -l < "$TEST_ROOT/ops") <= maxOps))
 }
@@ -93,6 +108,21 @@ extra-experimental-features = ca-derivations" startDaemon
 daemon_log=$TEST_ROOT/daemon-log
 dryRun daemon "$all" "$daemon_log" $((depth + 1))
 
+# With the daemon as the evaluation store, printMissing asks it in one
+# request whether it has the derivations to build, not once per derivation:
+# per derivation, only evaluation and the walk ask it, three times in all.
+nix-instantiate "$file" -A top "${graph[@]}" --option eval-store "" > /dev/null
+mark=$(wc -l < "$daemon_log")
+nix -vvvvv build -f "$file" top "${graph[@]}" --option eval-store daemon \
+    --store "local?root=$TEST_ROOT/query-missing-empty" --dry-run 2> /dev/null
+(($(tail -n +"$((mark + 1))" "$daemon_log" | sed -n 's/.*received daemon op \([0-9]*\).*/\1/p' | grep -cx 1) <= 3 * all))
+# With nothing to build, it is not asked.
+p=$(nix store add-file --store "local?root=$TEST_ROOT/query-missing-empty" ./config.nix)
+mark=$(wc -l < "$daemon_log")
+nix -vvvvv build "$p" --option eval-store daemon \
+    --store "local?root=$TEST_ROOT/query-missing-empty" --dry-run 2> /dev/null
+(($(tail -n +"$((mark + 1))" "$daemon_log" | sed -n 's/.*received daemon op \([0-9]*\).*/\1/p' | grep -cx 31) == 0))
+
 # With CA derivations, the output of the floating `unbuilt`, which is built
 # nowhere and which only the evaluation store has, is unknown: it is built.
 ca=(--extra-experimental-features ca-derivations)
@@ -110,5 +140,12 @@ nix-store --delete "$lone" > /dev/null
 nix build -f "$file" lone "${graph[@]}" --option eval-store "$eval_store" --store daemon \
     --substituters "file://$cache" --no-require-sigs --option substitute true --dry-run
 expectStderr 1 nix path-info --store daemon "$lone" > /dev/null
+
+# The derivations to build are listed dependencies first, also those that
+# only the build store has.
+chain=$(nix-instantiate "$file" -A top --arg depth 6 --arg width 1 --option eval-store "")
+nix build --dry-run "$chain^*" --option eval-store "$eval_store" --store daemon 2> "$TEST_ROOT/dry-run.log"
+expectStderr 1 nix path-info --store "$eval_store" "$chain"
+checkOrder daemon 6
 
 killDaemon
