@@ -393,11 +393,18 @@ void mainWrapped(int argc, char ** argv)
        self-aware. That is, it has to know where it is installed. We
        don't think it's sentient.
      */
-    settings.getWorkerSettings().buildHook.setDefault(
-        Strings{
-            getNixBin({}).string(),
-            "__build-remote",
-        });
+    auto nixBin = getNixBin({});
+    Strings buildHook{nixBin.string(), "__build-remote"};
+#ifndef _WIN32
+    /* Started through the dynamic loader, run the hook through it too, if
+       it is this program. */
+    if (nixBin == getSelfExe()) {
+        auto hook = throughLoader({.program = nixBin, .args = {"__build-remote"}});
+        buildHook = {hook.program.string()};
+        buildHook.splice(buildHook.end(), hook.args);
+    }
+#endif
+    settings.getWorkerSettings().buildHook.setDefault(buildHook);
 
     initNix();
     initGC();
