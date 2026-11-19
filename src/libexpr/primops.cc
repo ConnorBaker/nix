@@ -2377,6 +2377,8 @@ static RegisterPrimOp primop_findFile(
       The URLs of the tarballs from the official `nixos.org` channels can be abbreviated as `channel:<channel-name>`.
       See [documentation on `nix-channel`](@docroot@/command-ref/nix-channel.md) for details about channels.
 
+      Unless the entry is part of the lookup path configured with `-I`, [`NIX_PATH`](@docroot@/command-ref/env-common.md#env-NIX_PATH) or [`nix-path`](@docroot@/command-ref/conf-file.md#conf-nix-path), such URLs are rejected in [pure evaluation mode](@docroot@/command-ref/conf-file.md#conf-pure-eval), and in [restricted mode](@docroot@/command-ref/conf-file.md#conf-restrict-eval) they must be allowed by [`allowed-uris`](@docroot@/command-ref/conf-file.md#conf-allowed-uris).
+
       > **Example**
       >
       > These two search path entries are equivalent:
@@ -2419,6 +2421,10 @@ static RegisterPrimOp primop_findFile(
       > ```
       >
       > makes `<nixpkgs>` refer to a particular branch of the `NixOS/nixpkgs` repository on GitHub.
+
+      Unless the entry is part of the configured lookup path, the flake reference must be locked in pure evaluation mode, and in restricted mode it must be allowed by `allowed-uris`.
+      This is stricter than [`builtins.fetchTree`](@docroot@/language/builtins.md#builtins-fetchTree), which accepts an unlocked input that has a NAR hash, with a warning: in pure evaluation mode, a `flake:` entry that is locked only by its NAR hash is refused.
+      If the entry, or the flake registry entry it resolves to, specifies a NAR hash, the contents must match it.
     )",
         .impl = prim_findFile,
     });

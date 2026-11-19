@@ -3398,9 +3398,22 @@ EvalState::resolveLookupPathPath(const LookupPath::Path & value0, bool initAcces
     };
 
     if (EvalSettings::isPseudoUrl(value)) {
+        /* Unless the entry is part of the configured lookup path (`-I`,
+           `NIX_PATH`, `nix-path`), it may come from Nix code via
+           `builtins.findFile`, so apply the same restrictions as
+           `fetchTarball` before downloading it. */
+        if (!std::ranges::any_of(lookupPath.elements, [&](auto & elem) { return elem.path.s == value; })) {
+            if (settings.pureEval)
+                error<EvalError>(
+                    "cannot download Nix search path entry '%s' in pure evaluation mode (use '--impure' to override)",
+                    value)
+                    .debugThrow();
+            checkURI(EvalSettings::resolvePseudoUrl(value));
+        }
         try {
             auto accessor = fetchers::downloadTarball(*store, fetchSettings, EvalSettings::resolvePseudoUrl(value));
             auto storePath = fetchToStore(fetchSettings, *store, SourcePath(accessor), FetchMode::Copy);
+            allowPath(storePath);
             return finish(this->storePath(storePath));
         } catch (Error & e) {
             logWarning({.msg = HintFmt("Nix search path entry '%1%' cannot be downloaded, ignoring", value)});

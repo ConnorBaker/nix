@@ -14,6 +14,7 @@
 #include "nix/cmd/compatibility-settings.hh"
 #include "nix/expr/eval-settings.hh"
 #include "nix/store/globals.hh"
+#include "nix/util/url.hh"
 
 namespace nix {
 
@@ -31,11 +32,70 @@ EvalSettings evalSettings{
                 const auto & fetchSettings = state.fetchSettings;
                 experimentalFeatureSettings.require(Xp::Flakes);
                 auto flakeRef = parseFlakeRef(rest, {}, true, false);
+
+                /* The entry may come from Nix code via `builtins.findFile`, so
+                   apply the same URI checks as `fetchTree`, and stricter lock
+                   checks: an entry that is only checked by a NAR hash, which
+                   `fetchTree` accepts with a warning, is refused as well. Like
+                   `fetchTree`, don't consult the flake registries in pure
+                   mode. (Pure mode has no configured lookup path.) */
+                if (state.settings.pureEval && !flakeRef.input.isLocked(fetchSettings))
+                    state
+                        .error<EvalError>(
+                            "cannot fetch unlocked Nix search path entry 'flake:%s' in pure evaluation mode (use '--impure' to override)",
+                            rest)
+                        .debugThrow();
+
+                auto resolvedRef = state.settings.pureEval ? flakeRef : flakeRef.resolve(fetchSettings, *state.store);
+
+                /* Entries of the configured lookup path (`-I`, `NIX_PATH`,
+                   `nix-path`) are trusted. */
+                auto value = "flake:" + std::string(rest);
+                if (!std::ranges::any_of(
+                        state.getLookupPath().elements, [&](auto & elem) { return elem.path.s == value; }))
+                    state.checkURI(resolvedRef.input.toURLString());
+
+                /* Check both the NAR hash given in the entry as written and the
+                   one in the registry entry it resolves to, if any: each says
+                   what the contents must be. Not all fetchers check the NAR
+                   hash themselves (e.g. the `path` fetcher doesn't), and
+                   registry resolution drops the one given in the entry. The
+                   `indirect` input scheme doesn't even parse it, so take it
+                   from the URL (`flake:nixpkgs?narHash=...`). */
+                auto writtenInput = flakeRef.input;
+                if (!writtenInput.isDirect() && !writtenInput.getNarHash() && hasPrefix(rest, "flake:")) {
+                    auto url = parseURL(std::string(rest));
+                    if (auto narHash = get(url.query, "narHash"))
+                        writtenInput.attrs.insert_or_assign("narHash", *narHash);
+                }
+                auto checkNarHash = [&](const Hash & narHash) {
+                    for (auto & input : {writtenInput, resolvedRef.input})
+                        if (auto expectedNarHash = input.getNarHash(); expectedNarHash && narHash != *expectedNarHash)
+                            throw Error(
+                                (unsigned int) 102,
+                                "NAR hash mismatch in Nix search path entry 'flake:%s', expected '%s' but got '%s'",
+                                rest,
+                                expectedNarHash->to_string(HashFormat::SRI, true),
+                                narHash.to_string(HashFormat::SRI, true));
+                };
+
                 debug("fetching flake search path element '%s''", rest);
-                auto [accessor, lockedRef] =
-                    flakeRef.resolve(fetchSettings, *state.store).lazyFetch(fetchSettings, *state.store);
-                auto storePath = nix::fetchToStore(
-                    fetchSettings, *state.store, SourcePath(accessor), FetchMode::Copy, lockedRef.input.getName());
+                auto [accessor, lockedRef] = resolvedRef.lazyFetch(fetchSettings, *state.store);
+                auto name = lockedRef.input.getName();
+
+                /* Like `EvalState::mountInput()`, compute the NAR hash without
+                   copying first, so that we don't copy contents with the wrong
+                   NAR hash to the store. Check the copy again, in case the
+                   contents changed in between. */
+                if (writtenInput.getNarHash() || resolvedRef.input.getNarHash())
+                    checkNarHash(
+                        nix::fetchToStore2(fetchSettings, *state.store, SourcePath(accessor), FetchMode::DryRun, name)
+                            .second);
+
+                auto [storePath, narHash] =
+                    nix::fetchToStore2(fetchSettings, *state.store, SourcePath(accessor), FetchMode::Copy, name);
+                checkNarHash(narHash);
+
                 state.allowPath(storePath);
                 return state.storePath(storePath);
             },
