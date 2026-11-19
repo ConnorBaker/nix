@@ -297,20 +297,38 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store
                     /* true for regular derivations, and CA derivations for which we
                        have a trust mapping for all wanted outputs. */
                     auto knownOutputPaths = true;
-                    StorePathSet wanted;
-                    for (auto & [outputName, pathOpt] : queryPartialDerivationOutputMap(drvPath, drvStore)) {
-                        if (!pathOpt) {
-                            knownOutputPaths = false;
-                            break;
+                    /* Without CA derivations, every store's
+                       `queryPartialDerivationOutputMap` gives the evaluation
+                       store's static outputs of a derivation that this store
+                       does not have; RemoteStore asks whether it has it, once
+                       more per derivation (10a982d8f4). Ask that with the
+                       outputs' validity instead (`fast`), and ask for the
+                       outputs as before only if this store has it. */
+                    for (auto fast = drvStore != this && !experimentalFeatureSettings.isEnabled(Xp::CaDerivations);;
+                         fast = false) {
+                        StorePathSet wanted;
+                        for (auto & [outputName, pathOpt] :
+                             fast ? drvStore->queryStaticPartialDerivationOutputMap(drvPath)
+                                  : queryPartialDerivationOutputMap(drvPath, drvStore)) {
+                            if (!pathOpt) {
+                                knownOutputPaths = false;
+                                break;
+                            }
+                            if (bfd.outputs.contains(outputName))
+                                wanted.insert(*pathOpt);
                         }
-                        if (bfd.outputs.contains(outputName))
-                            wanted.insert(*pathOpt);
-                    }
-                    if (!wanted.empty()) {
+                        if (fast)
+                            wanted.insert(drvPath);
+                        if (wanted.empty())
+                            break;
                         auto valid = co_await validPaths.queryValidPaths(wanted);
+                        if (fast && valid->contains(drvPath))
+                            continue;
+                        wanted.erase(drvPath);
                         for (auto & path : wanted)
                             if (!valid->contains(path))
                                 invalid.insert(path);
+                        break;
                     }
                     if (knownOutputPaths && invalid.empty())
                         co_return;
