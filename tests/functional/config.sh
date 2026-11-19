@@ -72,3 +72,13 @@ val2=$(nix config show warn-dirty)
 [[ $(nix config show --min-free 64K min-free) = 65536 ]]
 [[ $(nix config show --min-free 1M min-free) = 1048576 ]]
 [[ $(nix config show --min-free 2G min-free) = 2147483648 ]]
+
+# NIX_REMOTE_SYSTEMS becomes builders joined by ';', skipping paths with '#'.
+[[ $(NIX_REMOTE_SYSTEMS='/a:/h#x:/b' nix config show | grep '^builders = ') = 'builders = @/a;@/b' ]]
+
+# A newline-separated builders list is written on one line.
+[[ $(nix config show --builders $'@/a # x\n@/b' | grep '^builders = ') = 'builders = @/a ;@/b' ]]
+
+# A setting value with a newline cannot be written as a configuration line.
+expectStderr 1 nix config show --user-agent-suffix $'a\nb' \
+    | grepQuiet "the value of setting 'user-agent-suffix' has a newline"
