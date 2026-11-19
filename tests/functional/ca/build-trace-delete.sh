@@ -58,6 +58,17 @@ expect 1 nix store build-trace info "$multiOutput"^out
 expect 1 nix store build-trace info "$multiOutput"^lib
 nix store build-trace info "$multiOutput"^dev
 
+# One id can name several outputs
+nix store build-trace delete "$multiOutput"^dev
+nix-build ./nondeterministic-ns.nix -A multiOut --no-out-link
+nix store build-trace delete "$multiOutput"^out,lib
+expect 1 nix store build-trace info "$multiOutput"^out
+expect 1 nix store build-trace info "$multiOutput"^lib
+nix store build-trace info "$multiOutput"^dev
+
+# '^*' is refused
+expectStderr 1 nix store build-trace delete "$multiOutput"^'*' | grepQuiet -F "must name each output after '^' ('^*' is not accepted)"
+
 # Only bin gone: the rebuild reproduces out, which keeps its trace and signatures
 partly=$(nix-instantiate ./nondeterministic-ns.nix -A partlyReproducible)
 nix-build ./nondeterministic-ns.nix -A partlyReproducible --no-out-link

@@ -4,7 +4,6 @@
 #include "nix/store/store-cast.hh"
 
 #include <nlohmann/json.hpp>
-#include <ranges>
 
 namespace nix {
 
@@ -104,8 +103,16 @@ struct CmdBuildTraceDelete : virtual StoreCommand
     {
         auto & gcStore = require<GcStore>(*store);
 
-        auto keys = ids | std::views::transform([&](std::string_view s) { return DrvOutput::parse(*store, s); })
-                    | std::ranges::to<std::set>();
+        std::set<DrvOutput> keys;
+        for (auto & id : ids) {
+            auto [drvS, spec] = ExtendedOutputsSpec::parse(id);
+            auto outputs = std::get_if<ExtendedOutputsSpec::Explicit>(&spec.raw);
+            auto names = outputs ? std::get_if<OutputsSpec::Names>(&outputs->raw) : nullptr;
+            if (!names)
+                throw UsageError("'%s' must name each output after '^' ('^*' is not accepted)", id);
+            for (auto & name : *names)
+                keys.insert(DrvOutput{.drvPath = store->parseStorePath(drvS), .outputName = name});
+        }
 
         gcStore.deleteBuildTraces(keys);
     }
