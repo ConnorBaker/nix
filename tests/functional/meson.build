@@ -157,6 +157,7 @@ suites = [
       'placeholders.sh',
       'post-hook.sh',
       'pure-eval.sh',
+      'query-missing.sh',
       'read-only-store.sh',
       'readfile-context.sh',
       'recursive.sh',
