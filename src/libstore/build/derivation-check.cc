@@ -21,8 +21,17 @@ void checkCAOutput(
             [&](const DerivationOutput::CAFixed & dof) {
                 auto & wanted = dof.ca.hash;
 
-                /* Check wanted hash */
-                assert(info.ca);
+                /* Check the method and hash algorithm as for a floating
+                   output, then the hash itself. */
+                checkCAOutput(
+                    store,
+                    drvPath,
+                    DerivationOutput{DerivationOutput::CAFloating{
+                        .method = dof.ca.method,
+                        .hashAlgo = wanted.algo,
+                    }},
+                    info,
+                    outputName);
                 auto & got = info.ca->hash;
                 if (wanted != got) {
                     throw BuildError(
@@ -46,7 +55,7 @@ void checkCAOutput(
                 if (!info.ca.has_value()) {
                     throw BuildError(
                         BuildResult::Failure::OutputRejected,
-                        "floating content-addressing derivation '%s' output '%s' (at '%s') was not content-addressed",
+                        "content-addressing derivation '%s' output '%s' (at '%s') was not content-addressed",
                         store.printStorePath(drvPath),
                         outputName,
                         store.printStorePath(info.path));

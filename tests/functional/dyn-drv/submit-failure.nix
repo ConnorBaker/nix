@@ -23,6 +23,22 @@ let
       outputHashAlgo = "sha256";
 
     };
+  # Submits `path` as the output of a flat fixed-output derivation of "hello\n".
+  submitFixed =
+    name: path:
+    derivation (
+      (buildSubmitting name "nix store submit-output ${path} out").drvAttrs
+      // {
+        __contentAddressed = false;
+        outputHashMode = "flat";
+        outputHash = builtins.hashString "sha256" "hello\n";
+      }
+    );
+  inputAddressed = mkDerivation {
+    name = "input-addressed";
+    buildCommand = "echo hello > $out";
+    __contentAddressed = false;
+  };
 in
 {
   duplicate = buildSubmitting "duplicate" ''
@@ -36,6 +52,13 @@ in
     b="$(nix store add -n duplicate ./b)"
     nix store submit-output "$b" out
   '';
+  notAdded = buildSubmitting "not-added" ''
+    echo kot > a
+    nix store submit-output "$(nix store add --dry-run -n not-added ./a)" out
+  '';
+  fixedInputAddressed = submitFixed "input-addressed" inputAddressed;
+  fixedText = submitFixed "fixed-text" (builtins.toFile "fixed-text" "hello\n");
+  fixedSha512 = submitFixed "fixed-sha512" ''"$(echo hello > a && nix store add --mode flat --hash-algo sha512 -n fixed-sha512 ./a)"'';
   noSubmit = buildSubmitting "no-submit" ''
     mkdir a
     echo "nyaa" > a/neko
