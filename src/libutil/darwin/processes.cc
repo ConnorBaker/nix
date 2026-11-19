@@ -100,9 +100,12 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
     /* This part is absolutely cursed, but XNU does have this functionality... */
 
     if (options.gid) {
-        /* Drop all other groups if we're setgid. The first entry is the egid of the process. */
-        gid_t groups[1] = {*options.gid};
-        if (int err = ::posix_spawnattr_set_groups_np(&attr, 1, groups, /*KAUTH_UID_NONE=*/(~(uid_t) 0 - 100)))
+        /* The supplementary groups (by default none) if we're setgid. The first entry is the egid of the
+           process. */
+        std::vector<gid_t> groups{*options.gid};
+        groups.insert(groups.end(), options.supplementaryGroups.begin(), options.supplementaryGroups.end());
+        if (int err = ::posix_spawnattr_set_groups_np(
+                &attr, groups.size(), groups.data(), /*KAUTH_UID_NONE=*/(~(uid_t) 0 - 100)))
             throw SysError(err, "posix_spawnattr_set_groups_np");
         if (int err = ::posix_spawnattr_set_gid_np(&attr, *options.gid))
             throw SysError(err, "posix_spawnattr_set_gid_np");

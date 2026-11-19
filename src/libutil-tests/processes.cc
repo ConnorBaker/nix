@@ -3,12 +3,16 @@
 #include "nix/util/file-system.hh"
 #include "nix/util/system-error.hh"
 #include "nix/util/signals.hh"
+#include "nix/util/file-descriptor.hh"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
 #ifdef __linux__
 #  include <cerrno>
+#  include <csignal>
+#  include <sys/prctl.h>
+#  include <sys/ptrace.h>
 #  include <sys/syscall.h>
 #  include <unistd.h>
 #endif
@@ -258,6 +262,134 @@ TEST(RootSpawnProgram, setuidAndSetgid)
     ASSERT_TRUE(statusOk(spawned.wait()));
 }
 
+#endif
+
+#ifdef __linux__
+/* As root: a spawned program that changes its credentials still dies with
+   its parent. */
+TEST(RootSpawnProgram, dieWithParentAfterSetuid)
+{
+    ASSERT_EQ(geteuid(), 0) << "Run Root* tests as root";
+    auto self = getSelfExe();
+    ASSERT_TRUE(self);
+
+    Pipe pipe;
+    pipe.create();
+    /* A parent that spawns the program as nobody, says its pid, and exits. */
+    Pid parent = startProcess([&] {
+        pipe.readSide.close();
+        Pid child = spawnProgram(
+            {
+                .program = *self,
+                .args = {"__util_test_spawn_sleep"},
+                .uid = 65534,
+                .gid = 65534,
+            },
+            {});
+        pid_t pid = child.release();
+        writeFull(pipe.writeSide.get(), {reinterpret_cast<char *>(&pid), sizeof pid});
+        _exit(0);
+    });
+    pipe.writeSide.close();
+    pid_t child;
+    readFull(pipe.readSide.get(), reinterpret_cast<char *>(&child), sizeof child);
+    parent.wait();
+
+    /* It got SIGKILL, and init reaps it. */
+    for (int i = 0; i < 1000 && ::kill(child, 0) == 0; ++i)
+        usleep(10000);
+    EXPECT_EQ(::kill(child, 0), -1) << "the program outlived its parent";
+    ::kill(child, SIGKILL);
+}
+#endif
+
+#ifdef __linux__
+/* The supplementary groups are set before the gid, as setUser() does: for
+   a user that can set neither, setgroups() is what fails. */
+TEST(spawnProgram, setsGroupsBeforeGid)
+{
+    if (geteuid() == 0)
+        GTEST_SKIP() << "root can set both";
+    auto self = getSelfExe();
+    ASSERT_TRUE(self);
+
+    /* The vfork() path reports the failure as a trace, the fork() path
+       (with ASan) on stderr. */
+    ::testing::internal::CaptureStderr();
+    std::string message;
+    try {
+        spawnProgram({.program = *self, .args = {"__util_test_spawn_trivial"}, .gid = getgid() + 1}, {}).wait();
+    } catch (Error & e) {
+        for (auto & trace : e.info().traces)
+            message += trace.hint.str();
+    }
+    message += ::testing::internal::GetCapturedStderr();
+    EXPECT_THAT(message, ::testing::HasSubstr("setgroups failed"));
+}
+
+/* A spawned program dies if its parent died before it set its death
+   signal: here, while the program was stopped (by ptrace) at its start. */
+TEST(spawnProgram, diesIfParentDiedFirst)
+{
+    auto self = getSelfExe();
+    ASSERT_TRUE(self);
+
+    Pid tracer = startProcess([&] {
+        /* The orphaned program becomes our child. */
+        if (prctl(PR_SET_CHILD_SUBREAPER, 1) == -1)
+            _exit(10);
+        pid_t parent = fork();
+        if (parent == 0) {
+            if (ptrace(PTRACE_TRACEME, 0, nullptr, nullptr) == -1)
+                _exit(77);
+            raise(SIGSTOP);
+            spawnProgram({.program = *self, .args = {"__util_test_spawn_sleep"}}, {});
+            _exit(0);
+        }
+        int status = 0;
+        if (waitpid(parent, &status, 0) != parent || !WIFSTOPPED(status))
+            _exit(WIFEXITED(status) ? WEXITSTATUS(status) : 11);
+        if (ptrace(PTRACE_SETOPTIONS, parent, nullptr, PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK) == -1)
+            _exit(12);
+        /* Until it forks the program. */
+        int sig = 0;
+        unsigned long program = 0;
+        do {
+            if (ptrace(PTRACE_CONT, parent, nullptr, sig) == -1 || waitpid(parent, &status, 0) != parent
+                || !WIFSTOPPED(status))
+                _exit(13);
+            sig = WSTOPSIG(status) == SIGTRAP ? 0 : WSTOPSIG(status);
+        } while (!(status >> 16) || ptrace(PTRACE_GETEVENTMSG, parent, nullptr, &program) == -1);
+        ::kill(parent, SIGKILL);
+        waitpid(parent, &status, 0);
+        if (waitpid(program, &status, __WALL) != (pid_t) program
+            || ptrace(PTRACE_DETACH, program, nullptr, nullptr) == -1)
+            _exit(14);
+        for (int i = 0; i < 1000; ++i, usleep(10000))
+            if (waitpid(program, &status, WNOHANG | __WALL) == (pid_t) program)
+                _exit(WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL ? 0 : 15);
+        ::kill(program, SIGKILL);
+        _exit(1);
+    });
+    int status = tracer.wait();
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 77)
+        GTEST_SKIP() << "cannot ptrace";
+    ASSERT_TRUE(WIFEXITED(status)) << statusToString(status);
+    EXPECT_NE(WEXITSTATUS(status), 1) << "the program outlived its parent";
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* killUser()'s child reports why it failed by its exit code, without
+   throwing: setuid() refuses an invalid uid. */
+TEST(killUser, reportsErrno)
+{
+    try {
+        killUser(uid_t(-1));
+        ADD_FAILURE() << "killUser() succeeded";
+    } catch (SysError & e) {
+        EXPECT_EQ(e.errNo, EINVAL) << e.what();
+    }
+}
 #endif
 
 /* TODO: Test a bunch more things. */

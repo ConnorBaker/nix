@@ -7,8 +7,18 @@
 #include "nix/store/local-store.hh"
 #include "nix/store/user-lock.hh"
 #include "nix/util/os-filename.hh"
+#include "nix/util/processes.hh"
 
 namespace nix {
+
+/**
+ * Point `fds` at copies of their sources above every target (owned by the
+ * result), so that applying them in order cannot overwrite a later source.
+ */
+std::vector<AutoCloseFD> moveAboveTargets(std::span<FdRedirection> fds);
+
+void writeStringMap(Sink & sink, const StringMap & map);
+StringMap readStringMap(Source & source);
 
 /**
  * This class represents the state for building locally on Unix.
@@ -209,6 +219,11 @@ protected:
     void openSlave();
 
     /**
+     * Open the slave side of the pseudoterminal in raw mode.
+     */
+    AutoCloseFD openRawSlave();
+
+    /**
      * Called by prepareBuild() to start the child process for the
      * build. Must set `pid`. The child must call runChild().
      */
@@ -278,6 +293,14 @@ protected:
      * Otherwise this function throws an Error.
      */
     void writeBuilderFile(const OsFilename & name, std::string_view contents);
+
+    /**
+     * The state that runChild() reads that the derivation, its required
+     * system features and the settings do not give, for a builder made
+     * from them in a fresh process.
+     */
+    virtual void writeChildState(Sink & sink);
+    virtual void readChildState(Source & source);
 
     /**
      * Arguments passed to runChild().

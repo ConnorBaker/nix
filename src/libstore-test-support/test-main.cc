@@ -1,5 +1,6 @@
 #include <cstdlib>
 
+#include "nix/store/build/derivation-builder.hh"
 #include "nix/store/globals.hh"
 #include "nix/util/logging.hh"
 
@@ -9,6 +10,9 @@ namespace nix {
 
 int testMainForBuildingPre(int argc, char ** argv)
 {
+#ifndef _WIN32
+    buildChildMain(argc, argv);
+#endif
     if (argc > 1 && std::string_view(argv[1]) == "__build-remote") {
         printError("test-build-remote: not supported in libexpr unit tests");
         return EXIT_FAILURE;

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <poll.h>
+#include <csignal>
 #include <span>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -79,6 +80,38 @@ TEST(MessageWithFds, streamWithData)
 
     int status = pid.wait();
     EXPECT_TRUE(WIFEXITED(status));
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* A closed peer is an error, not a SIGPIPE that kills a program that does
+   not ignore it. */
+TEST(MessageWithFds, closedPeerIsAnError)
+{
+    using namespace nix::unix;
+
+    int sockets[2];
+    /* A stream socket: a datagram or seqpacket one gets no SIGPIPE anyway. */
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+    AutoCloseFD sender(sockets[0]);
+    ::close(sockets[1]);
+
+    Pid pid = startProcess([&] {
+        signal(SIGPIPE, SIG_DFL);
+        sigset_t set;
+        sigemptyset(&set);
+        sigaddset(&set, SIGPIPE);
+        sigprocmask(SIG_UNBLOCK, &set, nullptr);
+        int fd = sender.get();
+        try {
+            sendMessageWithFds(sender.get(), std::as_bytes(std::span{"x"}), std::span{&fd, 1});
+        } catch (SysError & e) {
+            _exit(e.errNo == EPIPE ? 0 : 2);
+        }
+        _exit(1);
+    });
+
+    int status = pid.wait();
+    EXPECT_TRUE(WIFEXITED(status)) << statusToString(status);
     EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 

@@ -49,6 +49,9 @@ namespace unix {
  * non-empty, because the kernel silently drops ancillary data on
  * zero-length stream sends.
  *
+ * Where there is `MSG_NOSIGNAL`, a closed peer does not raise `SIGPIPE`:
+ * it is only an `EPIPE` error.
+ *
  * @param sockfd The socket file descriptor to send the message on
  * @param data The data to send
  * @param fds A span of file descriptors to pass via SCM_RIGHTS

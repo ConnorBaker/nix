@@ -182,9 +182,11 @@ void killUser(uid_t uid)
        users to which the current process can send signals.  So we
        fork a process, switch to uid, and send a mass kill. */
 
+    /* The child of this maybe multithreaded process must not allocate, so
+       it exits with errno rather than throwing. */
     Pid pid = startProcess([&] {
         if (setuid(uid) == -1)
-            throw SysError("setting uid");
+            _exit(errno);
 
         while (true) {
 #ifdef __APPLE__
@@ -202,13 +204,15 @@ void killUser(uid_t uid)
             if (errno == ESRCH || errno == EPERM)
                 break; /* no more processes */
             if (errno != EINTR)
-                throw SysError("cannot kill processes for uid '%1%'", uid);
+                _exit(errno);
         }
 
         _exit(0);
     });
 
     int status = pid.wait();
+    if (WIFEXITED(status) && WEXITSTATUS(status) != 0)
+        throw SysError(WEXITSTATUS(status), "cannot kill processes for uid '%1%'", uid);
     if (status != 0)
         throw Error("cannot kill processes for uid '%1%': %2%", uid, statusToString(status));
 
@@ -324,6 +328,9 @@ pid_t startProcess(fun<void()> processMain, const ProcessOptions & options)
 
 Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fdr)
 {
+#  ifdef __linux__
+    auto parentPid = getpid();
+#  endif
     return startProcess(
         [&] {
             try {
@@ -343,13 +350,27 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
                 }
                 if (options.chdir && chdir((*options.chdir).c_str()) == -1)
                     throw SysError("chdir failed");
-                if (options.gid && setgid(*options.gid) == -1)
-                    throw SysError("setgid failed");
-                /* Drop all other groups if we're setgid. */
-                if (options.gid && setgroups(0, 0) == -1)
+                /* Set the supplementary groups (by default none) if we're setgid,
+                   first, as setUser() does: on some systems setgroups() also sets
+                   the effective gid. */
+                if (options.gid
+                    && setgroups(options.supplementaryGroups.size(), options.supplementaryGroups.data()) == -1)
                     throw SysError("setgroups failed");
-                if (options.uid && setuid(*options.uid) == -1)
+                if (options.gid
+                    && (setgid(*options.gid) == -1 || getgid() != *options.gid || getegid() != *options.gid))
+                    throw SysError("setgid failed");
+                if (options.uid
+                    && (setuid(*options.uid) == -1 || getuid() != *options.uid || geteuid() != *options.uid))
                     throw SysError("setuid failed");
+
+#  ifdef __linux__
+                /* Only now: changing the credentials clears it. As the
+                   vfork() path does, die if the parent died before this. */
+                if (options.dieWithParent && prctl(PR_SET_PDEATHSIG, SIGKILL) == -1)
+                    throw SysError("setting death signal");
+                if (options.dieWithParent && getppid() != parentPid)
+                    kill(getpid(), SIGKILL);
+#  endif
 
                 Strings args_(options.args);
                 /* Allow the caller to specify an alternative argv[0]. Useful for self-exec
@@ -381,8 +402,9 @@ Pid spawnProgram(const SpawnOptions & options, std::span<const FdRedirection> fd
             }
         },
         {
-            /* TODO: This isn't really implemented on non-Linux. */
-            .dieWithParent = options.dieWithParent,
+            /* Set above instead, after the credentials. TODO: This isn't
+               really implemented on non-Linux. */
+            .dieWithParent = false,
         });
 }
 

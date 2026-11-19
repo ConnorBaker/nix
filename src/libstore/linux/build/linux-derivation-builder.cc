@@ -14,6 +14,12 @@
 #include "nix/util/os-filename.hh"
 #include "nix/util/logging.hh"
 #include "nix/util/serialise.hh"
+#include "nix/util/config-global.hh"
+#include "nix/util/current-process.hh"
+#include "nix/util/unix-domain-socket.hh"
+#include "nix/util/signals.hh"
+#include "nix/store/derivation/aterm.hh"
+#include "nix/store/builtins.hh"
 #include "linux/fchmodat2-compat.hh"
 #include "nix/util/system-error.hh"
 
@@ -34,6 +40,8 @@
 #include <sys/syscall.h>
 #include <sys/prctl.h>
 #include <grp.h>
+#include <dlfcn.h>
+#include <sys/socket.h>
 
 #if HAVE_SECCOMP
 #  include <seccomp.h>
@@ -449,6 +457,378 @@ void LinuxDerivationBuilder::enterChroot()
     });
 }
 
+static bool buildChildEntry = false;
+static void (*loadPlugins)() = nullptr;
+
+/**
+ * Sent first to the build child server, which refuses to run if it differs:
+ * it may be a helper from another build of Nix. Increment the number
+ * whenever what spawnBuildChild() sends changes.
+ */
+static const std::string buildChildVersion = "nix-build-child 1 " PACKAGE_VERSION;
+
+void buildChildMain(int argc, char ** argv, void (*initPlugins)())
+{
+    loadPlugins = initPlugins;
+    if (argc > 0 && std::string_view(argv[0]) == "__build-child")
+        LinuxDerivationBuilder::runBuildChild();
+    buildChildEntry = true;
+}
+
+/**
+ * The program to run as the build child: this one, if it calls
+ * buildChildMain(), or else the helper built with the libnixstore this
+ * process loaded, found next to it (in a build directory) or in its
+ * libexecdir (when installed).
+ */
+static std::filesystem::path buildChildProgram()
+{
+    if (buildChildEntry)
+        return "/proc/self/exe";
+#ifdef NIX_LIBEXEC_FROM_LIBDIR
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void *>(&buildChildMain), &info) && info.dli_fname) {
+        auto dir = std::filesystem::absolute(info.dli_fname).parent_path();
+        for (auto & helper : {dir / "nix-build-child", dir / NIX_LIBEXEC_FROM_LIBDIR / "nix-build-child"})
+            if (pathExists(helper))
+                return helper;
+    }
+#endif
+    throw Error(
+        "this program cannot build locally: it calls neither buildChildMain() nor nix_build_child_main(), and no nix-build-child was installed with its libnixstore");
+}
+
+static thread_local BuildChildServer * currentBuildChildServer = nullptr;
+
+BuildChildServer::BuildChildServer()
+    : previous(currentBuildChildServer)
+{
+    currentBuildChildServer = this;
+}
+
+BuildChildServer::~BuildChildServer()
+{
+    currentBuildChildServer = previous;
+}
+
+/**
+ * Start the build child server, a fresh exec of Nix (see runBuildChild()),
+ * and check that it is from the same build as this one.
+ */
+static void startBuildChildServer(BuildChildServer & server)
+{
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == -1)
+        throw SysError("creating socket pair");
+    AutoCloseFD socket = sv[0], theirs = sv[1];
+    /* Not our stdout, which may be a daemon client's connection. */
+    AutoCloseFD devNull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (!devNull)
+        throw SysError("opening /dev/null");
+    /* In its own session, out of reach of the terminal's signals. */
+    SpawnOptions options{
+        .program = buildChildProgram(),
+        .lookupPath = false,
+        .argv0 = "__build-child",
+        .setSid = true,
+        .restoreMounts = false,
+    };
+    Pid pid = spawnProgram(
+        throughLoader(options),
+        std::to_array<FdRedirection>({
+            {.from = theirs.get(), .to = STDIN_FILENO},
+            {.from = devNull.get(), .to = STDOUT_FILENO},
+        }));
+    theirs.close();
+
+    char reply[256];
+    ssize_t n = 0;
+    /* A server that exited has closed its end: the send fails, or the receive gets nothing or a reset. */
+    if (send(socket.get(), buildChildVersion.data(), buildChildVersion.size(), MSG_NOSIGNAL) != -1)
+        while ((n = recv(socket.get(), reply, sizeof reply, 0)) == -1 && errno == EINTR)
+            ;
+    else if (errno != EPIPE && errno != ECONNRESET)
+        throw SysError("sending to the build child server");
+    if (n == -1 && errno != ECONNRESET)
+        throw SysError("receiving from the build child server");
+    if (n <= 0)
+        throw Error(
+            "the build child server %s exited before it replied with its version: %s",
+            PathFmt(options.program),
+            statusToString(pid.wait()));
+    if (std::string_view(reply, n) != buildChildVersion)
+        throw Error(
+            "the build child server %s is from a different Nix build (%s) than this program (%s)",
+            PathFmt(options.program),
+            std::string_view(reply, n),
+            buildChildVersion);
+    server.pid = std::move(pid);
+    server.socket = std::move(socket);
+}
+
+/**
+ * Start a child of this process that runs Nix with `state` on stdin after
+ * the settings, and `fds`. A fork of this multithreaded process could run
+ * no Nix code, so the build child server forks it instead (see
+ * BuildChildServer).
+ */
+static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fds)
+{
+    std::map<std::string, AbstractConfig::SettingInfo> settings;
+    globalConfig.getSettings(settings);
+    StringMap config;
+    for (auto & [name, info] : settings)
+        config.insert_or_assign(name, info.value);
+    StringSink spec;
+    writeStringMap(spec, config);
+    spec << std::to_underlying(verbosity);
+    spec.s.append(state);
+
+    std::optional<BuildChildServer> own;
+    if (!currentBuildChildServer)
+        own.emplace();
+    auto & server = *currentBuildChildServer;
+    for (bool retry = true;; retry = false) {
+        if (!server.pid)
+            startBuildChildServer(server);
+        /* The child's stdin, which gets the spec only once we hold the
+           child's Pid. A child that a server started but did not report
+           (it went away first) reads nothing: it sends back its pid, so
+           that we reap it (it is our child, by CLONE_PARENT), and exits
+           without building. */
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) == -1)
+            throw SysError("creating socket pair");
+        AutoCloseFD input = sv[0], theirs = sv[1];
+        std::vector<int> targets{STDIN_FILENO}, sources{theirs.get()};
+        for (auto & fd : fds) {
+            targets.push_back(fd.to);
+            sources.push_back(fd.from);
+        }
+        pid_t pid;
+        ssize_t n = 0;
+        try {
+            unix::sendMessageWithFds(server.socket.get(), std::as_bytes(std::span(targets)), sources);
+            theirs.close();
+            auto onInterrupt = createInterruptCallback([&] { ::shutdown(server.socket.get(), SHUT_RDWR); });
+            while ((n = recv(server.socket.get(), &pid, sizeof pid, 0)) == -1 && errno == EINTR)
+                ;
+            if (n == -1 && errno != ECONNRESET)
+                throw SysError("receiving from the build child server");
+        } catch (SysError & e) {
+            /* Only a server that went away is tried again. */
+            if (e.errNo != EPIPE && e.errNo != ECONNRESET)
+                throw;
+        }
+        if (n == sizeof pid) {
+            if (pid <= 0)
+                throw SysError(-pid, "starting the build child");
+            Pid child(pid);
+            writeFull(input.get(), spec.s);
+            return child;
+        }
+        /* It went away: reap it, and any child it started but did not
+           report, and try once more with another. Once the server is gone,
+           only such a child still has the other end of `input`. */
+        server.socket.close();
+        server.pid.kill();
+        theirs.close();
+        ::shutdown(input.get(), SHUT_WR);
+        auto onInterrupt = createInterruptCallback([&] { ::shutdown(input.get(), SHUT_RDWR); });
+        checkInterrupt();
+        pid_t unreported;
+        ssize_t r;
+        while ((r = ::read(input.get(), &unreported, sizeof unreported)) == sizeof unreported
+               || (r == -1 && errno == EINTR))
+            if (r == sizeof unreported)
+                Pid(unreported).wait();
+        checkInterrupt();
+        if (!retry)
+            throw Error("the build child server exited before it started the build child");
+    }
+}
+
+Pid LinuxDerivationBuilder::spawnBuildChild(std::string_view mode, std::vector<FdRedirection> fds)
+{
+    StringSink spec;
+    spec << mode << store->storeDir << drv.name;
+    derivation::write(spec, *store, drv);
+    spec << drvOptions.requiredSystemFeatures << systemFeatures;
+    writeChildState(spec);
+#if NIX_WITH_AWS_AUTH
+    Strings aws;
+    if (auto creds = preResolveAwsCredentials()) {
+        aws = {creds->accessKeyId, creds->secretAccessKey};
+        if (creds->sessionToken)
+            aws.push_back(*creds->sessionToken);
+    }
+    spec << aws;
+#endif
+    /* Opened here, before the child can enter a user namespace. */
+    auto slave = openRawSlave();
+    fds.insert(fds.begin(), {{.from = slave.get(), .to = STDOUT_FILENO}, {.from = slave.get(), .to = STDERR_FILENO}});
+    return nix::spawnBuildChild(spec.s, std::move(fds));
+}
+
+void LinuxDerivationBuilder::startChild()
+{
+    pid = spawnBuildChild("unix");
+}
+
+namespace {
+
+/**
+ * The part of the store that a builder uses in the build child.
+ */
+struct ChildStore : BuildingStore
+{
+    using BuildingStore::BuildingStore;
+
+    std::filesystem::path getRealStoreDir() const override
+    {
+        unreachable();
+    }
+
+    std::filesystem::path getBuildDir() const override
+    {
+        unreachable();
+    }
+
+    const LocalSettings & getLocalSettings() const override
+    {
+        return settings.getLocalSettings();
+    }
+
+    ref<Store> makeRecursiveNixStore(RestrictionContext &) override
+    {
+        unreachable();
+    }
+};
+
+} // namespace
+
+static void bindInSandbox(Source & spec);
+
+void LinuxDerivationBuilder::runBuildChild()
+{
+    /* Serve the socket on stdin: first reply to the version with ours, and
+       stop if it differs; then for each request, start a child with the
+       fds it sent, as our parent's child (CLONE_PARENT), and reply with
+       its pid, or minus an errno. This process has no threads, so the
+       child may run any code. */
+    try {
+        char buf[256];
+        auto n = ::read(STDIN_FILENO, buf, sizeof buf);
+        if (n == -1)
+            throw SysError("receiving the version");
+        writeFull(STDIN_FILENO, buildChildVersion);
+        if (std::string_view version(buf, n); version != buildChildVersion)
+            throw Error(
+                "the build child server %s is from a different Nix build (%s) than the program that started it (%s)",
+                PathFmt(getSelfExe().value_or("/proc/self/exe")),
+                buildChildVersion,
+                version);
+        initLibStore(false);
+        while (true) {
+            int targets[8];
+            auto received = unix::receiveMessageWithFds(STDIN_FILENO, std::as_writable_bytes(std::span(targets)));
+            pid_t pid = -EINVAL;
+            if (received.bytesReceived == received.fds.size() * sizeof(int)) {
+                std::vector<FdRedirection> fds;
+                for (size_t i = 0; i < received.fds.size(); ++i)
+                    fds.push_back({.from = received.fds[i].get(), .to = targets[i]});
+                try {
+                    pid = startProcess(
+                        [&] {
+                            auto moved = moveAboveTargets(fds);
+                            for (auto & fd : fds)
+                                if (dup2(fd.from, fd.to) == -1)
+                                    _exit(1);
+                            runBuildChildOnce();
+                        },
+                        {.cloneFlags = CLONE_PARENT});
+                } catch (SysError & e) {
+                    pid = -e.errNo;
+                }
+            }
+            writeFull(STDIN_FILENO, {reinterpret_cast<char *>(&pid), sizeof pid});
+        }
+    } catch (EndOfFile &) {
+        _exit(0);
+    } catch (...) {
+        handleChildException(false);
+    }
+    _exit(1);
+}
+
+void LinuxDerivationBuilder::runBuildChildOnce()
+{
+    bool bind = false;
+    try {
+        auto bytes = drainFD(STDIN_FILENO);
+        /* Nix did not get our pid (see spawnBuildChild()): send it, so that
+           Nix reaps us, and don't build, nor report anything on the build's
+           stdout. */
+        if (bytes.empty()) {
+            pid_t self = getpid();
+            if (::write(STDIN_FILENO, &self, sizeof self) == -1) {
+            }
+            _exit(1);
+        }
+        StringSource spec(bytes);
+        auto config = readStringMap(spec);
+        /* First the experimental features: a setting that needs one is
+           ignored while it is not enabled. */
+        if (auto xp = config.extract("experimental-features"))
+            globalConfig.set(xp.key(), xp.mapped());
+        for (auto & [name, value] : config)
+            globalConfig.set(name, value);
+        verbosity = (Verbosity) readNum<unsigned>(spec);
+        auto mode = readString(spec);
+        if ((bind = mode == "bind"))
+            bindInSandbox(spec);
+
+        /* A builder made from what the parent's builder sent. It is
+           never destroyed, which would delete the build's directories. */
+        auto storeDir = readString(spec);
+        auto store = std::make_shared<ChildStore>(storeDir);
+        BasicDerivation drv;
+        auto name = readString(spec);
+        derivation::read(spec, *store, drv, name);
+        if (loadPlugins && drv.isBuiltin() && !get(RegisterBuiltinBuilder::builtinBuilders(), drv.builder.substr(8)))
+            loadPlugins();
+        DerivationOptions<StorePath> drvOptions;
+        drvOptions.requiredSystemFeatures = readStrings<StringSet>(spec);
+        BuildResult buildResult;
+        StorePathSet inputPaths;
+        BuildMode buildMode = bmNormal;
+        DerivationBuilderParams params{
+            .drvPath = StorePath::dummy,
+            .buildResult = buildResult,
+            .drv = drv,
+            .drvOptions = drvOptions,
+            .inputPaths = inputPaths,
+            .buildMode = buildMode,
+            .systemFeatures = readStrings<StringSet>(spec),
+        };
+        auto builder = mode == "chroot" ? new ChrootLinuxDerivationBuilder(store, nullptr, params)
+                                        : new LinuxDerivationBuilder(store, nullptr, params);
+        builder->readChildState(spec);
+        RunChildArgs args;
+#if NIX_WITH_AWS_AUTH
+        if (auto aws = readStrings<Strings>(spec); !aws.empty())
+            args.awsCredentials.emplace(
+                aws.front(), *std::next(aws.begin()), aws.size() > 2 ? std::optional{aws.back()} : std::nullopt);
+#endif
+        if (auto chroot = dynamic_cast<ChrootLinuxDerivationBuilder *>(builder))
+            chroot->startBuilder(std::move(args));
+        builder->runChild(std::move(args));
+    } catch (...) {
+        handleChildException(!bind);
+    }
+    _exit(1);
+}
+
 uid_t ChrootLinuxDerivationBuilder::sandboxUid()
 {
     return usingUserNamespace ? (!buildUser || buildUser->getUIDCount() == 1 ? 1000 : 0) : buildUser->getUID();
@@ -526,12 +906,6 @@ void ChrootLinuxDerivationBuilder::prepareSandbox()
 
 void ChrootLinuxDerivationBuilder::startChild()
 {
-    RunChildArgs args{
-#if NIX_WITH_AWS_AUTH
-        .awsCredentials = preResolveAwsCredentials(),
-#endif
-    };
-
     /* Set up private namespaces for the build:
 
         - The PID namespace causes the build to start as PID 1.
@@ -559,9 +933,9 @@ void ChrootLinuxDerivationBuilder::startChild()
         - The UTS namespace ensures that builders see a hostname of
           localhost rather than the actual hostname.
 
-       We use a helper process to do the clone() to work around
-       clone() being broken in multi-threaded programs due to
-       at-fork handlers not being run. Note that we use
+       We use a helper process, a fresh exec of Nix, to do the clone()
+       to work around clone() being broken in multi-threaded programs
+       due to at-fork handlers not being run. Note that we use
        CLONE_PARENT to ensure that the real builder is parented to
        us.
     */
@@ -573,41 +947,8 @@ void ChrootLinuxDerivationBuilder::startChild()
     Pipe sendPid;
     sendPid.create();
 
-    Pid helper = startProcess([&]() {
-        sendPid.readSide.close();
-
-        /* We need to open the slave early, before
-           CLONE_NEWUSER. Otherwise we get EPERM when running as
-           root. */
-        openSlave();
-
-        try {
-            /* Drop additional groups here because we can't do it
-               after we've created the new user namespace. */
-            if (setgroups(0, 0) == -1) {
-                if (errno != EPERM)
-                    throw SysError("setgroups failed");
-                if (store->getLocalSettings().requireDropSupplementaryGroups)
-                    throw Error(
-                        "setgroups failed. Set the require-drop-supplementary-groups option to false to skip this step.");
-            }
-
-            ProcessOptions options;
-            options.cloneFlags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_PARENT | SIGCHLD;
-            if (derivationType.isSandboxed())
-                options.cloneFlags |= CLONE_NEWNET;
-            if (usingUserNamespace)
-                options.cloneFlags |= CLONE_NEWUSER;
-
-            pid_t child = startProcess([this, args = std::move(args)]() { runChild(std::move(args)); }, options);
-
-            writeFull(sendPid.writeSide.get(), fmt("%d\n", child));
-            _exit(0);
-        } catch (...) {
-            handleChildException(true);
-            _exit(1);
-        }
-    });
+    Pid helper = spawnBuildChild(
+        "chroot", {{.from = userNamespaceSync.readSide.get(), .to = 3}, {.from = sendPid.writeSide.get(), .to = 4}});
 
     sendPid.writeSide.close();
 
@@ -700,6 +1041,55 @@ void ChrootLinuxDerivationBuilder::startChild()
     /* Signal the builder that we've updated its user namespace. */
     writeFull(userNamespaceSync.writeSide.get(), "1\n");
     userNamespaceSyncDone = true;
+}
+
+void ChrootLinuxDerivationBuilder::startBuilder(RunChildArgs args)
+{
+    userNamespaceSync.readSide = 3;
+
+    /* Drop additional groups here because we can't do it
+       after we've created the new user namespace. */
+    if (setgroups(0, 0) == -1) {
+        if (errno != EPERM)
+            throw SysError("setgroups failed");
+        if (store->getLocalSettings().requireDropSupplementaryGroups)
+            throw Error(
+                "setgroups failed. Set the require-drop-supplementary-groups option to false to skip this step.");
+    }
+
+    ProcessOptions options;
+    options.cloneFlags = CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWIPC | CLONE_NEWUTS | CLONE_PARENT | SIGCHLD;
+    if (derivationType.isSandboxed())
+        options.cloneFlags |= CLONE_NEWNET;
+    if (usingUserNamespace)
+        options.cloneFlags |= CLONE_NEWUSER;
+
+    pid_t child = startProcess([this, args = std::move(args)]() { runChild(std::move(args)); }, options);
+
+    writeFull(4, fmt("%d\n", child));
+    _exit(0);
+}
+
+void ChrootLinuxDerivationBuilder::writeChildState(Sink & sink)
+{
+    UnixDerivationBuilderImpl::writeChildState(sink);
+    sink << chrootRootDir.native() << pathsInChroot.size();
+    for (auto & [target, path] : pathsInChroot)
+        sink << target.native() << path.source.native() << path.optional;
+    sink << usingUserNamespace << (cgroup ? cgroup->native() : "");
+}
+
+void ChrootLinuxDerivationBuilder::readChildState(Source & source)
+{
+    UnixDerivationBuilderImpl::readChildState(source);
+    chrootRootDir = readString(source);
+    for (auto n = readNum<size_t>(source); n--;) {
+        std::filesystem::path target = readString(source), path = readString(source);
+        pathsInChroot.insert_or_assign(target, ChrootPath{.source = path, .optional = readNum<bool>(source)});
+    }
+    usingUserNamespace = readNum<bool>(source);
+    if (auto path = readString(source); !path.empty())
+        cgroup = path;
 }
 
 void ChrootLinuxDerivationBuilder::enterChroot()
@@ -986,26 +1376,41 @@ void ChrootLinuxDerivationBuilder::addDependencyImpl(const StorePath & path)
     /* Bind-mount the path into the sandbox. This requires
        entering its mount namespace, which is not possible
        in multithreaded programs. So we do this in a
-       child process.*/
-    Pid child(startProcess([&]() {
-        if (usingUserNamespace && (setns(sandboxUserNamespace.get(), CLONE_NEWUSER) == -1))
-            throw SysError("entering sandbox user namespace");
-
-        if (setns(sandboxMountNamespace.get(), CLONE_NEWNS) == -1)
-            throw SysError("entering sandbox mount namespace");
-
-        /* We really do have to reopen the dirfd in the child, otherwise move_mount dies with EINVAL. */
-        auto chrootRootDirFd = valueOr(
-            openDirectory(chrootRootDir, FinalSymlink::DontFollow),
-            NIX_THROW_NATIVE_SYS_ERROR_HANDLER("opening directory %s", PathFmt(chrootRootDir)));
-        doBind(source, chrootRootDirFd.get(), targetRelPath, chrootRootDir);
-
-        _exit(0);
-    }));
+       build child (see bindInSandbox()). */
+    StringSink spec;
+    spec << "bind" << usingUserNamespace << chrootRootDir.native() << source.native() << targetRelPath.native();
+    std::vector<FdRedirection> fds{{.from = sandboxMountNamespace.get(), .to = 3}};
+    if (usingUserNamespace)
+        fds.push_back({.from = sandboxUserNamespace.get(), .to = 4});
+    Pid child = nix::spawnBuildChild(spec.s, std::move(fds));
 
     int status = child.wait();
     if (!statusOk(status))
         throw Error("could not add path '%s' to sandbox: %s", store->printStorePath(path), statusToString(status));
+}
+
+/**
+ * In the build child: bind-mount a path into the sandbox whose mount and
+ * user namespaces are fds 3 and 4.
+ */
+static void bindInSandbox(Source & spec)
+{
+    auto usingUserNamespace = readNum<bool>(spec);
+    std::filesystem::path chrootRootDir = readString(spec), source = readString(spec), target = readString(spec);
+
+    if (usingUserNamespace && (setns(4, CLONE_NEWUSER) == -1))
+        throw SysError("entering sandbox user namespace");
+
+    if (setns(3, CLONE_NEWNS) == -1)
+        throw SysError("entering sandbox mount namespace");
+
+    /* We really do have to reopen the dirfd in the child, otherwise move_mount dies with EINVAL. */
+    auto chrootRootDirFd = valueOr(
+        openDirectory(chrootRootDir, FinalSymlink::DontFollow),
+        NIX_THROW_NATIVE_SYS_ERROR_HANDLER("opening directory %s", PathFmt(chrootRootDir)));
+    doBind(source, chrootRootDirFd.get(), target, chrootRootDir);
+
+    _exit(0);
 }
 
 } // namespace nix
