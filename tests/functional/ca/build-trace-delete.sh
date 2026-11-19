@@ -58,11 +58,6 @@ expect 1 nix store build-trace info "$multiOutput"^out
 expect 1 nix store build-trace info "$multiOutput"^lib
 nix store build-trace info "$multiOutput"^dev
 
-# A repair rebuilds an output whose path is already valid, made by another derivation with the
-# same output, and replaces it.
-nix-build ./content-addressed.nix -A dependentCA --arg seed 1 --no-out-link
-nix-build ./content-addressed.nix -A dependentCA --arg seed 2 --no-out-link --repair
-
 # Only bin gone: the rebuild reproduces out, which keeps its trace and signatures
 partly=$(nix-instantiate ./nondeterministic-ns.nix -A partlyReproducible)
 nix-build ./nondeterministic-ns.nix -A partlyReproducible --no-out-link
