@@ -1,0 +1,16 @@
+error:
+       … while calling the 'addDrvOutputDependencies' builtin
+         at /pwd/lang/eval-fail-appendContext-output-name.nix:2:1:
+            1| # Without the check, the context would name output `a` of output `b`.
+            2| builtins.addDrvOutputDependencies (
+             | ^
+            3|   builtins.appendContext "" {
+
+       … while calling the 'appendContext' builtin
+         at /pwd/lang/eval-fail-appendContext-output-name.nix:3:3:
+            2| builtins.addDrvOutputDependencies (
+            3|   builtins.appendContext "" {
+             |   ^
+            4|     ${
+
+       error: invalid derivation output name: name 'a!b' contains illegal character '!'

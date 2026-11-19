@@ -1501,11 +1501,7 @@ static void checkDerivationName(EvalState & state, std::string_view drvName)
     }
 }
 
-/**
- * Output names are parts of store path names and of deriving paths, so
- * they follow the rules for store path names.
- */
-static void checkOutputName(EvalState & state, std::string_view outputName, Value & v)
+void checkOutputName(EvalState & state, std::string_view outputName, Value & v)
 {
     try {
         checkName(outputName);

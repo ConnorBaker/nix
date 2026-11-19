@@ -38,4 +38,11 @@ void prim_exec(EvalState & state, CallSite callSite, Value * const * args, Value
 
 void makePositionThunks(EvalState & state, const PosIdx pos, Value & line, Value & column);
 
+/**
+ * Output names are parts of store path names and of deriving paths, so
+ * they follow the rules for store path names. Throw an `EvalError` at
+ * `v` if `outputName` does not.
+ */
+void checkOutputName(EvalState & state, std::string_view outputName, Value & v);
+
 } // namespace nix
