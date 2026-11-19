@@ -198,8 +198,18 @@ bool RemoteStore::isValidPathUncached(const StorePath & path)
 
 StorePathSet RemoteStore::queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute)
 {
-    auto conn(getConnection());
-    return conn->queryValidPaths(*this, &conn.daemonException, paths, maybeSubstitute);
+    {
+        auto conn(getConnection());
+        /* A daemon serving a `builder-rpc-v0` derivation allows only
+           IsValidPath. */
+        if (!conn->protoVersion.features.contains(WorkerProto::featureSubmitOutput))
+            return conn->queryValidPaths(*this, &conn.daemonException, paths, maybeSubstitute);
+    }
+    StorePathSet res;
+    for (auto & path : paths)
+        if (isValidPath(path))
+            res.insert(path);
+    return res;
 }
 
 StorePathSet RemoteStore::queryAllValidPaths()

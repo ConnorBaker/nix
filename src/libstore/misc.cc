@@ -15,6 +15,7 @@
 #include "nix/util/json-utils.hh"
 
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <boost/asio/any_completion_handler.hpp>
 
 namespace nix {
 
@@ -166,6 +167,84 @@ void Store::querySubstitutablePathInfos(const StorePathCAMap & paths, Substituta
         std::rethrow_exception(ex);
 }
 
+namespace {
+
+/**
+ * Collects the validity questions of the coroutines that are
+ * waiting on the strand and asks them together: with one
+ * `queryValidPaths` if the store says that is one request, and with
+ * `isValidPath` otherwise.
+ */
+class ValidPathsBatch
+{
+    Store & store;
+
+    using Valid = std::shared_ptr<const StorePathSet>;
+
+    struct Waiter
+    {
+        asio::any_io_executor executor;
+        asio::any_completion_handler<void(std::exception_ptr, Valid)> handler;
+    };
+
+    StorePathSet asked;
+    std::vector<Waiter> waiting;
+
+    void flush()
+    {
+        auto batch = std::move(waiting);
+        waiting.clear();
+        auto paths = std::move(asked);
+        asked.clear();
+
+        std::exception_ptr ex;
+        Valid valid;
+        try {
+            StorePathSet v;
+            if (store.queryValidPathsIsOneRequest())
+                v = store.queryValidPaths(paths);
+            else
+                for (auto & path : paths)
+                    if (store.isValidPath(path))
+                        v.insert(path);
+            valid = std::make_shared<const StorePathSet>(std::move(v));
+        } catch (...) {
+            ex = std::current_exception();
+        }
+
+        for (auto & waiter : batch)
+            asio::post(waiter.executor, [handler = std::move(waiter.handler), ex, valid]() mutable {
+                std::move(handler)(ex, std::move(valid));
+            });
+    }
+
+public:
+    ValidPathsBatch(Store & store)
+        : store(store)
+    {
+    }
+
+    /**
+     * The valid paths among those asked about in this batch, which
+     * includes `paths` (not empty): every coroutine's question that is
+     * outstanding when the strand next gets to run is asked with it.
+     */
+    asio::awaitable<Valid> queryValidPaths(const StorePathSet & paths)
+    {
+        return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr, Valid)>(
+            [this, &paths](auto handler) {
+                auto executor = asio::get_associated_executor(handler);
+                if (waiting.empty())
+                    asio::post(executor, [this] { flush(); });
+                asked.insert(paths.begin(), paths.end());
+                waiting.push_back({std::move(executor), std::move(handler)});
+            },
+            asio::use_awaitable);
+    }
+};
+
+} // namespace
+
 MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store * evalStore_)
 {
     Activity act(*logger, lvlDebug, actUnknown, "querying info about missing paths");
@@ -173,6 +252,8 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store
     auto & evalStore = evalStore_ ? *evalStore_ : *this;
 
     MissingPaths res;
+
+    ValidPathsBatch validPaths{*this};
 
     auto mustBuildDrv = [&](const StorePath & drvPath, const Derivation & drv, std::set<DerivedPath> & edges) {
         res.willBuild.insert(drvPath);
@@ -203,8 +284,10 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store
                     }
                     auto & drvPath = drvPathP->path;
 
-                    auto * drvStore = evalStore.isValidPath(drvPath) ? &evalStore : this;
-                    if (!drvStore->isValidPath(drvPath)) {
+                    /* Read the derivation from the evaluation store if it has
+                       it, as before; ask this store, in a batch, only otherwise. */
+                    auto * drvStore = &evalStore != this && evalStore.isValidPath(drvPath) ? &evalStore : this;
+                    if (drvStore == this && !(co_await validPaths.queryValidPaths({drvPath}))->contains(drvPath)) {
                         // FIXME: we could try to substitute the derivation.
                         res.unknown.insert(drvPath);
                         co_return;
@@ -214,13 +297,38 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store
                     /* true for regular derivations, and CA derivations for which we
                        have a trust mapping for all wanted outputs. */
                     auto knownOutputPaths = true;
-                    for (auto & [outputName, pathOpt] : queryPartialDerivationOutputMap(drvPath, drvStore)) {
-                        if (!pathOpt) {
-                            knownOutputPaths = false;
-                            break;
+                    /* Without CA derivations, every store's
+                       `queryPartialDerivationOutputMap` gives the evaluation
+                       store's static outputs of a derivation that this store
+                       does not have; RemoteStore asks whether it has it, once
+                       more per derivation (10a982d8f4). Ask that with the
+                       outputs' validity instead (`fast`), and ask for the
+                       outputs as before only if this store has it. */
+                    for (auto fast = drvStore != this && !experimentalFeatureSettings.isEnabled(Xp::CaDerivations);;
+                         fast = false) {
+                        StorePathSet wanted;
+                        for (auto & [outputName, pathOpt] :
+                             fast ? drvStore->queryStaticPartialDerivationOutputMap(drvPath)
+                                  : queryPartialDerivationOutputMap(drvPath, drvStore)) {
+                            if (!pathOpt) {
+                                knownOutputPaths = false;
+                                break;
+                            }
+                            if (bfd.outputs.contains(outputName))
+                                wanted.insert(*pathOpt);
                         }
-                        if (bfd.outputs.contains(outputName) && !isValidPath(*pathOpt))
-                            invalid.insert(*pathOpt);
+                        if (fast)
+                            wanted.insert(drvPath);
+                        if (wanted.empty())
+                            break;
+                        auto valid = co_await validPaths.queryValidPaths(wanted);
+                        if (fast && valid->contains(drvPath))
+                            continue;
+                        wanted.erase(drvPath);
+                        for (auto & path : wanted)
+                            if (!valid->contains(path))
+                                invalid.insert(path);
+                        break;
                     }
                     if (knownOutputPaths && invalid.empty())
                         co_return;
@@ -301,7 +409,7 @@ MissingPaths Store::queryMissing(const std::vector<DerivedPath> & targets, Store
                     }
                 },
                 [&](const DerivedPath::Opaque & bo) -> asio::awaitable<void> {
-                    if (isValidPath(bo.path))
+                    if ((co_await validPaths.queryValidPaths({bo.path}))->contains(bo.path))
                         co_return;
 
                     SubstitutablePathInfos infos;

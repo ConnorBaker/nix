@@ -76,6 +76,15 @@ public:
 
     StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute) override;
 
+    /**
+     * True without asking the daemon, which may not have been
+     * connected to yet.
+     */
+    bool queryValidPathsIsOneRequest() override
+    {
+        return true;
+    }
+
     StorePathSet queryAllValidPaths() override;
 
     void queryPathInfoUncached(

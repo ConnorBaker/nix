@@ -510,6 +510,20 @@ public:
     virtual StorePathSet queryValidPaths(const StorePathSet & paths, SubstituteFlag maybeSubstitute = NoSubstitute);
 
     /**
+     * Whether `queryMissing` should ask this store about the validity of
+     * many paths with one `queryValidPaths` call, as RemoteStore, whose
+     * `queryMissing` walks the graph here with a separate evaluation store
+     * (or against a daemon older than protocol 1.19). Other stores are
+     * asked with `isValidPath`, whose answers can differ: a binary cache
+     * parses the narinfo in `queryValidPaths`, and only checks that it
+     * exists in `isValidPath`. Answering must not contact the store.
+     */
+    virtual bool queryValidPathsIsOneRequest()
+    {
+        return false;
+    }
+
+    /**
      * Query the set of all valid paths. Note that for some store
      * backends, the name part of store paths may be replaced by `x`
      * (i.e. you'll get `/nix/store/<hash>-x` rather than

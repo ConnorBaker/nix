@@ -27,6 +27,9 @@ let
     mkdir dependency
     echo "this is a dependency" > dependency/foo
     out="$(nix store add --scan ./dependency)"
+    # A dry run with the daemon as a separate evaluation store asks it about
+    # $out with IsValidPath, the one validity question that it allows.
+    nix build --dry-run --eval-store "$NIX_REMOTE" "$out"
     nix store submit-output "$out" out
   '';
 in
