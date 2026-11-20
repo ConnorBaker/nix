@@ -2,6 +2,8 @@
 #include "nix/expr/primops.hh"
 #include "nix/store/builtins.hh"
 #include "nix/util/file-system.hh"
+#include "nix/store/local-store.hh"
+#include "nix/store/store-registration.hh"
 
 namespace nix {
 
@@ -31,5 +33,17 @@ static RegisterPrimOp rp({
     .arity = 0,
     .impl = prim_anotherNull,
 });
+
+/* A store type that only this plugin provides: the local store under
+   another scheme. */
+static struct RegisterPluginTestStore
+{
+    RegisterPluginTestStore()
+    {
+        auto factory = Implementations::registered().at(LocalStore::Config::name());
+        factory.uriSchemes = {"plugintest"};
+        Implementations::registered().emplace("Plugin Test Store", std::move(factory));
+    }
+} registerPluginTestStore;
 
 } // namespace nix
