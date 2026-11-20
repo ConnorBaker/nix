@@ -11,6 +11,8 @@ suites += {
     'gc-built-drv-eval.sh',
     'build-built-built-drv-input-addressed.sh',
     'build-built-built-drv.sh',
+    'build-built-drv-foreign-path.sh',
+    'build-built-drv-foreign-path-substitute.sh',
     'eval-outputOf.sh',
     'failing-outer.sh',
     'dep-built-drv.sh',

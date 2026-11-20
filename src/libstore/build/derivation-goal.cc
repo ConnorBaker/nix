@@ -276,7 +276,9 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
             return std::holds_alternative<SingleDerivedPath::Built>(input.raw());
         }));
         /* `writeDerivation` checks the derivation's references are valid,
-           so the eval store's sources must be copied over first. */
+           so the eval store's sources must be copied over first, and the
+           rest substituted. A derivation read from another store object
+           need not have had them. */
         if (&worker.evalStore != &worker.store) {
             RealisedPath::Set inputSrcs;
             for (auto & i : resolvedDrv->inputs)
@@ -284,6 +286,16 @@ Goal::Co<BuildResult> DerivationGoal::haveDerivation(bool storeDerivation)
                     inputSrcs.insert(i);
             copyClosure(worker.evalStore, worker.store, inputSrcs);
         }
+        Goals waitees;
+        for (auto & i : resolvedDrv->inputs)
+            if (!worker.store.isValidPath(i))
+                waitees.insert(upcast_goal(worker.makePathSubstitutionGoal(i)));
+        co_await await(std::move(waitees));
+        if (nrFailed != 0)
+            co_return failure(
+                {BuildResult::Failure::DependencyFailed,
+                 "failed to obtain the inputs of derivation '%s'",
+                 worker.store.printStorePath(drvPath)});
         /* Store the resolved derivation, as part of the record of
            what we're actually building */
         worker.store.writeDerivation(unresolve(*resolvedDrv));

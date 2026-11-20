@@ -479,7 +479,9 @@ Store::queryPartialDerivationOutputMap(const StorePath & path, Store * evalStore
         return outputs;
 
     auto drv = evalStore.readInvalidDerivation(path);
-    queryPartialDerivationOutputMapCA(*this, path, drv, outputs);
+    /* The build trace is keyed on the derivation's own path, which a
+       derivation held at another path does not have. */
+    queryPartialDerivationOutputMapCA(*this, nix::computeStorePath(*this, drv), drv, outputs);
 
     return outputs;
 }
