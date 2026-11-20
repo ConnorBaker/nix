@@ -110,6 +110,21 @@ TEST_F(DerivedPathTest, built_built_xp)
         MissingExperimentalFeature);
 }
 
+/**
+ * An inner output name must be a valid name, as an outer one must be.
+ * Otherwise `x.drv^a!b^out` would be printed in the legacy form as
+ * `x.drv!a!b!out`, which is a different path.
+ */
+TEST_F(DerivedPathTest, built_built_bad_inner_output)
+{
+    ExperimentalFeatureSettings mockXpSettings;
+    mockXpSettings.set("experimental-features", "dynamic-derivations ca-derivations");
+
+    ASSERT_THROW(
+        SingleDerivedPath::parse(*store, "/nix/store/g1w7hy3qg1w7hy3qg1w7hy3qg1w7hy3q-x.drv^a!b^out", mockXpSettings),
+        BadStorePathName);
+}
+
 RC_GTEST_FIXTURE_PROP(DerivedPathTest, prop_legacy_round_rip, (const DerivedPath & o))
 {
     ExperimentalFeatureSettings xpSettings;

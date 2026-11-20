@@ -1,0 +1,1 @@
+--eval --strict --show-trace --read-write-mode --store dummy://?read-only=false --extra-experimental-features dynamic-derivations --extra-experimental-features ca-derivations
