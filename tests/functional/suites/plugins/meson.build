@@ -14,7 +14,11 @@ libplugintest = shared_module(
   build_by_default : false,
 )
 
-plugin_tests += [ 'register-setting-and-primop.sh', 'builtin-builder.sh' ]
+plugin_tests += [
+  'register-setting-and-primop.sh',
+  'builtin-builder.sh',
+  'plugin-store-inputs-from.sh',
+]
 plugin_test_deps += [ libplugintest ]
 
 if get_option('plugin-c-api') and not host_machine.system().startswith('windows')

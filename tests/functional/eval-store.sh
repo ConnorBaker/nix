@@ -139,3 +139,16 @@ rm -rf "$eval_store"
 nix eval --raw --option eval-store "$eval_store" -f dependencies.nix drvPath
 (! ls "$NIX_STORE_DIR"/*.drv)
 ls "$eval_store"/nix/store/*.drv
+
+clearStore
+rm -rf "$eval_store"
+
+# An eval store given after `--inputs-from` is the one it uses.
+dep=$TEST_ROOT/inputs-from-dep
+mkdir -p "$dep"
+echo '{ outputs = _: { x = "hi"; }; }' > "$dep/flake.nix"
+top=$TEST_ROOT/inputs-from-top
+mkdir -p "$top"
+echo "{ inputs.dep.url = \"path:$dep\"; outputs = _: { }; }" > "$top/flake.nix"
+[[ $(nix eval --raw --inputs-from "$top" --eval-store "$eval_store" dep#x) = hi ]]
+ls "$eval_store"/nix/store/*-source
