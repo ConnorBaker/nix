@@ -45,6 +45,19 @@ rec {
     outputHashMode = "text";
   };
 
+  # Its output is `producingDrv`'s derivation, so it is two dynamic
+  # layers above `hello`.
+  producingProducingDrv = mkDerivation {
+    name = "hello.drv.drv";
+    buildCommand = ''
+      echo "Copying the derivation-producing derivation"
+      cp ${builtins.unsafeDiscardOutputDependency producingDrv.drvPath} $out
+    '';
+    __contentAddressed = true;
+    outputHashMode = "text";
+    outputHashAlgo = "sha256";
+  };
+
   wrapper = mkDerivation {
     name = "use-dynamic-drv-in-non-dynamic-drv";
     buildCommand = ''

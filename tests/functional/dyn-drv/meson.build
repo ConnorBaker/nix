@@ -10,6 +10,7 @@ suites += {
     'gc-built-drv-dep.sh',
     'gc-built-drv-eval.sh',
     'build-built-built-drv-input-addressed.sh',
+    'build-built-built-drv.sh',
     'eval-outputOf.sh',
     'failing-outer.sh',
     'dep-built-drv.sh',
