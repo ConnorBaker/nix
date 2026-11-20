@@ -170,6 +170,12 @@ public:
      */
     StorePathSet queryValidPaths(const StorePathSet & paths, bool lock, SubstituteFlag maybeSubstitute = NoSubstitute);
 
+    /**
+     * Make `paths` temporary roots on the remote side, for as long as the
+     * connection lasts, through the locking variant of `queryValidPaths`.
+     */
+    void addTempRoots(const StorePathSet & paths) override;
+
     void connect() override;
 
     unsigned int getProtocol() override;

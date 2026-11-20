@@ -1,6 +1,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <algorithm>
+#include <iterator>
 #include <filesystem>
 #include <set>
 #include <memory>
@@ -32,8 +33,6 @@
 #include "nix/util/system-error.hh"
 
 namespace nix {
-
-static void handleAlarm(int sig) {}
 
 std::string escapeUri(std::string uri)
 {
@@ -290,41 +289,35 @@ static int main_build_remote(int argc, char ** argv)
 
         auto wantedOutputs = readStrings<StringSet>(source);
 
-        AutoCloseFD uploadLock;
-        {
-            auto setUpdateLock = [&](auto && fileName) {
-                uploadLock = openLockFile(currentLoad / (escapeUri(fileName) + ".upload-lock"), true);
-            };
-            try {
-                setUpdateLock(storeUri);
-            } catch (SystemError & e) {
-                if (!e.is(std::errc::filename_too_long))
-                    throw;
-                // Try again hashing the store URL so we have a shorter path
-                auto h = hashString(HashAlgorithm::MD5, storeUri);
-                setUpdateLock(h.to_string(HashFormat::Base64, false));
-            }
-        }
-
-        {
-            Activity act(*logger, lvlTalkative, actUnknown, fmt("waiting for the upload lock to '%s'", storeUri));
-
-            auto old = signal(SIGALRM, handleAlarm);
-            alarm(15 * 60);
-            if (!lockFile(uploadLock.get(), ltWrite, true))
-                printError("somebody is hogging the upload lock for '%s', continuing...");
-            alarm(0);
-            signal(SIGALRM, old);
-        }
-
         auto substitute = settings.getWorkerSettings().buildersUseSubstitutes ? Substitute : NoSubstitute;
 
         {
             Activity act(*logger, lvlTalkative, actUnknown, fmt("copying dependencies to '%s'", storeUri));
-            copyPaths(*store, *sshStore, inputs, NoRepair, NoCheckSigs, substitute);
-        }
 
-        uploadLock = -1;
+            /* Hooks must not upload the same missing path to a machine at
+               the same time, which would divide the bandwidth between
+               them. So each upload is locked per (machine, path); asking
+               which paths are missing, and uploading different paths,
+               need no exclusion. copyPaths asks again under the locks,
+               skipping what another hook uploaded meanwhile. */
+            StorePathSet missing;
+            sshStore->addTempRoots(inputs);
+            auto valid = sshStore->queryValidPaths(inputs, substitute);
+            std::ranges::set_difference(inputs, valid, std::inserter(missing, missing.end()));
+
+            std::set<std::filesystem::path> uploadLocks;
+            for (auto & path : missing)
+                uploadLocks.insert(
+                    currentLoad
+                    / (hashString(HashAlgorithm::SHA256, storeUri + " " + store->printStorePath(path))
+                           .to_string(HashFormat::Nix32, false)
+                       + ".upload"));
+            PathLocks locks;
+            locks.setDeletion(true);
+            locks.lockPaths(uploadLocks);
+
+            copyPaths(*store, *sshStore, missing, NoRepair, NoCheckSigs, NoSubstitute);
+        }
 
         auto drv = store->readDerivation(*drvPath);
 
