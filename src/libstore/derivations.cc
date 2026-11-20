@@ -401,6 +401,10 @@ static void processDerivationOutputPaths(
             drvFeatureBuilderRpcV0);
 
     for (auto & [outputName, output] : drv.outputs) {
+        /* Output names are parts of store path names and of deriving
+           paths, so they follow the rules for store path names. */
+        checkName(outputName);
+
         auto envHasRightPath = [&](const StorePath & actual, bool isDeferred = false) {
             if (rpcOutputs)
                 return;

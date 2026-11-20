@@ -1,0 +1,16 @@
+error:
+       … while calling the 'addDrvOutputDependencies' builtin
+         at /pwd/lang/eval-fail-outputOf-output-name.nix:2:1:
+            1| # Without the check, the context would name output `a` of output `b`.
+            2| builtins.addDrvOutputDependencies (
+             | ^
+            3|   builtins.outputOf
+
+       … while calling the 'outputOf' builtin
+         at /pwd/lang/eval-fail-outputOf-output-name.nix:3:3:
+            2| builtins.addDrvOutputDependencies (
+            3|   builtins.outputOf
+             |   ^
+            4|     (derivation {
+
+       error: invalid derivation output name: name 'a!b' contains illegal character '!'

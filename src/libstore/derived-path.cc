@@ -99,6 +99,9 @@ SingleDerivedPath::Built SingleDerivedPath::Built::parse(
     const ExperimentalFeatureSettings & xpSettings)
 {
     drvRequireExperiment(*drv, xpSettings);
+    /* As in `OutputsSpec::parse` for the outermost layer. Otherwise an
+       output name containing `^` or `!` would be printed as extra layers. */
+    checkName(output);
     return {
         .drvPath = drv,
         .output = std::string{output},

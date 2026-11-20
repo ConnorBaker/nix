@@ -210,6 +210,28 @@ TEST_F(FillInOutputPathsTest, throwsOnMixedOutputTypes)
     ASSERT_THROW(checkInvariants(drv, *store), Error);
 }
 
+TEST_F(FillInOutputPathsTest, rejectsInvalidOutputName)
+{
+    Derivation drv{
+        .outputs =
+            {
+                {"a!b",
+                 DerivationOutput{DerivationOutput::CAFloating{
+                     .method = ContentAddressMethod::Raw::NixArchive,
+                     .hashAlgo = HashAlgorithm::SHA256,
+                 }}},
+            },
+        .platform = "x86_64-linux",
+        .builder = "/bin/sh",
+        .env = {{"__doc", "An output name must be a valid store path name"}, {"a!b", ""}},
+        .name = "bad-output-name",
+    };
+
+    /* A floating output has no path to check yet, so the name itself
+       must be checked. */
+    ASSERT_THROW(fillInOutputPaths(drv, *store), BadStorePathName);
+}
+
 TEST_F(FillInOutputPathsTest, skipsEnvVarsWithBuilderRpc)
 {
     Derivation drv{
