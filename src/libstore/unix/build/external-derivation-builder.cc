@@ -74,6 +74,8 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         /* Whether Nix builds the derivation itself if this builder
            declines it (exits with `externalBuilderDeclinedExitCode`). */
         json.emplace("canBuildLocally", canBuildLocally);
+        if (auto & client = settings.getLocalSettings().buildClient.get(); !client.empty())
+            json.emplace("client", client);
         {
             auto l = nlohmann::json::array();
             for (auto & i : inputPaths)

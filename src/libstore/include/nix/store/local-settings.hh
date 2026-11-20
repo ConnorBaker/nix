@@ -725,6 +725,23 @@ public:
         // Xp::ExternalBuilders
     };
 
+    Setting<std::string> buildClient{
+        this,
+        "",
+        "build-client",
+        R"(
+          Names the client on whose behalf this Nix builds. If it is not
+          empty, it is the `client` field of the JSON document given to an
+          [external builder](#conf-external-builders), which may use it to
+          tell clients apart (for example, to share builders fairly among
+          them); otherwise that field is absent. Nix does not interpret it.
+
+          A proxy that builds for its own clients through one daemon (one
+          connection per build) sets it per connection, so builds of one of
+          its clients carry one name. Only a trusted user can set it on a
+          daemon connection.
+        )"};
+
     /**
      * Finds the first external derivation builder that supports this
      * derivation, or else returns a null pointer.

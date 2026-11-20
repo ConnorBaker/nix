@@ -21,12 +21,13 @@ mkDerivation ({
 } // (if system == null then {} else { inherit system; }))
 EOF
 
-# Records `canBuildLocally` per derivation name, then declines.
+# Records `canBuildLocally` and `client` per derivation name, then declines.
 external_builder="$TEST_ROOT/external-builder.sh"
 cat > "$external_builder" <<EOF
 #! $SHELL -e
 PATH=${PATH@Q}
 jq -r .canBuildLocally < "\$1" > "$TEST_ROOT/can-\$(jq -r .env.name < "\$1")"
+jq -r '.client // "absent"' < "\$1" > "$TEST_ROOT/client-\$(jq -r .env.name < "\$1")"
 printf "\2\n"
 exit 222
 EOF
@@ -72,6 +73,13 @@ EOF
 startDaemon
 
 check daemon-ok true
+[[ $(cat "$TEST_ROOT/client-daemon-ok") = absent ]]
+
+# `build-client` names the client in build.json, for this connection only.
+check daemon-client true --option build-client some-session
+[[ $(cat "$TEST_ROOT/client-daemon-client") = some-session ]]
+check daemon-client-after true
+[[ $(cat "$TEST_ROOT/client-daemon-client-after") = absent ]]
 check daemon-foreign false --argstr system "$foreign"
 check daemon-foreign-extra true --argstr system "$foreign" --extra-platforms "$foreign"
 
@@ -80,3 +88,14 @@ check daemon-foreign-extra true --argstr system "$foreign" --extra-platforms "$f
 expectStderr 1 nix build --no-link --file "$expr" --argstr name daemon-no-jobs --max-jobs 0 \
     | grepQuiet "Unable to start any build"
 [[ ! -e "$TEST_ROOT/can-daemon-no-jobs" ]]
+
+# An untrusted client cannot name the client: its `build-client` is refused.
+killDaemon
+echo "trusted-users =" >> "$test_nix_conf"
+startDaemon
+out=$(nix build --no-link --print-out-paths --file "$expr" --argstr name daemon-untrusted \
+    --option build-client impostor 2> "$TEST_ROOT/untrusted.err")
+cat "$TEST_ROOT/untrusted.err" >&2
+[[ $(cat "$out") = local ]]
+grepQuiet "ignoring the client-specified setting 'build-client'" "$TEST_ROOT/untrusted.err"
+[[ $(cat "$TEST_ROOT/client-daemon-untrusted") = absent ]]
