@@ -1,5 +1,6 @@
 #include "nix/cmd/command.hh"
 #include "nix/cmd/installables.hh"
+#include "nix/cmd/installable-derived-path.hh"
 #include "nix/main/common-args.hh"
 #include "nix/main/shared.hh"
 #include "nix/store/store-api.hh"
@@ -148,8 +149,21 @@ struct CmdBuild : InstallablesCommand, MixOutLinkByDefault, MixDryRun, MixJSON, 
             return;
         }
 
+        /* Nothing below evaluates: the derived paths name everything to
+           realise, and linking, printing and the profile use only the
+           built paths. Keeping the evaluated installables and the
+           evaluator would hold the evaluator's whole heap for the build
+           wait, which can last hours, so resolve the installables here and
+           let the evaluator go before building. */
+        Installables resolved;
+        for (auto & i : installables)
+            for (auto & b : i->toDerivedPaths())
+                resolved.push_back(make_ref<InstallableDerivedPath>(store, std::move(b.path)));
+        installables.clear();
+        releaseEvalState();
+
         auto buildables =
-            Installable::build(getEvalStore(), store, Realise::Outputs, installables, repair ? bmRepair : buildMode);
+            Installable::build(getEvalStore(), store, Realise::Outputs, resolved, repair ? bmRepair : buildMode);
 
         if (json)
             logger->cout("%s", builtPathsWithResultToJSON(buildables, *store).dump());

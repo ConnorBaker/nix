@@ -6,6 +6,7 @@
 
 // For `NIX_USE_BOEHMGC`
 #include "nix/expr/config.hh"
+#include "nix/util/fun.hh"
 
 #if NIX_USE_BOEHMGC
 
@@ -81,6 +82,44 @@ void initGC();
  * Make sure `initGC` has already been called.
  */
 void assertGCInitialized();
+
+/**
+ * Collect garbage, then give every page the collector's heap no longer
+ * uses back to the operating system.
+ *
+ * The collector otherwise keeps its heap at its largest size for the
+ * rest of the process, so a command that evaluates and then waits on
+ * builds holds the memory evaluation needed for the whole wait.
+ *
+ * Words that returned frames left on the calling thread's stack, below
+ * the caller's frame, are cleared first, so they keep nothing alive. Words
+ * in live frames, in registers, or on other threads' stacks still do.
+ * Uses 64 KiB of the calling thread's stack.
+ */
+void releaseUnusedGCMemory();
+
+/**
+ * What the collector holds free but still mapped, and what it has unmapped
+ * (returned to the operating system), in bytes.
+ */
+struct GCMemoryCounts
+{
+    size_t free;
+    size_t unmapped;
+
+    bool operator==(const GCMemoryCounts &) const = default;
+};
+
+/**
+ * Call `collect`, which runs one collection and returns the counts after
+ * it, until two calls in a row leave the counts as they were, or `limit`
+ * calls. Returns the number of calls.
+ *
+ * One unchanged call is not enough: a block freed by one collection is
+ * unmapped only by the one after the next, so the collection between them
+ * changes nothing.
+ */
+unsigned collectUntilStable(fun<GCMemoryCounts()> collect, unsigned limit = 16);
 
 #if NIX_USE_BOEHMGC
 /**
