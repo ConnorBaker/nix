@@ -154,6 +154,12 @@ void RemoteStore::setOptions(Connection & conn)
     overrides.erase(loggerSettings.showTrace.name);
     overrides.erase(experimentalFeatureSettings.experimentalFeatures.name);
     overrides.erase(settings.useXDGBaseDirectories.name);
+    /* The store that this client uses is not the daemon's. A daemon that
+       takes it gives it to its build hook, which then imports the outputs
+       of a remote build through another connection to the daemon, where
+       the import waits for the output locks that the build holds while it
+       waits for the hook. */
+    overrides.erase(settings.storeUri.name);
     overrides.erase("plugin-files");
     conn.to << overrides.size();
     for (auto & i : overrides)
