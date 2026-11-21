@@ -114,6 +114,15 @@ struct EvalCommand : virtual StoreCommand, MixEvalArgs
 
     ref<EvalState> getEvalState();
 
+    /**
+     * Let the evaluator go once a command has nothing left to evaluate:
+     * print its statistics, drop this command's reference to it and
+     * return the memory it no longer reaches to the system. The
+     * evaluator is destroyed if nothing else (such as an installable)
+     * still refers to it.
+     */
+    void releaseEvalState();
+
 private:
     std::shared_ptr<Store> evalStore;
 

@@ -6,6 +6,9 @@
 
 #include "expr-config-private.hh"
 
+#include <cstring>
+#include <optional>
+
 #if NIX_USE_BOEHMGC
 
 #  include <pthread.h>
@@ -149,6 +152,61 @@ void initGC()
 void assertGCInitialized()
 {
     assert(gcInitialised);
+}
+
+unsigned collectUntilStable(fun<GCMemoryCounts()> collect, unsigned limit)
+{
+    unsigned calls = 0;
+    std::optional<GCMemoryCounts> last;
+    for (unsigned unchanged = 0; unchanged < 2 && calls < limit; ++calls) {
+        auto now = collect();
+        unchanged = now == last ? unchanged + 1 : 0;
+        last = now;
+    }
+    return calls;
+}
+
+#if NIX_USE_BOEHMGC
+/**
+ * Zero the stack below the caller's frame.
+ *
+ * The collector scans a stack from its current top, and the frames of a
+ * collection leave some of their slots unwritten, so it also scans
+ * whatever words the frames that returned before it (evaluation's, say)
+ * left there. bdwgc clears this region itself, a little at a time, on
+ * allocation (its internal `GC_clear_stack`), but not before an explicit
+ * collection.
+ */
+[[gnu::noinline]] static void clearStackBelowCaller()
+{
+    /* A collection's frames lie well within this: in a `nix build` on
+       aarch64-linux, zeroing 16 KiB was enough to release the evaluator,
+       and 4 KiB was not. */
+    char returned[64 * 1024];
+    std::memset(returned, 0, sizeof returned);
+    /* `returned` is never read; keep the stores anyway. */
+    asm volatile("" : : "r"(returned) : "memory");
+}
+#endif
+
+void releaseUnusedGCMemory()
+{
+#if NIX_USE_BOEHMGC
+    assertGCInitialized();
+    clearStackBelowCaller();
+    /* A collection frees the blocks nothing reaches any more, but even
+       when told to unmap as much as possible, the collector unmaps only
+       blocks that have stayed free for more than one further collection
+       (`GC_unmap_old` against an unmap threshold of 1). And a block need
+       not be freed by the first collection: a stale word that a later
+       collection's frames overwrite keeps what it points to until then.
+       Allocation on other threads can keep the counts changing, hence
+       the limit on collections. */
+    collectUntilStable([] {
+        GC_gcollect_and_unmap();
+        return GCMemoryCounts{.free = GC_get_free_bytes(), .unmapped = GC_get_unmapped_bytes()};
+    });
+#endif
 }
 
 } // namespace nix

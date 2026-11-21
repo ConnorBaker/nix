@@ -9,6 +9,7 @@
 #include "nix/store/local-fs-store.hh"
 #include "nix/store/derivations.hh"
 #include "nix/expr/nixexpr.hh"
+#include "nix/expr/eval-gc.hh"
 #include "nix/store/profiles.hh"
 #include "nix/cmd/repl.hh"
 #include "nix/util/strings.hh"
@@ -180,6 +181,15 @@ ref<EvalState> EvalCommand::getEvalState()
         };
     }
     return ref<EvalState>(evalState);
+}
+
+void EvalCommand::releaseEvalState()
+{
+    if (evalState) {
+        evalState->maybePrintStats();
+        evalState.reset();
+    }
+    releaseUnusedGCMemory();
 }
 
 MixOperateOnOptions::MixOperateOnOptions()

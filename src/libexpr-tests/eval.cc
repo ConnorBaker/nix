@@ -2,7 +2,9 @@
 #include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
 
+#include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 #include "nix/expr/eval.hh"
 #include "nix/expr/tests/libexpr.hh"
@@ -316,6 +318,70 @@ TEST_F(LibExprTest, resetFileCacheReleasesValues)
 
     EXPECT_EQ(nullptr, *weak);
 }
+
+/* Leave copies of `*weak` in the stack below the caller's frame, as the
+   frames of an evaluation that has returned leave pointers to its values.
+   The kilobyte nearest the caller is left alone: the frame of whatever the
+   caller calls next lies there, and a live frame is scanned as it is. */
+[[gnu::noinline]] static void leavePointersOnStack(void ** weak)
+{
+    constexpr size_t n = 2048;
+    void * volatile words[n];
+    /* The stack grows down, so the first elements are the deepest. */
+    for (size_t i = 0; i < n - 1024 / sizeof(void *); ++i)
+        words[i] = *weak;
+}
+
+TEST_F(LibExprTest, releaseUnusedGCMemoryIgnoresPointersReturnedFramesLeft)
+{
+    auto weak = static_cast<void **>(GC_MALLOC_ATOMIC(sizeof(void *)));
+    ASSERT_NE(nullptr, weak);
+    *weak = nullptr;
+    Finally cleanup([&] {
+        GC_unregister_disappearing_link(weak);
+        GC_FREE(weak);
+    });
+
+    runOnGCThread([&] {
+        auto object = GC_MALLOC(64);
+        ASSERT_NE(nullptr, object);
+        *weak = object;
+        ASSERT_EQ(GC_SUCCESS, GC_GENERAL_REGISTER_DISAPPEARING_LINK(weak, object));
+    });
+    ASSERT_FALSE(HasFatalFailure());
+
+    leavePointersOnStack(weak);
+    releaseUnusedGCMemory();
+
+    EXPECT_EQ(nullptr, *weak);
+}
+
 #endif
+
+/* What the collector reports when it frees blocks at its second collection
+   (they were kept by something its first collection still saw) and, as it
+   must wait one more collection before unmapping them, unmaps them at its
+   fourth. */
+TEST(collectUntilStable, waitsForBlocksFreedLateToBeUnmapped)
+{
+    std::vector<GCMemoryCounts> after{
+        {.free = 0, .unmapped = 100},
+        {.free = 50, .unmapped = 100},
+        {.free = 50, .unmapped = 100},
+        {.free = 0, .unmapped = 150},
+        {.free = 0, .unmapped = 150},
+        {.free = 0, .unmapped = 150},
+    };
+    size_t i = 0;
+    auto calls = collectUntilStable([&] { return after.at(std::min(i++, after.size() - 1)); });
+    EXPECT_EQ(6u, calls);
+}
+
+TEST(collectUntilStable, stopsAtTheLimitWhileTheCountsKeepChanging)
+{
+    size_t i = 0;
+    auto calls = collectUntilStable([&] { return GCMemoryCounts{.free = i++, .unmapped = 0}; }, 5);
+    EXPECT_EQ(5u, calls);
+}
 
 } // namespace nix
