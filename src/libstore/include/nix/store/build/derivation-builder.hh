@@ -62,6 +62,13 @@ struct BuildChildServer
 #endif
 
 /**
+ * Exit status with which an external builder declines a build, asking
+ * Nix to build it locally instead (used when no remote worker can serve
+ * the derivation's system).
+ */
+constexpr int externalBuilderDeclinedExitCode = 222;
+
+/**
  * Denotes a build failure that stemmed from the builder exiting with a
  * failing exist status.
  */
@@ -409,12 +416,16 @@ DerivationBuilderUnique makeDerivationBuilder(
 /**
  * @param handler Must be chosen such that it supports the given
  * derivation.
+ *
+ * @param canBuildLocally Whether Nix builds the derivation itself if
+ * the external builder declines it; written to build.json.
  */
 DerivationBuilderUnique makeExternalDerivationBuilder(
     std::shared_ptr<BuildingStore> store,
     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
     DerivationBuilderParams params,
-    const ExternalBuilder & handler);
+    const ExternalBuilder & handler,
+    bool canBuildLocally);
 #endif
 
 } // namespace nix

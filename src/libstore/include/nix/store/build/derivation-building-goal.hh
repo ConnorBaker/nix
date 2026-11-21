@@ -90,6 +90,16 @@ private:
         PathLocks outputLocks);
 
     /**
+     * Would this Nix build the derivation itself? Its platform must be
+     * this system's (or an extra platform, or builtin), this store must
+     * have every system feature it requires, and max-jobs must be
+     * nonzero. Nix falls back to a local build when an external builder
+     * declines exactly when this holds, and tells the external builder
+     * its value in build.json.
+     */
+    bool canBuildLocally(const DerivationOptions<StorePath> & drvOptions);
+
+    /**
      * Is the build hook willing to perform the build?
      */
     HookReply tryBuildHook(const DerivationOptions<StorePath> & drvOptions);

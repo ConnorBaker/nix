@@ -9,15 +9,26 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
 {
     ExternalBuilder externalBuilder;
 
+    bool canBuildLocally;
+
     ExternalDerivationBuilder(
         std::shared_ptr<BuildingStore> store,
         std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
         DerivationBuilderParams params,
-        ExternalBuilder externalBuilder)
+        ExternalBuilder externalBuilder,
+        bool canBuildLocally)
         : UnixDerivationBuilderImpl(store, miscMethods, std::move(params))
         , externalBuilder(std::move(externalBuilder))
+        , canBuildLocally(canBuildLocally)
     {
         experimentalFeatureSettings.require(Xp::ExternalBuilders);
+    }
+
+    void prepareSandbox() override
+    {
+        /* Sandboxing (including uid-range support) is the external
+           builder's responsibility; don't reject derivations the
+           local platform could not sandbox itself. */
     }
 
     std::filesystem::path tmpDirInSandbox() override
@@ -35,9 +46,6 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
 
     void startChild() override
     {
-        if (drvOptions.getRequiredSystemFeatures(drv).count("recursive-nix"))
-            throw Error("'recursive-nix' is not supported yet by external derivation builders");
-
         auto json = nlohmann::json::object();
 
         json.emplace("version", 1);
@@ -60,6 +68,13 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         json.emplace("storeDir", store->storeDir);
         json.emplace("realStoreDir", store->getRealStoreDir().native());
         json.emplace("system", drv.platform);
+        json.emplace("timeout", settings.getWorkerSettings().buildTimeout.get());
+        json.emplace("maxSilentTime", settings.getWorkerSettings().maxSilentTime.get());
+        /* Whether Nix builds the derivation itself if this builder
+           declines it (exits with `externalBuilderDeclinedExitCode`). */
+        json.emplace("canBuildLocally", canBuildLocally);
+        if (auto & client = settings.getLocalSettings().buildClient.get(); !client.empty())
+            json.emplace("client", client);
         {
             auto l = nlohmann::json::array();
             for (auto & i : inputPaths)
@@ -110,6 +125,24 @@ struct ExternalDerivationBuilder : UnixDerivationBuilderImpl
         debug("executing external builder: %s %s", PathFmt(options.program), concatStringsSep(" ", options.args));
         pid = spawnProgram(options, fds);
     }
+
+    SingleDrvOutputs registerOutputs(LocalStore & localStore) override
+    {
+        auto resultJsonPath = topTmpDir / "result.json";
+        if (pathExists(resultJsonPath)) {
+            auto result = nlohmann::json::parse(readFile(resultJsonPath));
+            auto added = result.find("addedPaths");
+            if (added != result.end() && added->is_array()) {
+                std::promise<void> done;
+                done.set_value();
+                auto ready = done.get_future().share();
+                auto state = state_.lock();
+                for (auto & p : *added)
+                    state->addedPaths.emplace(store->parseStorePath(p.get<std::string>()), ready);
+            }
+        }
+        return DerivationBuilderImpl::registerOutputs(localStore);
+    }
 };
 
 } // namespace
@@ -118,9 +151,11 @@ DerivationBuilderUnique makeExternalDerivationBuilder(
     std::shared_ptr<BuildingStore> store,
     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
     DerivationBuilderParams params,
-    const ExternalBuilder & handler)
+    const ExternalBuilder & handler,
+    bool canBuildLocally)
 {
-    return DerivationBuilderUnique(new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler));
+    return DerivationBuilderUnique(
+        new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler, canBuildLocally));
 }
 
 } // namespace nix
