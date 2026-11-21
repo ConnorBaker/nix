@@ -247,7 +247,7 @@ RestrictedStore::queryPartialDerivationOutputMap(const StorePath & path, Store *
 void RestrictedStore::addToStore(
     const ValidPathInfo & info, Source & narSource, RepairFlag repair, CheckSigsFlag checkSigs)
 {
-    next->addToStore(info, narSource, repair, checkSigs);
+    next->addToStore(info, narSource, repair, checkSigs, goal.locksHeld);
     goal.addDependency(info.path);
 }
 
@@ -260,7 +260,8 @@ StorePath RestrictedStore::addToStoreFromDump(
     const StorePathSet & references,
     RepairFlag repair)
 {
-    auto path = next->addToStoreFromDump(dump, name, dumpMethod, hashMethod, hashAlgo, references, repair);
+    auto path = next->addToStoreFromDump(
+        dump, name, dumpMethod, hashMethod, hashAlgo, references, repair, false, goal.locksHeld);
     goal.addDependency(path);
     return path;
 }
@@ -299,7 +300,7 @@ ref<const ValidPathInfo> RestrictedStore::addToStoreScanning(
     HashAlgorithm hashAlgo)
 {
     auto path = next->addToStoreFromDump(
-        dump, name, dumpMethod, hashMethod, hashAlgo, queryAllValidPaths(), RepairFlag::NoRepair, true);
+        dump, name, dumpMethod, hashMethod, hashAlgo, queryAllValidPaths(), RepairFlag::NoRepair, true, goal.locksHeld);
     goal.addDependency(path);
     return queryPathInfo(path);
 }

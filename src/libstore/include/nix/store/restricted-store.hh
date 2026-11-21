@@ -1,6 +1,7 @@
 #pragma once
 ///@file
 
+#include "nix/store/pathlocks.hh"
 #include "nix/store/store-api.hh"
 #include "nix/util/sync.hh"
 
@@ -38,6 +39,11 @@ public:
      * Paths that are already allowed to begin with
      */
     virtual const StorePathSet & originalPaths() = 0;
+
+    /**
+     * The output paths that the build has locked.
+     */
+    HeldLocks locksHeld;
 
     struct State
     {

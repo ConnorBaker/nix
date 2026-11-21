@@ -107,6 +107,7 @@ suites = [
       'fetchTree-file.sh',
       'fetchurl.sh',
       'filter-source.sh',
+      'fixed-add-own-output.sh',
       'fixed-slow-vs-bad.sh',
       'fixed.sh',
       'flamegraph-profiler.sh',
