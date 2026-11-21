@@ -425,6 +425,11 @@ StorePathSet LegacySSHStore::queryValidPaths(const StorePathSet & paths, bool lo
     return conn->queryValidPaths(*this, lock, paths, maybeSubstitute);
 }
 
+void LegacySSHStore::addTempRoots(const StorePathSet & paths)
+{
+    queryValidPaths(paths, true);
+}
+
 void LegacySSHStore::connect()
 {
     auto conn(connections->get());
