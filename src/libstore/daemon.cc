@@ -290,6 +290,15 @@ struct ClientSettings
                     if (parseFeatures(tokenizeString<StringSet>(value))
                         != experimentalFeatureSettings.experimentalFeatures.get())
                         debug("Ignoring the client-specified experimental features");
+                } else if (name == settings.storeUri.name) {
+                    // The client's store is where the client sends its
+                    // requests, not the daemon's store. Taken as the daemon's,
+                    // it reaches the build hook, which then imports the
+                    // outputs of a remote build through another connection to
+                    // the daemon, where the import waits for the output locks
+                    // that the build holds while it waits for the hook.
+                    // Clients no longer send it; older ones still do.
+                    debug("Ignoring the client-specified store");
                 } else if (name == "plugin-files") {
                     warn(
                         "Ignoring the client-specified plugin-files.\n"
