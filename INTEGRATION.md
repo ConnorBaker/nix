@@ -5,12 +5,18 @@ merged into it, one `git merge --no-ff` per branch, in the order below. It
 is what we build and run; it is not meant to go upstream as a whole. Each
 merged branch is its own unit and goes upstream (or not) on its own.
 
-When a source branch or `master` moves, this branch is rebuilt from scratch
-(a fresh `master`, then the same merges with the new heads), not rebased,
-and force-pushed. Every conflict a merge resolved is described in that
-merge commit's message.
+Until 2026-11-21, when a source branch or `master` moved, this branch was
+rebuilt from scratch (a fresh `master`, then the same merges with the new
+heads) and force-pushed. Since 2026-11-23 the existing merges are kept,
+because deployed and pinned revisions contain them: a newer `master` comes
+in as a "Merge upstream master <sha>" merge, and a new branch, or a newer
+head of a merged branch, as one more `--no-ff` merge after it, so the
+branch only moves forward. Every conflict a merge resolved is described in
+that merge commit's message.
 
 Base `master` commit: `6965392507e19998de706aa15e514f81e9b7ce11`
+
+Merged `master` commit: `96084b82ab08d1de1202d946fd9fa022e44e82db`
 
 ## Merged branches
 
@@ -42,6 +48,7 @@ Base `master` commit: `6965392507e19998de706aa15e514f81e9b7ce11`
 | 24 | `nix-fix/release-evaluator` | `636063591c3a24cc127f47aa3b74b7d4ec25d0df` | `nix build` lets the evaluator go before it waits on builds: it drops its installables and `EvalState`, zeroes 64 KiB of dead stack below the caller, then collects and unmaps free GC pages until two collections in a row change neither count; tests `build-release-evaluator.sh` and unit tests (`collectUntilStable`, stale stack pointers) |  |  |
 | 25 | `nix-fix/build-remote-substitutes` | `de424e280b47900ae2458d9cb7682cfa89acb61c` | Test only: with `builders-use-substitutes` a machine substitutes a build's inputs from its own substituters, over ssh:// and ssh-ng://, whether or not its daemon trusts the machine's user; an upload of the input is made to fail, so substitution is what passes |  |  |
 | 26 | `nix-fix/client-store-setting` | `4cf9353caeedce82d6fa666c6583951da786f611` | A client does not send its `store` setting to the daemon, whose build hook otherwise opened it and, with `--store daemon`, waited forever for the output lock its own build held; test `build-remote-store-setting.sh` |  |  |
+| 27 | `nix-fix/client-store-setting` | `121bf01f5c54b4f2ff678b6a34c74af10e433eb2` | The branch's next commit (its parent is 4cf9353cae, merged as row 26; in this branch's history it is merged after the merge of upstream `master` 96084b82ab): the daemon ignores a `store` setting sent by any client (older clients still send it), as it ignores a client's experimental features; the test speaks the protocol as such a client |  |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -77,7 +84,21 @@ Resolutions, each described in its merge commit's message:
   name order (the file as reviewed on the branch's reviewed base);
 - merge 25 (build-remote-substitutes): no conflict;
 - merge 26 (client-store-setting): conflict in `tests/functional/meson.build`
-  with merge 25's test, both kept in name order.
+  with merge 25's test, both kept in name order;
+- "Merge upstream master 96084b82ab" (after merge 26, the integration-only
+  commit and the 2026-11-21 describe commit): no conflict. Upstream and the
+  merged branches both changed `src/libexpr/eval.cc`,
+  `src/libexpr-tests/eval.cc`, `src/libstore/build/derivation-builder-impl.cc`,
+  `src/libstore/local-store.cc` and `tests/functional/flakes/flakes.sh`, in
+  hunks git merged by itself, none within 40 lines of the other side's
+  except in `src/libexpr-tests/eval.cc`, where the branches add tests after
+  the `resetFileCacheReleasesValues` test that upstream changed. The functions
+  and types whose declarations upstream changed (`restorePath`,
+  `copyRecursive`, the `FileSystemObjectSink`, `MemorySourceAccessor` and
+  `MemorySink` interfaces, `OsFilename`) occur in no line the merged branches
+  add;
+- merge 27 (client-store-setting at 121bf01f5c): no conflict; its change is
+  exactly the branch's commit since merge 26.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
@@ -109,13 +130,22 @@ The `integ/*` branches hold this fork's own commits that are not (yet) a
 `nix-fix/*` branch of their own.
 
 Integration-only commits (adaptations that belong to no source branch): one,
-after merge 26, "tests/functional/dyn-drv: build three-layer paths over the
+between merge 26 and the merge of `master`, "tests/functional/dyn-drv: build three-layer paths over the
 daemon too": it replaces the local-store-only guard of two of merge 18's tests,
 which need merge 19 to run over the daemon. The daemon must also have merge
 18's fix (2.35.6 fails them), hence `requireDaemonNewerThan "2.36pre"`. Risk:
 merge 18's fix is not upstream (NixOS/nix#16459 is open); once daemonCompat's
 daemon is an upstream 2.36 without it, the guard passes and the two tests fail
 there, so the guard must then name a version with the fix.
+The same risk holds for merge 22's `tests/functional/dyn-drv/build-built-drv-foreign-path.sh`
+and `build-built-drv-foreign-path-substitute.sh`, which are guarded by
+`requireDaemonNewerThan "2.37pre"`. Their fix (in `DerivationTrampolineGoal`)
+exists only in this fork, but an upstream `master` daemon built after "Bump
+version" (3705f35ddc, 2.37.0pre) passes that guard without it, so the two tests
+would fail against such a daemon. The same bump makes this branch's own daemon
+pass the guard: since the merge of 96084b82ab, `daemonCompat`'s run against
+this build's daemon runs `build-built-drv-foreign-path.sh`, which it skipped
+before (`build-built-drv-foreign-path-substitute.sh` is still skipped there).
 The `integration: describe the merged branches` commits only add or update
 this file and `maintainers/integration-status.sh`.
 
@@ -137,10 +167,13 @@ this file and `maintainers/integration-status.sh`.
   descendant, differing only in `tests/functional/build-remote-upload-lock.sh`),
   so `integration-status.sh` reported row 16 REWRITTEN for it. Row 16 now
   merges 326f70eaa9.
-- Until this integration is pushed together with its branches (rows 24-26
-  new, `integ/external-builders` moved to a1567615ff), `integration-status.sh`
-  reports rows 24-26 MISSING and row 15 REWRITTEN against the local and
-  `origin/` refs. Both are expected.
+- Rows 26 and 27 merge the same branch, `nix-fix/client-store-setting`, at
+  4cf9353cae and at its next commit 121bf01f5c, the branch's tip;
+  `integration-status.sh` compares only the newer merge with the branch's
+  tips and reports a tip still at 4cf9353cae as OLDER.
+- Every merged branch exists in this fork, and this branch merges its tip:
+  the branches are what integration is made of, and each is the source of
+  its upstream PR.
 
 ## How to check staleness
 
@@ -150,5 +183,7 @@ the merge commits themselves, cross-checks them against the table above,
 and for every branch prints the merged sha, the local and `origin/` tips
 that exist, and whether each is UP-TO-DATE, BEHIND (n commits), REWRITTEN
 (the tip no longer contains the merged sha) or MISSING. It also says how far
-the base is behind `master`, `origin/master` and `upstream/master`. It exits
-non-zero if anything is not up to date or the table disagrees with the merges.
+the merged `master` (the newest "Merge upstream master" merge's, else the
+base) is behind `master`, `origin/master` and `upstream/master`. It exits
+non-zero if anything is not up to date or the table, or the "Merged
+`master` commit" line, disagrees with the merges.

@@ -5,8 +5,11 @@
 #
 # Usage: maintainers/integration-status.sh [<integration commit>]   (default: HEAD)
 #
-# Exits 0 when every merged branch and the base are up to date and the
-# merges agree with INTEGRATION.md's table, and 1 otherwise.
+# Exits 0 when every merged branch's tips are at its newest merged sha or at
+# an earlier merged sha of the same branch, the merged `master` (the base, or
+# the newest "Merge upstream master" merge's) is up to date or older, and in
+# `upstream/master` when that ref exists, and the merges agree with
+# INTEGRATION.md; 1 otherwise.
 
 set -euo pipefail
 
@@ -30,8 +33,11 @@ if [[ -z $base ]]; then
 fi
 
 # The merges, oldest first, from the first-parent history above the base:
-# "<branch> <second parent>".
+# "<branch> <second parent>". A "Merge upstream master <sha>" merge brings a
+# newer `master` in without rebuilding; the newest one is the `master` this
+# integration contains.
 declare -a merged_branches=() merged_shas=()
+merged_master=
 on_chain=false
 while read -r commit _ parent2 rest; do
     if [[ $commit == "$base" ]]; then
@@ -43,14 +49,20 @@ while read -r commit _ parent2 rest; do
         if [[ -n $rest ]]; then
             echo "warning: $commit is an octopus merge; only its second parent is checked"
         fi
-        if [[ $subject =~ ^Merge\ ([^ ]+)\ \([0-9a-f]+\)$ ]]; then
+        if [[ $subject =~ ^Merge\ upstream\ master\ ([0-9a-f]+)$ ]]; then
+            if [[ $parent2 != "${BASH_REMATCH[1]}"* ]]; then
+                echo "MISMATCH: merge $commit names master ${BASH_REMATCH[1]} but merges $parent2"
+                problems=1
+            fi
+            [[ -n $merged_master ]] || merged_master=$parent2
+        elif [[ $subject =~ ^Merge\ ([^ ]+)\ \([0-9a-f]+\)$ ]]; then
             merged_branches=("${BASH_REMATCH[1]}" "${merged_branches[@]}")
             merged_shas=("$parent2" "${merged_shas[@]}")
         else
             echo "MISMATCH: merge $commit has an unexpected subject: $subject"
             problems=1
         fi
-    elif [[ $commit != "$head" || $subject != "integration: describe the merged branches" ]]; then
+    elif [[ $subject != "integration: describe the merged branches" ]]; then
         echo "note: integration-only commit $(git rev-parse --short "$commit") $subject"
     fi
 done < <(git rev-list --first-parent --parents "$head")
@@ -58,6 +70,14 @@ if ! $on_chain; then
     echo "MISMATCH: base $base is not on the first-parent history of $rev"
     problems=1
 fi
+
+# shellcheck disable=SC2016 # the backticks are literal
+named_master=$(sed -n 's/^Merged `master` commit: `\([0-9a-f]\{40\}\)`$/\1/p' <<<"$manifest")
+if [[ $named_master != "$merged_master" ]]; then
+    echo "MISMATCH: the newest merged master is ${merged_master:-(none)}, INTEGRATION.md says ${named_master:-(none)}"
+    problems=1
+fi
+master=${merged_master:-$base}
 
 # Cross-check against the table: "| <n> | `branch` | `sha` | ...".
 declare -a table_branches=() table_shas=()
@@ -82,7 +102,8 @@ for i in "${!merged_branches[@]}"; do
     fi
 done
 
-# status <merged sha> <tip>
+# status <merged sha> <tip>: UP-TO-DATE, BEHIND (the tip has newer commits)
+# or REWRITTEN (the tip does not contain the merged sha).
 status() {
     if [[ $2 == "$1" ]]; then
         echo "UP-TO-DATE"
@@ -93,19 +114,37 @@ status() {
     fi
 }
 
+# A branch can be merged more than once (a newer head merged after a newer
+# master); only its newest merge is compared with its tips.
+declare -A newest=()
+for i in "${!merged_branches[@]}"; do
+    newest[${merged_branches[i]}]=$i
+done
+
 echo
-echo "Integration $(git rev-parse --short "$head"), base $(git rev-parse --short "$base")"
+echo "Integration $(git rev-parse --short "$head"), base $(git rev-parse --short "$base"), master $(git rev-parse --short "$master")"
 echo
 for i in "${!merged_branches[@]}"; do
     branch=${merged_branches[i]}
     sha=${merged_shas[i]}
     echo "$((i + 1)). $branch merged at $sha"
+    if ((newest[$branch] != i)); then
+        echo "    superseded by merge $((newest[$branch] + 1))"
+        continue
+    fi
     found=false
     for ref in "refs/heads/$branch" "refs/remotes/origin/$branch"; do
         tip=$(git rev-parse --verify --quiet "$ref^{commit}") || continue
         found=true
         st=$(status "$sha" "$tip")
-        [[ $st == UP-TO-DATE ]] || problems=1
+        # A tip still at an earlier merge of this branch is that merge's head:
+        # integration has the newer one, nothing is lost.
+        for j in "${!merged_branches[@]}"; do
+            if ((j < i)) && [[ ${merged_branches[j]} == "$branch" && ${merged_shas[j]} == "$tip" ]]; then
+                st="OLDER (at merge $((j + 1))'s head)"
+            fi
+        done
+        [[ $st == UP-TO-DATE || $st == OLDER* ]] || problems=1
         printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "$st"
     done
     if ! $found; then
@@ -115,16 +154,23 @@ for i in "${!merged_branches[@]}"; do
 done
 
 echo
-echo "Base $base"
+echo "Master $master"
 for ref in refs/heads/master refs/remotes/origin/master refs/remotes/upstream/master; do
     tip=$(git rev-parse --verify --quiet "$ref^{commit}") || continue
-    if git merge-base --is-ancestor "$base" "$tip"; then
-        st=$(status "$base" "$tip")
+    if git merge-base --is-ancestor "$master" "$tip"; then
+        st=$(status "$master" "$tip")
         [[ $st == UP-TO-DATE ]] || problems=1
         printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "$st"
+    elif [[ $ref == refs/remotes/upstream/master ]]; then
+        # What is merged as upstream master must be in upstream's master.
+        problems=1
+        printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "NOT UPSTREAM (does not contain the merged master)"
+    elif git merge-base --is-ancestor "$tip" "$master"; then
+        # An older master than the merged one, as a fork's master is until pushed.
+        printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "OLDER ($(git rev-list --count "$tip..$master") commits before the merged master)"
     else
         problems=1
-        printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "REWRITTEN (does not contain the base)"
+        printf '    %-45s %s  %s\n' "${ref#refs/*/}" "$tip" "REWRITTEN (does not contain the merged master)"
     fi
 done
 
