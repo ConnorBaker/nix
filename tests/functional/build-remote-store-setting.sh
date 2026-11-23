@@ -42,3 +42,71 @@ for name in default daemon socket; do
     nix path-info --store "$TEST_ROOT/machine" "$out"
     [[ $(cat "$out") == "$name" ]]
 done
+
+# Older clients still send the setting; the daemon ignores it. Such a client
+# speaks the protocol here, through `nix daemon --stdio`, which forwards its
+# standard input and output to the daemon. A daemon of another version can
+# still take the setting, so the case runs only against this version's
+# daemon. It exits rather than skipping: the cases above ran against
+# whichever daemon this is, and their result still counts.
+if [[ -n "${NIX_DAEMON_PACKAGE-}" ]] \
+    && [[ $("$NIX_DAEMON_PACKAGE/bin/nix" daemon --version) != $(nix daemon --version) ]]; then
+    exit 0
+fi
+
+u64() {
+    local i bytes=
+    for ((i = 0; i < 64; i += 8)); do
+        bytes+=$(printf '\\x%02x' $(($1 >> i & 255)))
+    done
+    printf %b "$bytes"
+}
+str() {
+    u64 "${#1}"
+    printf %s "$1"
+    head -c $((-${#1} & 7)) /dev/zero
+}
+
+drv=$(nix-instantiate build-remote-store-setting.nix --arg busybox "$busybox" --argstr name sent)
+out=$(nix-store --query --outputs "$drv")
+
+mkfifo "$TEST_ROOT/client"
+# The daemon's end of the forwarding is a pipe, which splice(2) needs.
+nix daemon --stdio < "$TEST_ROOT/client" | cat > "$TEST_ROOT/client-replies" &
+clientPid=$!
+exec {client}> "$TEST_ROOT/client"
+{
+    # Handshake, as protocol version 1.37, which exchanges no features.
+    u64 0x6e697863
+    u64 $((1 << 8 | 37))
+    u64 0
+    u64 0
+    # SetOptions: keep-failed, keep-going, fallback, verbosity, max-jobs,
+    # max-silent-time, an obsolete field, verbose build (as 0), two obsolete
+    # fields, cores, substitute, and the overrides.
+    u64 19
+    u64 0; u64 0; u64 0; u64 0; u64 0
+    u64 0; u64 1; u64 0; u64 0; u64 0; u64 1; u64 0
+    u64 3
+    str builders; str "$TEST_ROOT/machine - - 1 1"
+    # As an older client sends it from NIX_CONFIG; a daemon started before
+    # NIX_CONFIG was set needs it.
+    str sandbox-build-dir; str /nix-build
+    str store; str daemon
+    # BuildPaths, in the normal mode.
+    u64 9
+    u64 1; str "$drv!out"
+    u64 0
+} >&"$client"
+
+for ((i = 0; i < 600; i++)); do
+    nix-store --check-validity "$out" 2> /dev/null && break
+    sleep 0.1
+done
+exec {client}>&-
+wait "$clientPid"
+# The replies' text says where the hook copied the output.
+tr -c '[:print:]' '\n' < "$TEST_ROOT/client-replies" | grep -F copying || true
+nix-store --check-validity "$out"
+nix path-info --store "$TEST_ROOT/machine" "$out"
+[[ $(cat "$out") == sent ]]
