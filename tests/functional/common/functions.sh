@@ -156,6 +156,16 @@ isDaemonNewer () {
   [[ $(nix eval --expr "builtins.compareVersions ''$daemonVersion'' ''$requiredVersion''") -ge 0 ]]
 }
 
+# Whether the Nix that runs the builds waits for a builder to exit,
+# rather than killing it once it closes its log. That needs pidfd_open(),
+# which the kernel or a seccomp filter may not provide.
+canWaitForBuilderExit () {
+  local nixBin=nix features
+  [[ -z "${NIX_DAEMON_PACKAGE:-}" ]] || nixBin="$NIX_DAEMON_PACKAGE/bin/nix"
+  features=$("$nixBin" -v --version | grep '^Features: ') || return 1
+  [[ ", ${features#Features: }, " == *", wait-for-builder-exit, "* ]]
+}
+
 skipTest () {
     echo "$1, skipping this test..." >&2
     exit 77

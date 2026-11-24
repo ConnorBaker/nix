@@ -107,6 +107,22 @@ public:
  * a SIGKILL.
  */
 void killUser(uid_t uid);
+
+/**
+ * Open a descriptor that `poll()` reports readable once the process
+ * `pid` has exited. Opening or polling the descriptor doesn't reap the
+ * process: its status is still for `waitpid()` to collect.
+ *
+ * `pid` must be a process that can't have been reaped, such as an
+ * unreaped child or the caller itself, so that its number can't have
+ * been reused.
+ *
+ * @return The descriptor (a pidfd), or an invalid descriptor if the
+ * system can't provide one: it isn't Linux, the kernel predates
+ * `pidfd_open()` (Linux 5.3), a seccomp filter refuses it, or it
+ * fails for any other reason. Never throws.
+ */
+AutoCloseFD openExitDescriptor(pid_t pid);
 #endif
 
 /**

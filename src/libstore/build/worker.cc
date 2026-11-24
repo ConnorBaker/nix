@@ -193,12 +193,20 @@ size_t Worker::getNrSubstitutions()
 }
 
 void Worker::childStarted(
-    GoalPtr goal, const std::set<MuxablePipePollState::CommChannel> & channels, bool inBuildSlot, bool respectTimeouts)
+    GoalPtr goal,
+    const std::set<MuxablePipePollState::CommChannel> & channels,
+    bool inBuildSlot,
+    bool respectTimeouts,
+    std::optional<Descriptor> exitChannel)
 {
+#ifdef _WIN32
+    assert(!exitChannel);
+#endif
     Child child;
     child.goal = goal;
     child.goal2 = goal.get();
     child.channels = channels;
+    child.exitChannel = exitChannel;
     child.timeStarted = child.lastOutput = steady_time_point::clock::now();
     child.inBuildSlot = inBuildSlot;
     child.respectTimeouts = respectTimeouts;
@@ -378,9 +386,9 @@ void Worker::waitForInput()
 
     /* Process output from the file descriptors attached to the
        children, namely log output and output path creation commands.
-       We also use this to detect child termination: if we get EOF on
-       the logger pipe of a build, we assume that the builder has
-       terminated. */
+       We also use this to detect child termination: EOF on the logger
+       pipe of a build, and, where the platform provides one, the
+       builder's exit channel becoming readable. */
 
     bool useTimeout = false;
     long timeout = 0;
@@ -438,6 +446,10 @@ void Worker::waitForInput()
             state.pollStatus.push_back((struct pollfd) {.fd = j, .events = POLLIN});
             state.fdToPollStatus[j] = state.pollStatus.size() - 1;
         }
+        if (i.exitChannel) {
+            state.pollStatus.push_back((struct pollfd) {.fd = *i.exitChannel, .events = POLLIN});
+            state.fdToPollStatus[*i.exitChannel] = state.pollStatus.size() - 1;
+        }
     }
 
     {
@@ -482,6 +494,14 @@ void Worker::waitForInput()
                 debug("%1%: got EOF", goal->getName());
                 goal->handleEOF(k);
             });
+
+#ifndef _WIN32
+        if (j->exitChannel && state.pollStatus.at(state.fdToPollStatus.at(*j->exitChannel)).revents) {
+            debug("%1%: child process exited", goal->getName());
+            j->exitChannel.reset();
+            goal->handleChildExited();
+        }
+#endif
 
         if (!goal->exitCode && 0 != settings.maxSilentTime && j->respectTimeouts
             && after - j->lastOutput >= std::chrono::seconds(settings.maxSilentTime)) {

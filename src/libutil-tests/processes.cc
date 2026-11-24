@@ -1,5 +1,6 @@
 #include "nix/util/processes.hh"
 #include "nix/util/current-process.hh"
+#include "nix/util/environment-variables.hh"
 #include "nix/util/file-system.hh"
 #include "nix/util/system-error.hh"
 #include "nix/util/signals.hh"
@@ -14,6 +15,7 @@
 #endif
 
 #ifndef _WIN32
+#  include <poll.h>
 #  include <sys/wait.h>
 #endif
 
@@ -257,6 +259,70 @@ TEST(RootSpawnProgram, setuidAndSetgid)
     ASSERT_TRUE(spawned);
     ASSERT_TRUE(statusOk(spawned.wait()));
 }
+
+/* ----------------------------------------------------------------------------
+ * openExitDescriptor
+ * --------------------------------------------------------------------------*/
+
+#  if defined(__linux__) && defined(SYS_pidfd_open)
+static bool pidfdOpenUnavailable()
+{
+    return ::syscall(SYS_pidfd_open, getpid(), 0) == -1 && errno == ENOSYS;
+}
+#  endif
+
+TEST(openExitDescriptor, readableOnceExitedAndDoesNotReap)
+{
+#  if defined(__linux__) && defined(SYS_pidfd_open)
+    if (pidfdOpenUnavailable())
+        GTEST_SKIP() << "pidfd_open() is unavailable";
+#  else
+    GTEST_SKIP() << "no exit descriptor on this platform";
+#  endif
+
+    /* The child exits with 42 once `go` reaches EOF. */
+    Pipe go;
+    go.create();
+    Pid child = startProcess([&] {
+        go.writeSide.close();
+        char c;
+        [[maybe_unused]] auto n = ::read(go.readSide.get(), &c, 1);
+        _exit(42);
+    });
+    go.readSide.close();
+
+    auto exited = openExitDescriptor(child);
+    ASSERT_TRUE(exited);
+
+    struct pollfd pfd = {.fd = exited.get(), .events = POLLIN};
+    ASSERT_EQ(::poll(&pfd, 1, 0), 0) << "readable while the child is still running";
+
+    go.writeSide.close();
+    ASSERT_EQ(::poll(&pfd, 1, 10000), 1) << "not readable after the child exited";
+    ASSERT_TRUE(pfd.revents & POLLIN);
+
+    /* Not reaped: the child's own status is still there to collect. */
+    int status = child.wait();
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 42);
+}
+
+#  if defined(__linux__) && defined(SYS_pidfd_open)
+/* Run by `run-without-new-syscalls`, which makes pidfd_open() fail with
+   ENOSYS and sets `_NIX_TEST_NO_PIDFD_OPEN`, so that this test can't be
+   skipped there. */
+TEST(openExitDescriptor, invalidWithoutPidfdOpen)
+{
+    if (!pidfdOpenUnavailable()) {
+        if (getEnv("_NIX_TEST_NO_PIDFD_OPEN"))
+            FAIL() << "pidfd_open() is available, although it should have been disabled";
+        GTEST_SKIP() << "pidfd_open() is available";
+    }
+    Pid child = startProcess([] { _exit(0); });
+    ASSERT_FALSE(openExitDescriptor(child));
+    ASSERT_TRUE(statusOk(child.wait()));
+}
+#  endif
 
 #endif
 

@@ -44,17 +44,26 @@ void Goal::ChildEvents::pushChildEvent(ChildEOF event)
     childEOF = std::move(event);
 }
 
+void Goal::ChildEvents::pushChildEvent(ChildExited event)
+{
+    if (childTimeout)
+        return; // Already timed out, ignore
+    assert(!childExited);
+    childExited = true;
+}
+
 void Goal::ChildEvents::pushChildEvent(TimedOut event)
 {
     // Timeout is immediate - flush pending events
     childOutputs = {};
     childEOF.reset();
+    childExited = false;
     childTimeout = std::make_unique<TimedOut>(std::move(event));
 }
 
 bool Goal::ChildEvents::hasChildEvent() const
 {
-    return !childOutputs.empty() || childEOF || childTimeout;
+    return !childOutputs.empty() || childEOF || childExited || childTimeout;
 }
 
 Goal::ChildEvent Goal::ChildEvents::popChildEvent()
@@ -66,6 +75,8 @@ Goal::ChildEvent Goal::ChildEvents::popChildEvent()
     }
     if (childEOF)
         return *std::exchange(childEOF, std::nullopt);
+    if (std::exchange(childExited, false))
+        return ChildExited{};
     if (childTimeout)
         return std::exchange(childTimeout, nullptr);
     unreachable();
@@ -199,6 +210,12 @@ void Goal::handleChildOutput(Descriptor fd, std::string_view data)
 void Goal::handleEOF(Descriptor fd)
 {
     childEvents.pushChildEvent(ChildEOF{fd});
+    worker.wakeUp(shared_from_this());
+}
+
+void Goal::handleChildExited()
+{
+    childEvents.pushChildEvent(ChildExited{});
     worker.wakeUp(shared_from_this());
 }
 

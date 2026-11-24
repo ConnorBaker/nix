@@ -124,11 +124,13 @@ mkMesonExecutable (finalAttrs: {
               }
               ''
                 export _NIX_TEST_UNIT_DATA=${./data}
+                export _NIX_TEST_NO_PIDFD_OPEN=1
                 enosys \
                   --syscall openat2 \
                   --syscall fchmodat2 \
                   --syscall close_range \
                   --syscall copy_file_range \
+                  --syscall pidfd_open \
                   -- ${lib.getExe finalAttrs.finalPackage}
                 touch $out
               '';

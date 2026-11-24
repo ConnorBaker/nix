@@ -30,6 +30,7 @@
 #ifdef __linux__
 #  include <sys/prctl.h>
 #  include <sys/mman.h>
+#  include <sys/syscall.h>
 #endif
 
 #include "util-unix-config-private.hh"
@@ -216,6 +217,23 @@ void killUser(uid_t uid)
        no processes left running under `uid', but there is no portable
        way to do so (I think).  The most reliable way may be `ps -eo
        uid | grep -q $uid'. */
+}
+
+AutoCloseFD openExitDescriptor(pid_t pid)
+{
+#if defined(__linux__) && defined(SYS_pidfd_open)
+    /* pidfd_open() sets close-on-exec on the descriptor it returns.
+       It fails with ENOSYS if the kernel predates it, or with EPERM if
+       a seccomp filter (e.g. a container runtime's) refuses syscalls
+       it doesn't know. Callers fall back to not knowing when the
+       process exits, so don't fail on any error (e.g. EMFILE) here. */
+    AutoCloseFD fd = static_cast<Descriptor>(syscall(SYS_pidfd_open, pid, 0));
+    if (!fd)
+        debug("cannot open a pidfd for process %d: %s", pid, std::strerror(errno));
+    return fd;
+#else
+    return {};
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////
