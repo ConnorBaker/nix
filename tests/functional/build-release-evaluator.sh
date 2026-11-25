@@ -7,6 +7,10 @@ source common.sh
 
 [[ $(uname) == Linux ]] || skipTest "reads the client's resident memory from /proc"
 
+# The builder signals through files in $TEST_ROOT, which the NixOS test
+# daemon's sandbox hides from it.
+TODO_NixOS
+
 clearStore
 
 # nix's own messages from a build's stderr, without the collector's log.
