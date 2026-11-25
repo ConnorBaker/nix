@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #ifdef __linux__
 #  include <sys/prctl.h>
+#  include <sys/syscall.h>
 #  include "nix/util/linux-namespaces.hh"
 #endif
 
@@ -134,10 +135,10 @@ bool UnixDerivationBuilderImpl::killChild()
 
 BuilderExit UnixDerivationBuilderImpl::unprepareBuild()
 {
-    /* Since we got an EOF on the logger pipe, the builder is presumed
-       to have terminated.  In fact, the builder could also have
-       simply have closed its end of the pipe, so just to be sure,
-       kill it. */
+    /* We got an EOF on the logger pipe. With `builderExit`, the builder
+       has also exited (but isn't reaped yet), so this only kills what it
+       left behind. Without it, the builder could also have simply closed
+       its end of the pipe, so just to be sure, kill it. */
     int status = pid.kill();
 
     debug("builder process for '%s' finished", store->printStorePath(drvPath));
@@ -397,6 +398,10 @@ std::optional<Descriptor> UnixDerivationBuilderImpl::startBuild()
     startChild();
 
     pid.setSeparatePG(true);
+
+#ifdef SYS_pidfd_open
+    builderExit = static_cast<Descriptor>(::syscall(SYS_pidfd_open, pid_t(pid), 0));
+#endif
 
     processSandboxSetupMessages();
 

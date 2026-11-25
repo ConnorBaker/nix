@@ -30,7 +30,8 @@ void MuxablePipePollState::iterate(
             ssize_t rd = ::read(k, buffer.data(), buffer.size());
             // FIXME: is there a cleaner way to handle pt close
             // than EIO? Is this even standard?
-            if (rd == 0 || (rd == -1 && errno == EIO)) {
+            // EINVAL: a pidfd, readable once its process has exited.
+            if (rd == 0 || (rd == -1 && (errno == EIO || errno == EINVAL))) {
                 handleEOF(k);
                 channels.erase(k);
             } else if (rd == -1) {

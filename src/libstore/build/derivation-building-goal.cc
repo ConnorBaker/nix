@@ -1050,7 +1050,14 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
 
     actLock.reset();
 
-    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, true);
+    /* The build is done once the log is closed and the builder has exited. */
+    std::set<MuxablePipePollState::CommChannel> channels{builder->logChannel()};
+#ifndef _WIN32
+    if (builder->builderExit)
+        channels.insert(builder->builderExit.get());
+#endif
+    auto openChannels = channels.size();
+    worker.childStarted(shared_from_this(), channels, true, true);
 
     started();
 
@@ -1070,6 +1077,8 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
                     (*logFile->sink)(output->data);
             }
         } else if (std::get_if<ChildEOF>(&event)) {
+            if (--openChannels > 0)
+                continue;
             buildLog->flush();
             break;
         } else if (auto * timeout = std::get_if<std::unique_ptr<TimedOut>>(&event)) {

@@ -204,6 +204,7 @@ public:
      */
 #ifndef _WIN32
     AutoCloseFD builderOut;
+    AutoCloseFD builderExit; ///< The builder's pidfd, if `startBuild` could open one.
 #else
     MuxablePipe * builderOut = nullptr;
 #endif
