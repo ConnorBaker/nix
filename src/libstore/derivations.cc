@@ -1,5 +1,5 @@
 #include "nix/store/derivations.hh"
-#include "nix/store/derivation-options.hh"
+#include "nix/store/derivation/options.hh"
 #include "nix/store/derivation/aterm.hh"
 #include "nix/store/derivation/masked.hh"
 #include "nix/store/downstream-placeholder.hh"
@@ -143,8 +143,7 @@ StorePath Store::writeDerivation(const Derivation & drv, RepairFlag repair)
     return path;
 }
 
-// FIXME: remove
-bool isDerivation(std::string_view fileName)
+bool isDerivationFileName(std::string_view fileName)
 {
     return hasSuffix(fileName, drvExtension);
 }
@@ -382,11 +381,11 @@ static void processDerivationOutputPaths(
     bool rpcOutputs = [&] {
         auto * parsed = get(drv.structuredAttrs);
         if constexpr (std::is_same_v<std::decay_t<decltype(drv.inputs)>, std::set<SingleDerivedPath>>)
-            return derivationOptionsFromStructuredAttrs(store, drv.inputs, drv.env, parsed, /*shouldWarn=*/false)
+            return optionsFromStructuredAttrs(store, drv.inputs, drv.env, parsed, /*shouldWarn=*/false)
                        .requiredSystemFeatures.count(std::string{drvFeatureBuilderRpcV0})
                    != 0;
         else
-            return derivationOptionsFromStructuredAttrs(store, drv.env, parsed, /*shouldWarn=*/false)
+            return optionsFromStructuredAttrs(store, drv.env, parsed, /*shouldWarn=*/false)
                        .requiredSystemFeatures.count(std::string{drvFeatureBuilderRpcV0})
                    != 0;
     }();

@@ -28,9 +28,7 @@
 #include "nix/fetchers/input-cache.hh"
 #include "nix/util/current-process.hh"
 
-NIX_INCOMPLETE_SWITCH_BEGIN
-#include "parser-tab.hh"
-NIX_INCOMPLETE_SWITCH_END
+#include "parser/parser.hh"
 
 #include <algorithm>
 #include <cstddef>
@@ -264,7 +262,7 @@ EvalState::EvalState(
     , symbols(StaticEvalSymbols::staticSymbolTable())
     , repair(NoRepair)
     , storeFS(makeMountedSourceAccessor({
-          {CanonPath::root, makeEmptySourceAccessor()},
+          {CanonPath::root, makeEmptyDirectorySourceAccessor()},
           /* In the pure eval case, we can simply require
              valid paths. However, in the *impure* eval
              case this gets in the way of the union
@@ -294,9 +292,14 @@ EvalState::EvalState(
            underlying directory available. This is necessary for
            instance if we're evaluating a file from the physical
            /nix/store while using a chroot store, and also for lazy
-           mounted fetchTree. */
+           mounted fetchTree.
+
+           This is the only place where we should allow ourselves to
+           read arbitrarily within the host file system. Anything else
+           should use `makeFSSourceAccessor` for just what it needs to
+           read. */
         auto accessor = settings.pureEval ? storeFS.cast<SourceAccessor>()
-                                          : makeUnionSourceAccessor({getFSSourceAccessor(), storeFS});
+                                          : makeUnionSourceAccessor({makeFSSourceAccessor("/"), storeFS});
         /* Cache positive lstat/readlink results to speed up resolveSymlinks. */
         accessor = makeCachingSourceAccessor(accessor);
 
@@ -2669,7 +2672,7 @@ BackedStringView EvalState::coerceToString(
 
 StorePath EvalState::copyPathToStore(NixStringContext & context, const SourcePath & path)
 {
-    if (nix::isDerivation(path.path.abs()))
+    if (isDerivationFileName(path.path.abs()))
         error<EvalError>("file names are not allowed to end in '%1%'", drvExtension).debugThrow();
 
     auto dstPath = fetchToStore(
@@ -3282,8 +3285,6 @@ Expr * EvalState::parseExprFromFile(const SourcePath & path)
 Expr * EvalState::parseExprFromFile(const SourcePath & path, const std::shared_ptr<StaticEnv> & staticEnv)
 {
     auto buffer = path.resolveSymlinks().readFile();
-    // readFile hopefully have left some extra space for terminators
-    buffer.append("\0\0", 2);
     return parse(buffer.data(), buffer.size(), Pos::Origin(path), path.parent(), staticEnv);
 }
 
@@ -3294,7 +3295,6 @@ Expr * EvalState::parseExprFromString(
     // into their respective Pos::Origin until the parser stops overwriting its input
     // data.
     auto s = make_ref<std::string>(s_);
-    s_.append("\0\0", 2);
     return parse(s_.data(), s_.size(), Pos::String{.source = s}, basePath, staticEnv);
 }
 
@@ -3313,8 +3313,6 @@ ExprAttrs * EvalState::parseReplBindings(
     std::string s_, std::string errorSource, const SourcePath & basePath, const std::shared_ptr<StaticEnv> & staticEnv)
 {
     auto s = make_ref<std::string>(std::move(errorSource));
-    // flex requires two NUL terminators for yy_scan_buffer
-    s_.append("\0\0", 2);
     return parseReplBindings(s_.data(), s_.size(), Pos::String{.source = s}, basePath, staticEnv);
 }
 
@@ -3325,8 +3323,6 @@ Expr * EvalState::parseStdin()
     // input data.
     // Activity act(*logger, lvlTalkative, "parsing standard input");
     auto buffer = drainFD(0);
-    // drainFD should have left some extra space for terminators
-    buffer.append("\0\0", 2);
     auto s = make_ref<std::string>(buffer);
     return parse(buffer.data(), buffer.size(), Pos::Stdin{.source = s}, rootPath("."), staticBaseEnv);
 }

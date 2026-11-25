@@ -319,7 +319,7 @@ static void import(EvalState & state, Value & vPath, Value * vScope, Value & v)
         if (!state.store->isStorePath(path2))
             return std::nullopt;
         auto storePath = state.store->parseStorePath(path2);
-        if (!(state.store->isValidPath(storePath) && isDerivation(path2)))
+        if (!(state.store->isValidPath(storePath) && storePath.isDerivation()))
             return std::nullopt;
         return storePath;
     };
@@ -1533,7 +1533,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
 
     /* Check whether attributes should be passed as a JSON file. */
     using nlohmann::json;
-    std::optional<StructuredAttrs> jsonObject;
+    std::optional<derivation::StructuredAttrs> jsonObject;
     auto pos = v.determinePos(noPos);
     auto attr = attrs->get(state.s.structuredAttrs);
     if (attr
@@ -1542,7 +1542,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
             pos,
             "while evaluating the `__structuredAttrs` "
             "attribute passed to builtins.derivationStrict"))
-        jsonObject = StructuredAttrs{};
+        jsonObject = derivation::StructuredAttrs{};
 
     /* Check whether null attributes should be ignored. */
     bool ignoreNulls = false;
@@ -1745,7 +1745,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
                     if (i->name == state.s.json) {
                         warnAttr(HintFmt(
                             "setting structured attributes via '__json' is deprecated, and may be disallowed in future versions of Nix. Set '__structuredAttrs = true' instead."));
-                        drv.structuredAttrs = StructuredAttrs::parse(s);
+                        drv.structuredAttrs = derivation::StructuredAttrs::parse(s);
                     } else {
                         drv.env.emplace(key, s);
                         switch (i->name.getId()) {
@@ -1854,7 +1854,7 @@ static void derivationStrictInternal(EvalState & state, std::string_view drvName
         state.error<EvalError>("required attribute 'system' missing").atPos(v).debugThrow();
 
     /* Check whether the derivation name is valid. */
-    if (isDerivation(drvName)
+    if (isDerivationFileName(drvName)
         && !(
             ingestionMethod == ContentAddressMethod::Raw::Text && outputs.size() == 1 && *(outputs.begin()) == "out")) {
         state
