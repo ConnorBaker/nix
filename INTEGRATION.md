@@ -16,7 +16,7 @@ that merge commit's message.
 
 Base `master` commit: `6965392507e19998de706aa15e514f81e9b7ce11`
 
-Merged `master` commit: `96084b82ab08d1de1202d946fd9fa022e44e82db`
+Merged `master` commit: `a347df065adad662ac66a1a1d9e9b3ed426e5979`
 
 ## Merged branches
 
@@ -31,7 +31,7 @@ Merged `master` commit: `96084b82ab08d1de1202d946fd9fa022e44e82db`
 | 7 | `nix-fix/bt-star` | `f7346c2ce116396881e1e4a8ca8005957f7976ae` | `nix store build-trace delete` accepts `<drv>^<output>,<output>` |  |  |
 | 8 | `nix-fix/extbuilder` | `e16c42b44c2dd43548a69818741115ace889dbfc` | Reject invalid submitted output paths; check a fixed output's content-addressing method |  |  |
 | 9 | `nix-fix/u98-storepath` | `20102598ebe4eba95c93ec2c8beb51a92e21074b` | Copy store paths the eval store lacks from the build store; tests that a substituter is tried first, an unsigned copy is refused, and an input-addressed path's closure is copied |  |  |
-| 10 | `nix-fix/append-plugin-files` | `cd3b47cac839676321f3fede51377cbb61e85317` | Make path list and set settings appendable |  |  |
+| 10 | `nix-fix/append-plugin-files` | `cd3b47cac839676321f3fede51377cbb61e85317` | Make path list and set settings appendable; since upstream a098d2f678 (in the merged `master` a347df065a) upstream declares these specialisations itself, so the branch's declarations of them are superseded (see the merge of that `master` below) |  |  |
 | 11 | `nix-fix/kv-newline` | `002134995e1eb0b98f8b64ca2d7f986860d02ee4` | Write the `builders` setting on one line; report a setting value with a newline instead of asserting | Fixes a regression from NixOS/nix#16659 |  |
 | 12 | `nix-fix/findfile-restricted` | `2e5224e855da3a223299ace73a1fba8aa7143171` | Check `findFile` URLs before downloading; restrict `flake:` lookup path entries from Nix code |  |  |
 | 13 | `integ/eval-store` | `6b7a52a4d932507c64002568114eb138cbbd59ce` | Separate evaluation store: `eval-store` setting; read derivations from it; build from it (repl, bundle, flake check, build hook) | Build hook part fixes NixOS/nix#13179 | `nix-fix/u98-storepath` |
@@ -49,6 +49,9 @@ Merged `master` commit: `96084b82ab08d1de1202d946fd9fa022e44e82db`
 | 25 | `nix-fix/build-remote-substitutes` | `de424e280b47900ae2458d9cb7682cfa89acb61c` | Test only: with `builders-use-substitutes` a machine substitutes a build's inputs from its own substituters, over ssh:// and ssh-ng://, whether or not its daemon trusts the machine's user; an upload of the input is made to fail, so substitution is what passes |  |  |
 | 26 | `nix-fix/client-store-setting` | `4cf9353caeedce82d6fa666c6583951da786f611` | A client does not send its `store` setting to the daemon, whose build hook otherwise opened it and, with `--store daemon`, waited forever for the output lock its own build held; test `build-remote-store-setting.sh` |  |  |
 | 27 | `nix-fix/client-store-setting` | `121bf01f5c54b4f2ff678b6a34c74af10e433eb2` | The branch's next commit (its parent is 4cf9353cae, merged as row 26; in this branch's history it is merged after the merge of upstream `master` 96084b82ab): the daemon ignores a `store` setting sent by any client (older clients still send it), as it ignores a client's experimental features; the test speaks the protocol as such a client |  |  |
+| 28 | `nix-fix/release-evaluator` | `77253d340c5cc13927962fd932fa67e224ed4f8e` | The branch's next commit (its parent is 636063591c, merged as row 24): `build-release-evaluator.sh` is skipped on NixOS (`TODO_NixOS`), where its `clearStore` aborts and the test daemon's sandbox hides the `$TEST_ROOT` files its builder signals through |  |  |
+| 29 | `nix-fix/builddrv-repair` | `82ce79f89f3fd780a4ee5342d986083fd56986fd` | The branch's next commit (its parent is 8c7aa713d4, merged as row 3): its `daemon.cc` test names gtest's matchers `::testing::…`, since a test including `nix/util/tests/gmock-matchers.hh` (which declares `nix::testing`) ahead of it in libstore-tests' unity translation unit, as upstream's `buildenv.cc` does from a347df065a, makes `testing::` name that namespace |  |  |
+| 30 | `builder-exit-ends-build` | `f840f97c988c079e307afee8190d1f7f052fa2ed` | Wait for the builder to exit instead of killing it when its log reaches EOF (a builder that closes stdout/stderr and then exits, e.g. a script ending in a coreutils program, no longer fails with signal 9); Linux only, through a pidfd the worker polls with the log (`ChildExited`); without `pidfd_open()` the build still ends at log EOF; `nix -v --version` lists `wait-for-builder-exit`; tests `builder-exit.sh`, `external-builders.sh` (an external builder that closes its output and keeps working), `timeout.sh` (`closeLog` now times out under `--max-silent-time`), `nix-functional-tests-run-without-pidfd` (`builder-exit.sh`, `external-builders.sh` and `timeout.sh` without `pidfd_open()`), `openExitDescriptor` unit tests; release note `builder-exit.md`. Based on upstream `master` a347df065a, hence the merge of that `master` before it | Upstream issue 2176 of NixOS/nix (open); PR not yet opened |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -99,6 +102,36 @@ Resolutions, each described in its merge commit's message:
   add;
 - merge 27 (client-store-setting at 121bf01f5c): no conflict; its change is
   exactly the branch's commit since merge 26.
+- merge 28 (release-evaluator at 77253d340c): no conflict; its change is
+  exactly the branch's commit since merge 24.
+- merge 29 (builddrv-repair at 82ce79f89f): no conflict; its change is
+  exactly the branch's commit since merge 3.
+- "Merge upstream master a347df065a" (after merge 29): one conflict, in `src/libutil/include/nix/util/config-impl.hh`,
+  with merge 10 (append-plugin-files): upstream now declares the appendable
+  settings, the list and set of filesystem paths among them, with
+  `NIX_DECLARE_APPENDABLE_SETTING`, covering what the branch declared by
+  hand; both hunks take upstream's side, and the branch's
+  `NIX_DECLARE_CONFIG_SERIALISER(std::list<std::filesystem::path>)` stays.
+  Upstream renamed `isDerivation` (file names) to `isDerivationFileName`,
+  `derivationOptionsFromStructuredAttrs` to
+  `derivation::optionsFromStructuredAttrs`, moved `derivation-options.hh`
+  and `parsed-derivations.hh` under `derivation/`, and removed
+  `getFSSourceAccessor`; no line a merged branch adds uses an old name.
+  Of the 16 files both upstream and the merged branches changed, the other
+  hunks within 40 lines of each other are in `src/libstore-tests/meson.build`,
+  `src/libstore/misc.cc`, `src/libexpr/primops.cc`,
+  `src/libexpr/primops/context.cc`, `src/libstore/derivations.cc`,
+  `derivation-builder.hh` and `src/libcmd/installables.cc`, all renames or
+  include paths on upstream's side, which git merged by itself;
+- merge 30 (builder-exit-ends-build): conflicts in
+  `src/libstore/build/derivation-building-goal.cc` with merge 15
+  (external-builders), whose `childStarted` call passes
+  `!localBuildCap.externalBuilder` for `respectTimeouts`: both kept, with
+  this branch's `exitChannel`, and this branch's comment that
+  `max-silent-time` and `timeout` keep applying while the worker waits
+  now says that an external builder applies them itself; and in
+  `tests/functional/meson.build` with merge 2's `build-child.sh`: both
+  kept, in name order.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
@@ -130,7 +163,7 @@ The `integ/*` branches hold this fork's own commits that are not (yet) a
 `nix-fix/*` branch of their own.
 
 Integration-only commits (adaptations that belong to no source branch): one,
-between merge 26 and the merge of `master`, "tests/functional/dyn-drv: build three-layer paths over the
+between merge 26 and the merge of `master` 96084b82ab, "tests/functional/dyn-drv: build three-layer paths over the
 daemon too": it replaces the local-store-only guard of two of merge 18's tests,
 which need merge 19 to run over the daemon. The daemon must also have merge
 18's fix (2.35.6 fails them), hence `requireDaemonNewerThan "2.36pre"`. Risk:
@@ -151,6 +184,16 @@ this file and `maintainers/integration-status.sh`.
 
 ## Known state
 
+- Merge 30 and external builders: the worker does not apply `timeout` or
+  `max-silent-time` to an external builder (merge 15). An external builder
+  that closes its output and keeps running is now waited for rather than
+  killed, so only its own timeouts bound it (`external-builders.sh`
+  tests the wait). That test's `--timeout 120` therefore doesn't bound
+  its builder here: a regression that never ends such a build would hang
+  the functional tests rather than fail them. Merge 2's build child server
+  forks Linux builders with `CLONE_PARENT`, so the builder stays this
+  process's unreaped child, which the pidfd requires.
+
 - Rows 24 and 25 are ports onto this base of their reviewed commits, which
   were made on a candidate with a newer `master`: `nix-fix/release-evaluator`
   636063591c of 84018b2acf (the same added and removed lines; only the
@@ -170,7 +213,9 @@ this file and `maintainers/integration-status.sh`.
 - Rows 26 and 27 merge the same branch, `nix-fix/client-store-setting`, at
   4cf9353cae and at its next commit 121bf01f5c, the branch's tip;
   `integration-status.sh` compares only the newer merge with the branch's
-  tips and reports a tip still at 4cf9353cae as OLDER.
+  tips and reports a tip still at 4cf9353cae as OLDER. Rows 24 and 28
+  (`nix-fix/release-evaluator`) and rows 3 and 29
+  (`nix-fix/builddrv-repair`) are the same kind of pair.
 - Every merged branch exists in this fork, and this branch merges its tip:
   the branches are what integration is made of, and each is the source of
   its upstream PR.
