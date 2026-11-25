@@ -243,6 +243,12 @@ public:
      */
 #ifndef _WIN32
     AutoCloseFD builderOut;
+
+    /**
+     * Readable once the builder process has exited (see
+     * `openExitDescriptor`), or invalid if the system can't tell us.
+     */
+    AutoCloseFD builderExit;
 #else
     MuxablePipe * builderOut = nullptr;
 #endif
@@ -257,6 +263,24 @@ public:
 #else
         return builderOut;
 #endif
+    }
+
+    /**
+     * What the worker should wait on for the builder process's exit,
+     * if this platform can wait for it; set by `startBuild`.
+     *
+     * The build ends once the builder has exited *and* its log has
+     * reached EOF. Without this, the build ends at the log's EOF
+     * alone, and `unprepareBuild` kills the builder if it is still
+     * running then.
+     */
+    std::optional<Descriptor> exitChannel()
+    {
+#ifndef _WIN32
+        if (builderExit)
+            return builderExit.get();
+#endif
+        return std::nullopt;
     }
 
     /**

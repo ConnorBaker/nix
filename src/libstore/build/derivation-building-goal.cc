@@ -1070,11 +1070,25 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
 
     /* An external builder gets the build's timeouts in build.json and
        enforces them itself, as a remote builder does. */
-    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, !localBuildCap.externalBuilder);
+    auto exitChannel = builder->exitChannel();
+    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, !localBuildCap.externalBuilder, exitChannel);
 
     started();
 
     uint64_t logSize = 0;
+
+    /* The build is over once the builder has closed its log (and so
+       has everything it left running) and the builder process itself
+       has exited. A builder can close its log and keep working, or
+       exit after closing its log (e.g. coreutils, which closes stdout
+       and stderr at exit), so the log's EOF alone doesn't mean it is
+       done. If we can't wait for the builder's exit, only the log's
+       EOF counts, and `unprepareBuild` kills the builder if it is
+       still running. Either way, `max-silent-time` and `timeout`
+       keep applying, here for a local builder and in the builder
+       itself for an external one (see above). */
+    bool logClosed = false;
+    bool builderExited = !exitChannel;
 
     while (true) {
         auto event = co_await WaitForChildEvent{};
@@ -1091,7 +1105,13 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
             }
         } else if (std::get_if<ChildEOF>(&event)) {
             buildLog->flush();
-            break;
+            logClosed = true;
+            if (builderExited)
+                break;
+        } else if (std::get_if<ChildExited>(&event)) {
+            builderExited = true;
+            if (logClosed)
+                break;
         } else if (auto * timeout = std::get_if<std::unique_ptr<TimedOut>>(&event)) {
             builder->killChild();
             co_return std::move(**timeout);

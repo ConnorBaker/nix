@@ -144,6 +144,7 @@ bool UnixDerivationBuilderImpl::killChild()
         killSandbox(true);
 
         pid.wait();
+        builderExit.close();
 
         miscMethods->childTerminated();
     }
@@ -152,11 +153,14 @@ bool UnixDerivationBuilderImpl::killChild()
 
 BuilderExit UnixDerivationBuilderImpl::unprepareBuild()
 {
-    /* Since we got an EOF on the logger pipe, the builder is presumed
-       to have terminated.  In fact, the builder could also have
-       simply have closed its end of the pipe, so just to be sure,
-       kill it. */
+    /* The builder's log has reached EOF. If we have `builderExit`,
+       the builder has also exited, and is not yet reaped, so this
+       collects its own exit status; the signal then reaches only what
+       it left behind in its process group. Without `builderExit`, the
+       builder may only have closed its end of the log while still
+       running, so it is killed. */
     int status = pid.kill();
+    builderExit.close();
 
     debug("builder process for '%s' finished", store->printStorePath(drvPath));
 
@@ -415,6 +419,8 @@ std::optional<Descriptor> UnixDerivationBuilderImpl::startBuild()
     startChild();
 
     pid.setSeparatePG(true);
+
+    builderExit = openExitDescriptor(pid);
 
     processSandboxSetupMessages();
 

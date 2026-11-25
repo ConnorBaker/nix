@@ -77,6 +77,7 @@ suites = [
       'build-remote-with-mounted-ssh-ng.sh',
       'build.sh',
       'build-child.sh',
+      'builder-exit.sh',
       'ca-old-daemon.sh',
       'characterisation-test-infra.sh',
       'check-refs.sh',

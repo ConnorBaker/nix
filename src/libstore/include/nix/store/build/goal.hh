@@ -96,7 +96,19 @@ public:
         Descriptor fd;
     };
 
-    using ChildEvent = std::variant<ChildOutput, ChildEOF, std::unique_ptr<TimedOut>>;
+    /**
+     * The child process has exited; see `Worker::childStarted`'s
+     * `exitChannel`.
+     *
+     * This is not a `ChildEOF`: a builder's exit and its log's EOF
+     * usually arrive in the same poll round, and a goal gets at most
+     * one `ChildEOF` (the remote build path's `builderOut` can't reach
+     * EOF while the hook runs, since we hold its write side).
+     */
+    struct ChildExited
+    {};
+
+    using ChildEvent = std::variant<ChildOutput, ChildEOF, ChildExited, std::unique_ptr<TimedOut>>;
 
 private:
     class ChildEvents
@@ -105,15 +117,18 @@ private:
          * Structured queue of child events:
          * - outputs: stream of data from child
          * - eof: optional end-of-stream marker
+         * - exited: whether the child process has exited
          * - timeout: optional timeout that flushes/overrides other events
          */
         std::queue<ChildOutput> childOutputs;
         std::optional<ChildEOF> childEOF;
+        bool childExited = false;
         std::unique_ptr<TimedOut> childTimeout;
 
     public:
         void pushChildEvent(ChildOutput event);
         void pushChildEvent(ChildEOF event);
+        void pushChildEvent(ChildExited event);
         void pushChildEvent(TimedOut event);
         bool hasChildEvent() const;
         ChildEvent popChildEvent();
@@ -632,6 +647,12 @@ public:
      * Stores the event and resumes the coroutine.
      */
     void handleEOF(Descriptor fd);
+
+    /**
+     * Called by the worker when the child process has exited.
+     * Stores the event and resumes the coroutine.
+     */
+    void handleChildExited();
 
     /**
      * Called by the worker when a build times out.

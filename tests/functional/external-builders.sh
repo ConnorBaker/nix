@@ -52,3 +52,42 @@ nix build -L --file "$expr" --out-link "$TEST_ROOT/result" \
   --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"args\": [\"bla\"], \"program\": \"$external_builder\"}]"
 
 [[ $(cat "$TEST_ROOT/result") = foobar ]]
+
+# An external builder that closes its output and keeps working is waited
+# for, like any other builder (see builder-exit.sh).
+expr="$TEST_ROOT/closes-output.nix"
+cat > "$expr" <<EOF
+with import ${config_nix};
+mkDerivation {
+  name = "external-closes-output";
+  system = "x68_46-xunil";
+  buildCommand = "";
+}
+EOF
+
+external_builder="$TEST_ROOT/external-builder-closes-output.sh"
+cat > "$external_builder" <<EOF
+#! $SHELL -e
+
+PATH=${PATH@Q}
+
+out="\$(jq -r .env.out < "\$1")"
+
+printf "\2\n"
+exec >&- 2>&-
+sleep 1
+printf foo > \$out
+EOF
+chmod +x "$external_builder"
+
+buildClosesOutput() {
+  nix build -L --file "$expr" --no-link --print-out-paths --timeout 120 \
+    --extra-experimental-features external-builders \
+    --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"args\": [], \"program\": \"$external_builder\"}]"
+}
+
+if canWaitForBuilderExit; then
+  [[ $(cat "$(buildClosesOutput)") = foo ]]
+else
+  expectStderr 1 buildClosesOutput | grepQuiet "builder failed due to signal"
+fi

@@ -105,6 +105,26 @@ mkMesonDerivation (
       platforms = lib.platforms.unix;
     };
 
+    passthru.tests = lib.optionalAttrs stdenv.hostPlatform.isLinux {
+      # Run the tests whose expectations depend on waiting for a builder's
+      # exit with pidfd_open() disabled via seccomp, as on Linux before
+      # 5.3, to exercise the fallback of killing the builder at log EOF.
+      run-without-pidfd = finalAttrs.finalPackage.overrideAttrs (prevAttrs: {
+        pname = "${prevAttrs.pname}-run-without-pidfd";
+        checkPhase = ''
+          runHook preCheck
+          # (Its own HOME, so that resolving the store leaves nothing
+          # behind in the one the tests will use.)
+          if HOME=$(mktemp -d) enosys --syscall pidfd_open -- nix -v --version | grep '^Features: .*wait-for-builder-exit'; then
+            echo "pidfd_open() is still available under enosys" >&2
+            exit 1
+          fi
+          enosys --syscall pidfd_open -- meson test --no-rebuild --print-errorlogs builder-exit external-builders timeout
+          runHook postCheck
+        '';
+      });
+    };
+
   }
   // lib.optionalAttrs (test-daemon != null) {
     # TODO rename to _NIX_TEST_DAEMON_PACKAGE

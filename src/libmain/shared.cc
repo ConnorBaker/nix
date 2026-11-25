@@ -12,6 +12,7 @@
 #include "nix/util/util.hh"
 #include "nix/util/terminal.hh"
 #include "nix/util/system-error.hh"
+#include "nix/util/processes.hh"
 
 #include <algorithm>
 #include <iostream>
@@ -365,6 +366,14 @@ void printVersion(const std::string & programName)
         cfg.push_back("gc");
 #endif
         cfg.push_back("signed-caches");
+#ifndef _WIN32
+        /* Whether local builds wait for the builder to exit, rather than
+           killing it when it closes its log (see `exitChannel` in
+           `DerivationBuilder`). This can depend on the kernel and on
+           seccomp filters, so ask the system the same way builds do. */
+        if (openExitDescriptor(getpid()))
+            cfg.push_back("wait-for-builder-exit");
+#endif
         std::cout << "System type: " << settings.thisSystem << "\n";
         std::cout << "Additional system types: " << concatStringsSep(", ", settings.extraPlatforms.get()) << "\n";
         std::cout << "Features: " << concatStringsSep(", ", cfg) << "\n";

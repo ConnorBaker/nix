@@ -15,6 +15,14 @@ expectStderr 1 nix-build -Q timeout.nix -A infiniteLoop --max-build-log-size 100
 
 expectStderr 101 nix-build timeout.nix -A silent --max-silent-time 2 | grepQuiet "timed out after 2 seconds"
 
-expectStderr 100 nix-build timeout.nix -A closeLog | grepQuiet "builder failed due to signal"
+# (`--timeout 120` turns a regression that makes Nix wait for this builder
+# forever into a failure.)
+if canWaitForBuilderExit; then
+    # Closing the log doesn't end the build, so a builder that closes it
+    # and keeps running is subject to the timeouts like any other.
+    expectStderr 101 nix-build timeout.nix -A closeLog --max-silent-time 2 --timeout 120 | grepQuiet "timed out after 2 seconds"
+else
+    expectStderr 100 nix-build timeout.nix -A closeLog --timeout 120 | grepQuiet "builder failed due to signal"
+fi
 
 expectStderr 1 nix build -f timeout.nix silent --max-silent-time 2 | grepQuiet "timed out after 2 seconds"

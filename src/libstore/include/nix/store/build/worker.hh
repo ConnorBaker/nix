@@ -55,6 +55,11 @@ struct Child
     WeakGoalPtr goal;
     Goal * goal2; // ugly hackery
     std::set<MuxablePipePollState::CommChannel> channels;
+    /**
+     * A descriptor that becomes readable when the child process
+     * exits; see `Worker::childStarted`.
+     */
+    std::optional<Descriptor> exitChannel;
     bool respectTimeouts;
     bool inBuildSlot;
     /**
@@ -355,12 +360,18 @@ public:
     /**
      * Registers a running child process.  `inBuildSlot` means that
      * the process counts towards the jobs limit.
+     *
+     * The goal gets a `Goal::ChildEOF` for each of `channels` when it
+     * reaches end of file, and a `Goal::ChildExited` when `exitChannel`
+     * (Unix only) becomes readable, i.e. the process has exited. The
+     * worker never reads from `exitChannel`.
      */
     void childStarted(
         GoalPtr goal,
         const std::set<MuxablePipePollState::CommChannel> & channels,
         bool inBuildSlot,
-        bool respectTimeouts);
+        bool respectTimeouts,
+        std::optional<Descriptor> exitChannel = std::nullopt);
 
     /**
      * Unregisters a running child process.
