@@ -92,7 +92,7 @@ TEST(DaemonConnection, untrustedBuildDerivationRepairIsRefused)
     ASSERT_TRUE(ex);
     EXPECT_THAT(
         [&] { std::rethrow_exception(ex); },
-        testing::ThrowsMessage<Error>(testing::HasSubstr("repairing is not allowed")));
+        ::testing::ThrowsMessage<Error>(::testing::HasSubstr("repairing is not allowed")));
 }
 
 TEST(DaemonConnection, trustedBuildDerivationRepairIsAllowed)
