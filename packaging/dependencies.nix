@@ -13,6 +13,35 @@ in
 scope: {
   inherit stdenv;
 
+  # mimalloc must not advise its arenas to use transparent huge pages. It
+  # calls madvise(MADV_HUGEPAGE) on each arena it reserves, 1 GiB at first.
+  # Where transparent_hugepage/defrag is `madvise` (the kernel's default), a
+  # page fault in such an arena that finds no free 2 MiB block compacts and
+  # reclaims memory synchronously, and where free memory is fragmented the
+  # compaction mostly fails and the fault falls back to small pages after the
+  # stall. Each of the daemon's workers is forked from it and touches a few
+  # tens of MiB of the arena it inherits.
+  #
+  # The C define MI_NO_THP removes only that madvise call. allow_thp keeps its
+  # default, so where transparent huge pages are `always` the kernel can still
+  # back the arenas with them, and mimalloc still purges in 2 MiB units so as
+  # not to split them. The CMake option of the same name sets no such define;
+  # it selects allow_thp=0 instead, which calls prctl(PR_SET_THP_DISABLE), and
+  # every process the daemon starts, builds included, would inherit that
+  # across execve. The NixOS test mimalloc-thp-advice fails if mimalloc
+  # advises again or disables them.
+  #
+  # Nix's BumpMemoryResource still asks for huge pages for the evaluator's
+  # memory, and its page faults face the same stalls where they cannot be had.
+  mimalloc = pkgs.mimalloc.overrideAttrs (attrs: {
+    env = attrs.env or { } // {
+      NIX_CFLAGS_COMPILE = toString [
+        (attrs.env.NIX_CFLAGS_COMPILE or "")
+        "-DMI_NO_THP"
+      ];
+    };
+  });
+
   boehmgc =
     (pkgs.boehmgc.override {
       enableLargeConfig = true;
