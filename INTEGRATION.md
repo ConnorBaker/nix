@@ -52,6 +52,7 @@ Merged `master` commit: `a347df065adad662ac66a1a1d9e9b3ed426e5979`
 | 28 | `nix-fix/release-evaluator` | `77253d340c5cc13927962fd932fa67e224ed4f8e` | The branch's next commit (its parent is 636063591c, merged as row 24): `build-release-evaluator.sh` is skipped on NixOS (`TODO_NixOS`), where its `clearStore` aborts and the test daemon's sandbox hides the `$TEST_ROOT` files its builder signals through |  |  |
 | 29 | `nix-fix/builddrv-repair` | `82ce79f89f3fd780a4ee5342d986083fd56986fd` | The branch's next commit (its parent is 8c7aa713d4, merged as row 3): its `daemon.cc` test names gtest's matchers `::testing::…`, since a test including `nix/util/tests/gmock-matchers.hh` (which declares `nix::testing`) ahead of it in libstore-tests' unity translation unit, as upstream's `buildenv.cc` does from a347df065a, makes `testing::` name that namespace |  |  |
 | 30 | `builder-exit-ends-build` | `f840f97c988c079e307afee8190d1f7f052fa2ed` | Wait for the builder to exit instead of killing it when its log reaches EOF (a builder that closes stdout/stderr and then exits, e.g. a script ending in a coreutils program, no longer fails with signal 9); Linux only, through a pidfd the worker polls with the log (`ChildExited`); without `pidfd_open()` the build still ends at log EOF; `nix -v --version` lists `wait-for-builder-exit`; tests `builder-exit.sh`, `external-builders.sh` (an external builder that closes its output and keeps working), `timeout.sh` (`closeLog` now times out under `--max-silent-time`), `nix-functional-tests-run-without-pidfd` (`builder-exit.sh`, `external-builders.sh` and `timeout.sh` without `pidfd_open()`), `openExitDescriptor` unit tests; release note `builder-exit.md`. Based on upstream `master` a347df065a, hence the merge of that `master` before it | Upstream issue 2176 of NixOS/nix (open); PR not yet opened |  |
+| 31 | `nix-fix/mimalloc-thp-advice` | `36b7c88f026378ac0f0dfdf494b218be8c5cfbbe` | Build mimalloc with the C define `MI_NO_THP`, so it no longer advises its arenas with `madvise(MADV_HUGEPAGE)`, whose page faults compact and reclaim memory synchronously where `transparent_hugepage/defrag` is `madvise`; `allow_thp` keeps its default, so no `prctl(PR_SET_THP_DISABLE)` reaches the processes Nix starts; NixOS test `mimalloc-thp-advice` (a guest with `transparent_hugepage=madvise`) |  |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -132,6 +133,8 @@ Resolutions, each described in its merge commit's message:
   now says that an external builder applies them itself; and in
   `tests/functional/meson.build` with merge 2's `build-child.sh`: both
   kept, in name order.
+- merge 31 (mimalloc-thp-advice): no conflict; nothing merged since
+  6bc0ca807c touches `packaging/dependencies.nix` or `tests/nixos`.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
