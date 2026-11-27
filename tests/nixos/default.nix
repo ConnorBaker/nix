@@ -202,6 +202,8 @@ in
 
   cgroups = runNixOSTest ./cgroups;
 
+  mimalloc-thp-advice = runNixOSTest ./mimalloc-thp-advice;
+
   fetchurl = runNixOSTest ./fetchurl.nix;
 
   fetchersSubstitute = runNixOSTest ./fetchers-substitute.nix;
