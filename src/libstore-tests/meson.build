@@ -68,6 +68,7 @@ sources = files(
   'path-info.cc',
   'path.cc',
   'pathlocks.cc',
+  'query-missing-realisations.cc',
   'query-missing.cc',
   'realisation.cc',
   'references.cc',
