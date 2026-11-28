@@ -1089,12 +1089,39 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
 
     actLock.reset();
 
-    /* An external builder gets the build's timeouts in build.json and
-       enforces them itself, as a remote builder does. */
-    auto exitChannel = builder->exitChannel();
-    worker.childStarted(shared_from_this(), {builder->logChannel()}, true, !localBuildCap.externalBuilder, exitChannel);
+    /* The builder may still be setting up its environment (e.g. the
+       sandbox). Wait for that like for its output, so that other goals
+       can run meanwhile, and apply timeouts only once it is done. Its
+       exit is waited for from then on too: until the setup is done,
+       only its output says how the setup went.
 
-    started();
+       An external builder gets the build's timeouts in build.json and
+       enforces them itself, as a remote builder does. */
+    bool settingUp = !builder->processSetupOutput("");
+    auto exitChannel = builder->exitChannel();
+    auto registerChild = [&]() {
+        worker.childStarted(
+            shared_from_this(),
+            {builder->logChannel()},
+            true,
+            !settingUp && !localBuildCap.externalBuilder,
+            settingUp ? std::nullopt : exitChannel);
+    };
+    registerChild();
+    if (!settingUp)
+        started();
+
+    /* Returns the build log output that follows the end of the setup. */
+    auto processSetupOutput = [&](std::optional<std::string_view> data) {
+        auto rest = builder->processSetupOutput(data);
+        if (rest) {
+            settingUp = false;
+            worker.childTerminated(this);
+            registerChild();
+            started();
+        }
+        return rest;
+    };
 
     uint64_t logSize = 0;
 
@@ -1115,16 +1142,22 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
         auto event = co_await WaitForChildEvent{};
         if (auto * output = std::get_if<ChildOutput>(&event)) {
             if (output->fd == builder->logDescriptor()) {
-                logSize += output->data.size();
+                std::optional<std::string> rest;
+                if (settingUp && !(rest = processSetupOutput(output->data)))
+                    continue;
+                std::string_view data = rest ? *rest : output->data;
+                logSize += data.size();
                 if (worker.settings.maxLogSize && logSize > worker.settings.maxLogSize) {
                     builder->killChild();
                     co_return logLimitExceeded();
                 }
-                (*buildLog)(output->data);
+                (*buildLog)(data);
                 if (logFile->sink)
-                    (*logFile->sink)(output->data);
+                    (*logFile->sink)(data);
             }
         } else if (std::get_if<ChildEOF>(&event)) {
+            if (settingUp)
+                processSetupOutput(std::nullopt);
             buildLog->flush();
             logClosed = true;
             if (builderExited)
