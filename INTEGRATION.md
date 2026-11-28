@@ -60,6 +60,9 @@ Merged `master` commit: `6fa1defb4d5869a3e8c8a1ad8e25b0cab59f596d`
 | 36 | `nix-fix/builder-setup-in-worker-loop` | `f015f7b15f4331cd374c15cf1dbf49e12e279995` | The worker no longer blocks while a builder sets up its environment (e.g. the sandbox): `startBuild` returns at once and the build goal passes the builder's output to `processSetupOutput` until the `\2` line, so other goals run meanwhile; the build gets its timeouts and is shown as started only once the setup is done, and a failed sandbox helper's error is read from the builder's output. Tests in `external-builders.sh`: two builders that each finish starting only when the other has started, a builder that cannot be started, a setup error longer than one read, a builder that exits before `\2`. On upstream `master` 6fa1defb4d |  |  |
 | 37 | `nix-fix/fork-safety` | `48c26b6fbf2431d40cb9f30673ff3c57938cd818` | The branch's next two commits (their parent is ca173f4d61, merged as row 2): `spawnBuildChild` checks for an interrupt once the callback that ends its wait for the build child server's reply is registered, where an interrupt taken between the request and the registration was lost (a fault in the test's shim puts one there); and `build-child-faults.sh` loses its `timeout`s and poll counts, starts nix-build through `setpriv --pdeathsig KILL`, so that a Nix that hangs dies with the test's shell, and requires an interrupted Nix to exit with status 1 |  |  |
 | 38 | `nix-fix/build-hook-handshake` | `70390d8cbe857f8c76e00ca047d72fcf2c95239f` | Nix no longer waits, on the one thread that runs every goal, while a build hook connects to its machine: `nix __build-remote` writes the log message `@nix {"action":"connecting"}` once it holds a build slot and before it connects; on that message the goal takes the hook from the worker, which starts the next goal's hook, and waits for the rest of the answer as child events (`tryBuildHook` is a coroutine and hands the hook, the machine's name and what it read past the name to `buildWithHook` in an `AcceptedHook`). A hook that then cannot connect goes back to the worker, so the next goal asks a hook that knows the machine. The hook does not say it when a machine it may connect to for the derivation is an ssh one (`ssh://`, `ssh-ng://`, `mounted-ssh-ng://`, a bare host name), because sshd refuses connections while too many are unauthenticated (`MaxStartups`): for such machines, and for a hook that never says it (an older or a custom one), the goal blocks up to the answer and the machine's name as before. A goal of an older Nix ignores the message. And: a goal whose hook has finished a build on another machine, or whose accepted hook is destroyed, wakes one of the goals that wait for a while (the first in the set's order), so a goal the hook postponed asks again when a slot frees up and not only after `build-poll-interval`. Test `build-hook-waiting.sh`. On upstream `master` 6fa1defb4d | Upstream issue 3651 of NixOS/nix (closed as stale; its reporter's machine is an ssh one, a kind this change leaves as it was); no pull request |  |
+| 39 | `nix-fix/filename-literal-ubsan` | `f3882b79f68ef76d399db95517d0a9f37cd67dcb` | With GCC and `-fsanitize=undefined`, `nix-util-tests` did not compile: the check of a `"..."_filename` literal looked for `/` and NUL with `std::string_view::contains`, which tests a pointer against null, and for a literal that has one of them GCC does not take that test as a constant expression there, so the two `static_assert`s of `src/libutil-tests/filename.cc` on such literals were errors. At compile time the check now looks for the character with a loop; at run time nothing changes. The VM test of row 2, `tests/nixos/spawn-program-root.nix`, builds those unit tests with ASan and UBSan and needs this |  |  |
+| 40 | `nix-fix/build-hook-handshake` | `6142a7ee6fe2112ffcb9f49166fb4358189b36dc` | The branch's next commit (its parent is 70390d8cbe, merged as row 38), test only: `build-hook-waiting.sh` gives its case of a machine that cannot be connected to a second such machine, so that a hook says twice that it is connecting and the goal that holds it has to ignore the second time; and it checks that a goal waiting for its hook holds no build slot by counting the goals that wait for one, as merge 38 already made it do here |  |  |
+| 41 | `nix-fix/builder-setup-in-worker-loop` | `ec4ef44fe6054bf0fd8c70f76dd7a2611f75d493` | The branch's next commit (its parent is f015f7b15f, merged as row 36), test only: `timeout.sh` holds a stock builder in its setup (a `builtin:fetchurl` whose build child reads a FIFO as `netrc-file`) until Nix has reported that another build was timed out by `max-silent-time`, and requires that it then still gets through its setup: the timeouts do not apply to a stock builder that is still setting up. On this branch an external builder gets no worker timeouts at any time (merge 15), so the first sentence of the commit's message is true here of a stock builder only |  |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -274,11 +277,13 @@ Resolutions, each described in its merge commit's message:
   `canBuildLocally`'s declaration stays, the branch's declaration of
   `tryBuildHook` follows it; and in `tests/functional/meson.build`,
   adjacent entries of the list, all kept. Outside the test's two files
-  the merge adds and removes the 169 lines of the branch's earlier trial
-  merge on integration 78e3105524; the conflict with merge 35 is new
-  since then. The merge's message lists what git merged by itself next
-  to other merges' changes; `buildWithHook` is changed by this branch
-  only, `buildLocally` by merges 15, 30, 35 and 36 only.
+  the merge adds and removes the same 169 lines as an earlier trial of
+  the branch on integration 78e3105524, which is not a merge although
+  the merge's message calls it one: the branch's two commits replayed
+  there. The conflict with merge 35 is new since then. The merge's
+  message lists what git merged by itself next to other merges'
+  changes; `buildWithHook` is changed by this branch only,
+  `buildLocally` by merges 4, 15, 30, 35 and 36 only.
   What the merges mean for each other, by the branch's notes. Merge 35:
   a goal that waits for a connecting hook holds the output locks it took
   at the start of that round of `tryHookLoop`, as it did through the
@@ -320,16 +325,54 @@ Resolutions, each described in its merge commit's message:
   accepted; by the branch's mutants a Nix that ignores the hook's
   message fails an earlier case of the test, on this tree too. The
   test's other lines are the branch's.
+- merge 39 (filename-literal-ubsan): no conflict. The branch's one
+  commit changes `src/libutil/include/nix/util/filename.hh`, a file
+  that came with the merge of `master` 6fa1defb4d and that no other
+  merge touches. Why it is merged: see the Known-state entry on the
+  gate of da34491316.
+- merge 40 (build-hook-handshake, the branch's next commit): no
+  conflict. Its change to the case of the build slot is the one that
+  merge 38 made itself, and the case of two machines that cannot be
+  connected to is new. After it both of the test's files are the
+  branch's, byte for byte: the difference that the last paragraph of
+  merge 38's entry describes is gone.
+- merge 41 (builder-setup-in-worker-loop, the branch's next commit): no
+  conflict; git merged `tests/functional/timeout.sh` by itself, merge 30
+  having changed earlier lines of it. What the test is for here: the
+  branch's check of a builder that exits before `\2` after more than
+  `max-silent-time` uses an external builder, which has no worker
+  timeouts on this branch at any time (merge 15), so until this merge
+  nothing here showed that a builder which is still setting up gets
+  none: with `!settingUp &&` removed from `registerChild` the whole
+  local suite passed. The new test holds a stock builder in its setup;
+  with the guard removed it fails here, and only that test (measured).
+  For the same reason the first sentence of the commit's message, "A
+  builder is registered with the worker without timeouts until it has
+  reported `\2`, and with them from then on", is true here of a stock
+  builder only.
+  The test catches the removed guard only while the fetch that it
+  holds is started before the other build's setup has ended. Both
+  builders are started before the worker first waits, so it is. If a
+  change to the worker made the fetch start later, the test would go
+  on passing and would no longer fail without the guard (the review of
+  the commit measured that, with the fetch behind a derivation that
+  takes 1.5 s): after such a change the guard has to be removed once
+  by hand to see that the test still fails.
+  Of the gate's jobs only the VM test `functional_root` runs the new
+  lines under a sandbox with build users: the package checks build
+  with `sandbox = false`, the other VM tests and the daemon
+  compatibility suite skip the script. When this was written that job
+  had not been run with these lines.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
 they are.
 Row 33's head 2e385bdf57 was reviewed with the candidate that merged it
 (78e3105524): those reviews covered its difference from row 9's revision.
-The trial merges that the messages of merges 35, 36 and 38 name by
-their commit ids are ancestors of no branch. In the repository where
-these merges were made they are kept under `refs/archive/2026-11-28/`;
-they are not in this fork.
+The trial merges that the messages of merges 35 and 36 name by their
+commit ids, and the replayed trial that merge 38's names, are ancestors
+of no branch. In the repository where these merges were made they are
+kept under `refs/archive/2026-11-28/`; they are not in this fork.
 
 NixOS/nix#16459 is not merged: its check,
 made on the resolved output rather than on the derivation about to be read,
@@ -356,8 +399,15 @@ upstream in d21034932d; dropped by decision), `nix-fix/empty-flat-fork`
 The `integ/*` branches hold this fork's own commits that are not (yet) a
 `nix-fix/*` branch of their own.
 
-Integration-only commits (adaptations that belong to no source branch): one,
-between merge 26 and the merge of `master` 96084b82ab, "tests/functional/dyn-drv: build three-layer paths over the
+Integration-only commits (adaptations that belong to no source branch): two.
+The second, after merge 40, is "tests/functional/build-hook-waiting: a connecting hook with an eval store": a case
+of `build-hook-waiting.sh` in which two derivations that are in the evaluation store only are built through a
+`unix://` machine. It needs merge 13 (a hook is given a derivation that is not in the build store, and Nix copies it
+there once the hook has accepted) and merge 38 (the hook says that it is connecting), and two of merge 38's five
+conflicts are in that code; `eval-store-remote.sh`, merge 13's own test, uses an ssh-ng machine, whose hook is
+silent, and needs the sandbox. With merge 13's copy removed the case fails, and the suite without the case passes
+where there is no sandbox (measured).
+The first is between merge 26 and the merge of `master` 96084b82ab, "tests/functional/dyn-drv: build three-layer paths over the
 daemon too": it replaces the local-store-only guard of two of merge 18's tests,
 which need merge 19 to run over the daemon. The daemon must also have merge
 18's fix (2.35.6 fails them), hence `requireDaemonNewerThan "2.36pre"`. Risk:
@@ -396,6 +446,25 @@ this file and `maintainers/integration-status.sh`.
   among this flake's checks, so nothing here fails on it.
   `nix_build_child_main` (merge 2) is not marked `NIXC_NOEXCEPT` as
   upstream's C API functions now are.
+- The gate of da34491316, this branch before merge 39 (142 targets on
+  x86_64-linux: this flake's checks, its default package, the static
+  functional suite, 15 NixOS VM tests, and the checks of three other
+  projects built with this Nix): 140 succeeded, and da34491316 was not
+  pushed by itself because of one of the other two.
+  `hydraJobs.tests.spawn-program-root`, the VM test of row 2
+  (`tests/nixos/spawn-program-root.nix`), was not built. It builds
+  libutil's unit tests a second time with ASan and UBSan, with GCC, and
+  that build did not compile `src/libutil-tests/filename.cc`, which came
+  with the merge of `master` 6fa1defb4d: row 39's description says why.
+  Control: the same test at 78e3105524, before the merge of `master`,
+  was built and passed. The unit-test derivation in question is one and
+  the same at every first-parent commit from that merge of `master` to
+  da34491316 and another one at 78e3105524, so no later merge changes
+  it. Merge 39 is the fix; when this was written the test had not been
+  built with it.
+  The second was the `clang-tidy` check of one of the other projects,
+  which rejects a line of that project's own test source as it did at
+  78e3105524 and before: not a finding about this branch.
 
 - Tests without a time limit of their own. Since merge 37
   `build-child-faults.sh` has none: a Nix that hangs in it keeps the test
@@ -414,12 +483,38 @@ this file and `maintainers/integration-status.sh`.
   build's output were no longer relayed, it waits for a line that never
   comes. A tree that lacks that wake-up must not be given to a package
   gate.
+  The lines that merge 41 adds to `timeout.sh` have no limit either.
+  They read Nix's output up to the report that another build was timed
+  out, and only then let the builder that they hold go on. So they wait
+  for ever, instead of failing, with a Nix that no longer reports a
+  failed dependency while other builds run; with one that does not time
+  a silent build out while another builder is still setting up (the
+  script's earlier lines have one build at a time and pass on it); and
+  with one that reads `netrc-file` in its own process before it starts
+  the build child. They also wait if the test's own shell ends between
+  opening the FIFO and releasing it, and (not reproduced) if a build
+  child that is more than 2 s late has resolved the FIFO's name before
+  the test renames it and opens it after the test has closed it. The
+  first four were measured with stand-ins in the reviews of the commit;
+  its message names the first and, of the second, says that the earlier
+  lines fail first, which holds only for a Nix that never applies
+  `max-silent-time`. In the package checks (`nix-functional-tests`, also
+  the static one) such a wait is a hang of the build; in the
+  `run-without-pidfd` check and in the NixOS VM tests `meson test` ends
+  it after 300 s. A tree with one of the first three must not be given
+  to a package gate.
 - Rows 2 and 37 merge `nix-fix/fork-safety` at ca173f4d61 and at
   48c26b6fbf, two commits later; `integration-status.sh` compares only
   row 37 with the branch's tips, as for the pairs below. When this was
   written both tips, the local one and this fork's, were still at
   ca173f4d61, which the script reports as OLDER; 48c26b6fbf becomes the
   fork's tip in the push that carries this merge.
+  Rows 38 and 40 merge `nix-fix/build-hook-handshake` at 70390d8cbe and
+  at 6142a7ee6f, and rows 36 and 41
+  `nix-fix/builder-setup-in-worker-loop` at f015f7b15f and at
+  ec4ef44fe6, each one commit later; the script again compares only the
+  later row of each pair. The tips of these two branches are at the
+  later commits.
 - Merge 37 (from the pointed review of ea80f0ec99; read in the code,
   not reproduced): the interrupt check it adds to `spawnBuildChild`
   throws after the request for a build child was sent. The build child
@@ -436,31 +531,66 @@ this file and `maintainers/integration-status.sh`.
   once (64 to the farm's hub). Before an integration build with this
   merge becomes the farm's daemon or a client's Nix, 64 or more new
   derivations go through the hub with a check that no `cannot build on`
-  line appears. The rig runs behind the branch's figures used a
-  `unix://` daemon and an earlier form of the change; nothing has been
-  timed with 70390d8cbe.
+  line appears. The three figures in the branch's commit message are
+  one run of the unpatched Nix through a gRPC machine. The stream's own
+  rig, whose results are not in that message, used `unix://` machines
+  and an earlier form of the change. Nothing has been timed with
+  70390d8cbe.
 - Merge 38, behaviour that no test pins (by the branch's notes). The
-  `!hook &&` in `tryBuildHook`, which makes a goal ignore a second
-  "connecting" from the hook it already holds: `nix __build-remote` says
-  it once per machine it tries, so with two machines that are not ssh
-  ones and the first not reachable, one hook says it twice for one
-  request. With the test's unreachable machine doubled the builds are
-  done here after four `cannot build on` lines; without the guard Nix's
-  output ends after the first, with no error message, and the command
-  fails. A second such machine in the test's `--builders` and 4 expected
-  lines would pin it. And the wake-up when a hook that had accepted is
-  destroyed (a log limit, a timeout, a cancelled goal): every remote
-  build in the test ends the ordinary way. Also not pinned: that a goal
-  destroyed while its hook connects is unregistered.
-- Merge 38, slots that become free without a wake-up, each bounded by
-  `build-poll-interval` and none worse than upstream: when the first
-  goal of the waiting set cannot use the slot, it takes every wake-up
-  while it is first; when a hook that said "connecting" gives up, its
-  slot wakes nobody; when a build of another Nix process ends.
-- Merge 38's test skips itself on NixOS and behind a daemon, so
-  `daemonCompat` and the VM functional tests do not run it, and the VM
-  remote-build tests use ssh machines, for which the hook stays silent:
-  only the plain functional suite makes a hook say "connecting".
+  wake-up when a hook that had accepted is destroyed (a log limit, a
+  cancelled goal; not a timeout, which Nix does not apply to a hook):
+  every remote build in the test ends the ordinary way. And that a goal
+  destroyed while its hook connects is unregistered. Until merge 40 the
+  `!hook &&` in `tryBuildHook` was in this list too, which makes a goal
+  ignore a second "connecting" from the hook it already holds
+  (`nix __build-remote` says it once per machine it tries); the test's
+  case of two machines that cannot be connected to now pins it.
+- Merge 38, a wait without a limit. A hook that has said "connecting"
+  and then never answers is waited for by its goal for ever: Nix
+  applies neither `timeout` nor `max-silent-time` to a hook, so the
+  build does not end, and the goal keeps its output locks meanwhile,
+  so another Nix process that wants the same output waits as long
+  (measured by the pointed review of da34491316: still waiting after
+  8 s, released when the hook was killed). This is narrower than
+  before the merge, when such a hook blocked every goal of the worker;
+  new is only that several goals can hold their locks this way at
+  once.
+- Merge 38, as designed (measured by the pointed review of
+  da34491316). When Nix stops, each connecting hook that ignores
+  SIGTERM costs up to `build-hook-kill-timeout` (500 ms), one after the
+  other, so up to 32 s for 64 of them. That Nix does not block while a
+  hook connects was pinned at da34491316 by one check of the test, that
+  the second build's hook is started before the first has accepted; the
+  integration-only case repeats that check with an evaluation store
+  (not run against a Nix that blocks).
+- Merge 38, slots that come free without a wake-up for a goal that
+  could use them. Each is bounded by `build-poll-interval`, and none is
+  worse than upstream, which only polls. A hook that said "connecting"
+  answers decline or postpone. Such a hook dies, and its goal fails. A
+  hook has accepted and the copy of the derivation from the evaluation
+  store throws (merge 13), so the hook is destroyed before the goal is
+  where it would wake anyone; only this merged tree has that one. A
+  hook that could not connect to its first machine answers "postpone"
+  for the next one, and the build that held that machine's slot has
+  ended in the same round of the worker's poll or an earlier one: the
+  wake-up came before the goal was among those that wait. The first
+  goal of the waiting set takes each wake-up while it is first, whether
+  or not it can use the slot. A build of another Nix process ends.
+  (The second to fourth are from the two reviews of da34491316, read in
+  the code and not reproduced.)
+- Merge 38's own test, `build-hook-waiting.sh`, skips itself on NixOS
+  and behind a daemon, so `daemonCompat` and the VM functional tests do
+  not run it. It is not the only test in which a hook says
+  "connecting": `binary-cache-build-remote.sh` takes such a hook too,
+  in the plain functional suite and behind a daemon, so in the
+  `daemonCompat` runs as well (measured by the pointed review of
+  da34491316), and by their machine lists so do the tests built on
+  `build-remote.sh` (read, not run: they need the sandbox). The VM
+  remote-build tests use ssh machines, for which the hook stays silent.
+  A regression in which a goal that has taken its hook never gets the
+  rest of the answer therefore hangs, without a time limit in a package
+  build, in both tests, and for `binary-cache-build-remote.sh` also in
+  the `daemonCompat` runs.
 
 - Merge 30 and external builders: the worker does not apply `timeout` or
   `max-silent-time` to an external builder (merge 15). An external builder
@@ -506,7 +636,9 @@ this file and `maintainers/integration-status.sh`.
   branch moved.
 - Every merged branch exists in this fork, and this branch merges its tip:
   the branches are what integration is made of, and each is the source of
-  its upstream PR.
+  its upstream PR. When this was written the branches of rows 34, 35,
+  39, of rows 36 and 41 and of rows 38 and 40 were not in this fork
+  yet; they are pushed with this branch.
 
 ## How to check staleness
 
