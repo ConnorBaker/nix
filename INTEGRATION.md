@@ -53,6 +53,8 @@ Merged `master` commit: `a347df065adad662ac66a1a1d9e9b3ed426e5979`
 | 29 | `nix-fix/builddrv-repair` | `82ce79f89f3fd780a4ee5342d986083fd56986fd` | The branch's next commit (its parent is 8c7aa713d4, merged as row 3): its `daemon.cc` test names gtest's matchers `::testing::…`, since a test including `nix/util/tests/gmock-matchers.hh` (which declares `nix::testing`) ahead of it in libstore-tests' unity translation unit, as upstream's `buildenv.cc` does from a347df065a, makes `testing::` name that namespace |  |  |
 | 30 | `builder-exit-ends-build` | `f840f97c988c079e307afee8190d1f7f052fa2ed` | Wait for the builder to exit instead of killing it when its log reaches EOF (a builder that closes stdout/stderr and then exits, e.g. a script ending in a coreutils program, no longer fails with signal 9); Linux only, through a pidfd the worker polls with the log (`ChildExited`); without `pidfd_open()` the build still ends at log EOF; `nix -v --version` lists `wait-for-builder-exit`; tests `builder-exit.sh`, `external-builders.sh` (an external builder that closes its output and keeps working), `timeout.sh` (`closeLog` now times out under `--max-silent-time`), `nix-functional-tests-run-without-pidfd` (`builder-exit.sh`, `external-builders.sh` and `timeout.sh` without `pidfd_open()`), `openExitDescriptor` unit tests; release note `builder-exit.md`. Based on upstream `master` a347df065a, hence the merge of that `master` before it | Upstream issue 2176 of NixOS/nix (open); PR not yet opened |  |
 | 31 | `nix-fix/mimalloc-thp-advice` | `36b7c88f026378ac0f0dfdf494b218be8c5cfbbe` | Build mimalloc with the C define `MI_NO_THP`, so it no longer advises its arenas with `madvise(MADV_HUGEPAGE)`, whose page faults compact and reclaim memory synchronously where `transparent_hugepage/defrag` is `madvise`; `allow_thp` keeps its default, so no `prctl(PR_SET_THP_DISABLE)` reaches the processes Nix starts; NixOS test `mimalloc-thp-advice` (a guest with `transparent_hugepage=madvise`) |  |  |
+| 32 | `nix-fix/fod-own-output-lock` | `b331d8f1531f0f74533ef46b8c85ebd28bde7a6d` | A fixed-output derivation whose builder adds its own output path through recursive Nix or builder-rpc-v0 no longer waits forever for the output lock its build goal holds: the builder records the outputs the goal locked, the restricted store passes them to `LocalStore::addToStore`, `addToStoreFromDump` and the scanning add, and for those paths `LocalStore` takes a mutex of that build instead of the file lock (`HeldLocks`; the build hook's `locksHeld` uses the same mechanism). This removes the hang only: under build users such an output is still rejected for its ownership, and in a Linux sandbox without them the build fails with a misleading hash mismatch. Test `fixed-add-own-output.sh` (on 3705f35ddc) |  |  |
+| 33 | `eval-store-copy-from-build-store` | `2e385bdf570fe903b6e293334b1c4edd3683e119` | The newer head of the change row 9 merged (`nix-fix/u98-storepath` 20102598eb), rewritten on upstream 4e458b037a as the head of its upstream pull request: `EvalState::ensurePath` registers the temporary root in the build store and checks that the build store has the path whenever substituting into the eval store failed (no early return when the eval store is the build store), and throws a failing copy's error instead of adding it to the substitution error as a trace; `eval-store.sh` also covers `builtins.fetchTarball`, checks that a path neither store has fails without an attempt to copy it, and that the refused unsigned copy's error is the one shown below several stack frames without `--show-trace`; release note `eval-store-copy-from-build-store.md` | Draft pull request 16855 of NixOS/nix |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -135,6 +137,23 @@ Resolutions, each described in its merge commit's message:
   kept, in name order.
 - merge 31 (mimalloc-thp-advice): no conflict; nothing merged since
   6bc0ca807c touches `packaging/dependencies.nix` or `tests/nixos`.
+- merge 32 (fod-own-output-lock): conflict in
+  `src/nix/build-remote/build-remote.cc` with merge 14
+  (build-remote-closure), where the hook copies the outputs back: this
+  branch's `locksHeld.try_emplace(...)` line and, after it, merge 14's
+  comment and `copyClosure(...)`, both kept. Merge 16
+  (build-remote-upload-lock)'s per-(machine, path) upload locks are in
+  another hunk of that file, which git merged by itself and which is
+  unchanged. In the other nine files the change is the branch's commit as
+  it is.
+- merge 33 (eval-store-copy-from-build-store at 2e385bdf57): conflicts in
+  `src/libexpr/primops.cc` (two hunks in `EvalState::ensurePath`) and
+  `tests/functional/eval-store.sh` (three hunks in the change's test
+  block) with merge 9, the older revision of the same change; every hunk
+  takes this branch's side, so the function and the test block are the
+  pull request's, line for line. Merge 13 (integ/eval-store)'s tests
+  before and after that block and merge 23's block at the end are as they
+  were.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
@@ -219,6 +238,16 @@ this file and `maintainers/integration-status.sh`.
   tips and reports a tip still at 4cf9353cae as OLDER. Rows 24 and 28
   (`nix-fix/release-evaluator`) and rows 3 and 29
   (`nix-fix/builddrv-repair`) are the same kind of pair.
+- Rows 9 and 33 are two revisions of one change under two branch names:
+  `nix-fix/u98-storepath` stays at 20102598eb, and
+  `eval-store-copy-from-build-store` (2e385bdf57), a rewrite of that
+  commit on a newer upstream `master` and not a descendant of it, is the
+  head of the change's upstream pull request. After merge 33 the change's
+  own lines are that head's. `integration-status.sh` knows a branch by
+  its name, so it checks the two rows separately, each against its own
+  branch's tips, and does not report row 9 as superseded as it does rows
+  3, 24 and 26; it would report `nix-fix/u98-storepath` only if that
+  branch moved.
 - Every merged branch exists in this fork, and this branch merges its tip:
   the branches are what integration is made of, and each is the source of
   its upstream PR.
