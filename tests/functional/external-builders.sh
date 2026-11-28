@@ -48,3 +48,17 @@ nix build -L --file "$expr" --out-link "$TEST_ROOT/result" \
   --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"args\": [\"bla\"], \"program\": \"$external_builder\"}]"
 
 [[ $(cat "$TEST_ROOT/result") = foobar ]]
+
+# Where nothing can be built, with `max-jobs = 0` and no build hook, the
+# output locks are still taken, once, without and with an external
+# builder: taking them is what waits for another process's build.
+lockRounds() {
+  expectStderr 1 nix build --impure --no-link --max-jobs 0 --option build-hook '' -vvvv "$@" --expr "
+    with import ${config_nix};
+    mkDerivation { name = \"unbuildable\"; system = \"x68_46-xunil\"; buildCommand = \"\"; }
+  " | sed -n "/: trying to build/p" | tee "$TEST_ROOT/rounds"
+  [[ $(wc -l < "$TEST_ROOT/rounds") -eq 1 ]]
+}
+lockRounds
+lockRounds --extra-experimental-features external-builders \
+  --external-builders "[{\"systems\": [\"x68_46-xunil\"], \"args\": [\"bla\"], \"program\": \"$external_builder\"}]"

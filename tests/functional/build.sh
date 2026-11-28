@@ -287,3 +287,18 @@ if isDaemonNewer "2.34pre"; then
       --no-link \
       | grepQuiet "local builds are disabled"
 fi
+
+# A goal takes its output locks only once it has a build slot, so
+# building three derivations one at a time locks each of them once.
+lockRounds() {
+    nix build --impure --no-link --max-jobs 1 "${@:3}" -vvvv --expr "
+      with import ${config_nix};
+      map (i: mkDerivation { name = \"$2-\${toString i}\"; buildCommand = \"touch \$out\"; }) [ 1 2 3 ]
+    " 2>&1 | sed -n "/$2-.*: trying to build/p" | tee "$TEST_ROOT/$2.log"
+    [[ $(wc -l < "$TEST_ROOT/$2.log") -eq $1 ]]
+}
+if isDaemonNewer "2.37pre"; then
+    # The build hook is asked first, which takes the locks once more:
+    # with no remote builders it declines for good at the first request.
+    lockRounds 4 lock-once --builders ''
+fi
