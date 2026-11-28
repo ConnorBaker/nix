@@ -25,4 +25,5 @@ rec {
   c = mk "c" { };
   both = mk "both" { inherit a b; };
   local = mk "local" { preferLocalBuild = true; };
+  local2 = mk "local2" { preferLocalBuild = true; };
 }

@@ -58,27 +58,30 @@ log=$(build unix a b --builders "$machine - - 2") || fail "$log"
 log=$(build ssh a b --builders "unix://$TEST_ROOT/no-machine - - 2; ssh-ng://localhost - - 2") || fail "$log"
 [[ $(startedBefore "^building '.*' on " "$log") == 1 ]] || fail "$log"
 
-# A machine that cannot be connected to. Both hooks try it at the same time
-# and give their builds back, so `a` and `b` are built here. The worker keeps
-# a hook that has given up on the machine: asked about `both`, it tries nothing.
-log=$(NIX_REMOTE='' nix build -f build-hook-waiting.nix --no-link --argstr salt refuse both \
-    --max-jobs 2 --builders "unix://$TEST_ROOT/no-machine - - 2" 2>&1) || fail "$log"
-[[ $(grep -c "cannot build on" <<< "$log") == 2 ]] || fail "$log"
+# Two machines that cannot be connected to. Both hooks try both at the same
+# time and say before each that they are connecting; a goal ignores that from
+# the hook it holds. They give their builds back, so `a` and `b` are built
+# here. The worker keeps a hook that has given up on the machines: asked
+# about `both`, it tries nothing.
+log=$(NIX_REMOTE='' nix build -f build-hook-waiting.nix --no-link --argstr salt refuse both --max-jobs 2 \
+    --builders "unix://$TEST_ROOT/no-machine - - 2; unix://$TEST_ROOT/no-machine2 - - 2" 2>&1) || fail "$log"
+[[ $(grep -c "cannot build on" <<< "$log") == 4 ]] || fail "$log"
 
 # A hook of one's own that says that it is connecting. While we wait for it,
-# it takes none of our build slots: `local` is built in the only one before
-# the hook has accepted `a`. What the hook says then, we read in the pieces
-# that arrive: a line longer than one piece is whole, and what follows the
-# name of the machine is not lost. (The hook builds nothing, so `a` fails.)
+# it takes none of our build slots: of `local` and `local2`, which are built
+# here in the only one, one has to wait for the slot, not both. What the
+# hook says then, we read in the pieces that arrive: a line longer than one
+# piece is whole, and what follows the name of the machine is not lost. (The
+# hook builds nothing, so `a` fails.)
 cat > "$TEST_ROOT/hook" << EOF
 #!/bin/sh
 printf '@nix {"action":"connecting"}\n$(printf %05000d 0)\n# accept\nsome-machine\n@nix {"action":"msg","level":0,"msg":"said after the name"}\n' >&2
 cat > /dev/null
 EOF
 chmod +x "$TEST_ROOT/hook"
-log=$(NIX_REMOTE='' expectStderr 1 nix build -f build-hook-waiting.nix --no-link --argstr salt hook a local \
-    --max-jobs 1 --option build-hook "$TEST_ROOT/hook")
-[[ $(grep -m 1 "^building '" <<< "$log") == *-local.drv* ]] || fail "$log"
+log=$(NIX_REMOTE='' expectStderr 1 nix build -f build-hook-waiting.nix --no-link --argstr salt hook a local local2 \
+    --max-jobs 1 -vvv --option build-hook "$TEST_ROOT/hook")
+[[ $(grep -c "\.drv': wait for build slot" <<< "$log") == 1 ]] || fail "$log"
 grepQuiet -x "0\{5000\}" <<< "$log" || fail "$log"
 grepQuiet "said after the name" <<< "$log" || fail "$log"
 
