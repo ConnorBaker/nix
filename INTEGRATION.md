@@ -16,7 +16,7 @@ that merge commit's message.
 
 Base `master` commit: `6965392507e19998de706aa15e514f81e9b7ce11`
 
-Merged `master` commit: `a347df065adad662ac66a1a1d9e9b3ed426e5979`
+Merged `master` commit: `6fa1defb4d5869a3e8c8a1ad8e25b0cab59f596d`
 
 ## Merged branches
 
@@ -154,6 +154,27 @@ Resolutions, each described in its merge commit's message:
   pull request's, line for line. Merge 13 (integ/eval-store)'s tests
   before and after that block and merge 23's block at the end are as they
   were.
+- "Merge upstream master 6fa1defb4d" (after merge 33 and the describe
+  commit that follows it): one conflict, in
+  `src/libstore-c/nix_api_store.cc`, with merge 2 (fork-safety), which
+  defines `nix_build_child_main` just before `nix_libstore_init`, whose
+  definition upstream now marks `NIXC_NOEXCEPT`: both kept, the branch's
+  function unmarked as it was. Of the 16 files both upstream and the
+  merged branches changed, the other hunks within 40 lines of each other
+  are in `src/libstore-c/nix_api_store.h`, `src/libexpr/primops.cc`,
+  `src/libstore/include/nix/store/worker-settings.hh`,
+  `src/libutil/include/nix/util/configuration.hh`,
+  `src/libutil-tests/package.nix`, `tests/functional/package.nix` and
+  `tests/functional/suites/plugins/meson.build`, which git merged by
+  itself; in each of the 16 files the merge's change is upstream's own.
+  Upstream gave `CanonPath` and `SourcePath` (`operator/`, `push`,
+  `baseName`, iteration) the new `FilenameView` in place of a string
+  view, keyed directory entries by `Filename`, changed the signatures of
+  `createChild`, `insertChild` and the virtual `dumpPath`, made
+  `StorePath::to_string()` of a temporary return a string, made the C
+  API's functions and `nix_get_string_callback` `noexcept`, and renamed
+  `plugintest_dlsym.cc`, `canon-path-algebra.cc` and the manual's
+  `installing-binary.md`; no line a merged branch adds uses any of these.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
@@ -205,6 +226,17 @@ The `integration: describe the merged branches` commits only add or update
 this file and `maintainers/integration-status.sh`.
 
 ## Known state
+
+- Since the merge of upstream `master` 6fa1defb4d: `initPlugins()` throws
+  on a second call, where it used to fail an assertion; merge 2 passes it
+  to `buildChildMain`, whose build child calls it at most once, when a
+  builtin builder is not registered (`builtin-builder.sh`). Upstream's
+  clang-tidy configuration rejects `std::filesystem::read_symlink` in
+  favour of `nix::readLink`; merge 1 (ldso-self-exe) calls it, with an
+  error code, in `src/libutil/current-process.cc`. clang-tidy is not
+  among this flake's checks, so nothing here fails on it.
+  `nix_build_child_main` (merge 2) is not marked `NIXC_NOEXCEPT` as
+  upstream's C API functions now are.
 
 - Merge 30 and external builders: the worker does not apply `timeout` or
   `max-silent-time` to an external builder (merge 15). An external builder
