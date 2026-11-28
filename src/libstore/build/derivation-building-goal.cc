@@ -527,6 +527,18 @@ Goal::Co<DerivationBuildingGoal::Result> DerivationBuildingGoal::tryToBuild()
     };
 
     auto tryHookLoop = [&]() -> Goal::Co<std::optional<Result>> {
+        /* Don't take the locks only to hear the hook decline; building
+           locally takes them next. Where no local build is possible,
+           this round is what waits for another process's build. */
+        bool hookDeclines =
+#ifdef _WIN32
+            true;
+#else
+            worker.settings.buildHook.get().empty() || !worker.tryBuildHook;
+#endif
+        if (hookDeclines && std::holds_alternative<LocalBuildCapability>(localBuildResult))
+            co_return std::nullopt;
+
         {
             PathLocks outputLocks;
             if (co_await acquireResources(outputLocks))
@@ -598,6 +610,17 @@ Goal::Co<DerivationBuildingGoal::Result> DerivationBuildingGoal::tryToBuild()
 
     auto tryBuildLocally = [&]() -> Goal::Co<std::optional<LocalBuildOutcome>> {
         if (auto * cap = std::get_if<LocalBuildCapability>(&localBuildResult)) {
+            /* Wait for a build slot before taking the locks, so goals
+               woken together don't all take their locks only to find
+               the slots gone. `buildLocally` checks again: the slot may
+               go while this goal waits for a contended lock or a free
+               build user. With `max-jobs = 0` no slot ever frees up, so
+               take the locks: another process may be building this. */
+            if (worker.settings.maxBuildJobs.get() != 0 && worker.getNrLocalBuilds() >= worker.settings.maxBuildJobs) {
+                co_await waitForBuildSlot();
+                co_return NeedsSlot{};
+            }
+
             PathLocks outputLocks;
             if (co_await acquireResources(outputLocks))
                 co_return Result{BuildResult::Success{
@@ -881,8 +904,6 @@ Goal::Co<DerivationBuildingGoal::LocalBuildOutcome> DerivationBuildingGoal::buil
     const DerivationOptions<StorePath> & drvOptions,
     PathLocks outputLocks)
 {
-    co_await yield();
-
     /* Computed once, so an external builder is told exactly what Nix
        will do if it declines. */
     const bool canBuildHere = canBuildLocally(drvOptions);
