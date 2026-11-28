@@ -305,7 +305,7 @@ rec {
   );
 
   # The first half of the installation script. This is uploaded
-  # to https://nixos.org/nix/install. It downloads the binary
+  # to https://channels.nixos.org/nix-latest/install. It downloads the binary
   # tarball for the user's system and calls the second half of the
   # installation script.
   installerScript = installScriptFor [
@@ -387,7 +387,11 @@ rec {
       };
     in
     pkgs.runCommand "docker-image-tarball-${components.nix-cli.version}"
-      { meta.description = "Docker image with Nix for ${system}"; }
+      {
+        __structuredAttrs = true;
+        strictDeps = true;
+        meta.description = "Docker image with Nix for ${system}";
+      }
       ''
         mkdir -p $out/nix-support
         image=$out/image.tar.gz
@@ -441,16 +445,22 @@ rec {
           components = nixComponentsFor.x86_64-linux.native;
           inherit (components._pkgs) runCommand;
         in
-        runCommand "eval-nixos" { buildInputs = [ components.nix-cli ]; } ''
-          type -p nix-env
-          # Note: we're filtering out nixos-install-tools because https://github.com/NixOS/nixpkgs/pull/153594#issuecomment-1020530593.
-          (
-            set -x
-            time nix-env --store dummy:// -f ${nixpkgs-regression} -qaP --drv-path | sort | grep -v nixos-install-tools > packages
-            [[ $(sha1sum < packages | cut -c1-40) = e01b031fc9785a572a38be6bc473957e3b6faad7 ]]
-          )
-          mkdir $out
-        '';
+        runCommand "eval-nixos"
+          {
+            __structuredAttrs = true;
+            strictDeps = true;
+            nativeBuildInputs = [ components.nix-cli ];
+          }
+          ''
+            type -p nix-env
+            # Note: we're filtering out nixos-install-tools because https://github.com/NixOS/nixpkgs/pull/153594#issuecomment-1020530593.
+            (
+              set -x
+              time nix-env --store dummy:// -f ${nixpkgs-regression} -qaP --drv-path | sort | grep -v nixos-install-tools > packages
+              [[ $(sha1sum < packages | cut -c1-40) = e01b031fc9785a572a38be6bc473957e3b6faad7 ]]
+            )
+            mkdir $out
+          '';
 
       nixpkgsLibTests = forAllSystems (
         system:
@@ -480,6 +490,8 @@ rec {
           pkgs = components._pkgs;
         in
         pkgs.runCommand "daemon-compat-tests" {
+          __structuredAttrs = true;
+          strictDeps = true;
           againstSelf = testNixVersions components components.nix-cli;
           againstCurrentLatest = testNixVersions components pkgs.nixVersions.latest;
           againstLatestStable = testNixVersions components pkgs.nixVersions.stable;
@@ -488,7 +500,7 @@ rec {
 
       /**
         Test the installer in QEMU VMs. Doesn't operate on the user-facing
-        installation script https://nixos.org/nix/install, which downloads
+        installation script https://channels.nixos.org/nix-latest/install, which downloads
         the binaries for the system architecture but the second-stage tarballs
         directly.
       */

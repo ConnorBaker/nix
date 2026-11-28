@@ -33,7 +33,7 @@ typedef struct Store Store;
  * @param[out] context Optional, stores error information
  * @return NIX_OK if the initialization was successful, an error code otherwise.
  */
-nix_err nix_libstore_init(nix_c_context * context);
+nix_err nix_libstore_init(nix_c_context * context) NIXC_NOEXCEPT;
 
 /**
  * @brief Runs a local build's child process, if this process is one.
@@ -50,7 +50,7 @@ void nix_build_child_main(int argc, char ** argv);
  *
  * This is useful when external configuration is not desired, such as when running unit tests.
  */
-nix_err nix_libstore_init_no_load_config(nix_c_context * context);
+nix_err nix_libstore_init_no_load_config(nix_c_context * context) NIXC_NOEXCEPT;
 
 /**
  * @brief Open a nix store.
@@ -81,7 +81,7 @@ nix_err nix_libstore_init_no_load_config(nix_c_context * context);
  *
  * @see nix_store_free
  */
-Store * nix_store_open(nix_c_context * context, const char * uri, const char *** params);
+Store * nix_store_open(nix_c_context * context, const char * uri, const char *** params) NIXC_NOEXCEPT;
 
 /**
  * @brief Deallocate a nix store and free any resources if not also held by other Store instances.
@@ -90,7 +90,7 @@ Store * nix_store_open(nix_c_context * context, const char * uri, const char ***
  *
  * @param[in] store the store to free
  */
-void nix_store_free(Store * store);
+void nix_store_free(Store * store) NIXC_NOEXCEPT;
 
 /**
  * @brief get the URI of a nix store
@@ -101,7 +101,8 @@ void nix_store_free(Store * store);
  * @see nix_get_string_callback
  * @return error code, NIX_OK on success.
  */
-nix_err nix_store_get_uri(nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data);
+nix_err nix_store_get_uri(nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data)
+    NIXC_NOEXCEPT;
 
 /**
  * @brief get the storeDir of a Nix store, typically `"/nix/store"`
@@ -112,8 +113,8 @@ nix_err nix_store_get_uri(nix_c_context * context, Store * store, nix_get_string
  * @see nix_get_string_callback
  * @return error code, NIX_OK on success.
  */
-nix_err
-nix_store_get_storedir(nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data);
+nix_err nix_store_get_storedir(
+    nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data) NIXC_NOEXCEPT;
 
 /**
  * @brief Parse a Nix store path that includes the store dir into a StorePath
@@ -124,7 +125,7 @@ nix_store_get_storedir(nix_c_context * context, Store * store, nix_get_string_ca
  * @param[in] path Path string to parse, copied
  * @return owned store path, NULL on error
  */
-StorePath * nix_store_parse_path(nix_c_context * context, Store * store, const char * path);
+StorePath * nix_store_parse_path(nix_c_context * context, Store * store, const char * path) NIXC_NOEXCEPT;
 
 /**
  * @brief Check if a StorePath is valid (i.e. that corresponding store object and its closure of references exists in
@@ -134,7 +135,7 @@ StorePath * nix_store_parse_path(nix_c_context * context, Store * store, const c
  * @param[in] path Path to check
  * @return true or false, error info in context
  */
-bool nix_store_is_valid_path(nix_c_context * context, Store * store, const StorePath * path);
+bool nix_store_is_valid_path(nix_c_context * context, Store * store, const StorePath * path) NIXC_NOEXCEPT;
 
 /**
  * @brief Get the physical location of a store path
@@ -153,7 +154,8 @@ bool nix_store_is_valid_path(nix_c_context * context, Store * store, const Store
  * @param[in] user_data arbitrary data, passed to the callback when it's called.
  */
 nix_err nix_store_real_path(
-    nix_c_context * context, Store * store, StorePath * path, nix_get_string_callback callback, void * user_data);
+    nix_c_context * context, Store * store, StorePath * path, nix_get_string_callback callback, void * user_data)
+    NIXC_NOEXCEPT;
 
 // nix_err nix_store_ensure(Store*, const char*);
 // nix_err nix_store_build_paths(Store*);
@@ -178,7 +180,7 @@ nix_err nix_store_realise(
     Store * store,
     StorePath * path,
     void * userdata,
-    void (*callback)(void * userdata, const char * outname, const StorePath * out));
+    void (*callback)(void * userdata, const char * outname, const StorePath * out)) NIXC_NOEXCEPT;
 
 /**
  * @brief get the version of a nix store.
@@ -192,8 +194,8 @@ nix_err nix_store_realise(
  * @see nix_get_string_callback
  * @return error code, NIX_OK on success.
  */
-nix_err
-nix_store_get_version(nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data);
+nix_err nix_store_get_version(
+    nix_c_context * context, Store * store, nix_get_string_callback callback, void * user_data) NIXC_NOEXCEPT;
 
 /**
  * @brief Create a `nix_derivation` from a JSON representation of that derivation.
@@ -209,7 +211,7 @@ nix_store_get_version(nix_c_context * context, Store * store, nix_get_string_cal
  * @param[in] json JSON of the derivation as a string.
  * @return A new derivation, or NULL on error. Free with `nix_derivation_free` when done using the `nix_derivation`.
  */
-nix_derivation * nix_derivation_from_json(nix_c_context * context, Store * store, const char * json);
+nix_derivation * nix_derivation_from_json(nix_c_context * context, Store * store, const char * json) NIXC_NOEXCEPT;
 
 /**
  * @brief Add the given `nix_derivation` to the given store
@@ -218,7 +220,7 @@ nix_derivation * nix_derivation_from_json(nix_c_context * context, Store * store
  * @param[in] store nix store reference. The derivation will be inserted here.
  * @param[in] derivation nix_derivation to insert into the given store.
  */
-StorePath * nix_add_derivation(nix_c_context * context, Store * store, nix_derivation * derivation);
+StorePath * nix_add_derivation(nix_c_context * context, Store * store, nix_derivation * derivation) NIXC_NOEXCEPT;
 
 /**
  * @brief Copy the closure of `path` from `srcStore` to `dstStore`.
@@ -228,7 +230,8 @@ StorePath * nix_add_derivation(nix_c_context * context, Store * store, nix_deriv
  * @param[in] dstStore nix destination store reference
  * @param[in] path Path to copy
  */
-nix_err nix_store_copy_closure(nix_c_context * context, Store * srcStore, Store * dstStore, StorePath * path);
+nix_err
+nix_store_copy_closure(nix_c_context * context, Store * srcStore, Store * dstStore, StorePath * path) NIXC_NOEXCEPT;
 
 /**
  * @brief Gets the closure of a specific store path
@@ -257,7 +260,7 @@ nix_err nix_store_get_fs_closure(
     bool include_outputs,
     bool include_derivers,
     void * userdata,
-    void (*callback)(nix_c_context * context, void * userdata, const StorePath * store_path));
+    void (*callback)(nix_c_context * context, void * userdata, const StorePath * store_path)) NIXC_NOEXCEPT;
 
 /**
  * @brief Returns the derivation associated with the store path
@@ -267,7 +270,8 @@ nix_err nix_store_get_fs_closure(
  * @param[in] path The nix store path
  * @return A new derivation, or NULL on error. Free with `nix_derivation_free` when done using the `nix_derivation`.
  */
-nix_derivation * nix_store_drv_from_store_path(nix_c_context * context, Store * store, const StorePath * path);
+nix_derivation *
+nix_store_drv_from_store_path(nix_c_context * context, Store * store, const StorePath * path) NIXC_NOEXCEPT;
 
 /**
  * @brief Query the full store path given the hash part of a valid store
@@ -278,7 +282,8 @@ nix_derivation * nix_store_drv_from_store_path(nix_c_context * context, Store * 
  * @param[in] hash Hash part of path as a string
  * @return Store path reference, NULL if no matching path is found.
  */
-StorePath * nix_store_query_path_from_hash_part(nix_c_context * context, Store * store, const char * hash);
+StorePath *
+nix_store_query_path_from_hash_part(nix_c_context * context, Store * store, const char * hash) NIXC_NOEXCEPT;
 
 /**
  * @brief Copy a path from one store to another.
@@ -291,7 +296,8 @@ StorePath * nix_store_query_path_from_hash_part(nix_c_context * context, Store *
  * @param[in] checkSigs Whether to check path signatures are trusted before copying
  */
 nix_err nix_store_copy_path(
-    nix_c_context * context, Store * srcStore, Store * dstStore, const StorePath * path, bool repair, bool checkSigs);
+    nix_c_context * context, Store * srcStore, Store * dstStore, const StorePath * path, bool repair, bool checkSigs)
+    NIXC_NOEXCEPT;
 
 // cffi end
 #ifdef __cplusplus

@@ -442,7 +442,7 @@ static CanonPath portablePathOf(const SymlinkNotAllowed & e)
  */
 static OsFilename osBaseNameOf(const CanonPath & path)
 {
-    return OsFilename::fromPathAsserting(*path.baseName());
+    return OsFilename{*path.baseName()};
 }
 
 std::function<void(AutoCloseFD, OsCanonPath)> PosixDirectorySourceAccessor::makeDirFdCallback()
@@ -599,8 +599,10 @@ void PosixDirectorySourceAccessor::readFile(const CanonPath & path, Sink & sink,
                 osBaseNameOf(path),
 #ifdef _WIN32
                 /* No `FILE_NON_DIRECTORY_FILE`, so that a directory is
-                   reported as `NotARegularFile` below, like on Unix. */
-                GENERIC_READ,
+                   reported as `NotARegularFile` below, like on Unix.
+                   `SYNCHRONIZE` is needed for the synchronous I/O
+                   that every open asks for. */
+                GENERIC_READ | SYNCHRONIZE,
                 0
 #else
                 O_RDONLY | O_CLOEXEC
@@ -686,9 +688,10 @@ try {
         for (auto * entry = buf.data();;) {
             auto & info = *reinterpret_cast<const FILE_ID_BOTH_DIR_INFO *>(entry);
             std::wstring_view name{info.FileName, info.FileNameLength / sizeof(wchar_t)};
+            /* Windows file names never contain `/` or NUL. */
             if (name != L"." && name != L"..")
                 entries.emplace(
-                    os_string_to_string(name),
+                    Filename::fromStringUnchecked(os_string_to_string(name)),
                     /* Same classification as `fstat`, which reports every
                        reparse point as a symlink. */
                     info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT ? tSymlink
@@ -740,7 +743,9 @@ try {
             type = std::nullopt;
             break;
         }
-        entries.emplace(name, type);
+        /* Not empty, `.` or `..`, and the OS's file names never contain
+           `/` or NUL. */
+        entries.emplace(Filename::fromStringUnchecked(std::string{name}), type);
     }
 
     if (errno)

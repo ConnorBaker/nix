@@ -65,7 +65,7 @@ static std::string canonStoreDir(std::filesystem::path path)
 }
 
 StoreConfigBase::StoreDirSetting::StoreDirSetting(Config * options, FilePathType pathType)
-    : BaseSetting<std::string>(
+    : BaseSetting(
           [pathType]() -> std::string {
               auto envOverrides = getEnvOsNonEmpty(OS_STR("NIX_STORE_DIR")).or_else([] {
                   return getEnvOsNonEmpty(OS_STR("NIX_STORE"));
@@ -162,7 +162,7 @@ std::filesystem::path Store::followLinksToStore(std::string_view _path) const
     const unsigned int maxFollow = 1024;
 
     while (!isInStore(path.string())) {
-        if (!std::filesystem::is_symlink(path))
+        if (!isSymlink(path))
             break;
 
         if (++followCount >= maxFollow)
