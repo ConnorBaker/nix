@@ -55,6 +55,10 @@ Merged `master` commit: `6fa1defb4d5869a3e8c8a1ad8e25b0cab59f596d`
 | 31 | `nix-fix/mimalloc-thp-advice` | `36b7c88f026378ac0f0dfdf494b218be8c5cfbbe` | Build mimalloc with the C define `MI_NO_THP`, so it no longer advises its arenas with `madvise(MADV_HUGEPAGE)`, whose page faults compact and reclaim memory synchronously where `transparent_hugepage/defrag` is `madvise`; `allow_thp` keeps its default, so no `prctl(PR_SET_THP_DISABLE)` reaches the processes Nix starts; NixOS test `mimalloc-thp-advice` (a guest with `transparent_hugepage=madvise`) |  |  |
 | 32 | `nix-fix/fod-own-output-lock` | `b331d8f1531f0f74533ef46b8c85ebd28bde7a6d` | A fixed-output derivation whose builder adds its own output path through recursive Nix or builder-rpc-v0 no longer waits forever for the output lock its build goal holds: the builder records the outputs the goal locked, the restricted store passes them to `LocalStore::addToStore`, `addToStoreFromDump` and the scanning add, and for those paths `LocalStore` takes a mutex of that build instead of the file lock (`HeldLocks`; the build hook's `locksHeld` uses the same mechanism). This removes the hang only: under build users such an output is still rejected for its ownership, and in a Linux sandbox without them the build fails with a misleading hash mismatch. Test `fixed-add-own-output.sh` (on 3705f35ddc) |  |  |
 | 33 | `eval-store-copy-from-build-store` | `2e385bdf570fe903b6e293334b1c4edd3683e119` | The newer head of the change row 9 merged (`nix-fix/u98-storepath` 20102598eb), rewritten on upstream 4e458b037a as the head of its upstream pull request: `EvalState::ensurePath` registers the temporary root in the build store and checks that the build store has the path whenever substituting into the eval store failed (no early return when the eval store is the build store), and throws a failing copy's error instead of adding it to the substitution error as a trace; `eval-store.sh` also covers `builtins.fetchTarball`, checks that a path neither store has fails without an attempt to copy it, and that the refused unsigned copy's error is the one shown below several stack frames without `--show-trace`; release note `eval-store-copy-from-build-store.md` | Draft pull request 16855 of NixOS/nix |  |
+| 34 | `nix-fix/query-missing-realisations` | `e19cec45d0275ad8ceca1f0e7852b08e0e293799` | `queryMissing` asks the substituters for the realisation of an output whose path is not known in advance (e.g. of a floating content-addressed derivation) with the callback form of `queryRealisation`, awaited, instead of the blocking one, so the lookups of different derivations overlap instead of running one after the other; a derivation wanted with two sets of outputs now sends two requests for the same realisation, and when several lookups fail the error is that of the first to fail. Test `query-missing-realisations.cc` in libstore-tests, a network test: an HTTP binary cache that answers no lookup until four wait at once. On upstream `master` 6fa1defb4d |  |  |
+| 35 | `nix-fix/locks-after-build-slot` | `3a048b37c9df19d8098a5ef1ae5b5e59babc8610` | A build goal takes its output locks only once a build slot is free: `tryHookLoop` returns at once when the hook can only decline and a local build is possible, `tryBuildLocally` waits for a slot before it locks unless `max-jobs` is 0, and `buildLocally` no longer yields on entry. Outcomes are unchanged; three derivations built one at a time take their locks 4 times instead of 12. Tests in `build.sh` and `external-builders.sh` count the "trying to build" rounds. On upstream `master` 6fa1defb4d |  |  |
+| 36 | `nix-fix/builder-setup-in-worker-loop` | `f015f7b15f4331cd374c15cf1dbf49e12e279995` | The worker no longer blocks while a builder sets up its environment (e.g. the sandbox): `startBuild` returns at once and the build goal passes the builder's output to `processSetupOutput` until the `\2` line, so other goals run meanwhile; the build gets its timeouts and is shown as started only once the setup is done, and a failed sandbox helper's error is read from the builder's output. Tests in `external-builders.sh`: two builders that each finish starting only when the other has started, a builder that cannot be started, a setup error longer than one read, a builder that exits before `\2`. On upstream `master` 6fa1defb4d |  |  |
+| 37 | `nix-fix/fork-safety` | `48c26b6fbf2431d40cb9f30673ff3c57938cd818` | The branch's next two commits (their parent is ca173f4d61, merged as row 2): `spawnBuildChild` checks for an interrupt once the callback that ends its wait for the build child server's reply is registered, where an interrupt taken between the request and the registration was lost (a fault in the test's shim puts one there); and `build-child-faults.sh` loses its `timeout`s and poll counts, starts nix-build through `setpriv --pdeathsig KILL`, so that a Nix that hangs dies with the test's shell, and requires an interrupted Nix to exit with status 1 |  |  |
 
 Resolutions, each described in its merge commit's message:
 - merge 5 (replace-valid-path): no conflict that git flags, but h1-build-traces
@@ -175,10 +179,86 @@ Resolutions, each described in its merge commit's message:
   API's functions and `nix_get_string_callback` `noexcept`, and renamed
   `plugintest_dlsym.cc`, `canon-path-algebra.cc` and the manual's
   `installing-binary.md`; no line a merged branch adds uses any of these.
+- merge 34 (query-missing-realisations): conflict in
+  `src/libstore-tests/meson.build` with merge 17
+  (query-missing-eval-store): both add a source after `pathlocks.cc`;
+  both kept, in name order. In `src/libstore/misc.cc` merges 13, 17 and
+  18 changed `queryMissing` above this branch's hunk, the nearest change
+  23 lines before it; git merged the file by itself, and the branch's
+  lines replace the same lines as upstream.
+- merge 35 (locks-after-build-slot): conflicts in
+  `src/libstore/build/derivation-building-goal.cc`, at the start of
+  `buildLocally`, with merge 15 (external-builders): the branch's removal
+  of the yield and merge 15's `canBuildHere`, which is now the function's
+  first statement, both kept; and in
+  `tests/functional/external-builders.sh`, where merge 30's block and
+  this branch's lock rounds both follow upstream's last line: both kept,
+  merge 30's first. When an external builder declines, the stock
+  builder's slot check now runs without a yield before it, so no other
+  goal can take the slot the external builder gave up first.
+- merge 36 (builder-setup-in-worker-loop): conflicts in
+  `src/libstore/unix/build/unix-derivation-builder.cc` with merge 30
+  (`killChild`: merge 30's `builderExit.close()` stays in the block on
+  the pid, the branch's unregistration follows the block; end of
+  `startBuild`: merge 30's `openExitDescriptor` stays, the blocking wait
+  for the setup goes); in `derivation-building-goal.cc` with merges 15
+  and 30, where `buildLocally` registers the builder: one lambda,
+  `registerChild`, makes the registration during the setup (no timeouts,
+  no exit channel) and the one after it (timeouts unless the builder is
+  external, and the exit channel), also in place of the
+  `childStarted(..., true, true)` that git merges into the branch's
+  `processSetupOutput` lambda without a conflict; and in
+  `tests/functional/external-builders.sh`, where this branch's block
+  goes before merge 30's. The two source files are resolved as in the
+  branch's own trial merge (the same patch-id in each). The test's block
+  is the trial merge's with one line more, and differs from the branch's
+  in two places.
+  The branch has two checks of a builder that cannot be executed, a
+  missing program and a name too long. Both expect the failed exec to
+  arrive through the builder's output. Merge 2 starts an external
+  builder with `spawnProgram`, which reports the failure to Nix itself
+  (`could not start program`), so here the test fails at the first of
+  them. What they pinned that still holds here stays pinned, in two
+  parts. That such a build fails with an error that names the program:
+  the first check is kept, with `spawnProgram`'s message (this is the
+  line the trial merge does not have); a name too long fails the same
+  way here, so the second check would add nothing to it. That an error
+  which arrives through the builder's output in more than one read is
+  passed on whole, under "while setting up the build environment": a
+  builder that sends such an error in the build child's wire format
+  takes the second check's place (the trial merge's replacement).
+  The branch's last check, that a cancelled build's child is killed when
+  it has no process group of its own yet, is left out: here it fails
+  although the kill works. Its builder waits until Nix is asleep or
+  gone, on the premise that Nix does not sleep before the kill. But
+  `Worker::run` (merge 2) stops the build child server when it returns,
+  before the cancelled goal is destroyed and its child killed, and Nix
+  sleeps while it waits for the server to exit. Measured on this tree
+  with the check put back, on a 20-CPU machine busy with other work: a
+  builder survived in 3 of 200 tries with nothing added beside the
+  test, and in 51 of 200 with the test and four busy loops held to one
+  CPU; where the builder recorded Nix's children, the server was still
+  one of them in 18 of 18 records. A form of the check that waits for
+  that as well, until the builder is Nix's only child, left no survivor
+  in 1000 tries. But with `kill(pid)` removed from `killChild`, the
+  line the check is for, it left one in only 34 of 1000: here the child
+  has usually called `setsid()` by the time the server has exited, so
+  the kill of its process group reaches it. A check that the broken
+  kill fails so seldom is not added. With that line removed,
+  `build-child-faults.sh` (merge 2) was ended by its runner's time
+  limit in 3 of 3 runs, at its build child that a fault stops before
+  `setsid()`: Nix waits for a child it did not kill.
+- merge 37 (fork-safety at 48c26b6fbf): no conflict. The merge base is
+  ca173f4d61, merge 2's head, so the merge brings the branch's two newer
+  commits only; the line they add to
+  `src/libstore/linux/build/linux-derivation-builder.cc` is in
+  `spawnBuildChild`, far from merge 36's change to `startChild`.
 
 Rows marked PENDING REVIEW or PENDING RE-REVIEW are merged for the gate;
 their reviews are not yet done, and this candidate is not pushed until
 they are.
+Row 33's head 2e385bdf57 was reviewed with the candidate that merged it
+(78e3105524): those reviews covered its difference from row 9's revision.
 
 NixOS/nix#16459 is not merged: its check,
 made on the resolved output rather than on the derivation about to be read,
@@ -222,6 +302,14 @@ would fail against such a daemon. The same bump makes this branch's own daemon
 pass the guard: since the merge of 96084b82ab, `daemonCompat`'s run against
 this build's daemon runs `build-built-drv-foreign-path.sh`, which it skipped
 before (`build-built-drv-foreign-path-substitute.sh` is still skipped there).
+The same risk holds for merge 32's `tests/functional/fixed-add-own-output.sh`,
+guarded by `requireDaemonNewerThan "2.37.0pre20261120"`, and for merge 35's
+count of lock rounds in `tests/functional/build.sh`, guarded by
+`isDaemonNewer "2.37pre"`: both fixes exist only in this fork, and
+`daemonCompat` also runs against Nixpkgs' `nixVersions.latest` and `stable`
+(`packaging/hydra.nix`). Both are older than 2.37 today, so the two checks are
+skipped there; once one of them is a 2.37 release, it passes both guards
+without the fixes, and the checks fail against it.
 The `integration: describe the merged branches` commits only add or update
 this file and `maintainers/integration-status.sh`.
 
@@ -237,6 +325,23 @@ this file and `maintainers/integration-status.sh`.
   among this flake's checks, so nothing here fails on it.
   `nix_build_child_main` (merge 2) is not marked `NIXC_NOEXCEPT` as
   upstream's C API functions now are.
+
+- Tests without a time limit of their own. Since merge 37
+  `build-child-faults.sh` has none: a Nix that hangs in it keeps the test
+  waiting until the test's runner ends it. `meson test` does, after 300 s
+  per functional test. A package build does not: Nixpkgs' meson hook runs
+  the check phase with `--timeout-multiplier=0`, so there the hang lasts
+  until the `timeout` or `max-silent-time` of the Nix that runs the build,
+  if it sets one, and under `checkPhase` in the development shell until
+  the developer ends it. The same holds for merge 36's two builders in
+  `external-builders.sh` that wait for each other. Merge 34's unit test
+  sets no limit either: a regression leaves it waiting for a lookup that
+  the test's cache holds, which `meson test` ends after 30 s and, in a
+  package build, Nix's `stalled-download-timeout` after 300 s.
+- Rows 2 and 37 merge `nix-fix/fork-safety` at ca173f4d61 and at
+  48c26b6fbf, two commits later; `integration-status.sh` compares only
+  row 37 with the branch's tips and reports a tip still at ca173f4d61 as
+  OLDER, as for the pairs below.
 
 - Merge 30 and external builders: the worker does not apply `timeout` or
   `max-silent-time` to an external builder (merge 15). An external builder
