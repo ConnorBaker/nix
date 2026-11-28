@@ -233,8 +233,20 @@ void Worker::childTerminated(Goal * goal)
     childTerminated(goal, goal->jobCategory());
 }
 
-void Worker::childTerminated(Goal * goal, JobCategory jobCategory)
+void Worker::childTerminated(Goal * goal, JobCategory jobCategory, bool remoteBuildEnded)
 {
+    /* That machine has a build slot free. Wake one of the goals that wait
+       for a while, as those do that the hook postponed, to ask again now
+       and not only at the next poll: the first in the set's order,
+       whether or not it is one that can use the slot. */
+    if (remoteBuildEnded)
+        for (auto i = waitingForAWhile.begin(); i != waitingForAWhile.end(); i = waitingForAWhile.erase(i))
+            if (auto waiting = i->lock()) {
+                waitingForAWhile.erase(i);
+                wakeUp(waiting);
+                break;
+            }
+
     // FIXME: Inefficient. Make children a map from Goal -> Child instead.
     auto i = std::find_if(children.begin(), children.end(), [&](const Child & child) { return child.goal2 == goal; });
     if (i == children.end())

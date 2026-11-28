@@ -61,6 +61,7 @@ suites = [
       'build-cores.sh',
       'build-delete.sh',
       'build-dry.sh',
+      'build-hook-waiting.sh',
       'build-release-evaluator.sh',
       'build-remote-ca-rebuild-after-gc.sh',
       'build-remote-content-addressed-fixed.sh',

@@ -80,8 +80,17 @@ private:
     Co<ExitCode> init();
     Co<void> realiseInputs();
     Co<Result> tryToBuild();
+    /**
+     * The build hook that this goal has taken from the worker: one that
+     * has accepted the build, or that is connecting to a machine.
+     */
+    struct AcceptedHook;
+
     Co<Result> buildWithHook(
-        const StorePathSet & inputPaths, std::map<std::string, InitialOutput> & initialOutputs, PathLocks outputLocks);
+        AcceptedHook & accepted,
+        const StorePathSet & inputPaths,
+        std::map<std::string, InitialOutput> & initialOutputs,
+        PathLocks outputLocks);
     Co<LocalBuildOutcome> buildLocally(
         LocalBuildCapability localBuildCap,
         const StorePathSet & inputPaths,
@@ -100,9 +109,10 @@ private:
     bool canBuildLocally(const DerivationOptions<StorePath> & drvOptions);
 
     /**
-     * Is the build hook willing to perform the build?
+     * Is the build hook willing to perform the build? If so, `accepted`
+     * is that hook.
      */
-    HookReply tryBuildHook(const DerivationOptions<StorePath> & drvOptions);
+    Co<HookReply> tryBuildHook(const DerivationOptions<StorePath> & drvOptions, AcceptedHook & accepted);
 
     BuildError logLimitExceeded();
 
