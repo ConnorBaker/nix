@@ -58,12 +58,14 @@ log=$(build unix a b --builders "$machine - - 2") || fail "$log"
 log=$(build ssh a b --builders "unix://$TEST_ROOT/no-machine - - 2; ssh-ng://localhost - - 2") || fail "$log"
 [[ $(startedBefore "^building '.*' on " "$log") == 1 ]] || fail "$log"
 
-# A machine that cannot be connected to. Both hooks try it at the same time
-# and give their builds back, so `a` and `b` are built here. The worker keeps
-# a hook that has given up on the machine: asked about `both`, it tries nothing.
-log=$(NIX_REMOTE='' nix build -f build-hook-waiting.nix --no-link --argstr salt refuse both \
-    --max-jobs 2 --builders "unix://$TEST_ROOT/no-machine - - 2" 2>&1) || fail "$log"
-[[ $(grep -c "cannot build on" <<< "$log") == 2 ]] || fail "$log"
+# Two machines that cannot be connected to. Both hooks try both at the same
+# time and say before each that they are connecting; a goal ignores that from
+# the hook it holds. They give their builds back, so `a` and `b` are built
+# here. The worker keeps a hook that has given up on the machines: asked
+# about `both`, it tries nothing.
+log=$(NIX_REMOTE='' nix build -f build-hook-waiting.nix --no-link --argstr salt refuse both --max-jobs 2 \
+    --builders "unix://$TEST_ROOT/no-machine - - 2; unix://$TEST_ROOT/no-machine2 - - 2" 2>&1) || fail "$log"
+[[ $(grep -c "cannot build on" <<< "$log") == 4 ]] || fail "$log"
 
 # A hook of one's own that says that it is connecting. While we wait for it,
 # it takes none of our build slots: of `local` and `local2`, which are built
