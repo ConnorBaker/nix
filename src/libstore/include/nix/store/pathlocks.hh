@@ -2,10 +2,18 @@
 ///@file
 
 #include <filesystem>
+#include <map>
+#include <mutex>
 
 #include "nix/util/file-descriptor.hh"
 
 namespace nix {
+
+/**
+ * Store paths whose lock the caller already holds, so must not take again.
+ * Each one's mutex serialises the caller's own threads instead.
+ */
+using HeldLocks = std::map<std::string, std::mutex>;
 
 /**
  * Open (possibly create) a lock file and return the file descriptor.

@@ -1104,6 +1104,12 @@ bool LocalStore::realisationIsUntrusted(const Realisation & realisation)
 
 void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs)
 {
+    addToStore(info, source, repair, checkSigs, locksHeld);
+}
+
+void LocalStore::addToStore(
+    const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs, HeldLocks & locksHeld)
+{
     if (checkSigs && pathInfoIsUntrusted(info))
         throw Error("cannot add path '%s' because it lacks a signature by a trusted key", printStorePath(info.path));
 
@@ -1113,13 +1119,16 @@ void LocalStore::addToStore(const ValidPathInfo & info, Source & source, RepairF
         if (repair || !isValidPath(info.path)) {
 
             PathLocks outputLock;
+            std::unique_lock<std::mutex> heldLock;
 
             auto realPath = toRealPath(info.path);
 
-            /* Lock the output path.  But don't lock if we're being called
-               from a build hook (whose parent process already acquired a
-               lock on this path). */
-            if (!locksHeld.count(printStorePath(info.path)))
+            /* Lock the output path, unless the caller already holds that
+               lock: a build hook's parent process, or the build whose
+               builder is adding its own output. */
+            if (auto * held = get(locksHeld, printStorePath(info.path)))
+                heldLock = std::unique_lock(*held);
+            else
                 outputLock.lockPaths({realPath});
 
             /* The path may have been created by another process in the meantime, so check again. */
@@ -1254,7 +1263,8 @@ StorePath LocalStore::addToStoreFromDump(
     const StorePathSet & references,
     RepairFlag repair)
 {
-    return addToStoreFromDump(source0, name, dumpMethod, hashMethod, hashAlgo, references, repair, false);
+    HeldLocks none;
+    return addToStoreFromDump(source0, name, dumpMethod, hashMethod, hashAlgo, references, repair, false, none);
 }
 
 StorePath LocalStore::addToStoreFromDump(
@@ -1265,7 +1275,8 @@ StorePath LocalStore::addToStoreFromDump(
     HashAlgorithm hashAlgo,
     const StorePathSet & originalReferences,
     RepairFlag repair,
-    bool filterReferences)
+    bool filterReferences,
+    HeldLocks & locksHeld)
 {
     /* For computing the store path. */
     auto hashSink = std::make_shared<HashSink>(hashAlgo);
@@ -1383,7 +1394,12 @@ StorePath LocalStore::addToStoreFromDump(
 
         auto realPath = toRealPath(dstPath);
 
-        PathLocks outputLock({realPath});
+        PathLocks outputLock;
+        std::unique_lock<std::mutex> heldLock;
+        if (auto * held = get(locksHeld, printStorePath(dstPath)))
+            heldLock = std::unique_lock(*held);
+        else
+            outputLock.lockPaths({realPath});
 
         /* The path may have been created by another process in the meantime, so check again. */
         if (repair || !isValidPathUncached(dstPath)) {

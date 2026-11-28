@@ -258,7 +258,7 @@ public:
     /**
      * Hack for build-remote.cc.
      */
-    PathSet locksHeld;
+    HeldLocks locksHeld;
 
     /**
      * Initialise the local store, upgrading the schema if
@@ -296,7 +296,12 @@ public:
     bool pathInfoIsUntrusted(const ValidPathInfo &) override;
     bool realisationIsUntrusted(const Realisation &) override;
 
+    using Store::addToStore;
+
     void addToStore(const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs) override;
+
+    void addToStore(
+        const ValidPathInfo & info, Source & source, RepairFlag repair, CheckSigsFlag checkSigs, HeldLocks & locksHeld);
 
     StorePath addToStoreFromDump(
         Source & dump,
@@ -318,7 +323,8 @@ public:
         HashAlgorithm hashAlgo,
         const StorePathSet & references,
         RepairFlag repair,
-        bool filterReferences);
+        bool filterReferences,
+        HeldLocks & locksHeld);
 
     void addTempRoots(const StorePathSet & paths) override;
 

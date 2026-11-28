@@ -710,6 +710,11 @@ void UnixDerivationBuilderImpl::startDaemon()
 
     auto storeForDaemon = this->store->makeRecursiveNixStore(*this);
 
+    /* The build goal has locked the outputs whose paths are known. */
+    for (auto & [_, output] : outputsAndOptPaths(drv, *store))
+        if (output.second)
+            locksHeld.try_emplace(store->printStorePath(*output.second));
+
     state_.lock()->addedPaths.clear();
 
     auto socketName = ".nix-socket";
