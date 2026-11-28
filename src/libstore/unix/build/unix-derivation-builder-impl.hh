@@ -144,6 +144,8 @@ public:
 
     std::optional<Descriptor> startBuild() override;
 
+    std::optional<std::string> processSetupOutput(std::optional<std::string_view> data) override;
+
     BuilderExit unprepareBuild() override;
 
     void cleanupBuild(bool force) override;
@@ -230,14 +232,12 @@ private:
      */
     void initEnv();
 
-protected:
-
     /**
-     * Process messages send by the sandbox initialization.
+     * Setup output not processed yet and setup messages received so far;
+     * see `processSetupOutput`.
      */
-    void processSandboxSetupMessages();
-
-private:
+    std::string setupOutput;
+    Strings setupMessages;
 
     /**
      * Start an in-process nix daemon thread for recursive-nix.

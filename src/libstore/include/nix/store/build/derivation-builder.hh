@@ -25,7 +25,7 @@ void rethrowExceptionAsError();
 
 /**
  * Send the current exception to the parent in the format expected by
- * `UnixDerivationBuilderImpl::processSandboxSetupMessages()`.
+ * `UnixDerivationBuilderImpl::processSetupOutput()`.
  */
 void handleChildException(bool sendException);
 
@@ -244,8 +244,28 @@ public:
      * @note "success" just means that we were able to set up the environment
      * and start the build. The builder could have immediately exited with
      * failure, and that would still be considered a successful start.
+     * The builder may also still be setting up its environment; see
+     * `processSetupOutput`.
      */
     virtual std::optional<Descriptor> startBuild() = 0;
+
+    /**
+     * Process the output of a builder that is setting up its environment
+     * (e.g. the sandbox). Until that is done, its output is not the build
+     * log, but must be passed here.
+     *
+     * @param data Output read from `builderOut` (empty right after
+     * `startBuild`), or `std::nullopt` at EOF.
+     *
+     * @returns `std::nullopt` while the setup goes on; once it is done, the
+     * output that followed, which is build log.
+     *
+     * @throws if the setup failed.
+     */
+    virtual std::optional<std::string> processSetupOutput(std::optional<std::string_view> data)
+    {
+        return std::string(data.value_or(""));
+    }
 
     /**
      * Tear down build environment after the builder exits (either on

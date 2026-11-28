@@ -611,11 +611,10 @@ void ChrootLinuxDerivationBuilder::startChild()
 
     sendPid.writeSide.close();
 
-    if (auto status = helper.wait(); !statusOk(status)) {
-        processSandboxSetupMessages();
-        // Only reached if the child process didn't send an exception.
-        throw Error("unable to start build process: %s", statusToString(status));
-    }
+    /* A helper that failed sent its error on the builder's output; the
+       caller finds it there with `processSetupOutput`. */
+    if (!statusOk(helper.wait()))
+        return;
 
     userNamespaceSync.readSide = -1;
 

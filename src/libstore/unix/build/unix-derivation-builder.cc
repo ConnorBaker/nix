@@ -120,15 +120,21 @@ bool UnixDerivationBuilderImpl::killChild()
            condition: if we kill the build user before the child has
            done its setuid() to the build user uid, then it won't be
            killed, and we'll potentially lock up in pid.wait().  So
-           also send a conventional kill to the child. */
+           also send a conventional kill to the child: to the child
+           itself too, which is in a process group of its own only once
+           it has called setsid(). */
+        ::kill(pid, SIGKILL);  /* ignore the result */
         ::kill(-pid, SIGKILL); /* ignore the result */
 
         killSandbox(true);
 
         pid.wait();
-
-        miscMethods->childTerminated();
     }
+
+    /* Also without a child: one that exited during its setup has been
+       waited for, and a failed sandbox helper leaves none. */
+    miscMethods->childTerminated();
+
     return ret;
 }
 
@@ -398,8 +404,8 @@ std::optional<Descriptor> UnixDerivationBuilderImpl::startBuild()
 
     pid.setSeparatePG(true);
 
-    processSandboxSetupMessages();
-
+    /* The child is now setting up the build environment; the caller
+       waits for that with `processSetupOutput`. */
     return builderOut.get();
 }
 
@@ -546,35 +552,45 @@ void UnixDerivationBuilderImpl::startChild()
     });
 }
 
-void UnixDerivationBuilderImpl::processSandboxSetupMessages()
+std::optional<std::string> UnixDerivationBuilderImpl::processSetupOutput(std::optional<std::string_view> data)
 {
-    std::vector<std::string> msgs;
-    while (true) {
-        std::string msg = [&]() {
+    if (data)
+        setupOutput += *data;
+
+    for (size_t nl; (nl = setupOutput.find('\n')) != std::string::npos;) {
+        std::string msg = setupOutput.substr(0, nl);
+        if (msg.starts_with("\2"))
+            return setupOutput.substr(nl + 1);
+        if (msg.starts_with("\1")) {
+            /* The child sends the error after this line. */
+            StringSource source(std::string_view(setupOutput).substr(nl + 1));
+            std::optional<Error> ex;
             try {
-                return readLine(builderOut.get());
-            } catch (Error & e) {
-                auto status = pid != unix::INVALID_PID ? pid.wait() : 0;
-                e.addTrace(
-                    {},
-                    "while waiting for the build environment for '%s' to initialize (%s, previous messages: %s)",
-                    store->printStorePath(drvPath),
-                    status ? statusToString(status) : "no status",
-                    concatStringsSep("|", msgs));
-                throw;
+                ex = readError(source);
+            } catch (EndOfFile &) {
+                /* Not all of it is here yet. */
+                break;
             }
-        }();
-        if (msg.substr(0, 1) == "\2")
-            break;
-        if (msg.substr(0, 1) == "\1") {
-            FdSource source(builderOut.get());
-            auto ex = readError(source);
-            ex.addTrace({}, "while setting up the build environment");
-            throw std::move(ex);
+            ex->addTrace({}, "while setting up the build environment");
+            throw std::move(*ex);
         }
         debug("sandbox setup: " + msg);
-        msgs.push_back(std::move(msg));
+        setupMessages.push_back(std::move(msg));
+        setupOutput.erase(0, nl + 1);
     }
+
+    if (data)
+        return std::nullopt;
+
+    EndOfFile e("unexpected EOF reading a line");
+    auto status = pid != unix::INVALID_PID ? pid.wait() : 0;
+    e.addTrace(
+        {},
+        "while waiting for the build environment for '%s' to initialize (%s, previous messages: %s)",
+        store->printStorePath(drvPath),
+        status ? statusToString(status) : "no status",
+        concatStringsSep("|", setupMessages));
+    throw e;
 }
 
 void UnixDerivationBuilderImpl::initEnv()
