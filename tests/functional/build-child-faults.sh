@@ -10,13 +10,17 @@ needLocalStore "the build child is started by the process that builds"
 export NIX_TEST_FAULT_DIR=$TEST_ROOT/faults
 
 # Build $1 (a name) with the fault $NIX_TEST_FAULT injected, unsandboxed so
-# that the builder can count its runs in $TEST_ROOT.
+# that the builder can count its runs in $TEST_ROOT. No build here has a
+# deadline: a Nix that never exits keeps the test waiting until the runner
+# ends it. `meson test` does after its limit per test; `checkPhase`, in a
+# package build or the development shell, has no limit. nix-build is then
+# killed with this shell (--pdeathsig): a hung Nix may not act on SIGTERM.
 withFault() {
     local name=$1
     shift
     rm -rf "$NIX_TEST_FAULT_DIR"
     mkdir -p "$NIX_TEST_FAULT_DIR"
-    LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so timeout -k 5 60 \
+    LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so setpriv --pdeathsig KILL \
         nix-build --no-out-link --option sandbox false "$@" -E "
         with import ${config_nix}; mkDerivation {
           name = \"$name\";
@@ -35,7 +39,6 @@ NIX_TEST_FAULT=slave-on-stdin withFault slave-on-stdin < /dev/null
 # process group (with setsid()).
 status=0
 NIX_TEST_FAULT=child-stops-before-setsid withFault child-stops-before-setsid 2> "$TEST_ROOT/log" || status=$?
-[[ $status != 124 && $status != 137 ]] || fail "Nix waited for the build child that it stopped"
 [[ $status != 0 ]]
 grepQuiet "unexpected error type 'Fail'" "$TEST_ROOT/log"
 [[ -e $NIX_TEST_FAULT_DIR/child-stopped ]] || fail "the fault was not injected"
@@ -89,7 +92,7 @@ echo "$zombies" > "$1"
 EOF
 rm -rf "$NIX_TEST_FAULT_DIR"
 mkdir -p "$NIX_TEST_FAULT_DIR"
-NIX_TEST_FAULT=server-exits-before-reply LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so timeout -k 5 60 \
+NIX_TEST_FAULT=server-exits-before-reply LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so setpriv --pdeathsig KILL \
     nix-build --no-out-link --option sandbox false -E "
     with import ${config_nix}; mkDerivation {
       name = \"unreported-child\";
@@ -123,23 +126,18 @@ expectOwnError reply-fails "receiving from the build child server"
 expectInterruptible() {
     rm -rf "$NIX_TEST_FAULT_DIR"
     mkdir -p "$NIX_TEST_FAULT_DIR"
-    NIX_TEST_FAULT=$1 LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so \
+    NIX_TEST_FAULT=$1 LD_PRELOAD=${_NIX_TEST_BUILD_DIR}/build-child-faults-shim.so setpriv --pdeathsig KILL \
         nix-build --no-out-link --option sandbox false -E "
         with import ${config_nix}; mkDerivation { name = \"$1\"; buildCommand = \"echo > \$out\"; }" \
         2> "$TEST_ROOT/log" &
     local nixPid=$! status=0 waitedFor
-    for _ in {1..600}; do [[ -e $NIX_TEST_FAULT_DIR/$2 ]] && break; sleep 0.1; done
+    until [[ -e $NIX_TEST_FAULT_DIR/$2 ]] || ! kill -0 "$nixPid" 2> /dev/null; do sleep 0.1; done
     [[ -e $NIX_TEST_FAULT_DIR/$2 ]] || fail "the fault was not injected"
     waitedFor=$(< "$NIX_TEST_FAULT_DIR/$2")
     kill -INT "$nixPid"
-    for _ in {1..300}; do kill -0 "$nixPid" 2> /dev/null || break; sleep 0.1; done
-    if kill -0 "$nixPid" 2> /dev/null; then
-        kill -9 "$nixPid" "$waitedFor"
-        fail "Nix did not stop waiting ($1) when interrupted"
-    fi
-    if [[ $(tr '\0' ' ' < "/proc/$waitedFor/cmdline" 2> /dev/null) = __build-child* ]]; then kill -9 "$waitedFor"; fi
     wait "$nixPid" || status=$?
-    [[ $status != 0 ]]
+    if [[ $(tr '\0' ' ' < "/proc/$waitedFor/cmdline" 2> /dev/null) = __build-child* ]]; then kill -9 "$waitedFor" 2> /dev/null || true; fi
+    [[ $status = 1 ]]
 }
 # For the build child server's reply,
 expectInterruptible server-hangs-before-reply server-hanging
