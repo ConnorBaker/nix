@@ -376,8 +376,11 @@ public:
      * This overload only uses `goal` as a pointer for comparison with
      * weak goal references, so it is safe to call from destructors
      * where the goal object may be partially destroyed.
+     *
+     * `remoteBuildEnded` says that the child was a build hook whose
+     * build on another machine is over.
      */
-    void childTerminated(Goal * goal, JobCategory jobCategory);
+    void childTerminated(Goal * goal, JobCategory jobCategory, bool remoteBuildEnded = false);
 
     /**
      * Put `goal` to sleep until a build slot becomes available (which
