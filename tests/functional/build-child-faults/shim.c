@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -132,7 +133,7 @@ ssize_t write(int fd, const void * buf, size_t count)
     if (buildChildProgram && getpid() == loadedPid && fd == STDIN_FILENO && count == sizeof(pid_t)) {
         if (once("server-exits-before-reply") || once("unreported-child-hangs"))
             _exit(1);
-        if (once("server-hangs-before-reply")) {
+        if (once("server-hangs-before-reply") || fault("interrupted-after-request")) {
             mark("server-hanging");
             while (1)
                 pause();
@@ -149,7 +150,7 @@ static int isSeqpacket(int fd)
 }
 
 /* Nix, about to send a request with fds to the build child server: with
-   one byte too many, or failing as on a bad fd. */
+   one byte too many, failing as on a bad fd, or interrupted afterwards. */
 ssize_t sendmsg(int fd, const struct msghdr * msg, int flags)
 {
     REAL(sendmsg);
@@ -170,6 +171,19 @@ ssize_t sendmsg(int fd, const struct msghdr * msg, int flags)
         longer.msg_iov = &iov;
         ssize_t sent = real_sendmsg(fd, &longer, flags);
         return sent > (ssize_t) n ? (ssize_t) n : sent;
+    }
+    /* Or Nix is interrupted when it has sent the request and does not wait
+       for the reply yet: this thread goes on once Nix's signal thread has
+       taken the signal. The sleep after that lets that thread handle it;
+       were it too short, a Nix that loses the interrupt would go unnoticed. */
+    if (!buildChildProgram && msg->msg_controllen && isSeqpacket(fd) && once("interrupted-after-request")) {
+        ssize_t sent = real_sendmsg(fd, msg, flags);
+        sigset_t pending;
+        kill(getpid(), SIGINT);
+        while (sigpending(&pending) == 0 && sigismember(&pending, SIGINT))
+            usleep(10000);
+        usleep(100000);
+        return sent;
     }
     return real_sendmsg(fd, msg, flags);
 }
