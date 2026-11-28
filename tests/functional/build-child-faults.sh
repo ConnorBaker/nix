@@ -145,3 +145,10 @@ expectInterruptible() {
 expectInterruptible server-hangs-before-reply server-hanging
 # and for a build child that the server started but did not report.
 expectInterruptible unreported-child-hangs child-hanging
+
+# Also for that reply when the interrupt comes earlier, after Nix's request
+# and before Nix waits: there Nix interrupts itself, and gets no reply.
+status=0
+NIX_TEST_FAULT=interrupted-after-request withFault interrupted-after-request 2> "$TEST_ROOT/log" || status=$?
+[[ $status = 1 ]]
+grepQuiet "interrupted by the user" "$TEST_ROOT/log"

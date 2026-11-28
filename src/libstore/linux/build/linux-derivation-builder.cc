@@ -611,6 +611,7 @@ static Pid spawnBuildChild(std::string_view state, std::vector<FdRedirection> fd
             unix::sendMessageWithFds(server.socket.get(), std::as_bytes(std::span(targets)), sources);
             theirs.close();
             auto onInterrupt = createInterruptCallback([&] { ::shutdown(server.socket.get(), SHUT_RDWR); });
+            checkInterrupt();
             while ((n = recv(server.socket.get(), &pid, sizeof pid, 0)) == -1 && errno == EINTR)
                 ;
             if (n == -1 && errno != ECONNRESET)
