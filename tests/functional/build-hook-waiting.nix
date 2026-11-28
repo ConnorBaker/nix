@@ -19,8 +19,10 @@ let
     );
 in
 
-{
+rec {
   a = mk "a" { };
   b = mk "b" { };
   c = mk "c" { };
+  both = mk "both" { inherit a b; };
+  local = mk "local" { preferLocalBuild = true; };
 }

@@ -163,6 +163,7 @@ static int main_build_remote(int argc, char ** argv)
                 lockFile(lock.get(), ltWrite, true);
 
                 bool rightType = false;
+                bool sshMachine = false;
 
                 Machine * bestMachine = nullptr;
                 uint64_t bestLoad = 0;
@@ -172,6 +173,8 @@ static int main_build_remote(int argc, char ** argv)
                     if (m.enabled && m.systemSupported(neededSystem) && m.allSupported(requiredFeatures)
                         && m.mandatoryMet(requiredFeatures)) {
                         rightType = true;
+                        auto * uri = std::get_if<StoreReference::Specified>(&m.storeUri.variant);
+                        sshMachine |= uri && uri->scheme.contains("ssh");
                         AutoCloseFD free;
                         uint64_t load = 0;
                         for (uint64_t slot = 0; slot < m.maxJobs; ++slot) {
@@ -253,6 +256,14 @@ static int main_build_remote(int argc, char ** argv)
 #endif
 
                 lock = -1;
+
+                /* We have a build slot. Say so before we connect, which can
+                   take long: Nix then stops blocking on us and starts the
+                   hook of its next build. Not when a machine we may connect
+                   to is an ssh one: sshd refuses connections while too many
+                   are unauthenticated (`MaxStartups`, 10:30:100 by default). */
+                if (!sshMachine)
+                    std::cerr << "@nix {\"action\":\"connecting\"}\n";
 
                 try {
                     storeUri = bestMachine->storeUri.render();
