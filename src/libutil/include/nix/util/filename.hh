@@ -49,6 +49,24 @@ private:
     friend struct FilenameLiteral;
 
     /**
+     * `s.contains(c)`, except at compile time: `contains` tests a pointer
+     * to the character against null, which GCC with
+     * `-fsanitize=undefined` does not treat as a constant expression for
+     * the characters of a `FilenameLiteral`.
+     */
+    static constexpr bool contains(std::string_view s, char c) noexcept
+    {
+        if consteval {
+            for (char x : s)
+                if (x == c)
+                    return true;
+            return false;
+        } else {
+            return s.contains(c);
+        }
+    }
+
+    /**
      * Why @p s is not a valid `Filename`, or `std::nullopt` if it is.
      *
      * In the header and `constexpr` so that `FilenameLiteral` can check
@@ -62,9 +80,9 @@ private:
             return Problem::Dot;
         if (s == "..")
             return Problem::DotDot;
-        if (s.contains('/'))
+        if (contains(s, '/'))
             return Problem::Slash;
-        if (s.contains('\0'))
+        if (contains(s, '\0'))
             return Problem::Nul;
         return std::nullopt;
     }
