@@ -51,6 +51,14 @@ startedBefore() {
 log=$(build unix a b --builders "$machine - - 2") || fail "$log"
 [[ $(startedBefore "hook reply is 'accept'" "$log") == 2 ]] || fail "$log"
 
+# The same with the derivations in an evaluation store only. The hook reads
+# its derivation from the store that asks for the build, so Nix copies it
+# there once the hook has accepted, also when the goal waited for that hook
+# as for a child. Without the copy the hook finds no derivation and the
+# build fails.
+log=$(build evalstore a b --eval-store "$TEST_ROOT/eval" --builders "$machine - - 2") || fail "$log"
+[[ $(startedBefore "hook reply is 'accept'" "$log") == 2 ]] || fail "$log"
+
 # A hook that may connect to an ssh machine never says that it is connecting,
 # also not to another machine that it tries first: an ssh server refuses
 # connections while too many are not yet authenticated. Nix waits for such a
