@@ -163,24 +163,12 @@ void EvalState::ensurePath(const StorePath & path)
 {
     try {
         store->getBuilder()->ensurePath(path);
-    } catch (Error & e) {
-        if (store == buildStore)
-            throw;
+    } catch (Error &) {
         /* As `realiseContext()` does for the outputs of import-from-derivation. */
         buildStore->addTempRoot(path);
         if (!buildStore->isValidPath(path))
             throw;
-        try {
-            copyClosure(*buildStore, *store, StorePathSet{path});
-            return;
-        } catch (Error & copyError) {
-            e.addTrace(
-                nullptr,
-                "copying '%s' from the build store also failed: %s",
-                buildStore->printStorePath(path),
-                copyError.msg());
-        }
-        throw;
+        copyClosure(*buildStore, *store, StorePathSet{path});
     }
 }
 
