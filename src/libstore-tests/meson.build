@@ -67,6 +67,7 @@ sources = files(
   'path-info.cc',
   'path.cc',
   'pathlocks.cc',
+  'query-missing-realisations.cc',
   'realisation.cc',
   'references.cc',
   's3-binary-cache-store.cc',
